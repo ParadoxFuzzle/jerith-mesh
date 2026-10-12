@@ -151,12 +151,25 @@ async fn run_loop(
             match bootstrap.fetch_peers(&m.id).await {
                 Ok(peers) => {
                     let mut reg = state.registry.lock().await;
+                    let fetched = peers.len();
                     for ad in peers {
                         reg.upsert(ad);
                     }
+                    tracing::info!(
+                        target: "mesh",
+                        fetched,
+                        "peer list refreshed from bootstrap"
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "bootstrap unreachable — running degraded (local-only)");
+                    // Bootstrap turned this node away (signature/expiry) or
+                    // is unreachable — must be visible, not silent.
+                    tracing::warn!(
+                        target: "mesh",
+                        error = %e,
+                        "bootstrap list refresh failed — degraded (local-only)"
+                    );
+                    let _ = state.contribution_healthy.send(false);
                 }
             }
 
@@ -178,7 +191,10 @@ async fn run_loop(
                 (ad, state.identity.clone())
             };
             if let Err(e) = bootstrap.advertise(&ad, &identity).await {
-                tracing::debug!(error = %e, "advertise failed");
+                // An advertise failure means the mesh can't see us — warn.
+                tracing::warn!(target: "mesh", error = %e, "advertise rejected/failed");
+            } else {
+                tracing::debug!(target: "mesh", "advertised to bootstrap");
             }
         }
 
@@ -259,6 +275,18 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
     }
 
     if !failed.is_empty() {
+        let (report_evidence, my_id) = {
+            let reg = state.registry.lock().await;
+            let evidence: Vec<(String, u32)> = failed
+                .iter()
+                .filter_map(|id| {
+                    let h = reg.health_of(id)?;
+                    // Submit evidence only on the deprecating (3rd) failure.
+                    (h.consecutive_failures == 3).then_some((id.clone(), h.consecutive_failures))
+                })
+                .collect();
+            (evidence, state.identity.node_id())
+        };
         let mut reg = state.registry.lock().await;
         for node_id in &failed {
             let was_alive = matches!(reg.state_of(node_id), Some(PeerState::Alive));
@@ -266,6 +294,35 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             if was_alive && reg.state_of(node_id) == Some(PeerState::Deprecated) {
                 tracing::warn!(node = %node_id, "peer deprecated");
                 let _ = bootstrap.report_dead(node_id).await;
+            }
+        }
+        drop(reg);
+        // Failed-worker evidence to the bootstrap (signed, dedup'd server
+        // side). Only for transitions to Deprecated (3rd failure).
+        for (node_id, fails) in report_evidence {
+            if fails == 3 {
+                match bootstrap
+                    .report_fraud(
+                        crate::bootstrap_server::FraudKind::FailedWorker,
+                        &node_id,
+                        &my_id,
+                        &state.identity,
+                    )
+                    .await
+                {
+                    Ok(v) => tracing::info!(
+                        target: "mesh",
+                        node = %node_id,
+                        reply = %v,
+                        "failed-worker evidence submitted"
+                    ),
+                    Err(e) => tracing::debug!(
+                        target: "mesh",
+                        node = %node_id,
+                        error = %e,
+                        "fraud evidence submission failed"
+                    ),
+                }
             }
         }
     }

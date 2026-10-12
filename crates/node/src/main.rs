@@ -596,23 +596,47 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     // Phase 1: QUIC NodeRPC server. Peers dispatch
-    // expert queries here; the stand-in handler runs until the Colibri
-    // runtime exposes real expert tensors.
+    // expert queries here when the local runtime is reachable and serving
+    // the mesh model; otherwise the node registers no RPC endpoint (it
+    // stays discoverable but is not offered remote expert work).
     let quic_port = cfg.effective_rpc_port();
     let rpc_addr: std::net::SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
-    match jerith_mesh_core::quic::server_endpoint(rpc_addr) {
-        Ok(endpoint) => {
-            let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                let handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
-                    std::sync::Arc::new(jerith_mesh_core::quic::ReluExpert);
-                if let Err(e) = jerith_mesh_core::quic::serve(endpoint, handler, rpc_rx).await {
-                    tracing::error!(error = %e, "rpc server died");
+    let model_name = cfg
+        .model
+        .as_ref()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    match jerith_mesh_core::quic::RuntimeExpert::discover(&cfg.runtime_url, &model_name).await {
+        Ok(handler) => {
+            match jerith_mesh_core::quic::server_endpoint(rpc_addr) {
+                Ok(endpoint) => {
+                    let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
+                    tokio::spawn(async move {
+                        let handler_handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
+                            std::sync::Arc::new(handler);
+                        if let Err(e) =
+                            jerith_mesh_core::quic::serve(endpoint, handler_handler, rpc_rx).await
+                        {
+                            tracing::error!(error = %e, "rpc server died");
+                        }
+                    });
+                    println!(
+                        "   node-rpc    quic://0.0.0.0:{quic_port} (runtime expert dispatch, model: {model_name})"
+                    );
                 }
-            });
-            println!("   node-rpc    quic://0.0.0.0:{quic_port} (expert dispatch ready)");
+                Err(e) => tracing::warn!(error = %e, "quic rpc server unavailable"),
+            }
         }
-        Err(e) => tracing::warn!(error = %e, "quic rpc server unavailable"),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "runtime not servable — remote expert dispatch disabled"
+            );
+            println!(
+                "   node-rpc    disabled (runtime at {} is not serving this mesh model)",
+                cfg.runtime_url
+            );
+        }
     }
 
     println!(

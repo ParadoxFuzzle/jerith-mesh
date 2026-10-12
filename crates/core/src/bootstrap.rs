@@ -67,6 +67,11 @@ pub struct PeerRegistry {
 }
 
 impl PeerRegistry {
+    /// Read-only health lookup (for evidence decisions before mutation).
+    pub fn health_of(&self, node_id: &str) -> Option<&PeerHealth> {
+        self.health.get(node_id)
+    }
+
     pub fn new(model: Option<ModelId>) -> Self {
         Self {
             model,
@@ -268,6 +273,49 @@ impl BootstrapClient {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// Submit fraud evidence about a peer, signed so the bootstrap can
+    /// attribute (and someday weight) the report to the reporter.
+    pub async fn report_fraud(
+        &self,
+        kind: crate::bootstrap_server::FraudKind,
+        target_node_id: &str,
+        reporter_node_id: &str,
+        identity: &crate::signing::SigningIdentity,
+    ) -> anyhow::Result<serde_json::Value> {
+        if target_node_id == reporter_node_id {
+            anyhow::bail!("a node cannot report itself");
+        }
+        let stamp = now_ms();
+        let payload = format!(
+            "jerith-fraud1|{stamp}|{}|{}|{}",
+            match kind {
+                crate::bootstrap_server::FraudKind::FailedWorker => "failed_worker",
+                crate::bootstrap_server::FraudKind::Leeching => "leeching",
+                crate::bootstrap_server::FraudKind::DishonestResults => "dishonest_results",
+                crate::bootstrap_server::FraudKind::RateAbuse => "rate_abuse",
+            },
+            reporter_node_id,
+            target_node_id,
+        );
+        let auth = crate::signing::WireAuth::now(identity, payload.as_bytes());
+        let url = format!("{}/v1/report-fraud", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .inner
+            .post(&url)
+            .json(&serde_json::json!({
+                "node_id": target_node_id,
+                "reporter": reporter_node_id,
+                "kind": kind,
+            }))
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
     }
 
     /// Optional: live peer counts per model (used by setup UI).

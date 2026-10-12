@@ -49,7 +49,7 @@ struct DeadReport {
     node_id: String,
 }
 
-/// In-memory registry: node_id → (ad, last_refresh_ms, dead_votes).
+/// In-memory registry: node_id → (ad, last_refresh_ms, dead_votes, score).
 #[derive(Default)]
 struct Registry {
     entries: RwLock<HashMap<String, Entry>>,
@@ -61,9 +61,63 @@ struct Entry {
     last_refresh_ms: u64,
     /// Peer-submitted death reports; >= threshold evicts immediately.
     dead_votes: u32,
+    /// Reputation: 0 at join, decremented by corroborated fraud reports,
+    /// recovered by daily time-decay (+2/day) toward 0.
+    score: i32,
+    /// node_id of the reporting peer → (kind, last_report_ms) already held.
+    fraud_reports: HashMap<String, (FraudKind, u64)>,
 }
 
 const DEAD_VOTES_TO_EVICTION: u32 = 2;
+
+// --- Fraud scoring (peer-reported evidence + decay) -------------------
+
+/// Absolute floor — combined penalties cannot push below this.
+const REPUTATION_FLOOR: i32 = -100;
+/// Reports beyond this many distinct peers count double (corroboration).
+const MIN_CORROBORATORS: u32 = 2;
+
+/// Fraud reasons — peers report observed failures, not opinions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FraudKind {
+    /// Signed peer claimed jobs and failed/never returned results.
+    FailedWorker,
+    /// Advertised resources but customarily declines real dispatches.
+    Leeching,
+    /// Results failed redundant replay comparison.
+    DishonestResults,
+    /// Rate abuse / resource exhaustion.
+    RateAbuse,
+}
+
+fn penalty_for(kind: &FraudKind) -> i32 {
+    match kind {
+        FraudKind::FailedWorker => 30,
+        FraudKind::Leeching => 20,
+        FraudKind::DishonestResults => 40,
+        FraudKind::RateAbuse => 10,
+    }
+}
+
+/// Reputation floor: below this the halt-filter in `peers()` withholds the
+/// entry from peer lists (though it can be restored by behavior).
+pub const HALT_SCORE_THRESHOLD: i32 = -20;
+
+fn score_of(e: &Entry) -> i32 {
+    e.score
+}
+
+#[allow(dead_code)]
+fn entry_default_fields(ad: PeerAd) -> Entry {
+    Entry {
+        ad,
+        last_refresh_ms: now_ms(),
+        dead_votes: 0,
+        score: 0,
+        fraud_reports: HashMap::new(),
+    }
+}
 
 fn router(state: Arc<Registry>, ttl_ms: u64) -> Router {
     Router::new()
@@ -71,6 +125,7 @@ fn router(state: Arc<Registry>, ttl_ms: u64) -> Router {
         .route("/v1/peers", get(peers))
         .route("/v1/advertise", put(advertise))
         .route("/v1/report-dead", post(report_dead))
+        .route("/v1/report-fraud", post(report_fraud))
         .route("/v1/models/counts", get(model_counts))
         .with_state((state, ttl_ms))
 }
@@ -79,6 +134,38 @@ type Shared = (Arc<Registry>, u64);
 
 async fn bootstrap_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true, "service": "jerith-bootstrap" }))
+}
+
+/// attitude decay: +2 reputation per full day since the last report, capped at 0.
+fn apply_recovery(entry: &mut Entry, now_ms_val: u64) {
+    if entry.fraud_reports.is_empty() {
+        entry.score = entry.score.min(0);
+        return;
+    }
+    let last_report = entry
+        .fraud_reports
+        .values()
+        .map(|(_, ts)| *ts)
+        .max()
+        .unwrap_or(now_ms_val);
+    let days = (now_ms_val.saturating_sub(last_report) / 86_400_000) as i32;
+    let recovered = (entry.score + 2 * days).min(0);
+    entry.score = recovered.max(REPUTATION_FLOOR);
+}
+
+/// Remove expired entries; returns a snapshot of live, recovery-applied ones.
+async fn sweep_live_scored(registry: &Registry, ttl_ms: u64) -> Vec<Entry> {
+    let now = now_ms();
+    let mut entries = registry.entries.write().await;
+    entries.retain(|_, e| now.saturating_sub(e.last_refresh_ms) < ttl_ms);
+    let live: Vec<Entry> = entries
+        .values_mut()
+        .map(|e| {
+            apply_recovery(e, now);
+            e.clone()
+        })
+        .collect();
+    live
 }
 
 /// Remove expired entries; returns a snapshot of live ones.
@@ -94,10 +181,14 @@ async fn peers(
     State((registry, ttl_ms)): State<Shared>,
 ) -> Response {
     let want_model = params.get("model").cloned().unwrap_or_default();
-    let live = sweep_live(&registry, ttl_ms).await;
+    let live = sweep_live_scored(&registry, ttl_ms).await;
+    // Halt-filtered: bins below HALT_SCORE_THRESHOLD are withheld — a
+    // persistent non-contributor stops receiving mesh traffic but can come
+    // back via adverts once its behavior corrects.
     let peers: Vec<PeerAd> = live
         .into_iter()
         .filter(|e| want_model.is_empty() || e.ad.model_id == want_model)
+        .filter(|e| score_of(e) > HALT_SCORE_THRESHOLD)
         .map(|e| e.ad)
         .collect();
     (StatusCode::OK, Json(PeerListResponse { peers })).into_response()
@@ -160,13 +251,15 @@ async fn advertise(
     ad.last_seen_ms = client_seen.max(now_ms().saturating_sub(1_000));
 
     let mut entries = registry.entries.write().await;
+    // Preserve score/history across re-advertise (identity is stable).
+    let entry = entries.remove(&ad.node_id).unwrap_or_else(|| entry_default_fields(ad.clone()));
     entries.insert(
         ad.node_id.clone(),
         Entry {
             last_refresh_ms: now_ms(),
-            dead_votes: 0,
-            ad,
-        },
+            ..entry
+        }
+        .with_ad(ad),
     );
     let _ = ttl_ms;
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
@@ -197,6 +290,113 @@ async fn report_dead(
             }
         }
     }
+}
+
+impl Entry {
+    /// Replace the advertised payload while keeping score/history.
+    fn with_ad(mut self, ad: PeerAd) -> Self {
+        self.ad = ad;
+        self
+    }
+}
+
+/// Peer-submitted fraud evidence. Deduplicated per (reporter, target);
+/// corroborated by ≥2 distinct reporters counting double.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FraudReport {
+    /// Node being accused.
+    pub node_id: String,
+    /// Node filing the report (must not equal node_id).
+    pub reporter: String,
+    /// Observed failure kind.
+    pub kind: FraudKind,
+}
+
+async fn report_fraud(
+    State((registry, _ttl_ms)): State<Shared>,
+    Json(rep): Json<FraudReport>,
+) -> Response {
+    if rep.node_id == rep.reporter || rep.reporter.is_empty() || rep.node_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reporter must differ from node_id"})),
+        )
+            .into_response();
+    }
+    if !matches!(rep.kind, FraudKind::FailedWorker | FraudKind::Leeching | FraudKind::DishonestResults | FraudKind::RateAbuse) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown fraud kind"})),
+        )
+            .into_response();
+    }
+    let mut entries = registry.entries.write().await;
+    let Some(entry) = entries.get_mut(&rep.node_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown node"})),
+        )
+            .into_response();
+    };
+
+    apply_recovery(entry, now_ms());
+    let now = now_ms();
+
+    // Was this kind already reported by someone else before this report?
+    let kind_already_seen = entry
+        .fraud_reports
+        .values()
+        .any(|(k, _)| k == &rep.kind);
+    // Count of distinct reporters who already reported this kind.
+    let prior_kind_reporters = entry
+        .fraud_reports
+        .values()
+        .filter(|(k, _)| k == &rep.kind)
+        .count() as u32;
+
+    let already_reported_by_this_reporter =
+        entry.fraud_reports.contains_key(&rep.reporter);
+
+    if already_reported_by_this_reporter {
+        // First claim by a reporter wins; later reports only refresh the
+        // timestamp (cheap report-flood defense). No penalty change.
+        if let Some(record) = entry.fraud_reports.get_mut(&rep.reporter) {
+            record.1 = now;
+        }
+    } else if !kind_already_seen {
+        // New (reporter, kind) pair, kind not seen before: single penalty.
+        entry
+            .fraud_reports
+            .insert(rep.reporter.clone(), (rep.kind.clone(), now));
+        entry.score = (entry.score - penalty_for(&rep.kind)).max(REPUTATION_FLOOR);
+    } else {
+        // Corroboration: this kind was already reported by someone else.
+        // Penalize each additional distinct reporter (≥MIN_CORROBORATORS).
+        entry
+            .fraud_reports
+            .insert(rep.reporter.clone(), (rep.kind.clone(), now));
+        if prior_kind_reporters + 1 >= MIN_CORROBORATORS {
+            entry.score = (entry.score - penalty_for(&rep.kind)).max(REPUTATION_FLOOR);
+        }
+    }
+    let score = entry.score;
+    drop(entries);
+    tracing::warn!(
+        node = %rep.node_id,
+        reporter = %rep.reporter,
+        kind = ?rep.kind,
+        score,
+        "fraud report recorded"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "recorded": true,
+            "score": score,
+            "halted": score <= HALT_SCORE_THRESHOLD,
+        })),
+    )
+        .into_response()
 }
 
 async fn model_counts(State((registry, ttl_ms)): State<Shared>) -> Response {
@@ -543,6 +743,279 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    async fn seed_live_peer(
+        registry: &Arc<Registry>,
+        base: &str,
+        client: &reqwest::Client,
+        identity: &crate::signing::SigningIdentity,
+    ) -> String {
+        let a = PeerAd {
+            node_id: identity.node_id(),
+            address: "127.0.0.1:9000".into(),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 30,
+            last_seen_ms: now_ms(),
+            role: NodeRole::Hybrid,
+        };
+        let r = client
+            .put(format!("{base}/v1/advertise"))
+            .headers(signed_headers(identity, &a))
+            .json(&a)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        a.node_id
+    }
+
+    #[tokio::test]
+    async fn fraud_reports_penalize_and_halt() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let accused = crate::signing::SigningIdentity::generate();
+        let r1 = crate::signing::SigningIdentity::generate();
+        let r2 = crate::signing::SigningIdentity::generate();
+        let target = seed_live_peer(&registry, &base, &client, &accused).await;
+
+        async fn post(
+            client: &reqwest::Client,
+            base: &str,
+            target: &str,
+            reporter_id: &str,
+        ) -> reqwest::Response {
+            client
+                .post(format!("{base}/v1/report-fraud"))
+                .json(&serde_json::json!({
+                    "node_id": target,
+                    "reporter": reporter_id,
+                    "kind": "failed_worker",
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        // Self-report rejected.
+        let r = client
+            .post(format!("{base}/v1/report-fraud"))
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": target,
+                "kind": "failed_worker",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        // First report: -30 → already past the halt threshold (-20): a
+        // single corroborated-or-not failed-worker signal stops mesh
+        // dispatches immediately.
+        let v: serde_json::Value = post(&client, &base, &target, &r1.node_id())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -30);
+        assert_eq!(v["halted"], true);
+
+        // Same reporter repeats: deduped, no double penalty.
+        let v: serde_json::Value = post(&client, &base, &target, &r1.node_id())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -30);
+
+        // Second distinct reporter (corroboration): another -30 → -60 → halted.
+        let v: serde_json::Value = post(&client, &base, &target, &r2.node_id())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -60);
+        assert_eq!(v["halted"], true);
+
+        // Halted node no longer appears in the public peer list.
+        let list: PeerListResponse = client
+            .get(format!("{base}/v1/peers?model=glm-5.3"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(list.peers.is_empty(), "halted peer must be withheld");
+
+        // Different fraud kind adds a separate penalty once.
+        let r3 = crate::signing::SigningIdentity::generate();
+        let v: serde_json::Value = client
+            .post(format!("{base}/v1/report-fraud"))
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": r3.node_id(),
+                "kind": "dishonest_results",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -100); // -60 - 40, at the -25... floor check below
+
+        // Floor: beyond it never goes.
+        let v2: serde_json::Value = client
+            .post(format!("{base}/v1/report-fraud"))
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": r2.node_id(),
+                "kind": "rate_abuse",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v2["score"], -100); // capped at REPUTATION_FLOOR
+    }
+
+    #[tokio::test]
+    async fn reputation_survives_readvertise_and_decays() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let accused = crate::signing::SigningIdentity::generate();
+        let reporter = crate::signing::SigningIdentity::generate();
+        let target = seed_live_peer(&registry, &base, &client, &accused).await;
+
+        // One fraud report → -30.
+        let _: serde_json::Value = client
+            .post(format!("{base}/v1/report-fraud"))
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": reporter.node_id(),
+                "kind": "leeching",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Node re-advertises (e.g., restart) → score/history must persist.
+        let a = PeerAd {
+            node_id: target.clone(),
+            address: "127.0.0.1:9000".into(),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 30,
+            last_seen_ms: now_ms(),
+            role: NodeRole::Hybrid,
+        };
+        // Re-sign with the accused's identity (same key, same node_id).
+        let r = client
+            .put(format!("{base}/v1/advertise"))
+            .headers(signed_headers(&accused, &a))
+            .json(&a)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+
+        // Another report from a distinct peer: coroutine applies -20 on top
+        // of -20 (decay is 0 immediately) → -40.
+        let corroborator = crate::signing::SigningIdentity::generate();
+        let v: serde_json::Value = client
+            .post(format!("{base}/v1/report-fraud"))
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": corroborator.node_id(),
+                "kind": "leeching",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -40);
+
+        // Old reporter repeats after re-advertise: still deduped (history
+        // carried across).
+        let v: serde_json::Value = client
+            .post(format!("{base}/v1/report-fraud"))
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": reporter.node_id(),
+                "kind": "leeching",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -40);
+    }
+
+    #[test]
+    fn reputation_recovery_calculates_decayed_scores() {
+        let mut e = Entry {
+            ad: PeerAd {
+                node_id: "x".into(),
+                address: String::new(),
+                model_id: String::new(),
+                quant: String::new(),
+                contribution_percent: 30,
+                last_seen_ms: 0,
+                role: NodeRole::Hybrid,
+            },
+            last_refresh_ms: 0,
+            dead_votes: 0,
+            score: -60,
+            fraud_reports: HashMap::new(),
+        };
+        // No reports → pinned at or below 0.
+        apply_recovery(&mut e, now_ms());
+        assert_eq!(e.score, -60);
+
+        // A report 2 full days old → -60 + 4 = -56.
+        e.fraud_reports
+            .insert("r1".into(), (FraudKind::Leeching, now_ms() - 2 * 86_400_000));
+        apply_recovery(&mut e, now_ms());
+        assert_eq!(e.score, -56);
+
+        // Long recovery: 60 days → capped at 0.
+        e.fraud_reports
+            .insert("r1".into(), (FraudKind::Leeching, now_ms() - 60 * 86_400_000));
+        apply_recovery(&mut e, now_ms());
+        assert_eq!(e.score, 0);
+
+        // Floor respected.
+        e.score = -30;
+        e.fraud_reports
+            .insert("r2".into(), (FraudKind::RateAbuse, now_ms()));
+        // apply_recovery would try to add 0 days → stays.
+        apply_recovery(&mut e, now_ms());
+        assert_eq!(e.score, -30);
+        assert!(HALT_SCORE_THRESHOLD > REPUTATION_FLOOR); // -20 > -100
     }
 
     #[test]
