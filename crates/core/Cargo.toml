@@ -1,0 +1,21 @@
+[package]
+name = "jerith-mesh-core"
+version.workspace = true
+edition.workspace = true
+description = "Core library: hardware probing, config, peer registry, ping loop, model gateway"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sysinfo.workspace = true
+hex.workspace = true
+rand.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]

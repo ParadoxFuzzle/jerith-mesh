@@ -1,0 +1,10 @@
+/target
+Cargo.lock.orig
+*.swp
+.DS_Store
+
+# Node-local state (never commit keys or memory databases)
+/data/
+*.key
+*.token
+config.toml

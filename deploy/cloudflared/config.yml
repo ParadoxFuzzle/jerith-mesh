@@ -1,0 +1,11 @@
+# cloudflared config for the jerith-mesh bootstrap node.
+# Install to /etc/cloudflared/config.yml and adjust the credentials path.
+tunnel: jerith-bootstrap
+credentials-file: /etc/cloudflared/jerith-bootstrap.json
+
+ingress:
+  # Public bootstrap API → local bootstrap node.
+  - hostname: p2p.jerithai.com
+    service: http://localhost:8901
+  # Everything else: 404.
+  - service: http_status:404

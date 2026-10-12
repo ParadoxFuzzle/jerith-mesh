@@ -1,0 +1,20 @@
+[Unit]
+Description=jerith-mesh bootstrap node (p2p.jerithai.com)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jerith
+Group=jerith
+ExecStart=/usr/local/bin/jerith bootstrap --port 8901
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
