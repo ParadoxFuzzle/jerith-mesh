@@ -113,6 +113,13 @@ pub struct SpecialistConfig {
     /// Matryoshka truncation for nomic-embed-text-v2-moe.
     #[serde(default = "default_embedding_dim")]
     pub embedding_dim: u32,
+    /// Local Ollama base URL (serves the nomic embedding model).
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
+}
+
+fn default_ollama_url() -> String {
+    "http://127.0.0.1:11434".to_string()
 }
 
 fn default_true() -> bool {
@@ -128,6 +135,7 @@ impl Default for SpecialistConfig {
             vision_enabled: true,
             embeddings_enabled: true,
             embedding_dim: default_embedding_dim(),
+            ollama_url: default_ollama_url(),
         }
     }
 }
@@ -219,16 +227,29 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Generate a fresh identity (node_id + secret key) — idempotent.
+    /// Generate (or restore) the Ed25519 identity — idempotent.
+    /// The `node_id` is the pubkey fingerprint; it is (re)derived from the
+    /// secret so a node always self-consistently signs as its own node_id.
     pub fn ensure_identity(&mut self) -> anyhow::Result<()> {
-        if self.secret_key_hex.is_none() || self.node_id.is_empty() {
-            let key: [u8; 32] = rand::random();
-            self.secret_key_hex = Some(key.to_vec());
-            // node_id = short fingerprint of the key (Phase 0 placeholder
-            // for proper Ed25519 public key derivation).
-            self.node_id = hex::encode(&key[..8]);
-        }
+        let identity = match &self.secret_key_hex {
+            Some(secret) => crate::signing::SigningIdentity::from_secret_bytes(secret)?,
+            None => {
+                let id = crate::signing::SigningIdentity::generate();
+                self.secret_key_hex = Some(id.secret_bytes().to_vec());
+                id
+            }
+        };
+        self.node_id = identity.node_id();
         Ok(())
+    }
+
+    /// Load the signing identity for wire auth (errors if unset).
+    pub fn identity(&self) -> anyhow::Result<crate::signing::SigningIdentity> {
+        let secret = self
+            .secret_key_hex
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no identity — run setup first"))?;
+        crate::signing::SigningIdentity::from_secret_bytes(secret)
     }
 
     /// Set the model and (per spec) this implies disconnecting from any peers
@@ -346,6 +367,24 @@ mod tests {
         assert_eq!(id1, cfg.node_id);
         assert_eq!(key1, cfg.secret_key_hex);
         assert_eq!(key1.unwrap().len(), 32);
+    }
+
+    #[test]
+    fn node_id_is_pubkey_fingerprint() {
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().unwrap();
+        let identity = cfg.identity().unwrap();
+        assert_eq!(cfg.node_id, identity.node_id());
+        assert_eq!(cfg.node_id.len(), 16);
+    }
+
+    #[test]
+    fn identity_restores_from_saved_secret() {
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().unwrap();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: NodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.identity().unwrap().pubkey_hex(), cfg.identity().unwrap().pubkey_hex());
     }
 
     #[test]

@@ -50,22 +50,26 @@ pub struct MeshState {
     pub config: RwLock<NodeConfig>,
     pub registry: Mutex<PeerRegistry>,
     pub meters: Mutex<Meters>,
+    /// This node's Ed25519 wire identity (node_id = pubkey fingerprint).
+    pub identity: crate::signing::SigningIdentity,
     /// Set when the contribution ratio dips below the minimum (rolling).
     pub contribution_healthy: watch::Sender<bool>,
     pub started_at: std::time::Instant,
 }
 
 impl MeshState {
-    pub fn new(config: NodeConfig) -> (Arc<Self>, watch::Receiver<bool>) {
+    pub fn new(config: NodeConfig) -> anyhow::Result<(Arc<Self>, watch::Receiver<bool>)> {
         let (tx, rx) = watch::channel(true);
+        let identity = config.identity()?;
         let state = Arc::new(Self {
             config: RwLock::new(config),
             registry: Mutex::new(PeerRegistry::new(None)),
             meters: Mutex::new(Meters::default()),
+            identity,
             contribution_healthy: tx,
             started_at: std::time::Instant::now(),
         });
-        (state, rx)
+        Ok((state, rx))
     }
 }
 
@@ -159,13 +163,9 @@ async fn run_loop(
             // Ping every connectable peer.
             ping_all(&state, &bootstrap).await;
 
-            // Advertise ourselves.
-            let (ad, secret) = {
+            // Advertise ourselves (signed).
+            let (ad, identity) = {
                 let cfg = state.config.read().await;
-                let secret = cfg
-                    .secret_key_hex
-                    .as_ref()
-                    .and_then(|h| hex::decode(h).ok());
                 let ad = PeerAd {
                     node_id: cfg.node_id.clone(),
                     address: format!("127.0.0.1:{}", cfg.gateway_port),
@@ -175,9 +175,9 @@ async fn run_loop(
                     last_seen_ms: now_ms(),
                     role: cfg.role,
                 };
-                (ad, secret)
+                (ad, state.identity.clone())
             };
-            if let Err(e) = bootstrap.advertise(&ad, secret.as_deref()).await {
+            if let Err(e) = bootstrap.advertise(&ad, &identity).await {
                 tracing::debug!(error = %e, "advertise failed");
             }
         }
@@ -204,7 +204,9 @@ async fn run_loop(
     tracing::info!("mesh loop stopped");
 }
 
-/// Ping all connectable peers with a minimal-resource request.
+/// Ping all connectable peers with a minimal-resource, signed request.
+/// The reply must carry a valid Ed25519 health signature from the peer's
+/// own key before we count it as alive — spoofed liveness is rejected.
 async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
     let targets: Vec<(String, String)> = {
         let reg = state.registry.lock().await;
@@ -221,18 +223,37 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
         .timeout(Duration::from_secs(4))
         .build()
         .expect("reqwest client");
+    let my_id = state.identity.node_id();
 
     let mut failed: Vec<String> = Vec::new();
     for (node_id, url) in targets {
         let started = std::time::Instant::now();
-        match client.get(&url).send().await {
+        let stamp = now_ms();
+        let payload = crate::signing::ping_payload(&my_id, &node_id, stamp);
+        let auth = crate::signing::WireAuth::now(&state.identity, payload.as_bytes());
+        let result = client
+            .get(&url)
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
+            .header("x-jerith-from", &my_id)
+            .send()
+            .await;
+        match result {
             Ok(resp) if resp.status().is_success() => {
+                // Verify the signed health reply attributes it to the peer.
                 let rtt = started.elapsed().as_millis() as u64;
-                let mut reg = state.registry.lock().await;
-                reg.record_ping_ok(&node_id, rtt);
+                let ok = verify_health_reply(&state, &node_id, resp).await;
+                if ok {
+                    let mut reg = state.registry.lock().await;
+                    reg.record_ping_ok(&node_id, rtt);
+                } else {
+                    tracing::warn!(peer = %node_id, "health reply signature invalid — not counted alive");
+                    failed.push(node_id);
+                }
             }
             _ => {
-                failed.push(node_id.clone());
+                failed.push(node_id);
             }
         }
     }
@@ -248,6 +269,44 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             }
         }
     }
+}
+
+/// Verify a peer's signed health reply.
+/// Body must include node_id, pubkey, stamp, sig, uptime_seconds,
+/// contribution_percent — signature over the canonical health payload,
+/// made by a key whose fingerprint equals the claimed node_id.
+async fn verify_health_reply(
+    _state: &Arc<MeshState>,
+    expected_node_id: &str,
+    resp: reqwest::Response,
+) -> bool {
+    #[derive(serde::Deserialize)]
+    struct HealthReply {
+        node_id: String,
+        pubkey: String,
+        stamp_ms: u64,
+        sig: String,
+        uptime_seconds: u64,
+        contribution_percent: u64,
+    }
+    let Ok(reply) = resp.json::<HealthReply>().await else {
+        return false;
+    };
+    if reply.node_id != expected_node_id {
+        return false;
+    }
+    // The pubkey fingerprint must match the claimed identity.
+    if reply.pubkey.len() != 64 || &reply.pubkey[..16] != reply.node_id {
+        return false;
+    }
+    let payload = crate::signing::health_payload(
+        &reply.node_id,
+        reply.stamp_ms,
+        reply.uptime_seconds,
+        reply.contribution_percent,
+    );
+    crate::signing::verify(&reply.pubkey, payload.as_bytes(), &reply.sig)
+        && now_ms().saturating_sub(reply.stamp_ms) <= crate::signing::STAMP_MAX_AGE_MS
 }
 
 /// Statistics about the most recent ping cycle, surfaced to the web UI.

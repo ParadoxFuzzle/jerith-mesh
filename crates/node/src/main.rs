@@ -91,6 +91,23 @@ enum Cmd {
         /// e.g. contribution_percent=40, gateway_port=8900
         assignments: Vec<String>,
     },
+    /// Local memory skills (strictly node-private).
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// Embed + store a text entry.
+    Add { text: String },
+    /// Vector-search local memory.
+    Search { query: String, #[arg(long, default_value_t = 5)] top_k: usize },
+    /// Number of stored entries.
+    Count,
+    /// Delete an entry by id.
+    Forget { id: i64 },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -141,7 +158,50 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Peers => peers_cmd().await,
         Cmd::Model { new_model } => model_cmd(new_model).await,
         Cmd::Config { assignments } => config_cmd(assignments).await,
+        Cmd::Memory { cmd } => memory_cmd(cmd).await,
     }
+}
+
+async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::memory::{EmbedConfig, MemoryStore};
+    let cfg = NodeConfig::load()?.context("no config — run setup first")?;
+    let embed_cfg = EmbedConfig {
+        ollama_url: cfg.specialists.ollama_url.clone(),
+        dim: cfg.specialists.embedding_dim as usize,
+        ..Default::default()
+    };
+    let store = MemoryStore::open(&NodeConfig::memory_db_path(), embed_cfg)?;
+    match cmd {
+        MemoryCmd::Add { text } => {
+            let (id, provider) = store.embed_and_store(&text).await?;
+            println!("stored #{id} (provider: {provider:?})");
+        }
+        MemoryCmd::Search { query, top_k } => {
+            let hits = store.search(&query, top_k).await?;
+            if hits.is_empty() {
+                println!("no hits");
+            }
+            for h in hits {
+                println!(
+                    "#{:<4} {:>6.3}  {}",
+                    h.id,
+                    h.score,
+                    h.text.chars().take(80).collect::<String>()
+                );
+            }
+        }
+        MemoryCmd::Count => {
+            println!("{} entries", store.count().await?);
+        }
+        MemoryCmd::Forget { id } => {
+            if store.forget(id).await? {
+                println!("forgot #{id}");
+            } else {
+                println!("#{id} not found");
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +533,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     );
     println!("   gateway     http://127.0.0.1:{}", cfg.gateway_port);
 
-    let (state, _health_watch) = MeshState::new(cfg.clone());
+    let (state, _health_watch) = MeshState::new(cfg.clone())?;
 
     // JER miner: active when crypto chain is JerithChain (spec default).
     let miner = jerith_mesh_core::economics::MinerConfig::from_crypto(
@@ -482,16 +542,41 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     )
     .map(|mc| jerith_mesh_core::economics::JerithMiner::new(mc, &cfg.node_id));
     match &miner {
-        Some(m) => {
-            let (attempted, _won) = m.stats.snapshot();
+        Some(_) => {
             println!(
                 "   economics   JER mining enabled ({}/1000 chance per served inference)",
                 cfg.crypto.mine_chance_permille
             );
-            let _ = attempted;
         }
         None => println!("   economics   off"),
     }
+
+    // Local memory (SQLite + local embeddings; strictly node-private).
+    let memory = if cfg.specialists.embeddings_enabled {
+        let embed_cfg = jerith_mesh_core::memory::EmbedConfig {
+            ollama_url: cfg.specialists.ollama_url.clone(),
+            dim: cfg.specialists.embedding_dim as usize,
+            ..Default::default()
+        };
+        match jerith_mesh_core::memory::MemoryStore::open(&NodeConfig::memory_db_path(), embed_cfg)
+        {
+            Ok(store) => {
+                println!(
+                    "   memory      SQLite at {} (dim {}, local-only)",
+                    NodeConfig::memory_db_path().display(),
+                    cfg.specialists.embedding_dim
+                );
+                Some(std::sync::Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "memory store unavailable");
+                println!("   memory      unavailable ({e})");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Spawn the mesh loop (discovery + pings + meters).
     let _loop_handle = jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
@@ -501,6 +586,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         state: state.clone(),
         runtime_url: cfg.runtime_url.clone(),
         miner,
+        memory: memory.clone(),
     };
     let app = axum::Router::new()
         .merge(gw.router())
@@ -508,6 +594,27 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
 
     let addr = format!("127.0.0.1:{}", cfg.gateway_port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // Phase 1: QUIC NodeRPC server on gateway_port + 1. Peers dispatch
+    // expert queries here; the stand-in handler runs until the Colibri
+    // runtime exposes real expert tensors.
+    let quic_port = cfg.gateway_port + 1;
+    let rpc_addr: std::net::SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
+    match jerith_mesh_core::quic::server_endpoint(rpc_addr) {
+        Ok(endpoint) => {
+            let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                let handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
+                    std::sync::Arc::new(jerith_mesh_core::quic::ReluExpert);
+                if let Err(e) = jerith_mesh_core::quic::serve(endpoint, handler, rpc_rx).await {
+                    tracing::error!(error = %e, "rpc server died");
+                }
+            });
+            println!("   node-rpc    quic://0.0.0.0:{quic_port} (expert dispatch ready)");
+        }
+        Err(e) => tracing::warn!(error = %e, "quic rpc server unavailable"),
+    }
+
     println!(
         "\nReady: web UI http://{addr}/ · OpenAI API http://{addr}/v1\nCtrl+C to stop."
     );

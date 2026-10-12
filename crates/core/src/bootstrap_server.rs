@@ -105,11 +105,10 @@ async fn peers(
 
 async fn advertise(
     State((registry, ttl_ms)): State<Shared>,
+    headers: axum::http::HeaderMap,
     ad: Json<PeerAd>,
 ) -> Response {
     let mut ad = ad.0;
-    // Never trust the client's own clock for expiry.
-    ad.last_seen_ms = now_ms();
     if ad.node_id.is_empty() || ad.model_id.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -117,6 +116,49 @@ async fn advertise(
         )
             .into_response();
     }
+
+    // --- Wire auth: Ed25519 signature over the canonical payload ---
+    let (pubkey, stamp, sig) = match (
+        headers.get("x-jerith-pubkey").and_then(|v| v.to_str().ok()),
+        headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()),
+        headers.get("x-jerith-sig").and_then(|v| v.to_str().ok()),
+    ) {
+        (Some(p), Some(s), Some(g)) => (p.to_string(), s.to_string(), g.to_string()),
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "missing wire-auth headers"})),
+            )
+                .into_response()
+        }
+    };
+    let Ok(stamp_ms) = stamp.parse::<u64>() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "bad stamp"})),
+        )
+            .into_response();
+    };
+    let auth = crate::signing::WireAuth {
+        pubkey,
+        stamp_ms,
+        sig,
+    };
+    // The client sends last_seen_ms in the payload; the server re-pins it
+    // for expiry after verification.
+    let client_seen = ad.last_seen_ms;
+    let payload = crate::signing::advertise_payload(&ad, stamp_ms);
+    if let Err(e) = auth.validate(payload.as_bytes(), &ad.node_id) {
+        tracing::warn!(node = %ad.node_id, error = ?e, "rejected forged/stale advertisement");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": format!("wire auth failed: {e:?}")})),
+        )
+            .into_response();
+    }
+    // Signature valid: never trust the client's clock for expiry.
+    ad.last_seen_ms = client_seen.max(now_ms().saturating_sub(1_000));
+
     let mut entries = registry.entries.write().await;
     entries.insert(
         ad.node_id.clone(),
@@ -213,16 +255,19 @@ mod tests {
     use crate::config::NodeRole;
     use crate::models::{ModelId, ModelSource};
 
-    fn ad(node: &str, model: &str) -> PeerAd {
-        PeerAd {
-            node_id: node.into(),
-            address: format!("127.0.0.1:{}", 9000 + node.len()),
+    /// A peer ad backed by a real signing identity (node_id = fingerprint).
+    fn make_peer(model: &str) -> (crate::signing::SigningIdentity, PeerAd) {
+        let id = crate::signing::SigningIdentity::generate();
+        let a = PeerAd {
+            node_id: id.node_id(),
+            address: "127.0.0.1:9000".into(),
             model_id: model.into(),
             quant: "int4".into(),
             contribution_percent: 30,
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
-        }
+        };
+        (id, a)
     }
 
     fn model(id: &str) -> ModelId {
@@ -249,15 +294,17 @@ mod tests {
             client.get(format!("{base}/v1/models/counts")).send().await.unwrap().json().await.unwrap();
         assert!(counts.is_empty());
 
-        // Two glm-5.3 nodes, one qwen node.
-        for (node, model) in [("a", "glm-5.3"), ("b", "glm-5.3"), ("c", "qwen3.8-flash-next")] {
+        // Two glm-5.3 nodes, one qwen node — all signed by real identities.
+        for model in ["glm-5.3", "glm-5.3", "qwen3.8-flash-next"] {
+            let (id, a) = make_peer(model);
             let r = client
                 .put(format!("{base}/v1/advertise"))
-                .json(&ad(node, model))
+                .headers(signed_headers(&id, &a))
+                .json(&a)
                 .send()
                 .await
                 .unwrap();
-            assert!(r.status().is_success());
+            assert!(r.status().is_success(), "signed ad must be accepted");
         }
 
         // Peer list filtered by model: only same-model peers return.
@@ -290,9 +337,11 @@ mod tests {
         let base = format!("http://{addr}");
         let client = reqwest::Client::new();
 
+        let (id, a) = make_peer("glm-5.3");
         client
             .put(format!("{base}/v1/advertise"))
-            .json(&ad("dead-node", "glm-5.3"))
+            .headers(signed_headers(&id, &a))
+            .json(&a)
             .send()
             .await
             .unwrap();
@@ -300,7 +349,7 @@ mod tests {
         // First vote: not evicted.
         let r: serde_json::Value = client
             .post(format!("{base}/v1/report-dead"))
-            .json(&serde_json::json!({"node_id": "dead-node"}))
+            .json(&serde_json::json!({"node_id": a.node_id}))
             .send()
             .await
             .unwrap()
@@ -312,7 +361,7 @@ mod tests {
         // Second vote: evicted.
         let r: serde_json::Value = client
             .post(format!("{base}/v1/report-dead"))
-            .json(&serde_json::json!({"node_id": "dead-node"}))
+            .json(&serde_json::json!({"node_id": a.node_id}))
             .send()
             .await
             .unwrap()
@@ -342,9 +391,11 @@ mod tests {
         let base = format!("http://{addr}");
         let client = reqwest::Client::new();
 
+        let (id, a) = make_peer("glm-5.3");
         client
             .put(format!("{base}/v1/advertise"))
-            .json(&ad("ghost", "glm-5.3"))
+            .headers(signed_headers(&id, &a))
+            .json(&a)
             .send()
             .await
             .unwrap();
@@ -370,6 +421,99 @@ mod tests {
         assert!(list.peers.is_empty(), "expired entry must drop from the list");
     }
 
+    fn signed_headers(id: &crate::signing::SigningIdentity, a: &PeerAd) -> axum::http::HeaderMap {
+        let stamp = crate::bootstrap::now_ms();
+        let payload = crate::signing::advertise_payload(a, stamp);
+        let auth = crate::signing::WireAuth::now(id, payload.as_bytes());
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-jerith-pubkey",
+            auth.pubkey.parse().unwrap(),
+        );
+        h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+        h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn advertise_requires_valid_signature() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/advertise");
+
+        // Real identity, correctly signed → accepted and listed.
+        let (id, mut good) = make_peer("glm-5.3");
+        let r = client
+            .put(&url)
+            .headers(signed_headers(&id, &good))
+            .json(&good)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "valid ad must be accepted");
+        let list: PeerListResponse = client
+            .get(format!("http://{addr}/v1/peers?model=glm-5.3"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list.peers.len(), 1);
+
+        // Forged: attacker signs a claim to the victim's node_id → 401.
+        let attacker = crate::signing::SigningIdentity::generate();
+        good.node_id = id.node_id();
+        let stamp = crate::bootstrap::now_ms();
+        let payload = crate::signing::advertise_payload(&good, stamp);
+        let forged = crate::signing::WireAuth {
+            pubkey: id.pubkey_hex(), // victim's key claimed
+            stamp_ms: stamp,
+            sig: attacker.sign(payload.as_bytes()),
+        };
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-jerith-pubkey", forged.pubkey.parse().unwrap());
+        h.insert("x-jerith-stamp", forged.stamp_ms.to_string().parse().unwrap());
+        h.insert("x-jerith-sig", forged.sig.parse().unwrap());
+        let r = client
+            .put(&url)
+            .headers(h)
+            .json(&good)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        // Missing headers entirely → 401.
+        let r = client.put(&url).json(&good).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        // Stale stamp (replay) → 401.
+        let old = crate::bootstrap::now_ms()
+            - crate::signing::STAMP_MAX_AGE_MS
+            - 5_000;
+        let payload = crate::signing::advertise_payload(&good, old);
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-jerith-pubkey", id.pubkey_hex().parse().unwrap());
+        h.insert("x-jerith-stamp", old.to_string().parse().unwrap());
+        h.insert(
+            "x-jerith-sig",
+            id.sign(payload.as_bytes()).parse().unwrap(),
+        );
+        let r = client
+            .put(&url)
+            .headers(h)
+            .json(&good)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn advertise_rejects_missing_fields() {
         let registry = Arc::new(Registry::default());
@@ -378,8 +522,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = reqwest::Client::new();
-        // Complete body but blank identity fields → handler must reject 400.
-        let mut bad = serde_json::to_value(ad("", "glm-5.3")).unwrap();
+        // Complete body but blank identity fields → handler must reject 400
+        // (field validation happens before wire auth).
+        let mut bad = serde_json::to_value(make_peer("glm-5.3").1).unwrap();
+        bad["node_id"] = serde_json::json!("");
         bad["model_id"] = serde_json::json!("");
         let r = client
             .put(format!("http://{}{}", addr, "/v1/advertise"))

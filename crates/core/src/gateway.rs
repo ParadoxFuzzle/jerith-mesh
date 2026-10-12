@@ -11,13 +11,14 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::economics::JerithMiner;
+use crate::memory::SharedMemory;
 use crate::ping::MeshState;
 
 pub struct Gateway {
@@ -26,6 +27,8 @@ pub struct Gateway {
     pub runtime_url: String,
     /// Optional JER miner (present when crypto chain = JerithChain).
     pub miner: Option<JerithMiner>,
+    /// Local memory store backing the memory.* skills.
+    pub memory: Option<SharedMemory>,
 }
 
 impl Gateway {
@@ -36,18 +39,149 @@ impl Gateway {
             .route("/status", get(status))
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
+            .route(
+                "/v1/skills/memory/embed",
+                post(skill_memory_embed),
+            )
+            .route(
+                "/v1/skills/memory/search",
+                post(skill_memory_search),
+            )
             .with_state(state)
+    }
+}
+
+/// skill: memory.embed — embed + store text locally. Never leaves the node.
+async fn skill_memory_embed(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(memory) = &gw.memory else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "memory backend not configured"})),
+        )
+            .into_response();
+    };
+    let Some(text) = body.get("text").and_then(|t| t.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "field 'text' is required"})),
+        )
+            .into_response();
+    };
+    match memory.embed_and_store(text).await {
+        Ok((id, provider)) => (
+            StatusCode::OK,
+            Json(json!({"id": id, "provider": provider})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// skill: memory.search — local vector search over the local store.
+async fn skill_memory_search(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(memory) = &gw.memory else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "memory backend not configured"})),
+        )
+            .into_response();
+    };
+    let Some(query) = body.get("query").and_then(|q| q.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "field 'query' is required"})),
+        )
+            .into_response();
+    };
+    let top_k = body.get("top_k").and_then(|k| k.as_u64()).unwrap_or(5) as usize;
+    match memory.search(query, top_k).await {
+        Ok(hits) => (StatusCode::OK, Json(json!({"hits": hits}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 /// Minimal-resource ping target for other nodes. <1 ms CPU; reports only
 /// identity + liveness data, never user data.
-async fn health(State(gw): State<Arc<Gateway>>) -> Json<Value> {
+///
+/// Wire auth: when the request carries signed ping headers they are
+/// verified — a bad signature gets a 401 and must not count as liveness.
+/// The reply itself is Ed25519-signed so the pinger can attribute it.
+async fn health(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+) -> Response {
     let cfg = gw.state.config.read().await;
     let meters = gw.state.meters.lock().await;
+
+    // Verify the pinger's signature when headers are present.
+    let has_auth = headers.contains_key("x-jerith-pubkey");
+    if has_auth {
+        let from = headers
+            .get("x-jerith-from")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let pubkey = headers
+            .get("x-jerith-pubkey")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let stamp = headers
+            .get("x-jerith-stamp")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let sig = headers
+            .get("x-jerith-sig")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let payload = crate::signing::ping_payload(&from, &cfg.node_id, stamp);
+        let auth = crate::signing::WireAuth {
+            pubkey,
+            stamp_ms: stamp,
+            sig,
+        };
+        if auth.validate(payload.as_bytes(), &from).is_err() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "ping signature invalid"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Sign our reply so liveness can't be spoofed.
+    let stamp = crate::bootstrap::now_ms();
+    let payload = crate::signing::health_payload(
+        &cfg.node_id,
+        stamp,
+        meters.uptime_seconds,
+        cfg.contribution_percent,
+    );
+    let sig = gw.state.identity.sign(payload.as_bytes());
+    let pubkey = gw.state.identity.pubkey_hex();
+
     Json(json!({
         "ok": true,
         "node_id": cfg.node_id,
+        "pubkey": pubkey,
+        "stamp_ms": stamp,
+        "sig": sig,
         "model_id": cfg.model.as_ref().map(|m| m.id.clone()),
         "quant": cfg.model.as_ref().map(|m| m.quant.clone()),
         "contribution_percent": cfg.contribution_percent,
@@ -56,6 +190,7 @@ async fn health(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "expert_activations": meters.expert_activations,
         "bytes_relayed": meters.bytes_relayed,
     }))
+    .into_response()
 }
 
 /// Human/CLI-facing status snapshot.

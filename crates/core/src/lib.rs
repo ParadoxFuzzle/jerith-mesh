@@ -7,8 +7,11 @@ pub mod config;
 pub mod economics;
 pub mod gateway;
 pub mod hw;
+pub mod memory;
 pub mod models;
 pub mod ping;
+pub mod quic;
+pub mod signing;
 pub mod web;
 
 pub use bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState};

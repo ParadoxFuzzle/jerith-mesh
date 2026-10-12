@@ -235,27 +235,26 @@ impl BootstrapClient {
     }
 
     /// Advertise ourselves with the bootstrap node (heartbeat).
-    #[allow(clippy::too_many_arguments)]
+    /// The advertisement is Ed25519-signed over the canonical payload;
+    /// the bootstrap rejects anything it cannot verify.
     pub async fn advertise(
         &self,
         ad: &PeerAd,
-        secret_key: Option<&[u8]>,
+        identity: &crate::signing::SigningIdentity,
     ) -> anyhow::Result<()> {
         let url = format!("{}/v1/advertise", self.base_url.trim_end_matches('/'));
-        let mut req = self
-            .inner
+        let stamp = now_ms();
+        let payload = crate::signing::advertise_payload(ad, stamp);
+        let auth = crate::signing::WireAuth::now(identity, payload.as_bytes());
+        self.inner
             .put(&url)
-            .json(ad);
-        if let Some(key) = secret_key {
-            // Phase 0: simple HMAC-style proof of identity. Replaced by real
-            // Ed25519 signatures in Phase 1.
-            let stamp = now_ms().to_string();
-            let digest = simple_digest(key, stamp.as_bytes());
-            req = req
-                .header("x-jerith-stamp", stamp)
-                .header("x-jerith-digest", hex::encode(digest));
-        }
-        req.send().await?.error_for_status()?;
+            .json(ad)
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -295,21 +294,7 @@ impl BootstrapClient {
     }
 }
 
-fn simple_digest(key: &[u8], stamp: &[u8]) -> [u8; 32] {
-    // Phase 0 placeholder: FNV-inspired double mix. Not a real MAC — just
-    // makes casual spoofing harder until Ed25519 lands in Phase 1.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in key.iter().chain(stamp.iter()) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        h = h.wrapping_mul(0x100000001b3) ^ (h >> 29) ^ (i as u64);
-        *slot = (h >> 56) as u8;
-    }
-    out
-}
+
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -433,16 +418,6 @@ mod tests {
         assert!(reg.is_empty());
     }
 
-    #[test]
-    fn digest_is_deterministic_and_key_sensitive() {
-        let a = simple_digest(b"key1", b"123");
-        let b = simple_digest(b"key1", b"123");
-        let c = simple_digest(b"key2", b"123");
-        let d = simple_digest(b"key1", b"124");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(a, d);
-    }
 
     #[test]
     fn urlencode_encodes_specials() {
