@@ -150,19 +150,64 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
             });
         }
     }
+    persist_tally_after_win(ctx).await;
     ctx.say(outcome.message).await?;
     Ok(())
 }
 
-/// Show the /mine leaderboard (bot-observed wins since bot start).
+/// Save the tally to disk after a /mine (cheap: small JSON, atomic rename).
+/// Best-effort: failures log a warning and don't affect the reply.
+async fn persist_tally_after_win(ctx: Ctx<'_>) {
+    // Snapshot the state Arc, then write in the background so the user's
+    // reply isn't delayed by disk IO.
+    let st = ctx.data().state.clone();
+    tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            let path = crate::state::tally_path();
+            if let Err(e) = st.save_to_disk(&path) {
+                tracing::warn!(error = %e, path = %path.display(), "failed to persist mine tally");
+            }
+        })
+        .await
+        .ok();
+    });
+}
+
+/// JER mining leaderboard (chain totals when available).
 #[poise::command(slash_command, prefix_command)]
 pub async fn leaderboard(ctx: Ctx<'_>) -> Result<(), Error> {
     if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
         ctx.say(msg).await?;
         return Ok(());
     }
+    let viewer = user_id(&ctx);
+    // Chain is authoritative; on failure use the bot's persisted tally.
+    let token = crate::core_token().ok();
+    let chain = match api::chain_leaderboard(&ctx.data().cfg, token, 10).await {
+        Ok(entries) if !entries.is_empty() => {
+            let rows: Vec<(u64, u64, u32)> = entries
+                .into_iter()
+                .map(|e| (e.discord_id, e.total_mined_uj, e.wins.min(u32::MAX as u64) as u32))
+                .collect();
+            ctx.say(format_leaderboard(&rows, viewer, "chain totals (lifetime)"))
+                .await?;
+            return Ok(());
+        }
+        Ok(_) => "chain reports no wins yet",
+        Err(e) => {
+            tracing::debug!(error = %e, "chain leaderboard unavailable, using bot tally");
+            ""
+        }
+    };
     let rows = ctx.data().state.leaderboard(10);
-    ctx.say(format_leaderboard(&rows, user_id(&ctx))).await?;
+    let source = if chain.is_empty() && rows.is_empty() {
+        ""
+    } else if chain.is_empty() {
+        "bot-observed wins (chain unavailable)"
+    } else {
+        ""
+    };
+    ctx.say(format_leaderboard(&rows, viewer, source)).await?;
     Ok(())
 }
 
@@ -198,12 +243,17 @@ pub fn format_reply(reply: &str, served_by: Option<&str>) -> String {
 }
 
 /// /leaderboard rendering: medal for top 3, `<@id>` mentions, mono totals.
-pub fn format_leaderboard(rows: &[(u64, u64, u32)], viewer: u64) -> String {
+pub fn format_leaderboard(rows: &[(u64, u64, u32)], viewer: u64, source: &str) -> String {
     if rows.is_empty() {
-        return "🏆 no /mine wins recorded yet (bot-side, resets on restart) — be the first! `/mine`".to_string();
+        return "🏆 no /mine wins recorded yet — be the first! `/mine`".to_string();
     }
     let medals = ["🥇", "🥈", "🥉"];
-    let mut out = String::from("🏆 **JER mining leaderboard**\n");
+    let title = if source.is_empty() {
+        "🏆 **JER mining leaderboard**".to_string()
+    } else {
+        format!("🏆 **JER mining leaderboard** — *{source}*")
+    };
+    let mut out = format!("{title}\n");
     for (i, (id, jer_uj, wins)) in rows.iter().enumerate() {
         let jer = *jer_uj as f64 / 1_000_000.0;
         let jer_txt = if jer == (jer as u64) as f64 {
@@ -351,10 +401,11 @@ mod tests {
 
     #[test]
     fn leaderboard_empty_and_medals() {
-        assert!(format_leaderboard(&[], 1).contains("no /mine wins"));
+        assert!(format_leaderboard(&[], 1, "").contains("no /mine wins"));
         let rows = vec![(10u64, 5_000_000u64, 1u32), (20, 15_000_000, 3), (30, 2_500_000, 2), (40, 1_000_000, 1)];
-        let out = format_leaderboard(&rows, 20);
+        let out = format_leaderboard(&rows, 20, "chain totals (lifetime)");
         // Input order preserved (docs: sort caller-side); medal per position.
+        assert!(out.contains("*chain totals (lifetime)*"));
         assert!(out.contains("🥇 <@10>"));
         assert!(out.contains("🥈 <@20>") && out.contains("(you)"));
         assert!(out.contains("🥉 <@30>"));

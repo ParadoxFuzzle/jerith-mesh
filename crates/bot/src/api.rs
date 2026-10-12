@@ -211,6 +211,65 @@ pub async fn mine(
     }
 }
 
+/// One chain /mystate row (top user by total mined).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainLbEntry {
+    pub discord_id: u64,
+    pub wins: u64,
+    pub total_mined_uj: u64,
+}
+
+/// GET /mystate on the chain node — chain-authoritative leaderboard totals
+/// (per-user lifetime, includes passive mining the bot never observed).
+pub async fn chain_leaderboard(
+    cfg: &crate::config::BotConfig,
+    token: Option<String>,
+    top: usize,
+) -> Result<Vec<ChainLbEntry>> {
+    let token = match token {
+        Some(t) => t,
+        None => return Err(anyhow::anyhow!("no chain api token")),
+    };
+    let url = format!("{}/mystate?limit={}", cfg.chain_url, top.min(200));
+    let resp = client()
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("chain node unreachable at {url}"))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.context("chain returned non-JSON")?;
+    if !status.is_success() {
+        anyhow::bail!("mystate failed: {}", body_error(&body, status));
+    }
+    let mut out = Vec::new();
+    for e in body
+        .get("entries")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(top)
+    {
+        // Pass the raw string through; a non-numeric discord id just never
+        // matches any Discord user later.
+        let did: u64 = e
+            .get("discord_id")
+            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if did == 0 {
+            continue;
+        }
+        out.push(ChainLbEntry {
+            discord_id: did,
+            wins: e.get("wins").and_then(|v| v.as_u64()).unwrap_or(0),
+            total_mined_uj: e.get("total_mined_uj").and_then(|v| v.as_u64()).unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
 /// Announcement text for a win in the configured channel, or `None` when not
 /// a win. Formatted here so both the reply and the announcement stay in sync.
 pub fn mine_announcement(outcome: &MineOutcome, user: &str) -> Option<String> {
@@ -249,6 +308,20 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chain_leaderboard_unreachable_is_err() {
+        let cfg = crate::config::BotConfig::from_parts("http://127.0.0.1:3", "http://127.0.0.1:4");
+        let res = chain_leaderboard(&cfg, Some("tok".to_string()), 10).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn chain_leaderboard_requires_token() {
+        let cfg = crate::config::BotConfig::from_parts("http://127.0.0.1:3", "http://127.0.0.1:4");
+        let res = chain_leaderboard(&cfg, None, 10).await;
+        assert!(res.is_err());
+    }
 
     #[test]
     fn mine_announcement_only_for_wins() {

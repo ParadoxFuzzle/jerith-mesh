@@ -63,6 +63,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = BotConfig::load()?;
     let state = new_state();
+    // Restore the persisted mine tally + chat history (best-effort: a
+    // missing or corrupt file means a fresh tally, never a failed startup).
+    let path = state::tally_path();
+    match state.load_from_disk(&path) {
+        Ok(n) if n > 0 => {
+            tracing::info!(path = %path.display(), users = n, "restored mine tally")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "no persisted tally loaded"),
+    }
     let token = cfg.discord_token.clone();
     tracing::info!(
         gateway = %cfg.gateway_url,

@@ -5,6 +5,7 @@
 //! already stores.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,7 +62,73 @@ fn gate(last: &mut Option<Instant>, cooldown: Duration, label: &str) -> GateResu
     Ok(())
 }
 
+/// Where the tally is persisted: `<home>/mine-tally.json`, rebased if
+/// `JERITH_HOME` moves — so /leaderboard survives bot restarts.
+pub fn tally_path() -> PathBuf {
+    let dir = std::env::var("JERITH_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".jerith-mesh").join("bot")
+        });
+    dir.join("mine-tally.json")
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedTally {
+    users: HashMap<u64, PersistedUser>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedUser {
+    jer_won: u64,
+    mine_wins: u32,
+    history: Vec<Value>,
+}
+
 impl BotStateInner {
+    /// Persist the mine tally (+ chat history for continuity) to disk.
+    /// Best-effort: a failed write is logged in tests only, never fatal —
+    /// the caller decides where failures matter.
+    pub fn save_to_disk(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let users = self.users.lock().expect("user map lock");
+        let mut persisted = PersistedTally::default();
+        for (id, st) in users.iter() {
+            persisted.users.insert(
+                *id,
+                PersistedUser {
+                    jer_won: st.jer_won,
+                    mine_wins: st.mine_wins,
+                    history: st.history.clone(),
+                },
+            );
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&persisted)?)?;
+        std::fs::rename(&tmp, path)?; // atomic on POSIX
+        Ok(())
+    }
+
+    /// Load the persisted tally + history into memory (returns # users read).
+    pub fn load_from_disk(&self, path: &std::path::Path) -> anyhow::Result<usize> {
+        let raw = std::fs::read(path)?;
+        let persisted: PersistedTally = serde_json::from_slice(&raw)?;
+        let mut users = self.users.lock().expect("user map lock");
+        let n = persisted.users.len();
+        for (id, p) in persisted.users {
+            let st = users.entry(id).or_default();
+            st.jer_won = st.jer_won.max(p.jer_won);
+            st.mine_wins = st.mine_wins.max(p.mine_wins);
+            if st.history.is_empty() {
+                st.history = p.history;
+            }
+        }
+        Ok(n)
+    }
+
     /// Record a /mine win: adds to the user's bot-observed total.
     pub fn record_mine_win(&self, user: u64, jer_amount_uj: u64) {
         let mut users = self.users.lock().expect("user map lock");
@@ -204,6 +271,56 @@ mod tests {
         assert!(s.leaderboard(1).len() == 1);
         // Users without wins never appear.
         assert!(!s.leaderboard(10).iter().any(|r| r.0 == 99));
+    }
+
+    #[test]
+    fn tally_survives_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("jb-tally-{}", std::process::id()));
+        let path = dir.join("mine-tally.json");
+        let s = state();
+        s.record_mine_win(111, 3_000_000);
+        s.record_mine_win(111, 2_000_000);
+        s.record_mine_win(222, 9_999);
+        s.push_turn(111, "hi", "yo");
+        s.save_to_disk(&path).expect("save");
+
+        // Fresh state (like a restarted bot process).
+        let s2 = state();
+        let n = s2.load_from_disk(&path).expect("load");
+        assert_eq!(n, 2);
+        let rows = s2.leaderboard(10);
+        assert_eq!(rows[0], (111, 5_000_000, 2));
+        assert_eq!(rows[1], (222, 9_999, 1));
+        // Chat history continuity preserved.
+        assert_eq!(s2.history(111).len(), 2);
+        // Merging is max() per field: a reload never *lowers* anything, a
+        // stale-snapshot reload never erases a newer win, and a reload of
+        // the same data is an exact no-op.
+        let s3 = state();
+        s3.load_from_disk(&path).unwrap();
+        // New win adds to the running total (5M + 6M) and increments wins.
+        s3.record_mine_win(111, 6_000_000);
+        // A stale snapshot reload must not undo the newer win.
+        s3.load_from_disk(&path).unwrap();
+        assert_eq!(s3.leaderboard(10)[0], (111, 11_000_000, 3));
+        // But a *below* snapshot must be ignored (no downgrade).
+        let s4 = state();
+        s4.record_mine_win(333, 7_000_000);
+        s4.load_from_disk(&path).unwrap();
+        assert_eq!(s4.leaderboard(10)[0], (333, 7_000_000, 1));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_creates_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!("jb-dirs-{}", std::process::id()));
+        let path = dir.join("a").join("b").join("tally.json");
+        let s = state();
+        s.record_mine_win(77, 1);
+        s.save_to_disk(&path).expect("save");
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
