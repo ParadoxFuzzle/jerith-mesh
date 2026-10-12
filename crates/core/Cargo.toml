@@ -19,6 +19,7 @@ axum.workspace = true
 reqwest.workspace = true
 ed25519-dalek.workspace = true
 rusqlite.workspace = true
+futures-core.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

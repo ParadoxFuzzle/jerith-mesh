@@ -581,12 +581,24 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     // Spawn the mesh loop (discovery + pings + meters).
     let _loop_handle = jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
 
+    // Mesh fallback for chat: a QUIC client endpoint + router, wired into
+    // the gateway so /v1/chat/completions can fail over to runtime-backed
+    // peers when the local runtime is unavailable.
+    let mesh_fallback = match jerith_mesh_core::ping::MeshFallbackChat::spawn() {
+        Ok(mf) => Some(mf),
+        Err(e) => {
+            tracing::warn!(error = %e, "mesh chat fallback unavailable");
+            None
+        }
+    };
+
     // Gateway + web UI on one port.
     let gw = Gateway {
         state: state.clone(),
         runtime_url: cfg.runtime_url.clone(),
         miner,
         memory: memory.clone(),
+        mesh_fallback,
     };
     let app = axum::Router::new()
         .merge(gw.router())

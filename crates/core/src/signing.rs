@@ -97,6 +97,21 @@ pub fn health_payload(node_id: &str, stamp_ms: u64, uptime_seconds: u64, contrib
     format!("{HEALTH_PREFIX}|{stamp_ms}|{node_id}|{uptime_seconds}|{contribution_percent}")
 }
 
+/// Transitional: the canonical payload exactly as it existed before
+/// `rpc_address` was appended. Server-side only, for rolling upgrades.
+pub fn legacy_ad_excerpt(ad: &PeerAd, stamp_ms: u64) -> String {
+    format!(
+        "{ADV_PREFIX}|{stamp_ms}|{}|{}|{}|{}|{}|{}|{}",
+        ad.node_id,
+        ad.address,
+        ad.model_id,
+        ad.quant,
+        ad.contribution_percent,
+        ad.last_seen_ms,
+        role_str(ad.role),
+    )
+}
+
 fn role_str(role: crate::config::NodeRole) -> &'static str {
     match role {
         crate::config::NodeRole::Contributor => "contributor",

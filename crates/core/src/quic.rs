@@ -47,6 +47,16 @@ pub enum NodeRpcRequest {
         stamp_ms: u64,
         sig: String,
     },
+    /// Ask a peer to run a full chat completion on its local runtime.
+    /// Used by mesh fallback routing when the local runtime is down.
+    ChatQuery {
+        req_id: String,
+        /// Full OpenAI-style messages array (a caller-owned PrivacyContext).
+        messages: Vec<serde_json::Value>,
+        from_node_id: String,
+        stamp_ms: u64,
+        sig: String,
+    },
 }
 
 /// The reply, same framing.
@@ -55,6 +65,8 @@ pub enum NodeRpcRequest {
 pub enum NodeRpcReply {
     Pong { node_id: String, stamp_ms: u64 },
     ExpertResult { req_id: String, output: Vec<f32>, node_id: String },
+    /// Full chat-completion reply from a peer's runtime.
+    ChatResult { req_id: String, content: String, node_id: String },
     Error { req_id: String, message: String },
 }
 
@@ -69,11 +81,16 @@ pub fn sign_request(req: &mut NodeRpcRequest, identity: &SigningIdentity) {
         NodeRpcRequest::ExpertQuery { stamp_ms, sig: _, .. } => {
             *stamp_ms = stamp;
         }
+        NodeRpcRequest::ChatQuery { stamp_ms, sig: _, .. } => {
+            *stamp_ms = stamp;
+        }
     }
     let payload = request_payload_for_stamp(req, stamp);
     let signature = identity.sign(payload.as_bytes());
     match req {
-        NodeRpcRequest::Ping { sig, .. } | NodeRpcRequest::ExpertQuery { sig, .. } => {
+        NodeRpcRequest::Ping { sig, .. }
+        | NodeRpcRequest::ExpertQuery { sig, .. }
+        | NodeRpcRequest::ChatQuery { sig, .. } => {
             *sig = signature;
         }
     }
@@ -88,6 +105,10 @@ fn request_payload_for_stamp(req: &NodeRpcRequest, stamp: u64) -> String {
             "rpc-expq1|{req_id}|{expert_id}|{}|{from_node_id}|{stamp}",
             hex::encode(pack_f32(input))
         ),
+        NodeRpcRequest::ChatQuery { req_id, messages, from_node_id, .. } => format!(
+            "rpc-chatq1|{req_id}|{}|{from_node_id}|{stamp}",
+            hex::encode(serde_json::to_vec(messages).unwrap_or_default())
+        ),
     }
 }
 
@@ -96,7 +117,9 @@ fn verify_request(req: &NodeRpcRequest) -> bool {
     // verification against the registry's known pubkeys lands with cert
     // pinning in Phase 2.
     let stamp = match req {
-        NodeRpcRequest::Ping { stamp_ms, .. } | NodeRpcRequest::ExpertQuery { stamp_ms, .. } => *stamp_ms,
+        NodeRpcRequest::Ping { stamp_ms, .. }
+        | NodeRpcRequest::ExpertQuery { stamp_ms, .. }
+        | NodeRpcRequest::ChatQuery { stamp_ms, .. } => *stamp_ms,
     };
     let age = crate::bootstrap::now_ms().saturating_sub(stamp);
     age <= crate::signing::STAMP_MAX_AGE_MS
@@ -229,6 +252,88 @@ impl ExpertRouter {
     /// `local_run` computes locally when the plan's first candidate is
     /// local. Feedback failures land in `completed` as usual; the caller
     /// receives the first successful result.
+    /// Mesh fallback chat: try the local handler first, then remotes in
+    /// the same locality order used for experts. Identity is preserved
+    /// via attribution checks; privacy scoping happens at the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chat_over_quic(
+        &self,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        messages: &[serde_json::Value],
+        peers: &[(String, u64, bool, bool)],
+        local_chat: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<String> {
+        // Local first (caller decides strictness and messaging).
+        if let Ok(content) = local_chat() {
+            return Ok(content);
+        }
+        tracing::warn!(
+            target: "mesh",
+            "local runtime unavailable for chat — attempting mesh fallback"
+        );
+
+        // Remotes in lowest-RTT order (same ordering principle as experts).
+        let mut remotes: Vec<(String, u64)> = peers
+            .iter()
+            .filter(|(_, _, has, alive)| *has && *alive)
+            .map(|(id, rtt, _, _)| (id.clone(), *rtt))
+            .collect();
+        remotes.sort_by_key(|(_, rtt)| *rtt);
+
+        let mut last_err = anyhow::anyhow!("no peers available for mesh chat fallback");
+        for (node_id, _rtt) in remotes {
+            let Some(addr) = peer_addrs.get(&node_id) else {
+                continue;
+            };
+            let mut req = NodeRpcRequest::ChatQuery {
+                req_id: req_id.to_string(),
+                messages: messages.to_vec(),
+                from_node_id: identity.node_id(),
+                stamp_ms: 0,
+                sig: String::new(),
+            };
+            sign_request(&mut req, identity);
+            match call(endpoint, *addr, &req, identity, self.options.dispatch_timeout).await {
+                Ok(NodeRpcReply::ChatResult {
+                    req_id: rid,
+                    content,
+                    node_id: server_id,
+                }) => {
+                    if rid != req_id || server_id != node_id {
+                        tracing::debug!(
+                            target: "mesh",
+                            peer = %node_id,
+                            "chat reply attribution mismatch — trying next peer"
+                        );
+                        last_err = anyhow::anyhow!(
+                            "chat reply identity mismatch: expected {node_id}, got {server_id}"
+                        );
+                        continue;
+                    }
+                    tracing::info!(
+                        target: "mesh",
+                        peer = %node_id,
+                        "chat served via mesh fallback"
+                    );
+                    return Ok(content);
+                }
+                Ok(NodeRpcReply::Error { req_id: _id, message }) => {
+                    last_err = anyhow::anyhow!("peer rejected chat: {message}");
+                }
+                Ok(other) => {
+                    last_err = anyhow::anyhow!("unexpected reply kind: {other:?}");
+                }
+                Err(e) => {
+                    last_err = anyhow::anyhow!("quic chat dispatch failed: {e}");
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     pub async fn execute_over_quic(
         &self,
         endpoint: &quinn::Endpoint,
@@ -427,6 +532,17 @@ pub fn server_endpoint(addr: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
 /// execution; the wire shape stays identical.
 pub trait ExpertHandler: Send + Sync {
     fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>>;
+
+    /// Serve a full chat completion from the local runtime. Handlers that
+    /// can't do chat (pure expert stand-ins) default to an error reply.
+    fn chat<'a>(
+        &'a self,
+        _messages: &'a [serde_json::Value],
+    ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async {
+            anyhow::bail!("handler does not support chat completions")
+        })
+    }
 }
 
 /// Serve RPC requests on a bound endpoint until shutdown. Verifies
@@ -480,6 +596,19 @@ async fn handle_connection(
                                 Ok(output) => NodeRpcReply::ExpertResult {
                                     req_id,
                                     output,
+                                    node_id: server_id,
+                                },
+                                Err(e) => NodeRpcReply::Error {
+                                    req_id,
+                                    message: e.to_string(),
+                                },
+                            }
+                        }
+                        NodeRpcRequest::ChatQuery { req_id, messages, .. } => {
+                            match handler.chat(&messages).await {
+                                Ok(content) => NodeRpcReply::ChatResult {
+                                    req_id,
+                                    content,
                                     node_id: server_id,
                                 },
                                 Err(e) => NodeRpcReply::Error {
@@ -594,6 +723,13 @@ impl RuntimeExpert {
 }
 
 impl ExpertHandler for RuntimeExpert {
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [serde_json::Value],
+    ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async move { self.chat_impl(messages).await })
+    }
+
     fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
         // Real expert execution is async HTTP; bridge the sync trait with
         // a block-on worker and a strict timeout (never blocks a pass).
@@ -613,6 +749,42 @@ impl ExpertHandler for RuntimeExpert {
 }
 
 impl RuntimeExpert {
+    /// Synchronous-first chat implementation (also the trait method body).
+    async fn chat_impl(&self, messages: &[serde_json::Value]) -> anyhow::Result<String> {
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.runtime_url.trim_end_matches('/')
+        );
+        // Never forward a tool/system context we didn't intend; the
+        // messages are the caller's privacy-scoped payload verbatim.
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": 512,
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("runtime chat call failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| anyhow::anyhow!("runtime returned error: {e}"))?;
+        let body: serde_json::Value = resp.json().await?;
+        let content = body
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        if content.is_empty() {
+            anyhow::bail!("runtime returned empty chat completion");
+        }
+        Ok(content)
+    }
+
     async fn run_async(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
         let prompt = format!(
             "[expert:{expert_id}] input tensor digest: {:?} — respond with the computedsummary only.",
@@ -1039,6 +1211,94 @@ mod tests {
                 &peers,
                 &mut completed,
                 |_| Err(anyhow::anyhow!("local also down")),
+            )
+            .await;
+        assert!(err.is_err());
+    }
+
+    struct ChatAnswer {
+        content: String,
+    }
+
+    impl ExpertHandler for ChatAnswer {
+        fn run(&self, _expert_id: &str, _input: &[f32]) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _messages: &'a [serde_json::Value],
+        ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+            let content = self.content.clone();
+            Box::pin(async move { Ok(content) })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_over_quic_falls_back_to_peer() {
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let server_id = "peer-b".to_string();
+        tokio::spawn(async move {
+            serve(
+                server,
+                Arc::new(ChatAnswer {
+                    content: "mesh hello".into(),
+                }),
+                server_id,
+                rx,
+            )
+            .await
+        });
+
+        let r = router(50);
+        let client = client_endpoint().unwrap();
+        let identity = SigningIdentity::generate();
+        let mut addrs = HashMap::new();
+        addrs.insert("peer-b".to_string(), addr);
+        let peers = vec![("peer-b".to_string(), 8, true, true)];
+
+        // Local runtime down → falls back to the mesh peer.
+        let content = r
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "chat-1",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content, "mesh hello");
+
+        // Local healthy → mesh never used.
+        let content2 = r
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "chat-2",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                &peers,
+                || Ok("local hello".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content2, "local hello");
+
+        // No peers + local down → error (never blocks the request).
+        let err = r
+            .chat_over_quic(
+                &client,
+                &identity,
+                &HashMap::new(),
+                "chat-3",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
             )
             .await;
         assert!(err.is_err());

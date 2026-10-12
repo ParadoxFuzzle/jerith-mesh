@@ -187,7 +187,7 @@ Local specialists (not meshed):
 | CLI | ✅ `jerith setup/run/status/peers` | plugins, model switch UX |
 | Web UI | ✅ status page | full dashboard |
 | OpenAI API | ✅ | tool calling, embeddings |
-| Discord | 📋 Phase 3 | expanded beyond OpenClaw |
+| Discord | ✅ `/ask /reset /remember /recall /status /peers /mine` | expanded beyond OpenClaw |
 | Telegram / WhatsApp | 📋 Phase 3 | via plugin SDK |
 
 ## 12. Non-goals

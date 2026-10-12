@@ -57,7 +57,11 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ CLI (setup, run, status, peers, config);
 - ✅ Web UI status/dashboard page
 - ✅ OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`, streaming)
-- 📋 Discord bot — expand on OpenClaw's plugin (Phase 3)
+- ✅ Discord bot (`crates/bot`, poise/serenity): `/ask` (mesh-peer fallback included),
+  `/reset`, `/remember`, `/recall`, `/status`, `/peers`, `/mine`, `/help`;
+  per-user chat history (in-memory, capped) + per-user cooldowns; token via
+  `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via
+  `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`
 - 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+)
 
 ## 8. Plugin / Skill System

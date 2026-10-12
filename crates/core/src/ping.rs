@@ -9,6 +9,8 @@
 //! - Accumulates the four contribution meters (tokens, activations,
 //!   bandwidth, uptime) and marks the node's own contribution state.
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,6 +74,109 @@ impl MeshState {
         Ok((state, rx))
     }
 }
+
+/// Mesh-fallback chat handle shared with the gateway: owns the QUIC client
+/// endpoint + expert router so `/v1/chat/completions` can fail over to
+/// runtime-backed peers when the local runtime is unavailable.
+pub struct MeshFallbackChat {
+    pub endpoint: quinn::Endpoint,
+    pub router: std::sync::Arc<crate::quic::ExpertRouter>,
+}
+
+impl MeshFallbackChat {
+    pub fn spawn() -> anyhow::Result<Arc<Self>> {
+        let endpoint = crate::quic::client_endpoint()?;
+        let router = std::sync::Arc::new(crate::quic::ExpertRouter::new(
+            crate::quic::RouterOptions {
+                nearby_rtt_ms: 50,
+                dispatch_timeout: Duration::from_secs(30),
+            },
+        ));
+        Ok(Arc::new(Self { endpoint, router }))
+    }
+
+    /// Build inputs for the router from live registry state: connectable
+    /// peers (rtt, alive) + their advertised QUIC rpc addresses.
+    async fn mesh_view(
+        &self,
+        state: &Arc<MeshState>,
+    ) -> (Vec<(String, u64, bool, bool)>, HashMap<String, SocketAddr>) {
+        let reg = state.registry.lock().await;
+        let peers: Vec<(String, u64, bool, bool)> = reg
+            .all_ads()
+            .into_iter()
+            .filter_map(|ad| {
+                let health = reg.health_of(&ad.node_id)?;
+                let alive = health.state != PeerState::Deprecated;
+                let rtt = health.last_rtt_ms.unwrap_or(u64::MAX >> 2);
+                Some((ad.node_id.clone(), rtt, true, alive))
+            })
+            .collect();
+        let addrs: HashMap<String, SocketAddr> = reg
+            .all_ads()
+            .into_iter()
+            .filter(|ad| !ad.rpc_address.is_empty())
+            .filter_map(|ad| {
+                ad.rpc_address
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|a| (ad.node_id.clone(), a))
+            })
+            .collect();
+        (peers, addrs)
+    }
+
+    /// Try local-strict chat (the gateway's existing forward); on failure
+    /// fall back through the mesh. Returns content + which node answered
+    /// (None = local).
+    pub async fn chat_with_fallback(
+        &self,
+        state: &Arc<MeshState>,
+        messages: &[serde_json::Value],
+        local_try: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        req_id_tracker();
+        let req_id = format!("chat-{}", crate::bootstrap::now_ms());
+        let (peers, addrs) = self.mesh_view(state).await;
+        let local_attempt = local_try();
+        let router = self.router.clone();
+        let endpoint = self.endpoint.clone();
+        let identity = state.identity.clone();
+        let local_closed = local_attempt.is_err();
+        match router
+            .chat_over_quic(&endpoint, &identity, &addrs, &req_id, messages, &peers, || {
+                local_attempt
+            })
+            .await
+        {
+            Ok(content) => {
+                // Attribution: chat_over_quic returns the node_id inside the
+                // meters; here we distinguish local vs remote by whether the
+                // local attempt had failed before fallback.
+                if !local_closed {
+                    Ok((content, None))
+                } else {
+                    // Found a mesh node — attribute by RTT order (first
+                    // peer the router succeeded on). For observability we
+                    // echo the fastest known peer when attribution is
+                    // impractical from outside the router call.
+                    let attr = peers.first().map(|(id, _, _, _)| id.clone());
+                    Ok((content, attr))
+                }
+            }
+            Err(e) => {
+                if !local_closed {
+                    // Local error was the real failure — surface it.
+                    Err(e)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+fn req_id_tracker() {}
 
 /// Background loop handle.
 pub struct MeshLoop {

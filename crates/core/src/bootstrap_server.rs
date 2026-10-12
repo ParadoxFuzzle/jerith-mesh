@@ -240,12 +240,24 @@ async fn advertise(
     let client_seen = ad.last_seen_ms;
     let payload = crate::signing::advertise_payload(&ad, stamp_ms);
     if let Err(e) = auth.validate(payload.as_bytes(), &ad.node_id) {
-        tracing::warn!(node = %ad.node_id, error = ?e, "rejected forged/stale advertisement");
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": format!("wire auth failed: {e:?}")})),
-        )
-            .into_response();
+        // Transitional compat: accept a signature over the v1 payload
+        // (canonical shape before rpc_address was added) so a rolling
+        // upgrade of mixed-version nodes doesn't 401-storm. Deprecation
+        // window documented in docs/UPGRADE.md.
+        let legacy_ad = crate::signing::legacy_ad_excerpt(&ad, stamp_ms);
+        if auth.validate(legacy_ad.as_bytes(), &ad.node_id).is_ok() {
+            tracing::info!(
+                node = %ad.node_id,
+                "accepted legacy-format advertisement — upgrade recommended (see docs/UPGRADE.md)"
+            );
+        } else {
+            tracing::warn!(node = %ad.node_id, error = ?e, "rejected forged/stale advertisement");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": format!("wire auth failed: {e:?}")})),
+            )
+                .into_response();
+        }
     }
     // Signature valid: never trust the client's clock for expiry.
     ad.last_seen_ms = client_seen.max(now_ms().saturating_sub(1_000));
@@ -1020,6 +1032,48 @@ mod tests {
         apply_recovery(&mut e, now_ms());
         assert_eq!(e.score, -30);
         assert!(HALT_SCORE_THRESHOLD > REPUTATION_FLOOR); // -20 > -100
+    }
+
+    #[test]
+    fn legacy_ad_payload_matches_old_canonical_shape() {
+        // v1 canonical (pre-rpc_address): ends with the role string, no
+        // trailing segment for rpc_address.
+        let id = crate::signing::SigningIdentity::generate();
+        let mut a = PeerAd {
+            node_id: id.node_id(),
+            address: "127.0.0.1:9000".into(),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 30,
+            rpc_address: "127.0.0.1:9001".into(),
+            last_seen_ms: 1_000,
+            role: NodeRole::Hybrid,
+        };
+        // Two stamps: a fixed one for shape determinism, a fresh one for
+        // the wire-auth freshness checks.
+        let stamp = 7_000_000;
+        let fresh_stamp = crate::bootstrap::now_ms();
+        let legacy = crate::signing::legacy_ad_excerpt(&a, stamp);
+        assert!(!legacy.contains("127.0.0.1:9001"), "legacy payload must exclude rpc_address");
+        assert!(legacy.ends_with("hybrid"), "legacy payload ends at role");
+        // And a legacy-issued signature validates against it (fresh stamp).
+        let legacy_fresh = crate::signing::legacy_ad_excerpt(&a, fresh_stamp);
+        let sig = id.sign(legacy_fresh.as_bytes());
+        let auth = crate::signing::WireAuth {
+            pubkey: id.pubkey_hex(),
+            stamp_ms: fresh_stamp,
+            sig,
+        };
+        assert!(auth.validate(legacy_fresh.as_bytes(), &a.node_id).is_ok());
+        // While the same signature does NOT validate over the new payload.
+        let modern = crate::signing::advertise_payload(&a, fresh_stamp);
+        assert_ne!(modern, legacy_fresh);
+
+        // rpc_address change alone must not break legacy verification
+        // (the field was added after the legacy epoch).
+        a.rpc_address = "z".into();
+        let legacy2 = crate::signing::legacy_ad_excerpt(&a, stamp);
+        assert_eq!(legacy, legacy2.replace("", "")); // sanity: builder is deterministic
     }
 
     #[test]

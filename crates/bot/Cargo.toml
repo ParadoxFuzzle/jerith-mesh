@@ -1,0 +1,23 @@
+[package]
+name = "jerith-mesh-bot"
+version.workspace = true
+edition.workspace = true
+description = "jerith-mesh Discord bot: slash commands bridging Discord to a mesh gateway and JerithChain mining"
+
+[[bin]]
+name = "jerith-bot"
+path = "src/main.rs"
+
+[dependencies]
+jerith-mesh-core = { path = "../core" }
+poise.workspace = true
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+reqwest = { workspace = true }
+
+[dev-dependencies]

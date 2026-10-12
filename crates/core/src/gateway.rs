@@ -29,6 +29,9 @@ pub struct Gateway {
     pub miner: Option<JerithMiner>,
     /// Local memory store backing the memory.* skills.
     pub memory: Option<SharedMemory>,
+    /// Optional mesh-fallback chat handle (QUIC client endpoint + peer
+    /// address map). Present when the node runs a server endpoint.
+    pub mesh_fallback: Option<Arc<crate::ping::MeshFallbackChat>>,
 }
 
 impl Gateway {
@@ -267,11 +270,73 @@ async fn chat_completions(
 
     let resp = match send {
         Ok(r) => r,
-        Err(e) => {
+        Err(local_err) => {
+            // Mesh fallback: local runtime unreachable — try runtime-backed
+            // peers over QUIC (lowest RTT first). The request's messages are
+            // privacy-scoped by the caller config; we send them verbatim.
+            if let Some(mf) = &gw.mesh_fallback {
+                let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": format!("local runtime unreachable: {local_err} and no messages to forward"),
+                        })),
+                    )
+                        .into_response();
+                };
+                let state = gw.state.clone();
+                let msgs = messages.clone();
+                let result = mf
+                    .chat_with_fallback(&state, &msgs, || {
+                        Err(anyhow::anyhow!("local down: {local_err}"))
+                    })
+                    .await;
+                return match result {
+                    Ok((content, served_by)) => {
+                        {
+                            let mut meters = gw.state.meters.lock().await;
+                            meters.tokens_served += 1;
+                            meters.expert_activations += 1;
+                            meters.bytes_relayed += content.len() as u64;
+                        }
+                        if served_by.is_some() {
+                            tracing::info!(
+                                target: "mesh",
+                                peer = ?served_by,
+                                "chat completion served via mesh fallback"
+                            );
+                        }
+                        // OpenAI-shape reply.
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": format!("mesh-{}", crate::bootstrap::now_ms()),
+                                "object": "chat.completion",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": content},
+                                    "finish_reason": "stop"
+                                }],
+                                "mesh_fallback": served_by,
+                            })),
+                        )
+                            .into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": format!(
+                                "local runtime unreachable: {local_err}; mesh fallback failed: {e}"
+                            ),
+                        })),
+                    )
+                        .into_response(),
+                };
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
-                    "error": format!("local runtime unreachable: {e}. Is colibri/ollama running?"),
+                    "error": format!("local runtime unreachable: {local_err}. Is colibri/ollama running?"),
                 })),
             )
                 .into_response()
