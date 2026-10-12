@@ -57,11 +57,16 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ CLI (setup, run, status, peers, config);
 - ✅ Web UI status/dashboard page
 - ✅ OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`, streaming)
+  Chat replies carry `mesh_fallback` (node id when a mesh peer served it,
+  explicit `null` otherwise — including 502s when neither the local runtime
+  nor mesh peers are reachable: never a bare 500).
 - ✅ Discord bot (`crates/bot`, poise/serenity): `/ask` (mesh-peer fallback included),
   `/reset`, `/remember`, `/recall`, `/status`, `/peers`, `/mine`, `/help`;
   per-user chat history (in-memory, capped) + per-user cooldowns; token via
   `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via
-  `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`
+  `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`;
+  `/mine` wins optionally post to a channel via
+  `JERITH_ANNOUNCE_CHANNEL_ID` (or `announce_channel_id` in bot.toml)
 - 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+)
 
 ## 8. Plugin / Skill System

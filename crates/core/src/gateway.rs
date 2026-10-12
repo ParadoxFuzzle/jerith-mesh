@@ -280,6 +280,7 @@ async fn chat_completions(
                         StatusCode::BAD_GATEWAY,
                         Json(json!({
                             "error": format!("local runtime unreachable: {local_err} and no messages to forward"),
+                            "mesh_fallback": Value::Null,
                         })),
                     )
                         .into_response();
@@ -328,15 +329,19 @@ async fn chat_completions(
                             "error": format!(
                                 "local runtime unreachable: {local_err}; mesh fallback failed: {e}"
                             ),
+                            "mesh_fallback": Value::Null,
                         })),
                     )
                         .into_response(),
                 };
             }
+            // Bot/API contract: a non-fallback, non-OK reply still carries
+            // mesh_fallback (explicitly null) so clients always see the field.
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
                     "error": format!("local runtime unreachable: {local_err}. Is colibri/ollama running?"),
+                    "mesh_fallback": Value::Null,
                 })),
             )
                 .into_response()
@@ -407,4 +412,76 @@ async fn chat_completions(
         bytes,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+
+    fn spawn_plain(runtime_url: &'static str, fallback: bool) -> TestServer {
+        let mut cfg = crate::config::NodeConfig::default();
+        cfg.runtime_url = runtime_url.to_string();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: runtime_url.to_string(),
+            miner: None,
+            memory: None,
+            mesh_fallback: if fallback {
+                Some(crate::ping::MeshFallbackChat::spawn().expect("test fallback"))
+            } else {
+                None
+            },
+        };
+        TestServer::new(gw.router().into_make_service()).expect("test server")
+    }
+
+    #[tokio::test]
+    async fn chat_without_runtime_or_fallback_is_clean_502() {
+        // Nothing listens on :1; runtime dead, no mesh fallback configured.
+        let server = spawn_plain("http://127.0.0.1:1", false);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+        let body: Value = res.json();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("local runtime unreachable")
+        );
+        // Contract: the field is always present, explicitly null here.
+        assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn chat_with_dead_fallback_peers_also_clean_502() {
+        // Fallback configured but registry is empty — must still be a clean
+        // 502 with mesh_fallback: null, never a 500.
+        let server = spawn_plain("http://127.0.0.1:1", true);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+        let body: Value = res.json();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("mesh fallback failed"),
+            "body: {body}"
+        );
+        assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
+    }
 }

@@ -122,13 +122,22 @@ pub async fn gateway_status(cfg: &crate::config::BotConfig) -> Result<Value> {
     Ok(body)
 }
 
+/// Outcome of a /mine attempt — enough to render both the direct reply and
+/// an optional announcement post.
+#[derive(Debug)]
+pub struct MineOutcome {
+    pub won: bool,
+    pub message: String,
+    pub amount: Option<String>,
+}
+
 /// POST /mine on the local JerithChain node (bearer-token auth via
 /// keys/api.token or JERITH_TOKEN, same as the passive miner).
 pub async fn mine(
     cfg: &crate::config::BotConfig,
     discord_id: &str,
     channel_id: &str,
-) -> Result<String> {
+) -> Result<MineOutcome> {
     let token = crate::core_token()?;
     let url = format!("{}/mine", cfg.chain_url);
     let message_id = format!("discord-bot:{discord_id}:{}", now_ms());
@@ -150,26 +159,42 @@ pub async fn mine(
     if !status.is_success() {
         anyhow::bail!("mine failed: {}", body_error(&body, status));
     }
-    if body.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+    let won = body.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+    if won {
         let amount = body
             .get("amount")
-            .map(|a| value_to_string(a).unwrap_or_default())
-            .unwrap_or_default();
-        Ok(format!(
-            "⛏ mined JER{space}! 🎉",
-            space = if amount.is_empty() {
-                String::new()
-            } else {
-                format!(" ({amount})")
-            }
-        ))
+            .and_then(value_to_string)
+            .filter(|a| !a.is_empty());
+        let message = match &amount {
+            Some(a) => format!("⛏ mined JER ({a})! 🎉"),
+            None => "⛏ mined JER! 🎉".to_string(),
+        };
+        Ok(MineOutcome { won, message, amount })
     } else {
         let reason = body
             .get("reason")
             .and_then(value_to_string)
             .unwrap_or_else(|| "not this time".to_string());
-        Ok(format!("⛏ mine attempt: {reason}"))
+        Ok(MineOutcome {
+            won,
+            message: format!("⛏ mine attempt: {reason}"),
+            amount: None,
+        })
     }
+}
+
+/// Announcement text for a win in the configured channel, or `None` when not
+/// a win. Formatted here so both the reply and the announcement stay in sync.
+pub fn mine_announcement(outcome: &MineOutcome, user: &str) -> Option<String> {
+    if !outcome.won {
+        return None;
+    }
+    let amount = outcome
+        .amount
+        .as_deref()
+        .map(|a| format!(" ({a})"))
+        .unwrap_or_default();
+    Some(format!("⛏ **{user}** mined JER{amount}! 🎉"))
 }
 
 fn body_error(body: &Value, status: reqwest::StatusCode) -> String {
@@ -196,6 +221,25 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mine_announcement_only_for_wins() {
+        let win = MineOutcome {
+            won: true,
+            message: "⛏ mined JER (2)! 🎉".to_string(),
+            amount: Some("2".to_string()),
+        };
+        assert_eq!(
+            mine_announcement(&win, "@user").unwrap(),
+            "⛏ **@user** mined JER (2)! 🎉"
+        );
+        let loss = MineOutcome {
+            won: false,
+            message: "⛏ mine attempt: cooldown".to_string(),
+            amount: None,
+        };
+        assert!(mine_announcement(&loss, "@user").is_none());
+    }
 
     #[test]
     fn value_to_string_shapes() {

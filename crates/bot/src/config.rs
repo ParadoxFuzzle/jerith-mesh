@@ -20,6 +20,8 @@ pub const DISCORD_TOKEN_ENV: &str = "JERITH_DISCORD_TOKEN";
 pub const GATEWAY_URL_ENV: &str = "JERITH_GATEWAY_URL";
 /// JerithChain node RPC base URL env var (used by /mine).
 pub const CHAIN_URL_ENV: &str = "JERITH_CHAIN_URL";
+/// Discord channel id (decimal string) where /mine wins are announced.
+pub const ANNOUNCE_CHANNEL_ENV: &str = "JERITH_ANNOUNCE_CHANNEL_ID";
 
 /// Default gateway URL: the local node's gateway port.
 pub const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8900";
@@ -31,6 +33,9 @@ pub struct BotConfig {
     pub discord_token: String,
     pub gateway_url: String,
     pub chain_url: String,
+    /// Optional Discord channel for /mine announcements (Set via
+    /// `JERITH_ANNOUNCE_CHANNEL_ID` or bot.toml `announce_channel_id`).
+    pub announce_channel_id: Option<u64>,
 }
 
 impl BotConfig {
@@ -61,10 +66,17 @@ impl BotConfig {
             .trim_end_matches('/')
             .to_string();
 
+        let announce_channel_id = std::env::var(ANNOUNCE_CHANNEL_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .or(file.announce_channel_id.map(|v| v.to_string()))
+            .and_then(|v| v.trim().parse::<u64>().ok());
+
         Ok(Self {
             discord_token: token,
             gateway_url,
             chain_url,
+            announce_channel_id,
         })
     }
 
@@ -75,6 +87,7 @@ impl BotConfig {
             discord_token: String::new(),
             gateway_url: gateway_url.trim_end_matches('/').to_string(),
             chain_url: chain_url.trim_end_matches('/').to_string(),
+            announce_channel_id: None,
         }
     }
 }
@@ -90,6 +103,8 @@ struct FileConfig {
     discord_token: Option<String>,
     gateway_url: Option<String>,
     chain_url: Option<String>,
+    /// Decimal channel id in TOML; env overrides.
+    announce_channel_id: Option<u64>,
 }
 
 fn read_file_config(path: &PathBuf) -> Option<FileConfig> {

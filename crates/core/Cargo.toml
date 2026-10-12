@@ -25,3 +25,4 @@ rcgen.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
+axum-test = "17"

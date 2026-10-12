@@ -146,6 +146,11 @@ Setup on the same box as a running node:
    propagate the first time.
 4. Logs: `journalctl --user -u jerith-bot -f`
 
+Optional: `/mine` wins announce to a Discord channel when
+`JERITH_ANNOUNCE_CHANNEL_ID=<decimal channel id>` (or `announce_channel_id`
+in bot.toml) is set; failures to post are logged, never surfaced to the
+user's command.
+
 Config precedence (bot): env var > `~/.jerith-mesh/bot.toml` > defaults.
 `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL` override the URLs;
 `JERITH_TOKEN` (or `~/.jerith-mesh/keys/api.token` via the core default)

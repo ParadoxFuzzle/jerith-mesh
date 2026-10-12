@@ -129,8 +129,22 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
     }
     ctx.defer().await?;
     let channel = ctx.channel_id().get().to_string();
-    let out = api::mine(&ctx.data().cfg, &user.to_string(), &channel).await?;
-    ctx.say(out).await?;
+    let user = user.to_string();
+    let outcome = api::mine(&ctx.data().cfg, &user, &channel).await?;
+    // Optional: announce wins in a configured channel (fire-and-forget; a
+    // missing/incorrect channel id must not fail the user's command).
+    if let Some(announce_id) = ctx.data().cfg.announce_channel_id {
+        if let Some(text) = api::mine_announcement(&outcome, &user) {
+            let http = ctx.serenity_context().http.clone();
+            tokio::spawn(async move {
+                let ch = serenityall::ChannelId::new(announce_id);
+                if let Err(e) = ch.say(&http, &text).await {
+                    tracing::warn!(error = %e, channel = announce_id, "mine announcement failed");
+                }
+            });
+        }
+    }
+    ctx.say(outcome.message).await?;
     Ok(())
 }
 
