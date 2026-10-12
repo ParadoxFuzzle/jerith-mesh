@@ -129,6 +129,9 @@ pub struct MineOutcome {
     pub won: bool,
     pub message: String,
     pub amount: Option<String>,
+    /// Reward in micro-JER as reported by the chain node (`reward_uj`), when
+    /// it supplies it — used to credit the bot-side /leaderboard.
+    pub reward_uj: Option<u64>,
 }
 
 /// POST /mine on the local JerithChain node (bearer-token auth via
@@ -161,15 +164,39 @@ pub async fn mine(
     }
     let won = body.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
     if won {
-        let amount = body
-            .get("amount")
-            .and_then(value_to_string)
-            .filter(|a| !a.is_empty());
+        // Prefer the exact reward_uj; fall back to parsing amount strings.
+        let reward_uj = body
+            .get("reward_uj")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                body.get("reward_jer")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| (f * 1_000_000.0) as u64)
+            });
+        let amount = reward_uj
+            .map(|u| {
+                let jer = u as f64 / 1_000_000.0;
+                if jer == (jer as u64) as f64 {
+                    format!("{} JER", jer as u64)
+                } else {
+                    format!("{jer:.6} JER")
+                }
+            })
+            .or_else(|| {
+                body.get("amount")
+                    .and_then(value_to_string)
+                    .filter(|a| !a.is_empty())
+            });
         let message = match &amount {
-            Some(a) => format!("⛏ mined JER ({a})! 🎉"),
+            Some(a) => format!("⛏ mined {a}! 🎉"),
             None => "⛏ mined JER! 🎉".to_string(),
         };
-        Ok(MineOutcome { won, message, amount })
+        Ok(MineOutcome {
+            won,
+            message,
+            amount,
+            reward_uj,
+        })
     } else {
         let reason = body
             .get("reason")
@@ -179,6 +206,7 @@ pub async fn mine(
             won,
             message: format!("⛏ mine attempt: {reason}"),
             amount: None,
+            reward_uj: None,
         })
     }
 }
@@ -228,6 +256,7 @@ mod tests {
             won: true,
             message: "⛏ mined JER (2)! 🎉".to_string(),
             amount: Some("2".to_string()),
+            reward_uj: Some(2_000_000),
         };
         assert_eq!(
             mine_announcement(&win, "@user").unwrap(),
@@ -237,6 +266,7 @@ mod tests {
             won: false,
             message: "⛏ mine attempt: cooldown".to_string(),
             amount: None,
+            reward_uj: None,
         };
         assert!(mine_announcement(&loss, "@user").is_none());
     }

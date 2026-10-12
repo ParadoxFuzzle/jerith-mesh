@@ -65,6 +65,8 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   per-user chat history (in-memory, capped) + per-user cooldowns; token via
   `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via
   `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`;
+  `/leaderboard` — JER mining leaderboard (bot-observed wins credited from
+  the chain's `reward_uj`, medals for top 3, resets on bot restart)
   `/mine` wins optionally post to a channel via
   `JERITH_ANNOUNCE_CHANNEL_ID` (or `announce_channel_id` in bot.toml)
 - 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+)

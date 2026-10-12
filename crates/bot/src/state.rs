@@ -25,6 +25,10 @@ struct UserState {
     last_ask: Option<Instant>,
     last_mine: Option<Instant>,
     last_cmd: Option<Instant>,
+    /// Total JER this user has won via /mine (bot-observed; the chain node's
+    /// own `total_mined` includes passive mining the bot never saw).
+    jer_won: u64,
+    mine_wins: u32,
 }
 
 /// Shared bot state: per-user memory + cooldowns.
@@ -58,6 +62,28 @@ fn gate(last: &mut Option<Instant>, cooldown: Duration, label: &str) -> GateResu
 }
 
 impl BotStateInner {
+    /// Record a /mine win: adds to the user's bot-observed total.
+    pub fn record_mine_win(&self, user: u64, jer_amount_uj: u64) {
+        let mut users = self.users.lock().expect("user map lock");
+        let st = users.entry(user).or_default();
+        st.jer_won += jer_amount_uj;
+        st.mine_wins += 1;
+    }
+
+    /// /leaderboard rows: users with at least one bot-observed win, biggest
+    /// total first, capped at `top`.
+    pub fn leaderboard(&self, top: usize) -> Vec<(u64, u64, u32)> {
+        let users = self.users.lock().expect("user map lock");
+        let mut rows: Vec<(u64, u64, u32)> = users
+            .iter()
+            .filter(|(_, st)| st.mine_wins > 0)
+            .map(|(id, st)| (*id, st.jer_won, st.mine_wins))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+        rows.truncate(top);
+        rows
+    }
+
     /// Check + set the per-user /ask cooldown.
     pub fn gate_ask(&self, user: u64) -> GateResult {
         let mut users = self.users.lock().expect("user map lock");
@@ -162,6 +188,28 @@ mod tests {
         assert!(h[0].to_string().contains("q2"));
         assert_eq!(s.reset(5), 8); // capped at MAX_HISTORY turns
         assert!(s.history(5).is_empty());
+    }
+
+    #[test]
+    fn mine_wins_accumulate_and_rank() {
+        let s = state();
+        s.record_mine_win(100, 2_000_000); // 2 JER
+        s.record_mine_win(100, 1_000_000); // +1 JER
+        s.record_mine_win(200, 5_000_000); // 5 JER
+        let rows = s.leaderboard(10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (200, 5_000_000, 1));
+        assert_eq!(rows[1], (100, 3_000_000, 2));
+        // Cap works.
+        assert!(s.leaderboard(1).len() == 1);
+        // Users without wins never appear.
+        assert!(!s.leaderboard(10).iter().any(|r| r.0 == 99));
+    }
+
+    #[test]
+    fn leaderboard_empty() {
+        let s = state();
+        assert!(s.leaderboard(10).is_empty());
     }
 
     #[test]

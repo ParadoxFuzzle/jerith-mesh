@@ -122,15 +122,21 @@ pub async fn peers(ctx: Ctx<'_>) -> Result<(), Error> {
 /// Try to mine JER on the local JerithChain node (per-user cooldown).
 #[poise::command(slash_command, prefix_command)]
 pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
-    let user = user_id(&ctx);
-    if let Err(msg) = ctx.data().state.gate_mine(user) {
+    let discord_id = user_id(&ctx);
+    if let Err(msg) = ctx.data().state.gate_mine(discord_id) {
         ctx.say(msg).await?;
         return Ok(());
     }
     ctx.defer().await?;
     let channel = ctx.channel_id().get().to_string();
-    let user = user.to_string();
+    let user = discord_id.to_string();
     let outcome = api::mine(&ctx.data().cfg, &user, &channel).await?;
+    // Credit the bot-observed /leaderboard when the chain reports a reward.
+    if outcome.won {
+        if let Some(uj) = outcome.reward_uj {
+            ctx.data().state.record_mine_win(discord_id, uj);
+        }
+    }
     // Optional: announce wins in a configured channel (fire-and-forget; a
     // missing/incorrect channel id must not fail the user's command).
     if let Some(announce_id) = ctx.data().cfg.announce_channel_id {
@@ -145,6 +151,18 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
         }
     }
     ctx.say(outcome.message).await?;
+    Ok(())
+}
+
+/// Show the /mine leaderboard (bot-observed wins since bot start).
+#[poise::command(slash_command, prefix_command)]
+pub async fn leaderboard(ctx: Ctx<'_>) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    let rows = ctx.data().state.leaderboard(10);
+    ctx.say(format_leaderboard(&rows, user_id(&ctx))).await?;
     Ok(())
 }
 
@@ -168,6 +186,7 @@ pub const HELP_TEXT: &str = "\
 `/status` — node + mesh status snapshot
 `/peers` — list live peers in the mesh
 `/mine` — try to mine JER on the local JerithChain node
+`/leaderboard` — JER mining leaderboard (top winners)
 `/help` — this message";
 
 /// Append attribution when a mesh peer (not the local runtime) served it.
@@ -176,6 +195,30 @@ pub fn format_reply(reply: &str, served_by: Option<&str>) -> String {
         Some(node) => format!("{reply}\n\n— served by mesh peer `{node}`"),
         None => reply.to_string(),
     }
+}
+
+/// /leaderboard rendering: medal for top 3, `<@id>` mentions, mono totals.
+pub fn format_leaderboard(rows: &[(u64, u64, u32)], viewer: u64) -> String {
+    if rows.is_empty() {
+        return "🏆 no /mine wins recorded yet (bot-side, resets on restart) — be the first! `/mine`".to_string();
+    }
+    let medals = ["🥇", "🥈", "🥉"];
+    let mut out = String::from("🏆 **JER mining leaderboard**\n");
+    for (i, (id, jer_uj, wins)) in rows.iter().enumerate() {
+        let jer = *jer_uj as f64 / 1_000_000.0;
+        let jer_txt = if jer == (jer as u64) as f64 {
+            format!("{}", jer as u64)
+        } else {
+            format!("{jer:.6}")
+        };
+        let you = if *id == viewer { " (you)" } else { "" };
+        let medal = medals.get(i).copied().unwrap_or("▫️");
+        out.push_str(&format!(
+            "{medal} <@{id}>{you} — **{jer_txt} JER** ({wins} win{})\n",
+            if *wins == 1 { "" } else { "s" }
+        ));
+    }
+    out
 }
 
 /// One line per hit: `• <text snippet> (score)`.
@@ -304,6 +347,22 @@ mod tests {
         assert!(out.contains("3 total / 2 alive"));
         assert!(out.contains("11 tokens"));
         assert!(out.contains("mines: 2 attempted / 1 won"));
+    }
+
+    #[test]
+    fn leaderboard_empty_and_medals() {
+        assert!(format_leaderboard(&[], 1).contains("no /mine wins"));
+        let rows = vec![(10u64, 5_000_000u64, 1u32), (20, 15_000_000, 3), (30, 2_500_000, 2), (40, 1_000_000, 1)];
+        let out = format_leaderboard(&rows, 20);
+        // Input order preserved (docs: sort caller-side); medal per position.
+        assert!(out.contains("🥇 <@10>"));
+        assert!(out.contains("🥈 <@20>") && out.contains("(you)"));
+        assert!(out.contains("🥉 <@30>"));
+        assert!(out.contains("▫️ <@40>"));
+        assert!(out.contains("**15 JER** (3 wins)"));
+        assert!(out.contains("**2.500000 JER** (2 wins)"));
+        assert!(out.contains("**5 JER** (1 win)"));
+        assert!(out.contains("**1 JER** (1 win)"));
     }
 
     #[test]

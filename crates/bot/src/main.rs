@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::status(),
                 commands::peers(),
                 commands::mine(),
+                commands::leaderboard(),
                 commands::help(),
             ],
             on_error: |err| {
