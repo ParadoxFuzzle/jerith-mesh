@@ -122,3 +122,31 @@ and dropped off the list after shutdown when its TTL expired.
 - The advertise TTL is 90 s; a node that stops refreshing disappears from
   `/v1/peers` automatically, and `/v1/report-dead` (2 votes) evicts a
   misbehaving node immediately.
+
+## Discord bot deployment (`jerith-bot`)
+
+The bot (`crates/bot`) talks to a **local node gateway** (default
+`http://127.0.0.1:8900`) and the local JerithChain node
+(`http://127.0.0.1:8322`). It does not need to be reachable from the
+internet — Discord's gateway is an outbound websocket, so no tunnel
+entry is required.
+
+Setup on the same box as a running node:
+
+1. Token: create a Discord application + bot, copy the token, then either
+   - write `discord_token = "..."` into `~/.jerith-mesh/bot.toml`
+     (recommended), or
+   - set `JERITH_DISCORD_TOKEN` in the service unit.
+2. Install the unit (from the repo root):
+   `cp deploy/systemd/jerith-bot.service ~/.config/systemd/user/ &&
+    systemctl --user daemon-reload && systemctl --user enable --now jerith-bot`
+3. Verify: `systemctl --user status jerith-bot` then in Discord use
+   `/status` and `/peers` — they should show the local node snapshot.
+   Global slash-command registration can take a few minutes to
+   propagate the first time.
+4. Logs: `journalctl --user -u jerith-bot -f`
+
+Config precedence (bot): env var > `~/.jerith-mesh/bot.toml` > defaults.
+`JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL` override the URLs;
+`JERITH_TOKEN` (or `~/.jerith-mesh/keys/api.token` via the core default)
+authenticates `/mine` against the local JerithChain node.

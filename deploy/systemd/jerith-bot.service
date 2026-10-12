@@ -1,0 +1,29 @@
+# jerith-mesh Discord bot — user-level service template.
+# Install:
+#   cp deploy/systemd/jerith-bot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-bot
+# Configure the token beforehand — either in the [Service] Environment line
+# below (uncomment) or in ~/.jerith-mesh/bot.toml (recommended; keeps the
+# token out of `systemctl show` output and journal dumps).
+[Unit]
+Description=jerith-mesh Discord bot (jerith-bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith-bot
+Restart=always
+RestartSec=5
+# Uncomment and fill in if you prefer the token in the unit instead of bot.toml:
+#Environment=JERITH_DISCORD_TOKEN=replace-me
+# Optional overrides (defaults: gateway http://127.0.0.1:8900, chain http://127.0.0.1:8322):
+#Environment=JERITH_GATEWAY_URL=http://127.0.0.1:8900
+#Environment=JERITH_CHAIN_URL=http://127.0.0.1:8322
+#Environment=JERITH_TOKEN=/tmp/jn/keys/api.token
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
