@@ -101,6 +101,93 @@ sysctl daemon-reload
 sysctl enable --now jerith-node
 [ "$BOT" = "1" ] && sysctl enable --now jerith-bot || true
 
+echo "==> 4b/5 assets: scripts, plugin-skills, extensions, workspace docs/config"
+# A jerith-mesh install can't run OpenClaw's plugin system directly; instead we
+# stage everything script/project-shaped into a browsable migrated tree preserved
+# full-fidelity, plus machine-readable manifests that list what each service
+# used to do (so nothing silently disappears). Modify nothing in ~/.openclaw.
+ASSETS_ROOT="$HOME/.jerith-mesh/openclaw-migrated"
+MW="$ASSETS_ROOT/workspace"     # workspace scripts/docs/config
+MS="$ASSETS_ROOT/plugin-skills"
+ME="$ASSETS_ROOT/extensions"
+mkdir -p "$MW" "$MS" "$ME"
+if [ -d "$CLIENT_ROOT/workspace/scripts" ]; then
+  rsync -a "$CLIENT_ROOT/workspace/scripts/" "$MW/scripts/"
+  echo "   scripts: $(find "$MW/scripts" -maxdepth 1 -type f | wc -l) files → $MW/scripts"
+fi
+for doc in AGENTS.md IDENTITY.md MEMORY.md SOUL.md DREAMS.md grounding-protocol.md; do
+  if [ -f "$CLIENT_ROOT/workspace/$doc" ]; then
+    cp "$CLIENT_ROOT/workspace/$doc" "$MW/"
+    echo "   doc: $doc copied"
+  fi
+done
+if [ -d "$CLIENT_ROOT/workspace/config" ]; then
+  rsync -a "$CLIENT_ROOT/workspace/config/" "$MW/config/"
+  echo "   workspace config: $(find "$MW/config" -type f | wc -l) files"
+fi
+if [ -d "$CLIENT_ROOT/plugin-skills" ]; then
+  # Copy skill code but skip logs/caches — anything regenerable stays behind.
+  for skill in "$CLIENT_ROOT"/plugin-skills/*; do
+    name="$(basename "$skill")"
+    [ -d "$skill" ] || continue
+    rsync -a --exclude '*.log' --exclude '__pycache__' --exclude '.venv' "$skill/" "$MS/$name/"
+  done
+  echo "   plugin-skills: $(ls "$MS" | wc -l) skills → $MS"
+fi
+if [ -d "$CLIENT_ROOT/extensions" ]; then
+  for ext in "$CLIENT_ROOT"/extensions/*; do
+    name="$(basename "$ext")"
+    [ -d "$ext" ] || continue
+    rsync -a --exclude node_modules --exclude dist --exclude target "$ext/" "$ME/$name/"
+    echo "   extension: $name (src copied; node_modules/dist excluded — rebuild later)"
+  done
+fi
+# Cron/periodic jobs → manifest (not auto-installed: they ran agent logic; wired
+# back up deliberately, per job).
+python3 - "$ASSETS_ROOT" "$CLIENT_ROOT" <<'PY'
+import json, os, sys, datetime
+assets, client_root = sys.argv[1], sys.argv[2]
+rows = []
+for cand in ("cron/jobs.json", "cron/jobs.json.migrated"):
+    p = os.path.join(client_root, cand)
+    if os.path.exists(p):
+        try:
+            data = json.load(open(p))
+        except Exception:
+            continue
+        for j in data.get("jobs", []):
+            sched = j.get("schedule") or {}
+            kind = sched.get("kind")
+            if kind == "every":
+                ms = sched.get("everyMs", 0)
+                every_s = ms // 1000
+                desc = f"every {every_s // 3600}h{(every_s % 3600) // 60}m" if every_s >= 60 else f"every {every_s}s"
+            elif kind == "at":
+                desc = f"one-shot at {sched.get('at')}"
+            else:
+                desc = f"unknown: {sched}"
+            rows.append({"name": j.get("name", "?"), "id": j.get("id", "?"), "schedule": desc})
+out = os.path.join(assets, "cron-jobs-manifest.json")
+json.dump({"generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+           "note": "OpenClaw cron jobs. Re-create deliberately (systemd timers or /mine-style bot loops) — not auto-installed.",
+           "jobs": rows}, open(out, "w"), indent=2)
+print(f"   cron: {len(rows)} jobs → cron-jobs-manifest.json")
+PY
+# Workspace-driven systemd services → manifest of what ran outside the gateway
+{
+  echo "# OpenClaw workspace services found active/in unit files on this machine."
+  echo "# Each needs a jerith replacement or explicit retirement decision."
+  echo "# unit | purpose | script"
+  for f in "$HOME/.config/systemd/user"/openclaw-*.service; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f" .service)"
+    desc="$(grep -m1 '^Description=' "$f" | cut -d= -f2)"
+    execs="$(grep -E '^ExecStart=' "$f" | tail -1 | cut '-d=' -f2 | cut -d' ' -f2-)"
+    echo "$name | $desc | $execs"
+  done
+} > "$ASSETS_ROOT/workspace-services-manifest.tsv" 2>/dev/null || true
+echo "   workspace services → workspace-services-manifest.tsv"
+
 echo "==> 5/5 verify"
 sleep 6
 sysctl is-active jerith-node || true
