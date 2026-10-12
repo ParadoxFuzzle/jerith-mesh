@@ -19,6 +19,7 @@ use crate::models::ModelId;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PeerAd {
     pub node_id: String,
+    /// Host:port of the peer's HTTP gateway (health/status/API surface).
     pub address: String,
     pub model_id: String,
     pub quant: String,
@@ -26,6 +27,10 @@ pub struct PeerAd {
     /// Unix ms of the peer's last self-reported heartbeat.
     pub last_seen_ms: u64,
     pub role: crate::config::NodeRole,
+    /// Host:port of the peer's QUIC NodeRPC endpoint (expert dispatch).
+    /// Serialization-defaulted for pre-RPC peers; empty string = absent.
+    #[serde(default)]
+    pub rpc_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +392,7 @@ mod tests {
             model_id: model_id.into(),
             quant: quant.into(),
             contribution_percent: 30,
+            rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
         }

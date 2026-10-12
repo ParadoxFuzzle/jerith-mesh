@@ -464,6 +464,7 @@ mod tests {
             model_id: model.into(),
             quant: "int4".into(),
             contribution_percent: 30,
+            rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
         };
@@ -757,6 +758,7 @@ mod tests {
             model_id: "glm-5.3".into(),
             quant: "int4".into(),
             contribution_percent: 30,
+            rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
         };
@@ -926,6 +928,7 @@ mod tests {
             model_id: "glm-5.3".into(),
             quant: "int4".into(),
             contribution_percent: 30,
+            rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
         };
@@ -984,6 +987,7 @@ mod tests {
                 model_id: String::new(),
                 quant: String::new(),
                 contribution_percent: 30,
+                rpc_address: String::new(),
                 last_seen_ms: 0,
                 role: NodeRole::Hybrid,
             },

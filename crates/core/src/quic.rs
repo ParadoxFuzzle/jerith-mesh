@@ -156,6 +156,11 @@ impl ExpertRouter {
         self.local_experts.write().await.insert(expert_id.to_string());
     }
 
+    /// Drop a locally-hosted expert (e.g., evicted from cache).
+    pub async fn unregister_local_expert(&self, expert_id: &str) {
+        self.local_experts.write().await.remove(expert_id);
+    }
+
     pub async fn hosts_locally(&self, expert_id: &str) -> bool {
         self.local_experts.read().await.contains(expert_id)
     }
@@ -212,6 +217,96 @@ impl ExpertRouter {
                     return Ok(out);
                 }
                 Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// QUIC-backed dispatch: same candidate plan, but remote candidates
+    /// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
+    /// `local_run` computes locally when the plan's first candidate is
+    /// local. Feedback failures land in `completed` as usual; the caller
+    /// receives the first successful result.
+    pub async fn execute_over_quic(
+        &self,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        expert_id: &str,
+        input: &[f32],
+        peers: &[(String, u64, bool, bool)],
+        completed: &mut HashMap<String, Vec<f32>>,
+        local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+    ) -> anyhow::Result<Vec<f32>> {
+        if let Some(prev) = completed.get(req_id) {
+            return Ok(prev.clone());
+        }
+        let plan = self.plan_dispatch(expert_id, peers).await;
+        let mut last_err = anyhow::anyhow!(
+            "no dispatch candidates for expert {expert_id} (plan empty or all failed)"
+        );
+        for location in plan {
+            let result = match &location {
+                ExpertLocation::Local => local_run(input),
+                ExpertLocation::Remote { node_id, .. } => {
+                    match peer_addrs.get(node_id) {
+                        None => Err(anyhow::anyhow!("no QUIC address for peer {node_id}")),
+                        Some(addr) => {
+                            let mut req = NodeRpcRequest::ExpertQuery {
+                                req_id: req_id.to_string(),
+                                expert_id: expert_id.to_string(),
+                                input: input.to_vec(),
+                                from_node_id: identity.node_id(),
+                                stamp_ms: 0,
+                                sig: String::new(),
+                            };
+                            sign_request(&mut req, identity);
+                            match call(endpoint, *addr, &req, identity, self.options.dispatch_timeout)
+                                .await
+                            {
+                                Ok(NodeRpcReply::ExpertResult {
+                                    req_id: rid,
+                                    output,
+                                    node_id: server_id,
+                                }) => {
+                                    // Attribute check: reply must come from
+                                    // the exact candidate we dispatched to.
+                                    if server_id != *node_id || rid != req_id {
+                                        Err(anyhow::anyhow!(
+                                            "reply identity mismatch: expected {node_id}, got {server_id}"
+                                        ))
+                                    } else {
+                                        Ok(output)
+                                    }
+                                }
+                                Ok(NodeRpcReply::Error { req_id: _id, message }) => {
+                                    Err(anyhow::anyhow!("peer rejected expert query: {message}"))
+                                }
+                                Ok(other) => {
+                                    Err(anyhow::anyhow!("unexpected reply kind: {other:?}"))
+                                }
+                                Err(e) => Err(anyhow::anyhow!("quic dispatch failed: {e}")),
+                            }
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(out) => {
+                    completed.insert(req_id.to_string(), out.clone());
+                    return Ok(out);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "mesh",
+                        expert = %expert_id,
+                        location = ?location,
+                        error = %e,
+                        "dispatch candidate failed — falling through"
+                    );
                     last_err = e;
                 }
             }
@@ -335,10 +430,12 @@ pub trait ExpertHandler: Send + Sync {
 }
 
 /// Serve RPC requests on a bound endpoint until shutdown. Verifies
-/// request stamps and dispatches to the registered handler.
+/// request stamps and dispatches to the registered handler. Every reply
+/// carries `server_node_id` so the pinger can attribute it.
 pub async fn serve(
     endpoint: quinn::Endpoint,
     handler: Arc<dyn ExpertHandler>,
+    server_node_id: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut shutdown = shutdown;
@@ -347,9 +444,10 @@ pub async fn serve(
             conn = endpoint.accept() => {
                 let Some(conn) = conn else { break };
                 let handler = Arc::clone(&handler);
+                let server_node_id = server_node_id.clone();
                 tokio::spawn(async move {
                     if let Ok(connection) = conn.await {
-                        handle_connection(connection, handler).await;
+                        handle_connection(connection, handler, server_node_id).await;
                     }
                 });
             }
@@ -362,14 +460,19 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle_connection(connection: quinn::Connection, handler: Arc<dyn ExpertHandler>) {
+async fn handle_connection(
+    connection: quinn::Connection,
+    handler: Arc<dyn ExpertHandler>,
+    server_node_id: String,
+) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         match read_frame(&mut recv).await {
             Ok(line) => {
+                let server_id = server_node_id.clone();
                 let reply = match serde_json::from_slice::<NodeRpcRequest>(&line) {
                     Ok(req) if verify_request(&req) => match req {
                         NodeRpcRequest::Ping { .. } => NodeRpcReply::Pong {
-                            node_id: handler_node_id_fallback(),
+                            node_id: server_id,
                             stamp_ms: crate::bootstrap::now_ms(),
                         },
                         NodeRpcRequest::ExpertQuery { req_id, expert_id, input, .. } => {
@@ -377,7 +480,7 @@ async fn handle_connection(connection: quinn::Connection, handler: Arc<dyn Exper
                                 Ok(output) => NodeRpcReply::ExpertResult {
                                     req_id,
                                     output,
-                                    node_id: handler_node_id_fallback(),
+                                    node_id: server_id,
                                 },
                                 Err(e) => NodeRpcReply::Error {
                                     req_id,
@@ -408,13 +511,6 @@ async fn handle_connection(connection: quinn::Connection, handler: Arc<dyn Exper
             Err(_) => break,
         }
     }
-}
-
-fn handler_node_id_fallback() -> String {
-    // The server stamps replies with the local node_id; the wiring passes
-    // it via the handler context in Phase 1 integration. Placeholder keeps
-    // the wire shape stable.
-    "unknown".into()
 }
 
 async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
@@ -760,7 +856,9 @@ mod tests {
         let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move { serve(server, Arc::new(TimesTwo), rx).await });
+        tokio::spawn(async move {
+            serve(server, Arc::new(TimesTwo), "test-server".to_string(), rx).await
+        });
 
         let client = client_endpoint().unwrap();
         let identity = SigningIdentity::generate();
@@ -794,7 +892,9 @@ mod tests {
         let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move { serve(server, Arc::new(TimesTwo), rx).await });
+        tokio::spawn(async move {
+            serve(server, Arc::new(TimesTwo), "test-server".to_string(), rx).await
+        });
 
         let client = client_endpoint().unwrap();
         let identity = SigningIdentity::generate();
@@ -810,12 +910,148 @@ mod tests {
         assert!(matches!(reply, NodeRpcReply::Pong { .. }));
     }
 
+    struct Multiplier {
+        factor: f32,
+    }
+
+    impl ExpertHandler for Multiplier {
+        fn run(&self, _expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
+            Ok(input.iter().map(|x| x * self.factor).collect())
+        }
+    }
+
+    async fn spawn_expert_server(
+        factor: f32,
+        node_id: &str,
+    ) -> anyhow::Result<SocketAddr> {
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap())?;
+        let addr = server.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let node_id = node_id.to_string();
+        tokio::spawn(async move {
+            serve(server, Arc::new(Multiplier { factor }), node_id, rx).await
+        });
+        Ok(addr)
+    }
+
+    #[tokio::test]
+    async fn router_execute_over_quic_prefers_local_and_falls_through() {
+        // Two remote servers: near (×3, rtt 5) and far (×7, rtt 200).
+        let near_addr = spawn_expert_server(3.0, "near").await.unwrap();
+        let far_addr = spawn_expert_server(7.0, "far").await.unwrap();
+
+        let r = router(50); // nearby threshold 50ms
+        let node_id = SigningIdentity::generate().node_id();
+        let peers = vec![
+            ("near".to_string(), 5, true, true),
+            ("far".to_string(), 200, true, true),
+        ];
+        let mut addrs = HashMap::new();
+        addrs.insert("near".to_string(), near_addr);
+        addrs.insert("far".to_string(), far_addr);
+
+        let client = client_endpoint().unwrap();
+        let identity = SigningIdentity::generate();
+        let mut completed = HashMap::new();
+
+        // No local expert → remote plan: near ×3 first.
+        let out = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "q1",
+                "exp.test",
+                &[1.0, 2.0],
+                &peers,
+                &mut completed,
+                |_| Ok(vec![0.0]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, vec![3.0, 6.0]);
+
+        // Idempotence: same req_id returns the memoized result.
+        let out2 = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "q1",
+                "exp.test",
+                &[9.0, 9.0],
+                &peers,
+                &mut completed,
+                |_| Ok(vec![1.0]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out2, vec![3.0, 6.0]);
+
+        // Local-first: with a local expert registered, local wins.
+        r.register_local_expert("exp.test").await;
+        let out3 = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "q2",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut completed,
+                |input| Ok(input.iter().map(|x| x * 10.0).collect()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out3, vec![40.0]);
+
+        // Fallthrough: local unregistered + near dies (removed from addrs)
+        // → far ×7 serves.
+        r.unregister_local_expert("exp.test").await;
+        let mut addrs2 = addrs.clone();
+        addrs2.remove("near");
+        let out4 = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs2,
+                "q3",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut completed,
+                |input| Ok(input.iter().map(|x| x * 10.0).collect()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out4, vec![28.0]);
+
+        // All candidates gone → error carrying the last cause.
+        let err = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &HashMap::new(),
+                "q4",
+                "exp.test",
+                &[1.0],
+                &peers,
+                &mut completed,
+                |_| Err(anyhow::anyhow!("local also down")),
+            )
+            .await;
+        assert!(err.is_err());
+    }
+
     #[tokio::test]
     async fn quic_rejects_stale_stamp() {
         let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = server.local_addr().unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move { serve(server, Arc::new(TimesTwo), rx).await });
+        tokio::spawn(async move {
+            serve(server, Arc::new(TimesTwo), "test-server".to_string(), rx).await
+        });
 
         let client = client_endpoint().unwrap();
         let identity = SigningIdentity::generate();

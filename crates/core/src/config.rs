@@ -185,9 +185,11 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
-    /// Effective NodeRPC UDP port (defaults to gateway_port + 1).
+    /// Effective NodeRPC UDP port. Defaults to `GATEWAY+100` — deliberately
+    /// far from `gateway_port+1`, which collides with the bootstrap node's
+    /// TCP 8901 whenever gateway = 8900 (seen live during E2E).
     pub fn effective_rpc_port(&self) -> u16 {
-        self.rpc_port.unwrap_or(self.gateway_port + 1)
+        self.rpc_port.unwrap_or(self.gateway_port + 100)
     }
 }
 
@@ -441,9 +443,11 @@ mod tests {
     }
 
     #[test]
-    fn rpc_port_defaults_to_gateway_plus_one() {
+    fn rpc_port_defaults_clear_of_bootstrap_tcp() {
         let mut cfg = NodeConfig::default();
-        assert_eq!(cfg.effective_rpc_port(), 8901);
+        // Default gateway 8900 → RPC lands on 9000, never on the public
+        // bootstrap's TCP 8901.
+        assert_eq!(cfg.effective_rpc_port(), 9000);
         cfg.rpc_port = Some(9201);
         assert_eq!(cfg.effective_rpc_port(), 9201);
     }

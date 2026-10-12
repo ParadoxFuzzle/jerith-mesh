@@ -176,12 +176,14 @@ async fn run_loop(
             // Ping every connectable peer.
             ping_all(&state, &bootstrap).await;
 
-            // Advertise ourselves (signed).
+            // Advertise ourselves (signed); rpc_address points at our
+            // QUIC NodeRPC so peers can dispatch experts to us.
             let (ad, identity) = {
                 let cfg = state.config.read().await;
                 let ad = PeerAd {
                     node_id: cfg.node_id.clone(),
                     address: format!("127.0.0.1:{}", cfg.gateway_port),
+                    rpc_address: format!("127.0.0.1:{}", cfg.effective_rpc_port()),
                     model_id: my_ad_model.0,
                     quant: my_ad_model.1,
                     contribution_percent: cfg.contribution_percent,

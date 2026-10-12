@@ -74,7 +74,7 @@ impl SigningIdentity {
 /// Canonical advertisement payload — both sides must build it identically.
 pub fn advertise_payload(ad: &PeerAd, stamp_ms: u64) -> String {
     format!(
-        "{ADV_PREFIX}|{stamp_ms}|{}|{}|{}|{}|{}|{}|{}",
+        "{ADV_PREFIX}|{stamp_ms}|{}|{}|{}|{}|{}|{}|{}|{}",
         ad.node_id,
         ad.address,
         ad.model_id,
@@ -82,6 +82,7 @@ pub fn advertise_payload(ad: &PeerAd, stamp_ms: u64) -> String {
         ad.contribution_percent,
         ad.last_seen_ms,
         role_str(ad.role),
+        ad.rpc_address,
     )
 }
 
@@ -189,6 +190,7 @@ mod tests {
             model_id: "glm-5.3".into(),
             quant: "int4".into(),
             contribution_percent: 30,
+            rpc_address: String::new(),
             last_seen_ms: 1_000,
             role: NodeRole::Hybrid,
         }

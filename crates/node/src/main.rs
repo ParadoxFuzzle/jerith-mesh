@@ -611,11 +611,17 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             match jerith_mesh_core::quic::server_endpoint(rpc_addr) {
                 Ok(endpoint) => {
                     let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
+                    let node_id = cfg.node_id.clone();
                     tokio::spawn(async move {
                         let handler_handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
                             std::sync::Arc::new(handler);
-                        if let Err(e) =
-                            jerith_mesh_core::quic::serve(endpoint, handler_handler, rpc_rx).await
+                        if let Err(e) = jerith_mesh_core::quic::serve(
+                            endpoint,
+                            handler_handler,
+                            node_id,
+                            rpc_rx,
+                        )
+                        .await
                         {
                             tracing::error!(error = %e, "rpc server died");
                         }
