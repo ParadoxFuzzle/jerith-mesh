@@ -219,6 +219,42 @@ pub struct ChainLbEntry {
     pub total_mined_uj: u64,
 }
 
+/// Chain /balance for one Discord user.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MyBalance {
+    pub exists: bool,
+    pub balance_uj: u64,
+    pub address: Option<String>,
+    pub available_jer: Option<f64>,
+    pub opted_in: Option<bool>,
+}
+
+/// GET /balance on the chain node for the caller's Discord id.
+pub async fn my_balance(cfg: &crate::config::BotConfig, token: &str, discord_id: u64) -> Result<MyBalance> {
+    let url = format!("{}/balance?discord_id={}", cfg.chain_url, discord_id);
+    let resp = client()
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("chain node unreachable at {url}"))?;
+    let status = resp.status();
+    let body: Value = resp.json().await.context("chain returned non-JSON")?;
+    if !status.is_success() {
+        anyhow::bail!("balance failed: {}", body_error(&body, status));
+    }
+    let exists = body.get("exists").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(MyBalance {
+        exists,
+        balance_uj: body.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
+        address: body
+            .get("address")
+            .and_then(value_to_string),
+        available_jer: body.get("available_jer").and_then(|v| v.as_f64()),
+        opted_in: body.get("opted_in").and_then(|v| v.as_bool()),
+    })
+}
+
 /// GET /mystate on the chain node — chain-authoritative leaderboard totals
 /// (per-user lifetime, includes passive mining the bot never observed).
 pub async fn chain_leaderboard(
@@ -308,6 +344,44 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn my_balance_parsing_shapes() {
+        // The render side lives in commands.rs; here pin the field extraction
+        // from the two documented /balance response shapes.
+        let existing = serde_json::json!({
+            "exists": true, "address": "JERDC9695",
+            "balance_uj": 50_000_000u64, "balance_jer": 50.0,
+            "available_jer": 49.9, "opted_in": true
+        });
+        let got = MyBalance {
+            exists: existing.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
+            balance_uj: existing.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
+            address: existing.get("address").and_then(value_to_string),
+            available_jer: existing.get("available_jer").and_then(|v| v.as_f64()),
+            opted_in: existing.get("opted_in").and_then(|v| v.as_bool()),
+        };
+        assert!(got.exists);
+        assert_eq!(got.balance_uj, 50_000_000);
+        assert_eq!(got.address.as_deref(), Some("JERDC9695"));
+
+        let none = serde_json::json!({"exists": false, "balance_uj": 0, "balance_jer": 0.0});
+        let got2 = MyBalance {
+            exists: none.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
+            balance_uj: none.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
+            address: none.get("address").and_then(value_to_string),
+            available_jer: none.get("available_jer").and_then(|v| v.as_f64()),
+            opted_in: none.get("opted_in").and_then(|v| v.as_bool()),
+        };
+        assert!(!got2.exists);
+        assert!(got2.address.is_none());
+    }
+
+    #[tokio::test]
+    async fn my_balance_unreachable_is_err() {
+        let cfg = crate::config::BotConfig::from_parts("http://127.0.0.1:3", "http://127.0.0.1:4");
+        assert!(my_balance(&cfg, "t", 12345).await.is_err());
+    }
 
     #[tokio::test]
     async fn chain_leaderboard_unreachable_is_err() {

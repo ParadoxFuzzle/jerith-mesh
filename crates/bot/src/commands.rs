@@ -211,6 +211,21 @@ pub async fn leaderboard(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Show your own JER balance on the local JerithChain node.
+#[poise::command(slash_command, prefix_command)]
+pub async fn myjercraft(ctx: Ctx<'_>) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    ctx.defer().await?;
+    let did = user_id(&ctx);
+    let token = crate::core_token()?;
+    let bal = api::my_balance(&ctx.data().cfg, &token, did).await?;
+    ctx.say(format_my_balance(&bal, did)).await?;
+    Ok(())
+}
+
 /// Show bot help.
 #[poise::command(slash_command, prefix_command)]
 pub async fn help(ctx: Ctx<'_>) -> Result<(), Error> {
@@ -232,6 +247,7 @@ pub const HELP_TEXT: &str = "\
 `/peers` — list live peers in the mesh
 `/mine` — try to mine JER on the local JerithChain node
 `/leaderboard` — JER mining leaderboard (top winners)
+`/myjercraft` — show your own JER balance on the chain
 `/help` — this message";
 
 /// Append attribution when a mesh peer (not the local runtime) served it.
@@ -240,6 +256,57 @@ pub fn format_reply(reply: &str, served_by: Option<&str>) -> String {
         Some(node) => format!("{reply}\n\n— served by mesh peer `{node}`"),
         None => reply.to_string(),
     }
+}
+
+/// /myjercraft rendering: named after the `/balance` contract (exists flag
+/// drives the no-wallet hint; totals in uj-exact JER formatting).
+pub fn format_my_balance(bal: &api::MyBalance, viewer: u64) -> String {
+    if !bal.exists {
+        return format!(
+            "💳 <@{viewer}> — no JerithChain wallet yet. Run `/mine` once and one is created for you (mine rewards credit it automatically)."
+        );
+    }
+    let jer = bal.balance_uj as f64 / 1_000_000.0;
+    let jer_txt = if jer == (jer as u64) as f64 {
+        format!("{}", jer as u64)
+    } else {
+        format!("{jer:.6}")
+    };
+    let addr = bal
+        .address
+        .as_deref()
+        .map(short_addr)
+        .unwrap_or_else(|| "unknown".to_string());
+    let available = bal
+        .available_jer
+        .map(|a| {
+            let a_txt = if a == (a as u64) as f64 {
+                format!("{}", a as u64)
+            } else {
+                format!("{a:.6}")
+            };
+            format!(" · available **{a_txt} JER**")
+        })
+        .unwrap_or_default();
+    let opted = match bal.opted_in {
+        Some(true) => "",
+        Some(false) => "\n⚠️ you're opted out — mine rewards go to the pool owner until you opt in.",
+        None => "",
+    };
+    format!(
+        "💳 <@{viewer}> — **{jer_txt} JER**{available}\naddress: `{addr}`{opted}"
+    )
+}
+
+/// `JERDC9695D27…4312`-style short form (first 12 + last 4).
+fn short_addr(addr: &str) -> String {
+    let n = addr.chars().count();
+    if n <= 16 {
+        return addr.to_string();
+    }
+    let head: String = addr.chars().take(12).collect();
+    let tail: String = addr.chars().skip(n - 4).collect();
+    format!("{head}…{tail}")
 }
 
 /// /leaderboard rendering: medal for top 3, `<@id>` mentions, mono totals.
@@ -414,6 +481,45 @@ mod tests {
         assert!(out.contains("**2.500000 JER** (2 wins)"));
         assert!(out.contains("**5 JER** (1 win)"));
         assert!(out.contains("**1 JER** (1 win)"));
+    }
+
+    #[test]
+    fn my_balance_formats() {
+        let bal = crate::api::MyBalance {
+            exists: false,
+            balance_uj: 0,
+            address: None,
+            available_jer: None,
+            opted_in: None,
+        };
+        assert!(format_my_balance(&bal, 5).contains("no JerithChain wallet"));
+
+        let bal = crate::api::MyBalance {
+            exists: true,
+            balance_uj: 50_000_000,
+            address: Some("JERDC9695D27A54B2130A5CF25FC97A4312".to_string()),
+            available_jer: Some(50.0),
+            opted_in: Some(true),
+        };
+        let out = format_my_balance(&bal, 5);
+        assert!(out.contains("**50 JER**"));
+        assert!(out.contains("available **50 JER**"));
+        assert!(out.contains("JERDC9695D27…4312"));
+        assert!(!out.contains("opted out"));
+
+        let bal = crate::api::MyBalance {
+            exists: true,
+            balance_uj: 2_500_000,
+            address: Some("JERDAB".to_string()),
+            available_jer: Some(2.25),
+            opted_in: Some(false),
+        };
+        let out = format_my_balance(&bal, 9);
+        assert!(out.contains("**2.500000 JER**"));
+        assert!(out.contains("available **2.250000 JER**"));
+        assert!(out.contains("opted out"));
+        // short addresses pass through
+        assert!(out.contains("`JERDAB`"));
     }
 
     #[test]

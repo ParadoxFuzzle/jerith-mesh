@@ -65,6 +65,9 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   per-user chat history (in-memory, capped) + per-user cooldowns; token via
   `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via
   `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`;
+  `/myjercraft` — your own JER balance from the chain's `GET /balance`
+  (balance + available-after-mempool amounts, short address, opted-out
+  warning; no-wallet state points at `/mine` for auto-creation)
   `/leaderboard` — JER mining leaderboard; prefers chain-authoritative
   lifetime totals via jerith_node.py `GET /mystate` (labelled "chain
   totals"), falls back to the bot's persisted tally (labelled

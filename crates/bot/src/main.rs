@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::peers(),
                 commands::mine(),
                 commands::leaderboard(),
+                commands::myjercraft(),
                 commands::help(),
             ],
             on_error: |err| {
