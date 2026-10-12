@@ -265,10 +265,14 @@ impl ExpertRouter {
         messages: &[serde_json::Value],
         peers: &[(String, u64, bool, bool)],
         local_chat: impl FnOnce() -> anyhow::Result<String>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, String)> {
+        // Returns (content, answering_node_id). Local answers attribute to the
+        // empty string (the gateway maps that to mesh_fallback: null);
+        // remote answers carry the node_id that actually served the request,
+        // which the gateway/Meters then credit — not an RTT-order guess.
         // Local first (caller decides strictness and messaging).
         if let Ok(content) = local_chat() {
-            return Ok(content);
+            return Ok((content, String::new()));
         }
         tracing::warn!(
             target: "mesh",
@@ -318,7 +322,7 @@ impl ExpertRouter {
                         peer = %node_id,
                         "chat served via mesh fallback"
                     );
-                    return Ok(content);
+                    return Ok((content, node_id));
                 }
                 Ok(NodeRpcReply::Error { req_id: _id, message }) => {
                     last_err = anyhow::anyhow!("peer rejected chat: {message}");
@@ -1259,8 +1263,8 @@ mod tests {
         addrs.insert("peer-b".to_string(), addr);
         let peers = vec![("peer-b".to_string(), 8, true, true)];
 
-        // Local runtime down → falls back to the mesh peer.
-        let content = r
+        // Local runtime down → falls back to the mesh peer, attributed.
+        let (content, served_by) = r
             .chat_over_quic(
                 &client,
                 &identity,
@@ -1273,9 +1277,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "mesh hello");
+        assert_eq!(served_by, "peer-b"); // the node that actually answered
 
-        // Local healthy → mesh never used.
-        let content2 = r
+        // Local healthy → mesh never used, no remote attribution.
+        let (content2, served_by2) = r
             .chat_over_quic(
                 &client,
                 &identity,
@@ -1288,6 +1293,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content2, "local hello");
+        assert_eq!(served_by2, ""); // empty = local
 
         // No peers + local down → error (never blocks the request).
         let err = r

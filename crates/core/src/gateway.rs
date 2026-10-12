@@ -285,6 +285,59 @@ async fn chat_completions(
                     )
                         .into_response();
                 };
+                // Streaming + dead local runtime: peers serve non-streaming;
+                // wrap their single reply in a minimal SSE chunk shape so
+                // stream clients work too, attributed via mesh_fallback.
+                if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let state = gw.state.clone();
+                    let msgs = messages.clone();
+                    let result = mf
+                        .chat_with_fallback(&state, &msgs, || {
+                            Err(anyhow::anyhow!("local down: {local_err}"))
+                        })
+                        .await;
+                    return match result {
+                        Ok((content, served_by)) => {
+                            {
+                                let mut meters = gw.state.meters.lock().await;
+                                meters.tokens_served += 1;
+                                meters.expert_activations += 1;
+                                meters.bytes_relayed += content.len() as u64;
+                            }
+                            let id = format!("mesh-{}", crate::bootstrap::now_ms());
+                            let chunk = json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": content},
+                                    "finish_reason": "stop"
+                                }],
+                                "mesh_fallback": served_by,
+                            });
+                            let sse = format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                serde_json::to_string(&chunk).unwrap_or_default()
+                            );
+                            (
+                                StatusCode::OK,
+                                [("content-type", "text/event-stream")],
+                                sse,
+                            )
+                                .into_response()
+                        }
+                        Err(e) => (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({
+                                "error": format!(
+                                    "local runtime unreachable: {local_err}; mesh fallback failed: {e}"
+                                ),
+                                "mesh_fallback": Value::Null,
+                            })),
+                        )
+                            .into_response(),
+                    };
+                }
                 let state = gw.state.clone();
                 let msgs = messages.clone();
                 let result = mf
@@ -458,6 +511,26 @@ mod tests {
                 .contains("local runtime unreachable")
         );
         // Contract: the field is always present, explicitly null here.
+        assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_stream_with_dead_local_gets_mesh_sse_not_502() {
+        // stream: true + dead local runtime + empty peer registry → the
+        // fallback SSE shape when a peer can serve, or a clean 502 with
+        // mesh_fallback null when none can. Either way never a raw 500.
+        let server = spawn_plain("http://127.0.0.1:1", true);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "m",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .await;
+        let status = res.status_code();
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY); // registry empty here
+        let body: Value = res.json();
         assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
     }
 

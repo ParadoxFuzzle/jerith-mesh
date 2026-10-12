@@ -1,0 +1,25 @@
+# jerith-mesh node gateway — user-level service template.
+# Install (from the repo root):
+#   cp deploy/systemd/jerith-node.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-node
+# The node config lives at ~/.jerith-mesh/config.toml (create with
+# `target/release/jerith setup`). The Discord bot (jerith-bot) defaults to
+# this node's gateway at http://127.0.0.1:8900.
+[Unit]
+Description=jerith-mesh node (gateway :8900 + QUIC NodeRPC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith run
+Restart=always
+RestartSec=5
+# runtime_url etc. come from ~/.jerith-mesh/config.toml; override with:
+#Environment=JERITH_OK_BEYOND_CAPACITY=1
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

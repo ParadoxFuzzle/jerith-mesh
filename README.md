@@ -41,6 +41,7 @@ internet gives you 30–300 ms per hop. **jerith-mesh** restructures the problem
 | CLI (`jerith`) | ✅ MVP | setup, run, status, peers, model switch |
 | Web UI | ✅ MVP status page | full dashboard in later phases |
 | Discord bot | ✅ MVP | `/ask` `/reset` `/remember` `/recall` `/status` `/peers` `/mine` (`crates/bot`) |
+| OpenClaw migration | ✅ | `scripts/migrate-from-openclaw.sh` (stop stack, reuse model + bot token, start node/bot) |
 | OpenAI-compatible API | ✅ MVP | `/v1/chat/completions`, `/v1/models` |
 | Telegram / WhatsApp etc. | 📋 Plugin SDK | user-contributed modules |
 

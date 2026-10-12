@@ -149,29 +149,17 @@ impl MeshFallbackChat {
             })
             .await
         {
-            Ok(content) => {
-                // Attribution: chat_over_quic returns the node_id inside the
-                // meters; here we distinguish local vs remote by whether the
-                // local attempt had failed before fallback.
-                if !local_closed {
+            // The router reports which node actually answered: empty string =
+            // local runtime, otherwise the node_id that served it (already
+            // attribution-checked against the request's target on the wire).
+            Ok((content, answered_by)) => {
+                if local_closed && !answered_by.is_empty() {
+                    Ok((content, Some(answered_by)))
+                } else {
                     Ok((content, None))
-                } else {
-                    // Found a mesh node — attribute by RTT order (first
-                    // peer the router succeeded on). For observability we
-                    // echo the fastest known peer when attribution is
-                    // impractical from outside the router call.
-                    let attr = peers.first().map(|(id, _, _, _)| id.clone());
-                    Ok((content, attr))
                 }
             }
-            Err(e) => {
-                if !local_closed {
-                    // Local error was the real failure — surface it.
-                    Err(e)
-                } else {
-                    Err(e)
-                }
-            }
+            Err(e) => Err(e),
         }
     }
 }
