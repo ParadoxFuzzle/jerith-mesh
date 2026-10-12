@@ -595,10 +595,10 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", cfg.gateway_port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Phase 1: QUIC NodeRPC server on gateway_port + 1. Peers dispatch
+    // Phase 1: QUIC NodeRPC server. Peers dispatch
     // expert queries here; the stand-in handler runs until the Colibri
     // runtime exposes real expert tensors.
-    let quic_port = cfg.gateway_port + 1;
+    let quic_port = cfg.effective_rpc_port();
     let rpc_addr: std::net::SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
     match jerith_mesh_core::quic::server_endpoint(rpc_addr) {
         Ok(endpoint) => {
@@ -759,6 +759,13 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
                 cfg.contribution_percent = v;
             }
             "gateway_port" => cfg.gateway_port = v.parse().context("bad port")?,
+            "rpc_port" => {
+                if v.eq_ignore_ascii_case("none") || v == "0" {
+                    cfg.rpc_port = None;
+                } else {
+                    cfg.rpc_port = Some(v.parse().context("bad rpc_port")?);
+                }
+            }
             "runtime_url" => cfg.runtime_url = v.to_string(),
             "bootstrap_url" => cfg.bootstrap_url = v.to_string(),
             other => bail!("unknown config key {other:?}"),

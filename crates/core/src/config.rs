@@ -157,6 +157,8 @@ pub struct NodeConfig {
     pub specialists: SpecialistConfig,
     /// Port for the local OpenAI-compatible gateway + web UI.
     pub gateway_port: u16,
+    /// UDP port for the QUIC NodeRPC listener (defaults to gateway_port+1).
+    pub rpc_port: Option<u16>,
     /// Colibri / Ollama base URL to forward chat completions to.
     pub runtime_url: String,
 }
@@ -176,8 +178,16 @@ impl Default for NodeConfig {
             crypto: CryptoConfig::default(),
             specialists: SpecialistConfig::default(),
             gateway_port: 8900,
+            rpc_port: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
         }
+    }
+}
+
+impl NodeConfig {
+    /// Effective NodeRPC UDP port (defaults to gateway_port + 1).
+    pub fn effective_rpc_port(&self) -> u16 {
+        self.rpc_port.unwrap_or(self.gateway_port + 1)
     }
 }
 
@@ -428,6 +438,14 @@ mod tests {
             source: ModelSource::Curated,
         });
         assert_eq!(cfg.model.unwrap().id, "qwen3.8-flash-next");
+    }
+
+    #[test]
+    fn rpc_port_defaults_to_gateway_plus_one() {
+        let mut cfg = NodeConfig::default();
+        assert_eq!(cfg.effective_rpc_port(), 8901);
+        cfg.rpc_port = Some(9201);
+        assert_eq!(cfg.effective_rpc_port(), 9201);
     }
 
     #[test]
