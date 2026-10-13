@@ -53,6 +53,10 @@ internet gives you 30–300 ms per hop. **jerith-mesh** restructures the problem
 > `/health`, `/v1/peers?model=…` and `/v1/models/counts` on the public
 > internet. New nodes find each other with zero configuration.
 
+Prerequisites: **Rust ≥ 1.85** (edition 2024 — `rustup update stable`) and
+git; Linux hardware probing uses `inxi` (`sudo apt install inxi`) if present,
+else a fallback scan. Linux-only GPU flags need your vendor's driver stack.
+
 ```bash
 git clone https://github.com/ParadoxFuzzle/jerith-mesh.git
 cd jerith-mesh
