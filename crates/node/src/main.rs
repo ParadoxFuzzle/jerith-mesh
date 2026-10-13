@@ -584,7 +584,11 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     // Mesh fallback for chat: a QUIC client endpoint + router, wired into
     // the gateway so /v1/chat/completions can fail over to runtime-backed
     // peers when the local runtime is unavailable.
-    let mesh_fallback = match jerith_mesh_core::ping::MeshFallbackChat::spawn() {
+    let mesh_fallback = match jerith_mesh_core::ping::MeshFallbackChat::spawn_with(
+        state.verify.clone(),
+        // Phase 4 verification policy: replay probability from config.
+        cfg.verify_percent,
+    ) {
         Ok(mf) => Some(mf),
         Err(e) => {
             tracing::warn!(error = %e, "mesh chat fallback unavailable");

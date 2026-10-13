@@ -94,8 +94,17 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 ## 10. Contribution Proof & Anti-Fraud
 Phased — see ARCHITECTURE.md §8 for the full layered plan:
 - ✅ Health-ping + contribution accounting now (rolling 24 h windows)
-- 📋 Redundant / challenge-based verification on a configurable % of work (Phase 4)
-- 📋 Cryptographic commitments on expert results (Phase 4)
+- ✅ Cryptographic commitments on expert results: every `ExpertResult` carries
+  a SHA-256 commitment over (req_id, expert_id, node_id, input, output);
+  the requester recomputes and rejects tampered bodies (accepted body-only
+  from pre-Phase-4 peers — no unprovable rejection)
+- ✅ Redundant replay verification on a configurable % of remote expert work
+  (`verify_percent`, default 10 %, spec range 5–15 %): re-run on an
+  independent arbiter (local expert preferred as self-trusted ground truth,
+  else the next remote in the plan). Mismatch → both nodes (or the outlier
+  alone when the local arbiter decides) flagged as `DishonestResults`,
+  evidence signed and submitted to the bootstrap, ambiguous remote-vs-remote
+  disputes abort the remaining remote candidates for that req_id
 - 📋 Spot-check “ringer” tasks with known answers (Phase 4)
 - 📋 Statistical freerider detection (latency-vs-claim, activation patterns, work ratios) (Phase 4)
 - 📋 Reputation system with gossiped signed scores (Phase 4–5)

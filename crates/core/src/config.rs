@@ -161,6 +161,15 @@ pub struct NodeConfig {
     pub rpc_port: Option<u16>,
     /// Colibri / Ollama base URL to forward chat completions to.
     pub runtime_url: String,
+    /// Phase 4: probability (percent) of redundantly replaying a remote
+    /// expert result on a second node before trusting it. Spec range:
+    /// 5–15 %; 0 disables replay (commitments always checked).
+    #[serde(default = "default_verify_percent")]
+    pub verify_percent: u32,
+}
+
+fn default_verify_percent() -> u32 {
+    10
 }
 
 
@@ -180,6 +189,7 @@ impl Default for NodeConfig {
             gateway_port: 8900,
             rpc_port: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
+            verify_percent: default_verify_percent(),
         }
     }
 }

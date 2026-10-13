@@ -84,6 +84,7 @@ async fn mesh_chat_falls_back_over_quic_with_real_attribution() {
         let router = Arc::new(ExpertRouter::new(RouterOptions {
             nearby_rtt_ms: 50,
             dispatch_timeout: std::time::Duration::from_secs(30),
+            ..Default::default()
         }));
         let _ = router; // fb owns its own router internally
     }

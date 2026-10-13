@@ -64,7 +64,17 @@ pub enum NodeRpcRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeRpcReply {
     Pong { node_id: String, stamp_ms: u64 },
-    ExpertResult { req_id: String, output: Vec<f32>, node_id: String },
+    /// Expert activation + commitment: SHA-256 over the canonical
+    /// (req_id, expert_id, node_id, input, output) tuple — Phase 4
+    /// verification. `None` only from pre-Phase-4 peers (accepted without a
+    /// commitment check).
+    ExpertResult {
+        req_id: String,
+        output: Vec<f32>,
+        node_id: String,
+        #[serde(default)]
+        commitment: Option<String>,
+    },
     /// Full chat-completion reply from a peer's runtime.
     ChatResult { req_id: String, content: String, node_id: String },
     Error { req_id: String, message: String },
@@ -129,6 +139,12 @@ fn pack_f32(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
+/// Hex of the LE-packed f32 slice — used in the Phase 4 commitment payload
+/// so the verifier re-derives the exact bytes the server hashed.
+pub(crate) fn pack_f32_hex(v: &[f32]) -> String {
+    hex::encode(pack_f32(v))
+}
+
 /// Public: the node crate uses this when dispatching remote experts.
 /// (Lib-side: exercised by tests; Phase 2 wire compression will use it on
 /// the server decode path.)
@@ -151,13 +167,17 @@ pub enum ExpertLocation {
     Remote { node_id: String, rtt_ms: u64 },
 }
 
-/// Dispatch policy inputs (pure logic — unit-testable without QUIC).
 #[derive(Debug, Clone, Default)]
 pub struct RouterOptions {
     /// RTT under which a peer counts as "nearby" (<30–50 ms per spec).
     pub nearby_rtt_ms: u64,
     /// Per-dispatch timeout.
     pub dispatch_timeout: Duration,
+    /// Redundant-replay verification probability in percent (0–100;
+    /// 0 = never replay). The spec suggests 5–15 %.
+    pub verify_percent: u32,
+    /// Absolute tolerance when comparing replayed outputs (0 = exact).
+    pub verify_tolerance: f32,
 }
 
 /// The locality-aware expert router.
@@ -165,14 +185,33 @@ pub struct ExpertRouter {
     pub options: RouterOptions,
     /// Experts hosted locally (expert_id → present).
     local_experts: RwLock<std::collections::HashSet<String>>,
+    /// Phase 4: verification counters + queued fraud evidence about peers
+    /// whose results failed commitments or replay comparison.
+    verify: Arc<crate::verify::VerificationTracker>,
 }
 
 impl ExpertRouter {
     pub fn new(options: RouterOptions) -> Self {
+        Self::new_with_tracker(options, crate::verify::VerificationTracker::shared())
+    }
+
+    /// Construct with an external verification tracker — the mesh state's
+    /// tracker is shared so evidence flushes on the ping loop.
+    pub fn new_with_tracker(
+        options: RouterOptions,
+        verify: Arc<crate::verify::VerificationTracker>,
+    ) -> Self {
         Self {
             options,
             local_experts: RwLock::new(std::collections::HashSet::new()),
+            verify,
         }
+    }
+
+    /// The router's verification tracker — shared with the mesh state so
+    /// the ping loop flushes DishonestResults evidence to the bootstrap.
+    pub fn verify_tracker(&self) -> Arc<crate::verify::VerificationTracker> {
+        self.verify.clone()
     }
 
     pub async fn register_local_expert(&self, expert_id: &str) {
@@ -359,56 +398,55 @@ impl ExpertRouter {
         let mut last_err = anyhow::anyhow!(
             "no dispatch candidates for expert {expert_id} (plan empty or all failed)"
         );
-        for location in plan {
+        let mut ambiguous_abort: Option<anyhow::Error> = None;
+        for (idx, location) in plan.iter().enumerate() {
             let result = match &location {
                 ExpertLocation::Local => local_run(input),
                 ExpertLocation::Remote { node_id, .. } => {
-                    match peer_addrs.get(node_id) {
-                        None => Err(anyhow::anyhow!("no QUIC address for peer {node_id}")),
-                        Some(addr) => {
-                            let mut req = NodeRpcRequest::ExpertQuery {
-                                req_id: req_id.to_string(),
-                                expert_id: expert_id.to_string(),
-                                input: input.to_vec(),
-                                from_node_id: identity.node_id(),
-                                stamp_ms: 0,
-                                sig: String::new(),
-                            };
-                            sign_request(&mut req, identity);
-                            match call(
-                                endpoint,
-                                *addr,
-                                node_id,
-                                &req,
-                                identity,
-                                self.options.dispatch_timeout,
-                            )
-                            .await
+                    match self
+                        .remote_expert_attempt(
+                            endpoint, identity, peer_addrs, req_id, expert_id, input, node_id,
+                        )
+                        .await
+                    {
+                        Ok(out) => {
+                            self.verify.note_expert_result().await;
+                            // Phase 4: probabilistic redundant replay before
+                            // trusting this remote result.
+                            match self
+                                .replay_verify(
+                                    endpoint,
+                                    identity,
+                                    peer_addrs,
+                                    req_id,
+                                    expert_id,
+                                    input,
+                                    &plan,
+                                    idx,
+                                    node_id,
+                                    &out,
+                                    &local_run,
+                                )
+                                .await
                             {
-                                Ok(NodeRpcReply::ExpertResult {
-                                    req_id: rid,
-                                    output,
-                                    node_id: server_id,
-                                }) => {
-                                    // Attribute check: reply must come from
-                                    // the exact candidate we dispatched to.
-                                    if server_id != *node_id || rid != req_id {
-                                        Err(anyhow::anyhow!(
-                                            "reply identity mismatch: expected {node_id}, got {server_id}"
-                                        ))
-                                    } else {
-                                        Ok(output)
-                                    }
+                                ReplayVerdict::Trusted => Ok(out),
+                                ReplayVerdict::RejectContinue => Err(anyhow::anyhow!(
+                                    "replay verification rejected peer {node_id} (local arbiter disagrees)"
+                                )),
+                                ReplayVerdict::RejectAbort => {
+                                    // Ambiguous: two remotes disagree and we
+                                    // host no local truth — remaining remote
+                                    // candidates are equally suspect.
+                                    ambiguous_abort = Some(anyhow::anyhow!(
+                                        "remote outputs disagree (both peers flagged)"
+                                    ));
+                                    Err(anyhow::anyhow!(
+                                        "replay verification failed for expert {expert_id}: remote outputs disagree"
+                                    ))
                                 }
-                                Ok(NodeRpcReply::Error { req_id: _id, message }) => {
-                                    Err(anyhow::anyhow!("peer rejected expert query: {message}"))
-                                }
-                                Ok(other) => {
-                                    Err(anyhow::anyhow!("unexpected reply kind: {other:?}"))
-                                }
-                                Err(e) => Err(anyhow::anyhow!("quic dispatch failed: {e}")),
                             }
                         }
+                        Err(e) => Err(e),
                     }
                 }
             };
@@ -426,11 +464,213 @@ impl ExpertRouter {
                         "dispatch candidate failed — falling through"
                     );
                     last_err = e;
+                    if let Some(abort) = ambiguous_abort {
+                        tracing::warn!(
+                            target: "mesh",
+                            expert = %expert_id,
+                            "abandoning remaining remote candidates ({abort})"
+                        );
+                        return Err(abort);
+                    }
                 }
             }
         }
         Err(last_err)
     }
+
+    /// One signed remote expert dispatch: sign → call → attribute → verify
+    /// the Phase 4 commitment. The tracker records the commitment outcome
+    /// (and queues DishonestResults evidence when the body was tampered). If
+    /// a peer returns no commitment (pre-Phase-4), the result is accepted —
+    /// we never reject work we cannot *prove* wrong.
+    #[allow(clippy::too_many_arguments)]
+    async fn remote_expert_attempt(
+        &self,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        expert_id: &str,
+        input: &[f32],
+        node_id: &str,
+    ) -> anyhow::Result<Vec<f32>> {
+        let Some(addr) = peer_addrs.get(node_id) else {
+            return Err(anyhow::anyhow!("no QUIC address for peer {node_id}"));
+        };
+        let mut req = NodeRpcRequest::ExpertQuery {
+            req_id: req_id.to_string(),
+            expert_id: expert_id.to_string(),
+            input: input.to_vec(),
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut req, identity);
+        match call(
+            endpoint,
+            *addr,
+            node_id,
+            &req,
+            identity,
+            self.options.dispatch_timeout,
+        )
+        .await
+        {
+            Ok(NodeRpcReply::ExpertResult {
+                req_id: rid,
+                output,
+                node_id: server_id,
+                commitment,
+            }) => {
+                // Attribute check: reply must come from the exact candidate
+                // we dispatched to.
+                if server_id != node_id || rid != req_id {
+                    return Err(anyhow::anyhow!(
+                        "reply identity mismatch: expected {node_id}, got {server_id}"
+                    ));
+                }
+                match commitment {
+                    Some(c) => {
+                        let ok = crate::verify::verify_commitment(
+                            req_id,
+                            expert_id,
+                            node_id,
+                            input,
+                            &output,
+                            &c,
+                        );
+                        // note_commitment already flags the peer on failure.
+                        self.verify.note_commitment(node_id, ok).await;
+                        if ok {
+                            Ok(output)
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "commitment mismatch from peer {node_id}: body altered"
+                            ))
+                        }
+                    }
+                    None => Ok(output),
+                }
+            }
+            Ok(NodeRpcReply::Error { req_id: _id, message }) => {
+                Err(anyhow::anyhow!("peer rejected expert query: {message}"))
+            }
+            Ok(other) => Err(anyhow::anyhow!("unexpected reply kind: {other:?}")),
+            Err(e) => Err(anyhow::anyhow!("quic dispatch failed: {e}")),
+        }
+    }
+
+    /// Phase 4 redundant replay verification. Re-runs the same query on an
+    /// independent arbiter and compares:
+    /// - local expert hosted → the local run is the arbiter (self-trusted:
+    ///   a disagreement convicts the remote alone),
+    /// - else the next remote candidate in the plan (a disagreement
+    ///   convicts both — ambiguous, per the spec: "both (or the outlier)
+    ///   get a temporary reputation penalty").
+    ///
+    /// Runs only with probability `verify_percent`; with no arbiter
+    /// available the result is accepted unverified (nothing to report).
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_verify(
+        &self,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        expert_id: &str,
+        input: &[f32],
+        plan: &[ExpertLocation],
+        origin_idx: usize,
+        origin_node_id: &str,
+        origin_output: &[f32],
+        local_run: &impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+    ) -> ReplayVerdict {
+        if self.options.verify_percent == 0
+            || rand::random::<u32>() % 100 >= self.options.verify_percent
+        {
+            return ReplayVerdict::Trusted;
+        }
+
+        // Pick the arbiter: local truth first, else the next remote.
+        let mut arbiter: Option<(Vec<f32>, Option<String>)> = None;
+        if self.hosts_locally(expert_id).await {
+            if let Ok(local) = local_run(input) {
+                arbiter = Some((local, None)); // None = local (trusted self)
+            }
+        }
+        if arbiter.is_none() {
+            for loc in plan.iter().skip(origin_idx + 1) {
+                if let ExpertLocation::Remote { node_id, .. } = loc {
+                    if let Ok(out) = self
+                        .remote_expert_attempt(
+                            endpoint,
+                            identity,
+                            peer_addrs,
+                            &format!("{req_id}-rep"),
+                            expert_id,
+                            input,
+                            node_id,
+                        )
+                        .await
+                    {
+                        self.verify.note_expert_result().await;
+                        arbiter = Some((out, Some(node_id.clone())));
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((arbiter_out, arbiter_id)) = arbiter else {
+            // No independent arbiter reachable — verify not possible, no
+            // evidence either way (fail open, but no proof-of-liar).
+            return ReplayVerdict::Trusted;
+        };
+
+        if crate::verify::outputs_agree(
+            origin_output,
+            &arbiter_out,
+            self.options.verify_tolerance,
+        ) {
+            self.verify.note_replay(true).await;
+            return ReplayVerdict::Trusted;
+        }
+        self.verify.note_replay(false).await;
+        match arbiter_id {
+            None => {
+                // The local expert disagrees with the remote — we know who
+                // lies: the remote (or our local model, but self is truth).
+                self.verify.flag_dishonest(&[origin_node_id]).await;
+                tracing::warn!(
+                    target: "mesh",
+                    peer = %origin_node_id,
+                    expert = %expert_id,
+                    "replay mismatch vs local arbiter — peer flagged"
+                );
+                ReplayVerdict::RejectContinue
+            }
+            Some(other) => {
+                self.verify.flag_dishonest(&[origin_node_id, other.as_str()]).await;
+                tracing::warn!(
+                    target: "mesh",
+                    peers = [origin_node_id, other.as_str()].join(" "),
+                    expert = %expert_id,
+                    "remote replay mismatch — both flagged (ambiguous)"
+                );
+                ReplayVerdict::RejectAbort
+            }
+        }
+    }
+}
+
+/// Outcome of a redundant-replay verification.
+enum ReplayVerdict {
+    /// Agreed (or nothing to verify against) — trust the result.
+    Trusted,
+    /// Local arbiter disagrees: origin remote flagged, keep walking the plan.
+    RejectContinue,
+    /// Two remotes disagree (no local arbiter): both flagged, remaining
+    /// remote candidates are suspect — abort the trace for this req_id.
+    RejectAbort,
 }
 
 // ---------------------------------------------------------------------------
@@ -892,11 +1132,26 @@ async fn handle_connection(
                         },
                         NodeRpcRequest::ExpertQuery { req_id, expert_id, input, .. } => {
                             match handler.run(&expert_id, &input) {
-                                Ok(output) => NodeRpcReply::ExpertResult {
-                                    req_id,
-                                    output,
-                                    node_id: server_id,
-                                },
+                                Ok(output) => {
+                                    // Phase 4: commit to the result *before*
+                                    // the requester has decided whether it
+                                    // will replay-check — enables efficient
+                                    // fraud proofs later.
+                                    let commitment =
+                                        crate::verify::result_commitment(
+                                            &req_id,
+                                            &expert_id,
+                                            &server_id,
+                                            &input,
+                                            &output,
+                                        );
+                                    NodeRpcReply::ExpertResult {
+                                        req_id,
+                                        output,
+                                        node_id: server_id,
+                                        commitment: Some(commitment),
+                                    }
+                                }
                                 Err(e) => NodeRpcReply::Error {
                                     req_id,
                                     message: e.to_string(),
@@ -1187,6 +1442,16 @@ mod tests {
         ExpertRouter::new(RouterOptions {
             nearby_rtt_ms: nearby,
             dispatch_timeout: Duration::from_millis(250),
+            ..Default::default()
+        })
+    }
+
+    fn router_with_verify(nearby: u64, verify_percent: u32) -> ExpertRouter {
+        ExpertRouter::new(RouterOptions {
+            nearby_rtt_ms: nearby,
+            dispatch_timeout: Duration::from_millis(250),
+            verify_percent,
+            verify_tolerance: 0.0,
         })
     }
 
@@ -1540,6 +1805,157 @@ mod tests {
             )
             .await;
         assert!(err.is_err());
+    }
+
+    // --- Phase 4: redundant replay verification ---
+
+    /// Two honest ×3 servers, replay forced to 100 %: the near result must
+    /// survive verification against the far arbiter.
+    #[tokio::test]
+    async fn replay_agrees_on_honest_pairs() {
+        let (near_addr, near_identity, pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let (far_addr, far_identity, far_pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let far_map = far_pins.try_read().expect("far pins readable").clone();
+        pins.try_write().expect("pins writable").extend(far_map);
+        let near_id = near_identity.node_id();
+        let far_id = far_identity.node_id();
+
+        let r = router_with_verify(50, 100);
+        let peers = vec![(near_id.clone(), 5, true, true), (far_id.clone(), 200, true, true)];
+        let mut addrs = HashMap::new();
+        addrs.insert(near_id.clone(), near_addr);
+        addrs.insert(far_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut completed = HashMap::new();
+
+        let out = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "rp1",
+                "exp.test",
+                &[1.0, 2.0],
+                &peers,
+                &mut completed,
+                |_| Ok(vec![0.0]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, vec![3.0, 6.0]);
+        let s = r.verify_tracker().stats().await;
+        assert_eq!(s.replays_dispatched, 1);
+        assert_eq!(s.replay_matches, 1);
+        assert_eq!(s.replay_mismatches, 0);
+        assert_eq!(s.commitment_checks, 2); // near + far (replay arbiter)
+        assert_eq!(s.commitment_failures, 0);
+        assert_eq!(s.expert_results_received, 2);
+    }
+
+    /// near ×3 (honest) vs far ×7 (differing): forced replay must flag BOTH
+    /// peers (ambiguous without a local arbiter) and refuse to return any
+    /// result from the remaining suspect candidates.
+    #[tokio::test]
+    async fn replay_mismatch_flags_both_and_aborts() {
+        let (near_addr, near_identity, pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let (far_addr, far_identity, far_pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let far_map = far_pins.try_read().expect("far pins readable").clone();
+        pins.try_write().expect("pins writable").extend(far_map);
+        let near_id = near_identity.node_id();
+        let far_id = far_identity.node_id();
+
+        let r = router_with_verify(50, 100);
+        let peers = vec![(near_id.clone(), 5, true, true), (far_id.clone(), 200, true, true)];
+        let mut addrs = HashMap::new();
+        addrs.insert(near_id.clone(), near_addr);
+        addrs.insert(far_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut completed = HashMap::new();
+
+        let err = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "rp2",
+                "exp.test",
+                &[1.0],
+                &peers,
+                &mut completed,
+                |_| Ok(vec![0.0]),
+            )
+            .await;
+        assert!(err.is_err(), "unverifiable remote disagreement must not return a result");
+        let s = r.verify_tracker().stats().await;
+        assert_eq!(s.replays_dispatched, 1);
+        assert_eq!(s.replay_mismatches, 1);
+        // The tracker queued evidence for both (ropped here without a
+        // bootstrap — patch reports via the raw stats below).
+        let stats_after = r.verify_tracker().stats().await;
+        assert_eq!(stats_after.commitment_checks, 2);
+    }
+
+    /// Local arbiter: when we host the expert the local run is ground truth.
+    /// A remote that disagrees with it alone is flagged; the plan keeps
+    /// walking for a node that agrees.
+    #[tokio::test]
+    async fn local_arbiter_conicts_single_remote() {
+        let (near_addr, near_identity, pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let near_id = near_identity.node_id();
+
+        let r = router_with_verify(50, 100);
+        // Local expert registered, but the first local attempt fails
+        // (transient outage) — plan falls through to the remote, whose
+        // result is then arbitrated by the recovered local expert.
+        r.register_local_expert("exp.test").await;
+        let peers = vec![(near_id.clone(), 5, true, true)];
+        let mut addrs = HashMap::new();
+        addrs.insert(near_id.clone(), near_addr);
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut completed = HashMap::new();
+
+        let calls = std::sync::atomic::AtomicU64::new(0);
+        let err = r
+            .execute_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "rp3",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut completed,
+                |input| {
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        anyhow::bail!("first local attempt down");
+                    }
+                    Ok(input.iter().map(|x| x * 10.0).collect::<Vec<f32>>())
+                },
+            )
+            .await;
+        assert!(err.is_err(), "remote disagreeing with local truth must be rejected");
+        let s = r.verify_tracker().stats().await;
+        assert_eq!(s.replays_dispatched, 1);
+        assert_eq!(s.replay_mismatches, 1);
+        assert_eq!(s.replay_matches, 0);
     }
 
     struct ChatAnswer {

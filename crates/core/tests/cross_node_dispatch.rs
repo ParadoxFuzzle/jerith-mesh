@@ -51,6 +51,7 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
             req_id,
             output,
             node_id,
+            commitment,
         } => {
             assert_eq!(req_id, "e2e-cross-1");
             // Attribution: the server is node B; its advertised node id is
@@ -82,6 +83,22 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
                 }
                 other => panic!("unexpected reply: {other:?}"),
             }
+            // Phase 4: the reply must carry a commitment that verifies
+            // against the exact body it was returned with.
+            let c = commitment
+                .as_deref()
+                .expect("ExpertResult must carry a Phase 4 commitment");
+            assert!(
+                jerith_mesh_core::verify::verify_commitment(
+                    &req_id,
+                    "exp.router.test",
+                    &node_id,
+                    &[1.5, -2.0, 0.0, 3.0],
+                    &output,
+                    c
+                ),
+                "commitment must bind req_id/expert_id/node_id/input/output"
+            );
         }
         NodeRpcReply::Error { message, .. } => panic!("peer error: {message}"),
         other => panic!("unexpected reply: {other:?}"),

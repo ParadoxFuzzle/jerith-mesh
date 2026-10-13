@@ -22,6 +22,9 @@ use crate::bootstrap::{
 };
 use crate::config::{NodeConfig, NodeRole};
 
+/// Shared Phase 4 verification tracker: counters + pending fraud evidence.
+pub type SharedVerifyTracker = std::sync::Arc<crate::verify::VerificationTracker>;
+
 /// Contribution meters accumulated between settlements.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Meters {
@@ -57,6 +60,9 @@ pub struct MeshState {
     /// Set when the contribution ratio dips below the minimum (rolling).
     pub contribution_healthy: watch::Sender<bool>,
     pub started_at: std::time::Instant,
+    /// Phase 4 verification counters; the ping loop flushes queued
+    /// DishonestResults evidence to the bootstrap on its regular cadence.
+    pub verify: SharedVerifyTracker,
 }
 
 impl MeshState {
@@ -70,6 +76,7 @@ impl MeshState {
             identity,
             contribution_healthy: tx,
             started_at: std::time::Instant::now(),
+            verify: crate::verify::VerificationTracker::shared(),
         });
         Ok((state, rx))
     }
@@ -92,14 +99,27 @@ impl MeshFallbackChat {
     /// Pins are refreshed from the live registry before each dial batch via
     /// `set_pins`.
     pub fn spawn() -> anyhow::Result<Arc<Self>> {
+        Self::spawn_with(crate::verify::VerificationTracker::shared(), 0)
+    }
+
+    /// Spawn sharing the mesh state's verification tracker so router-side
+    /// commitment/replay outcomes feed the ping loop's evidence flush.
+    /// `verify_percent` seeds the router's Phase 4 replay policy.
+    pub fn spawn_with(
+        verify: SharedVerifyTracker,
+        verify_percent: u32,
+    ) -> anyhow::Result<Arc<Self>> {
         let pins = std::sync::Arc::new(tokio::sync::RwLock::new(Default::default()));
         let endpoint = crate::quic::pinned_client_endpoint_dyn(pins.clone())
             .map_err(|e| anyhow::anyhow!("pinned client endpoint: {e}"))?;
-        let router = std::sync::Arc::new(crate::quic::ExpertRouter::new(
+        let router = std::sync::Arc::new(crate::quic::ExpertRouter::new_with_tracker(
             crate::quic::RouterOptions {
                 nearby_rtt_ms: 50,
                 dispatch_timeout: Duration::from_secs(30),
+                verify_percent,
+                verify_tolerance: 0.0,
             },
+            verify,
         ));
         Ok(Arc::new(Self { endpoint, router, pins }))
     }
@@ -313,6 +333,13 @@ async fn run_loop(
             } else {
                 tracing::debug!(target: "mesh", "advertised to bootstrap");
             }
+        }
+
+        // Phase 4: flush queued DishonestResults fraud evidence to the
+        // bootstrap on the loop's regular cadence (never on the hot path).
+        let flushed = state.verify.flush_fraud_reports(&state).await;
+        if flushed > 0 {
+            tracing::info!(target: "mesh", flushed, "verification evidence flushed");
         }
 
         // Uptime metering on every tick.

@@ -12,6 +12,7 @@ pub mod models;
 pub mod ping;
 pub mod quic;
 pub mod signing;
+pub mod verify;
 pub mod web;
 
 pub use bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState};

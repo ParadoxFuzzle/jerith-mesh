@@ -94,8 +94,8 @@ shortfall → priority demotion → exclusion from work offers.
 | Layer | What it does | When |
 |---|---|---|
 | Health pings + accounting | Verify node is alive and contributing | Phase 0 ✅ |
-| Redundant replay | Same work to 2–3 nodes; mismatch → reputation penalty | Phase 4 |
-| Commitments | Hash of (input, output) committed before verification | Phase 4 |
+| Redundant replay | Same work to a second node on a configurable % (`verify_percent`, default 10, local expert arbitrates when hosted); mismatch flags both — or the outlier vs a local arbiter — and aborts ambiguous remote disputes | Phase 4 ✅ |
+| Commitments | Every `ExpertResult` carries SHA-256 over (req_id, expert_id, node_id, input, output); requester recomputes and rejects tampered bodies; committed before it can know whether the work will be replay-checked | Phase 4 ✅ |
 | Ringer challenges | Known-answer tasks injected at random | Phase 4 |
 | Statistical scoring | Latency-vs-claim, work ratios, activation-pattern fit | Phase 4 |
 | Gossiped reputation | Signed interaction records with decay | Phase 5 |
