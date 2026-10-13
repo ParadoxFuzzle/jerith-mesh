@@ -18,6 +18,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::CryptoConfig;
@@ -83,7 +84,43 @@ fn read_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Outcome of an attempted mine (for meters + logs).
+//// Effective chain RPC base URL for a crypto config.
+pub fn chain_rpc_url(crypto: &CryptoConfig) -> String {
+    crypto
+        .wallet_endpoint
+        .clone()
+        .unwrap_or_else(|| DEFAULT_JERITH_RPC_URL.to_string())
+}
+
+/// GET /balance?discord_id=<identity> → µJER credited balance.
+/// (The chain keys wallets by identity strings; a node identity behaves
+/// like any other account handle for this purpose.)
+pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u64> {
+    let url = format!(
+        "{}/balance?discord_id={}",
+        rpc_url.trim_end_matches('/'),
+        identity
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("chain balance unreachable")?;
+    let body: serde_json::Value = resp
+        .error_for_status()
+        .context("chain balance rejected")?
+        .json()
+        .await?;
+    Ok(body
+        .get("balance_uj")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0))
+}
+
+// Outcome of an attempted mine (for meters + logs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MineOutcome {
     pub attempted: bool,

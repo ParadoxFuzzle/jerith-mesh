@@ -86,6 +86,9 @@ pub struct CryptoConfig {
     /// inference. 120 ≈ ~12 % like the JerithChain Discord agent.
     #[serde(default = "default_mine_chance_permille")]
     pub mine_chance_permille: u32,
+    /// Phase 5 stake + slashing tier (optional; see stake.rs).
+    #[serde(default)]
+    pub stake: crate::stake::StakeConfig,
 }
 
 fn default_mine_chance_permille() -> u32 {
@@ -99,6 +102,7 @@ impl Default for CryptoConfig {
             wallet_endpoint: None,
             wallet_address: None,
             mine_chance_permille: default_mine_chance_permille(),
+            stake: crate::stake::StakeConfig::default(),
         }
     }
 }

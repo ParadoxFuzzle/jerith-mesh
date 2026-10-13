@@ -99,7 +99,7 @@ shortfall → priority demotion → exclusion from work offers.
 | Ringer challenges | Known-answer tasks injected at random — builtin `jerith-builtin/reverse2` expert (bit-exact f32, no model involvement) sent with `ringer_percent` probability per ping tick to a random alive peer; wrong outputs flag the peer | Phase 4 ✅ |
 | Statistical scoring | Latency-vs-claim, work ratios, activation-pattern fit | Phase 4 |
 | Gossiped reputation | Signed interaction records with decay | Phase 5 |
-| Stake + slashing | JER stake with slashing on proven misbehavior | Phase 5 |
+| Stake + slashing (optional tier) | Stake join gate — Contributor/Hybrid must show a chain balance ≥ `required_uj` or run demoted to Requester; verified offenses slash `slash_percent_per_offense` (25 %) with a persisted ledger and signed `/stake/slash` notices to the chain (contract pending chain-side) | Phase 5 ✅ |
 | TEE / ZK | Optional high-trust tiers | Phase 5+ |
 
 ## 6. Wire protocol

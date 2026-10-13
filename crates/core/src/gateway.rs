@@ -216,6 +216,14 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "replay_mismatches": verify.replay_mismatches,
         "fraud_reports_flushed": verify.fraud_reports_flushed,
     });
+    let stake = gw.state.stake.snapshot();
+    let stake_value = json!({
+        "required_uj": gw.state.stake.required_uj(),
+        "staked_uj": stake.staked_uj,
+        "slashed_total_uj": stake.slashed_total_uj,
+        "slash_events": stake.slash_events.len(),
+        "gate_clear": gw.state.stake.clears_gate(),
+    });
     let guard_value = gw
         .guard
         .as_ref()
@@ -254,6 +262,7 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "runtime_url": gw.runtime_url,
         "verify": verify_value,
         "guard": guard_value,
+        "stake": stake_value,
     }))
 }
 

@@ -196,10 +196,11 @@ impl VerificationTracker {
         }
     }
 
-    /// Actually submit queued reports to the bootstrap. Returns count sent.
-    /// Called on the mesh loop's regular cadence so evidence never runs
-    /// commander-order right on the inference hot path.
-    pub async fn flush_fraud_reports(&self, state: &Arc<crate::ping::MeshState>) -> usize {
+    /// Actually submit queued reports to the bootstrap. Returns the targets
+    /// the bootstrap accepted — the stake manager turns each into a signed
+    /// slash notice (Phase 5). Called on the mesh loop's regular cadence so
+    /// evidence submission never sits on the inference hot path.
+    pub async fn flush_fraud_reports(&self, state: &Arc<crate::ping::MeshState>) -> Vec<String> {
         // Drain before the await: targets flagged while we submit go to the
         // next flush instead of double-sending within one batch.
         let mut to_report: Vec<String> = {
@@ -209,14 +210,14 @@ impl VerificationTracker {
         to_report.sort();
         to_report.dedup();
         if to_report.is_empty() {
-            return 0;
+            return Vec::new();
         }
 
         let reporter = state.identity.node_id();
         let bootstrap = crate::bootstrap::BootstrapClient::new(
             state.config.read().await.bootstrap_url.clone(),
         );
-        let mut sent = 0;
+        let mut sent: Vec<String> = Vec::new();
         for node_id in &to_report {
             if node_id == &reporter {
                 continue; // a node cannot report itself
@@ -231,7 +232,7 @@ impl VerificationTracker {
                 .await
             {
                 Ok(_) => {
-                    sent += 1;
+                    sent.push(node_id.clone());
                     tracing::warn!(
                         target: "mesh",
                         node = %node_id,
@@ -248,9 +249,10 @@ impl VerificationTracker {
                 }
             }
         }
-        if sent > 0 {
+        let sent_count = sent.len();
+        if sent_count > 0 {
             // Count only what actually reached the bootstrap.
-            self.stats.lock().await.fraud_reports_flushed += sent as u64;
+            self.stats.lock().await.fraud_reports_flushed += sent_count as u64;
         }
         sent
     }
@@ -374,7 +376,8 @@ mod tests {
         let state = state();
         // Node reporting may fail (no bootstrap in test) — just ensure flush
         // caps at one report for the single dedup'd target.
-        let _ = t.flush_fraud_reports(&state).await;
+        let targets = t.flush_fraud_reports(&state).await;
+        assert!(targets.len() <= 1);
         let s2 = t.stats().await;
         assert!(s2.fraud_reports_flushed <= 1);
     }
@@ -415,6 +418,6 @@ mod tests {
         let me = state.identity.node_id();
         t.flag_dishonest(&[me.as_str()]).await;
         let sent = t.flush_fraud_reports(&state).await; // self-reports skipped
-        assert_eq!(sent, 0);
+        assert!(sent.is_empty());
     }
 }

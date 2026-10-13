@@ -516,6 +516,35 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     }
     cfg.validate()?;
 
+    // Phase 5 stake join gate: a Contributor/Hybrid with `required_uj` > 0
+    // must show a chain balance ≥ the requirement, or it runs this session
+    // demoted to Requester (can consume compute, never offered work). Config
+    // is not modified — the node self-restores its role on the next start.
+    if cfg.crypto.stake.required_uj > 0 && cfg.role != NodeRole::Requester {
+        let rpc = jerith_mesh_core::economics::chain_rpc_url(&cfg.crypto);
+        match jerith_mesh_core::economics::chain_balance_uj(&rpc, &cfg.node_id).await {
+            Ok(balance) if balance >= cfg.crypto.stake.required_uj => {
+                println!(
+                    "   stake       {} µJER locked (required {})",
+                    balance, cfg.crypto.stake.required_uj
+                );
+            }
+            Ok(balance) => {
+                println!(
+                    "   stake       XXX insufficient: {} µJER < required {} — demoting to requester for this session",
+                    balance, cfg.crypto.stake.required_uj
+                );
+                cfg.role = NodeRole::Requester;
+            }
+            Err(e) => {
+                println!(
+                    "   stake       chain balance unavailable ({e}) — demoting to requester for this session"
+                );
+                cfg.role = NodeRole::Requester;
+            }
+        }
+    }
+
     println!("🦜 jerith-mesh starting");
     let model = cfg.model.clone().expect("validated");
     println!("   model       {} ({})", model.id, model.quant);

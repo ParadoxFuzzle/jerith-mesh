@@ -13,6 +13,7 @@ pub mod models;
 pub mod ping;
 pub mod quic;
 pub mod signing;
+pub mod stake;
 pub mod verify;
 pub mod web;
 

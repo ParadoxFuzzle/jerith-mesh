@@ -394,7 +394,7 @@ impl Guard {
         };
 
         // Owner hard blocks first — cheapest and most authoritative.
-        for (name, re) in &self.blocklist {
+        for (_name, re) in &self.blocklist {
             let hits = re.find_iter(text).count() as u64;
             if hits > 0 {
                 detections.push(Detection::new("owner:blocklist", FilterAction::Block, hits));

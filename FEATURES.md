@@ -104,7 +104,14 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - 📋 Optional Bitcoin, Ethereum, Dogecoin, Monero (user supplies own miner/wallet endpoints) (Phase 4)
 - ✅ Interval metering hooks (tokens, expert activations, bandwidth, uptime) wired through the ping loop
 - 📋 Automatic JER mining attempt on each served inference (Phase 4)
-- 📋 Optional staking + slashing for higher-trust tiers (Phase 4–5)
+- ✅ Optional staking + slashing tier (Phase 5, off by default):
+  `[crypto.stake] required_uj` (µJER escrow line for Contributor/Hybrid —
+  insufficient/unreachable chain balance demotes the session to Requester,
+  config untouched so it self-restores), `slash_percent_per_offense`
+  (default 25 %) penalized per bootstrap-verified offense with a persisted
+  slash ledger (`data/stake.json`, audit ring + totals in `/status`), and
+  signed slash notices POSTed to the chain's `stake/slash` contract
+  (feature-tolerant until the chain side lands)
 
 ## 10. Contribution Proof & Anti-Fraud
 Phased — see ARCHITECTURE.md §8 for the full layered plan:

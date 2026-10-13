@@ -63,12 +63,20 @@ pub struct MeshState {
     /// Phase 4 verification counters; the ping loop flushes queued
     /// DishonestResults evidence to the bootstrap on its regular cadence.
     pub verify: SharedVerifyTracker,
+    /// Phase 5 stake + slashing handle (ledger persists across restarts).
+    pub stake: Arc<crate::stake::StakeManager>,
 }
 
 impl MeshState {
     pub fn new(config: NodeConfig) -> anyhow::Result<(Arc<Self>, watch::Receiver<bool>)> {
         let (tx, rx) = watch::channel(true);
         let identity = config.identity()?;
+        let node_id = identity.node_id();
+        let stake = crate::stake::StakeManager::new(
+            &config.crypto,
+            &node_id,
+            Some(identity.clone()),
+        );
         let state = Arc::new(Self {
             config: RwLock::new(config),
             registry: Mutex::new(PeerRegistry::new(None)),
@@ -77,6 +85,7 @@ impl MeshState {
             contribution_healthy: tx,
             started_at: std::time::Instant::now(),
             verify: crate::verify::VerificationTracker::shared(),
+            stake,
         });
         Ok((state, rx))
     }
@@ -339,9 +348,25 @@ async fn run_loop(
         // peer, THEN (same cadence) flush queued DishonestResults evidence
         // to the bootstrap — never on the inference hot path.
         maybe_spot_check_ringer(&state).await;
-        let flushed = state.verify.flush_fraud_reports(&state).await;
-        if flushed > 0 {
-            tracing::info!(target: "mesh", flushed, "verification evidence flushed");
+        let flushed_targets = state.verify.flush_fraud_reports(&state).await;
+        if !flushed_targets.is_empty() {
+            tracing::info!(
+                target: "mesh",
+                count = flushed_targets.len(),
+                "verification evidence flushed"
+            );
+            // Phase 5: each bootstrap-accepted report becomes a signed slash
+            // notice + ledger entry (no-op while staking is disabled).
+            for target in &flushed_targets {
+                let evidence = format!(
+                    "dishonest-results|{}|{target}",
+                    state.identity.node_id()
+                );
+                state
+                    .stake
+                    .notice(target, "dishonest_results", &evidence)
+                    .await;
+            }
         }
 
         // Uptime metering on every tick.
