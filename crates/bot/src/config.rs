@@ -60,6 +60,25 @@ pub struct BotConfig {
     /// (OpenClaw-stack defaults; password resolved from ~/.pgpass). Degrades
     /// silently to no context when the DB is unreachable.
     pub postgres: Option<crate::people::PgConfig>,
+    /// Web access via the gateway's web skills (OpenClaw migration): when
+    /// enabled, chat requests declare `web_search` + `web_fetch` tools and
+    /// executed tool calls are fed back into the conversation (OpenAI
+    /// tool-calling protocol). Off → the bot never touches the web.
+    pub web: WebToolsConfig,
+    /// The bot owner's Discord id (default-deny gate for system-level
+    /// commands; see owner.rs). Resolved from `$JERITH_BOT_OWNER_ID`, then
+    /// bot.toml `[owner] discord_id`, then the OpenClaw config's
+    /// `commands.ownerAllowFrom` (read-only borrow, like the token).
+    pub owner_discord_id: Option<u64>,
+    /// Discord thread-archiver (operator-configured background ingestion;
+    /// off unless `[archiver] enabled = true` and channels are listed).
+    pub archiver: ArchiverConfig,
+    /// Context squeeze (OpenClaw context-squeeze/juice-compact port):
+    /// per-user history compaction before chats.
+    pub squeeze: SqueezeConfig,
+    /// Ops monitor (OpenClaw ops-monitor family port): periodic checks
+    /// with a single owner DM when something fails. Reports only.
+    pub monitor: MonitorConfig,
 }
 
 impl BotConfig {
@@ -67,6 +86,9 @@ impl BotConfig {
     pub fn load() -> Result<Self> {
         let path = token_file_path();
         let file = read_file_config(&path).unwrap_or_default();
+
+        // Owner id resolved first — everything below partially-moves `file`.
+        let owner_discord_id = Self::resolve_owner(&file);
 
         let token = std::env::var(DISCORD_TOKEN_ENV)
             .ok()
@@ -110,7 +132,42 @@ impl BotConfig {
             guard: file.guard.unwrap_or_default(),
             system_prompt,
             postgres: file.postgres,
+            web: file.web.unwrap_or_default(),
+            owner_discord_id,
+            archiver: file.archiver.unwrap_or_default(),
+            squeeze: file.squeeze.unwrap_or_default(),
+            monitor: file.monitor.unwrap_or_default(),
         })
+    }
+
+    /// Owner id resolution (env → file → OpenClaw borrow). A missing owner
+    /// is allowed but leaves the default-deny gate closed for everyone:
+    /// system-level commands stay refused until an owner is configured.
+    fn resolve_owner(file: &FileConfig) -> Option<u64> {
+        let from_env = std::env::var("JERITH_BOT_OWNER_ID")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let resolved = from_env
+            .or(file.owner.as_ref().and_then(|o| o.discord_id))
+            .or_else(|| {
+                crate::owner::openclaw_config_file()
+                    .and_then(|p| crate::owner::borrow_owner_from_openclaw(&p))
+            });
+        match resolved {
+            Some(id) => {
+                if from_env.is_none() {
+                    tracing::info!(owner_discord_id = id, "bot owner id resolved (system-level commands gated)");
+                }
+                Some(id)
+            }
+            None => {
+                tracing::warn!(
+                    "no bot owner configured — system-level commands are default-deny for everyone. \
+                     Set $JERITH_BOT_OWNER_ID or [owner] discord_id in bot.toml to open the gate to yourself"
+                );
+                None
+            }
+        }
     }
 
     /// Build without requiring a token (tests / dry checks).
@@ -124,8 +181,191 @@ impl BotConfig {
             guard: jerith_mesh_core::guard::GuardConfig::default(),
             system_prompt: None,
             postgres: None,
+            web: WebToolsConfig::default(),
+            owner_discord_id: None,
+            archiver: ArchiverConfig::default(),
+            squeeze: SqueezeConfig::default(),
+            monitor: MonitorConfig::default(),
         }
     }
+}
+
+/// Context-squeeze settings (`[squeeze]` in bot.toml) — OpenClaw
+/// context-squeeze port. On by default with a gentle budget; `enabled =
+/// false` restores the plain 8-turn ring semantics verbatim.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SqueezeConfig {
+    /// Run compaction before chats.
+    #[serde(default = "default_squeeze_on")]
+    pub enabled: bool,
+    /// Char budget for a user's history before compaction kicks in
+    /// (roleplay/story threads blow past 8 short turns fast).
+    #[serde(default = "default_squeeze_budget")]
+    pub budget_chars: usize,
+    /// How many oldest messages get collapsed into the mesh summary
+    /// (stage 3), when even the passive squeeze isn't enough.
+    #[serde(default = "default_squeeze_summarize_count")]
+    pub summarize_count: usize,
+    /// Minimum seconds between stage-3 summaries per user (a mesh round
+    /// trip; pacing keeps it rare).
+    #[serde(default = "default_squeeze_interval")]
+    pub min_interval_secs: u64,
+}
+
+fn default_squeeze_on() -> bool {
+    true
+}
+fn default_squeeze_budget() -> usize {
+    4000
+}
+fn default_squeeze_summarize_count() -> usize {
+    6
+}
+fn default_squeeze_interval() -> u64 {
+    300
+}
+
+impl Default for SqueezeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_squeeze_on(),
+            budget_chars: default_squeeze_budget(),
+            summarize_count: default_squeeze_summarize_count(),
+            min_interval_secs: default_squeeze_interval(),
+        }
+    }
+}
+
+/// Discord thread-archiver configuration (`[archiver]` in bot.toml) — port
+/// of the OpenClaw thread-archiver skill's options. Disabled unless
+/// explicitly enabled AND at least one channel id is listed.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ArchiverConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Thread/channel ids (decimal) to archive — global/thread ids are
+    /// ordinary Discord channels to the REST API.
+    #[serde(default)]
+    pub channel_ids: Vec<u64>,
+    /// Sweep cadence in minutes (OpenClaw cron equivalent).
+    #[serde(default = "default_archiver_interval")]
+    pub interval_minutes: u64,
+    /// Page size per channel fetch (Discord max 100).
+    #[serde(default = "default_archiver_max_messages")]
+    pub max_messages_per_sweep: u32,
+    /// Note lines kept per channel per sweep.
+    #[serde(default = "default_archiver_max_notes")]
+    pub max_notes_per_sweep: usize,
+    /// Optional upstream-parity outbound copy of the summary markdown.
+    #[serde(default)]
+    pub notes_webhook: Option<String>,
+    /// Global decision/note marker override (case-insensitive substring
+    /// match per line). Empty → the built-in defaults (see
+    /// archiver::DEFAULT_MARKERS).
+    #[serde(default)]
+    pub markers: Vec<String>,
+    /// Per-guild marker overrides, read from bot.toml as
+    /// `[archiver.guild_markers.<guild_id>]` + `markers = [...]` — wins
+    /// over `markers` for every channel in that guild, so different
+    /// servers (language, topic) match their own phrasing.
+    #[serde(default)]
+    pub guild_markers: std::collections::HashMap<u64, GuildMarkerSet>,
+}
+
+/// The value of a `[archiver.guild_markers.<guild_id>]` table.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct GuildMarkerSet {
+    #[serde(default)]
+    pub markers: Vec<String>,
+}
+
+fn default_archiver_interval() -> u64 {
+    360
+}
+fn default_archiver_max_messages() -> u32 {
+    50
+}
+fn default_archiver_max_notes() -> usize {
+    40
+}
+
+impl Default for ArchiverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel_ids: Vec::new(),
+            interval_minutes: default_archiver_interval(),
+            max_messages_per_sweep: default_archiver_max_messages(),
+            max_notes_per_sweep: default_archiver_max_notes(),
+            notes_webhook: None,
+            markers: Vec::new(),
+            guild_markers: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Ops-monitor settings (`[monitor]` in bot.toml) — OpenClaw
+/// ops-monitor family port. On by default (disk/temp/log checks are
+/// free); the backup-freshness check only runs for listed dirs.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MonitorConfig {
+    /// Run the periodic checks + owner-DM reports.
+    #[serde(default = "default_monitor_on")]
+    pub enabled: bool,
+    /// Sweep cadence in minutes.
+    #[serde(default = "default_monitor_interval")]
+    pub interval_minutes: u64,
+    /// Data dirs whose newest file must be fresh (≤26h), else the
+    /// backups check fails into the owner DM.
+    #[serde(default)]
+    pub backup_dirs: Vec<String>,
+}
+
+fn default_monitor_on() -> bool {
+    true
+}
+fn default_monitor_interval() -> u64 {
+    30
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_monitor_on(),
+            interval_minutes: default_monitor_interval(),
+            backup_dirs: Vec::new(),
+        }
+    }
+}
+
+/// Tool-loop toggle for the gateway's web skills. Defaults on — the bot
+/// can only use the web when the node itself serves it and the runtime
+/// model cooperates; unsupported runtimes degrade to toolless chats (see
+/// api.rs graceful degradation).
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct WebToolsConfig {
+    /// Declare web_search/web_fetch in chat requests.
+    #[serde(default = "default_web_tools_on")]
+    pub enabled: bool,
+}
+
+fn default_web_tools_on() -> bool {
+    true
+}
+
+impl Default for WebToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_web_tools_on(),
+        }
+    }
+}
+
+/// `~/.jerith-mesh/data` — shared runtime data (ledger files,
+/// thread-archive markdown). Home-relative like the other path helpers.
+pub fn data_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".jerith-mesh").join("data")
 }
 
 /// `~/.jerith-mesh/bot.toml`
@@ -181,6 +421,28 @@ struct FileConfig {
     postgres: Option<crate::people::PgConfig>,
     /// Optional `[guard]` section — same shape as the node's config.toml.
     guard: Option<jerith_mesh_core::guard::GuardConfig>,
+    /// Optional `[web]` section — tool-loop toggle for the gateway's
+    /// web skills (Brave search + fetch).
+    web: Option<WebToolsConfig>,
+    /// Optional `[owner]` table — the bot owner's Discord id, gating
+    /// system-level commands (see owner.rs; borrowed from the OpenClaw
+    /// config when missing, same as the token).
+    owner: Option<OwnerTable>,
+    /// Optional `[archiver]` table — Discord thread-archiver config
+    /// (OpenClaw skill port, see archiver.rs).
+    archiver: Option<ArchiverConfig>,
+    /// Optional `[squeeze]` table — context-squeeze compaction settings
+    /// (OpenClaw context-squeeze port, see squeeze.rs).
+    squeeze: Option<SqueezeConfig>,
+    /// Optional `[monitor]` table — ops-monitor settings (checks +
+    /// owner-DM reports; see monitor.rs).
+    monitor: Option<MonitorConfig>,
+}
+
+/// `[owner] discord_id = <decimal>` in bot.toml.
+#[derive(Debug, Default, serde::Deserialize)]
+struct OwnerTable {
+    discord_id: Option<u64>,
 }
 
 fn read_file_config(path: &PathBuf) -> Option<FileConfig> {
@@ -210,6 +472,27 @@ mod tests {
         let cfg = BotConfig::from_parts("http://127.0.0.1:8900/", "http://127.0.0.1:8322/");
         assert_eq!(cfg.gateway_url, "http://127.0.0.1:8900");
         assert_eq!(cfg.chain_url, "http://127.0.0.1:8322");
+    }
+
+    #[test]
+    fn archiver_parses_per_guild_markers() {
+        let fc: FileConfig = toml::from_str(
+            "[archiver]\n\
+             enabled = true\n\
+             channel_ids = [7, 9]\n\
+             markers = [\"decision:\"]\n\
+             [archiver.guild_markers.4200]\n\
+             markers = [\"bestemd\", \"lore-claim\"]\n",
+        )
+        .unwrap();
+        let a = fc.archiver.expect("archiver section parsed");
+        assert!(a.enabled);
+        assert_eq!(a.channel_ids, vec![7, 9]);
+        assert_eq!(a.markers, vec!["decision:".to_string()]);
+        assert_eq!(
+            a.guild_markers.get(&4200).map(|s| s.markers.clone()),
+            Some(vec!["bestemd".to_string(), "lore-claim".to_string()])
+        );
     }
 
     #[test]

@@ -8,7 +8,9 @@ pub mod economics;
 pub mod gateway;
 pub mod guard;
 pub mod hw;
+pub mod lore;
 pub mod memory;
+pub mod metrics;
 pub mod model_router;
 pub mod models;
 pub mod ping;
@@ -17,6 +19,7 @@ pub mod signing;
 pub mod stake;
 pub mod verify;
 pub mod web;
+pub mod websearch;
 
 pub use bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState};
 pub use config::{MemoryBackend, NodeConfig, NodeRole, SetupChoices};

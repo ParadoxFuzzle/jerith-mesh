@@ -30,6 +30,11 @@ struct UserState {
     /// own `total_mined` includes passive mining the bot never saw).
     jer_won: u64,
     mine_wins: u32,
+    /// Pacing for context-squeeze stage 3 (mesh summaries).
+    last_squeeze: Option<Instant>,
+    /// Cumulative prompt+completion tokens across this user's chats
+    /// (bot-observed, from gateway usage figures).
+    tokens_used: u64,
 }
 
 /// Shared bot state: per-user memory + cooldowns.
@@ -84,6 +89,8 @@ struct PersistedUser {
     jer_won: u64,
     mine_wins: u32,
     history: Vec<Value>,
+    #[serde(default)]
+    tokens_used: u64,
 }
 
 impl BotStateInner {
@@ -100,6 +107,7 @@ impl BotStateInner {
                     jer_won: st.jer_won,
                     mine_wins: st.mine_wins,
                     history: st.history.clone(),
+                    tokens_used: st.tokens_used,
                 },
             );
         }
@@ -122,6 +130,7 @@ impl BotStateInner {
             let st = users.entry(id).or_default();
             st.jer_won = st.jer_won.max(p.jer_won);
             st.mine_wins = st.mine_wins.max(p.mine_wins);
+            st.tokens_used = st.tokens_used.max(p.tokens_used);
             if st.history.is_empty() {
                 st.history = p.history;
             }
@@ -172,6 +181,33 @@ impl BotStateInner {
         gate(&mut st.last_cmd, CMD_COOLDOWN, "this command")
     }
 
+    /// Context-squeeze pacing: true at most once per `min_interval_secs`
+    /// per user — bounds the mesh-summary round-trips stage 3 can spend.
+    pub fn try_gate_squeeze(&self, user: u64, min_interval_secs: u64) -> bool {
+        let mut users = self.users.lock().expect("user map lock");
+        let st = users.entry(user).or_default();
+        let now = Instant::now();
+        if let Some(t) = st.last_squeeze {
+            if now.duration_since(t) < Duration::from_secs(min_interval_secs.max(1)) {
+                return false;
+            }
+        }
+        st.last_squeeze = Some(now);
+        true
+    }
+
+    // Per-user cumulative token accounting (perf/cost meters, bot side).
+    pub fn record_usage(&self, user: u64, tokens: u64) {
+        let mut users = self.users.lock().expect("user map lock");
+        users.entry(user).or_default().tokens_used += tokens;
+    }
+
+    /// Total tokens recorded for a user (0 when none).
+    pub fn tokens_used(&self, user: u64) -> u64 {
+        let users = self.users.lock().expect("user map lock");
+        users.get(&user).map(|st| st.tokens_used).unwrap_or(0)
+    }
+
     /// Append a completed turn to the user's in-memory history and trim to
     /// `MAX_HISTORY` turns.
     pub fn push_turn(&self, user: u64, user_text: &str, assistant_text: &str) {
@@ -194,6 +230,18 @@ impl BotStateInner {
             .get(&user)
             .map(|st| st.history.clone())
             .unwrap_or_default()
+    }
+
+    /// Context squeeze: atomically replace a user's stored history with a
+    /// compacted version (squeeze.rs output). The next `history()` call
+    /// serves the compacted ring; the raw turns are gone (dropped-by-design
+    /// — the summary digest lives in the replacement), matching OpenClaw's
+    /// compaction semantics. Cooldown bookkeeping is untouched.
+    pub fn replace_history(&self, user: u64, squeezed: Vec<Value>) {
+        let mut users = self.users.lock().expect("user map lock");
+        if let Some(st) = users.get_mut(&user) {
+            st.history = squeezed;
+        }
     }
 
     /// Clear a user's in-memory chat history. Returns how many turns were dropped.

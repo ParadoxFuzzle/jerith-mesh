@@ -12,11 +12,49 @@
 //! overridden with `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`.
 
 mod api;
+mod archiver;
 mod chat_fallback;
 mod commands;
 mod config;
+mod monitor;
+mod owner;
 mod people;
+mod squeeze;
 mod state;
+mod workspace;
+
+/// Shared error type of the framework closures (`command_check`,
+/// `event_handler`, command bodies) — anyhow all the way down.
+type Error = anyhow::Error;
+
+/// Owner gate as the framework's `command_check` (poise gives no inferred
+/// types here, so it's a named fn). See owner.rs: user-level commands run
+/// for everyone; anything else — including unclassified future commands —
+/// runs only in a DM from the bot owner (default-deny, OpenClaw trust
+/// model ported).
+fn owner_gate_check(
+    ctx: poise::Context<'_, Data, Error>,
+) -> poise::BoxFuture<'_, Result<bool, Error>> {
+    Box::pin(async move {
+        let cmd = ctx.command().qualified_name.clone();
+        let dm = ctx.guild_id().is_none();
+        let author = ctx.author().id.get();
+        let owner = ctx.data().cfg.owner_discord_id;
+        match owner::gate_command(dm, author, owner, &cmd) {
+            owner::Gate::Allow => Ok(true),
+            owner::Gate::Deny(text) => {
+                tracing::warn!(
+                    command = %cmd,
+                    author,
+                    dm,
+                    "command refused by owner gate (owner-DM only)"
+                );
+                let _ = ctx.say(text).await;
+                Ok(false)
+            }
+        }
+    })
+}
 
 use poise::serenity_prelude as serenityall;
 
@@ -64,21 +102,36 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut cfg = BotConfig::load()?;
-    // Persona fallback: personality lives in `~/.jerith-mesh/persona.md`
-    // (distilled from the migrated SOUL/IDENTITY/USER/USER_MODEL docs) when
-    // neither `JERITH_PERSONA` nor bot.toml's `system_prompt` was set. This
-    // is what makes the bot answer as Jerith instead of as a nameless model.
+    // Persona: composed from the OpenClaw-style workspace canon docs
+    // (~/.jerith-mesh/workspace/IDENTITY|SOUL|USER|USER_MODEL|AGENTS|MEMORY.md,
+    // staged on first boot from the migrated OpenClaw workspace) when
+    // neither `JERITH_PERSONA` nor bot.toml's `system_prompt` is set. The
+    // flat `~/.jerith-mesh/persona.md` remains the fallback when the
+    // workspace holds no canon docs.
     if cfg.system_prompt.is_none() {
-        let path = config::persona_file_path();
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            cfg.system_prompt = Some(raw.trim().to_string());
-            let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
-            tracing::info!(file = %path.display(), chars, "persona system prompt loaded");
-        } else {
-            tracing::info!(
-                file = %path.display(),
-                "no persona file and no system_prompt configured — bot chats without a persona"
-            );
+        let (composed, staged) = workspace::load();
+        if !staged.is_empty() {
+            tracing::info!(staged = staged.join(", "), "workspace canon docs staged from the OpenClaw workspace");
+        }
+        match composed {
+            Some(p) => {
+                let chars = p.chars().count();
+                cfg.system_prompt = Some(p);
+                tracing::info!(files = staged.len(), chars, "persona composed from workspace canon docs");
+            }
+            None => {
+                let path = config::persona_file_path();
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    cfg.system_prompt = Some(raw.trim().to_string());
+                    let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+                    tracing::info!(file = %path.display(), chars, "persona system prompt loaded (flat fallback)");
+                } else {
+                    tracing::info!(
+                        dir = %crate::workspace::workspace_dir().display(),
+                        "no workspace canon and no persona file — bot chats without a persona"
+                    );
+                }
+            }
         }
     }
     // Known users: the jerith_people PostgreSQL database, exported live by
@@ -130,16 +183,24 @@ async fn main() -> anyhow::Result<()> {
                 commands::reset(),
                 commands::remember(),
                 commands::recall(),
+                commands::briefing(),
+                commands::lore(),
                 commands::status(),
                 commands::peers(),
                 commands::mine(),
                 commands::leaderboard(),
                 commands::myjercraft(),
+                // Guild-admin lever — deliberately unclassified in
+                // owner.rs's USER_COMMANDS: the default-deny gate makes
+                // it owner-DM only (system-level action).
+                commands::timeout(),
                 commands::help(),
             ],
             event_handler: |ctx, event| {
                 Box::pin(chat_fallback::handle(ctx, event))
             },
+            // Owner gate (see owner_gate_check + owner.rs).
+            command_check: Some(owner_gate_check),
             on_error: |err| {
                 Box::pin(async move {
                     if let Err(e) = poise::builtins::on_error(err).await {
@@ -153,6 +214,29 @@ async fn main() -> anyhow::Result<()> {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                 tracing::info!("slash commands registered globally");
+                // Discord thread archiver (OpenClaw skill port): an
+                // operator-configured background ingest — no commands, no
+                // system-level change; subscribed in bot.toml [archiver].
+                // Spawns after the gateway is registered so memory embeds
+                // have a reachable target from the first sweep.
+                if cfg.archiver.enabled {
+                    let archiving = cfg.clone();
+                    tokio::spawn(archiver::run_loop(archiving));
+                }
+                // Monitor scaffold (OpenClaw ops-monitor port): periodic
+                // checks with a single owner DM when something fails.
+                // Reports only — no restarts/no repairs (owner.rs holds
+                // the system-level boundary).
+                {
+                    // serenity's Arc-based http handle, cloned for the loop.
+                    if cfg.monitor.enabled {
+                        let http_handle = ctx.http.clone();
+                        let monitor_cfg = cfg.monitor.clone();
+                        tokio::spawn(async move {
+                            monitor::run_loop(http_handle, cfg.owner_discord_id, monitor_cfg).await;
+                        });
+                    }
+                }
                 Ok(Data { cfg, state })
             })
         })

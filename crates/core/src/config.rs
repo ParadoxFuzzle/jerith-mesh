@@ -144,6 +144,117 @@ impl Default for SpecialistConfig {
     }
 }
 
+/// Web access skills (OpenClaw migration): Brave Search API + URL fetch.
+/// See websearch.rs. Everything is node-local — search key resolution,
+/// SSRF guards and page fetching never touch mesh peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    /// Master switch for both /v1/skills/web/* endpoints.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Search provider id — only "brave" ships today (OpenClaw parity).
+    #[serde(default = "default_search_provider")]
+    pub provider: String,
+    /// Brave API key inline (wins over every other source). Usually left
+    /// empty and kept in a file instead.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Path to a file holding only the Brave API key (brave-key format:
+    /// the OpenClaw secrets provider's singleValue file).
+    #[serde(default)]
+    pub api_key_path: Option<String>,
+    /// Brave-compatible API base URL (trusted proxies); empty → the real
+    /// api.search.brave.com, exactly like the upstream plugin's baseUrl.
+    #[serde(default)]
+    pub base_url: String,
+    /// Hits per search when the caller doesn't pass one (upstream default).
+    #[serde(default = "default_search_count")]
+    pub default_count: u32,
+    /// Hard ceiling for the caller-passed count (upstream MAX_SEARCH_COUNT).
+    #[serde(default = "default_search_max_count")]
+    pub max_count: u32,
+    /// web_fetch cap: chars of readable text kept per page.
+    #[serde(default = "default_fetch_max_chars")]
+    pub fetch_max_chars: usize,
+    /// Per-request timeout for both search and fetch.
+    #[serde(default = "default_web_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_search_provider() -> String {
+    "brave".to_string()
+}
+fn default_search_count() -> u32 {
+    5
+}
+fn default_search_max_count() -> u32 {
+    20
+}
+fn default_fetch_max_chars() -> usize {
+    8000
+}
+fn default_web_timeout_secs() -> u64 {
+    30
+}
+fn default_chain_url() -> String {
+    "http://127.0.0.1:8322".to_string()
+}
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: default_search_provider(),
+            api_key: None,
+            api_key_path: None,
+            base_url: String::new(),
+            default_count: default_search_count(),
+            max_count: default_search_max_count(),
+            fetch_max_chars: default_fetch_max_chars(),
+            timeout_secs: default_web_timeout_secs(),
+        }
+    }
+}
+
+impl WebSearchConfig {
+    /// Resolve the Brave API key the same way OpenClaw's brave plugin was
+    /// configured (config inline → env → configured path), then the
+    /// jerith-side copies: the node home brave-key file, and finally — read
+    /// only — the OpenClaw keyring file this integration migrated from.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        let read_file = |p: &Path| -> Option<String> {
+            match std::fs::read_to_string(p) {
+                Ok(s) => {
+                    let s = s.trim().to_string();
+                    (!s.is_empty()).then_some(s)
+                }
+                Err(_) => {
+                    tracing::debug!(path = %p.display(), "brave key file unreadable");
+                    None
+                }
+            }
+        };
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("JERITH_BRAVE_API_KEY")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| self.api_key_path.as_deref().and_then(|p| read_file(Path::new(p))))
+            .or_else(|| read_file(&NodeConfig::home().join("brave-key")))
+            // Borrowed migration source (read-only; never written to):
+            .or_else(|| {
+                // Borrowed migration source (read-only; never written to):
+                let home = std::env::var("HOME").ok()?;
+                read_file(&Path::new(&home).join(".openclaw/keys/secrets/brave-key"))
+            })
+    }
+}
+
 /// Full node configuration (what `setup` writes and `run` reads).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -193,6 +304,19 @@ pub struct NodeConfig {
     /// prompt-injection and malware-request blocklists). See guard.rs.
     #[serde(default)]
     pub guard: crate::guard::GuardConfig,
+    /// Web access skills (Brave search + URL fetch). See websearch.rs.
+    #[serde(default)]
+    pub websearch: WebSearchConfig,
+    /// JerithChain node RPC (co-hosted install convention: the chain's
+    /// FastAPI on :8322). Used by `jerith chain …` and the gateway's
+    /// /status chain probe; the passive miner shares the same node.
+    #[serde(default = "default_chain_url")]
+    pub chain_url: String,
+    /// Local path to the chain's SQLite ledger (read-only `balances`
+    /// queries for `jerith chain wallets`). None → the CLI falls back to
+    /// the co-hosted repo layout + $JERITH_CHAIN_DATA.
+    #[serde(default)]
+    pub chain_data_dir: Option<String>,
 }
 
 fn default_verify_percent() -> u32 {
@@ -238,6 +362,9 @@ impl Default for NodeConfig {
             verify_percent: default_verify_percent(),
             ringer_percent: default_ringer_percent(),
             guard: crate::guard::GuardConfig::default(),
+            websearch: WebSearchConfig::default(),
+            chain_url: default_chain_url(),
+            chain_data_dir: None,
         }
     }
 }

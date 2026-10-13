@@ -1289,6 +1289,7 @@ name = "jerith-mesh-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "jerith-mesh-core",
  "poise",
  "reqwest",
@@ -1337,6 +1338,7 @@ dependencies = [
  "clap",
  "jerith-mesh-core",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

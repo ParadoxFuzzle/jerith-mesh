@@ -297,6 +297,75 @@ else
   echo "   pg: no reachable PostgreSQL at $PGD_HOST:$PGD_PORT as $PGD_USER — skipped (not in use?)"
 fi
 
+echo "==> 4d/5 brave key: stage the OpenClaw web-search key for jerith web skills"
+# The node's [websearch] resolves the Brave Search API key (in order):
+# config api_key/path → $JERITH_BRAVE_API_KEY → ~/.jerith-mesh/brave-key →
+# the OpenClaw keyring file (read-only borrow). Staging a local copy at
+# 0600 makes the node self-sufficient once OpenClaw is retired.
+BRAVE_SRC=~/".openclaw/keys/secrets/brave-key"
+BRAVE_DST=~/".jerith-mesh/brave-key"
+if [ -s "$BRAVE_SRC" ]; then
+  if [ ! -s "$BRAVE_DST" ]; then
+    cp "$BRAVE_SRC" "$BRAVE_DST" && chmod 600 "$BRAVE_DST"
+    echo "   brave key: staged $BRAVE_SRC → $BRAVE_DST (web_search ready)"
+  else
+    echo "   brave key: $BRAVE_DST already exists — left untouched"
+  fi
+else
+  echo "   brave key: no OpenClaw brave-key found — set JERITH_BRAVE_API_KEY or ~/.jerith-mesh/brave-key for web_search"
+fi
+
+echo "==> 4d2/5 chain token: stage the JerichChain api token for the mesh stack"
+# The JerithChain node's api token is the shared auth for the mesh's miner,
+# the bot's /mine, the gateway's chain probe and `jerith chain …`. The
+# chain is co-hosted (jerithchain repo on this machine); stage its token
+# into the mesh keys dir when the mesh side lacks one.
+CHAIN_TOK_SRC="${JERITHCHAIN_ROOT:-$HOME/Documents/Projects/jerithchain/keys/api.token}"
+CHAIN_TOK_DST="$HOME/.jerith-mesh/keys/api.token"
+if [ -s "$CHAIN_TOK_DST" ]; then
+  echo "   chain token: $CHAIN_TOK_DST already exists — left untouched"
+elif [ -s "$CHAIN_TOK_SRC" ]; then
+  mkdir -p "$HOME/.jerith-mesh/keys" && chmod 700 "$HOME/.jerith-mesh/keys"
+  cp "$CHAIN_TOK_SRC" "$CHAIN_TOK_DST" && chmod 600 "$CHAIN_TOK_DST"
+  echo "   chain token: staged $CHAIN_TOK_SRC → $CHAIN_TOK_DST (600) — miner/bot/CLI share the chain's api auth"
+else
+  echo "   chain token: no chain api.token at $CHAIN_TOK_SRC — set JERITH_TOKEN or stage the file manually"
+fi
+
+echo "==> 4e/5 owner gate: stage the bot owner id for system-level command ACL"
+# The owner's Discord id gates anything beyond user-level commands
+# (owner.rs default-deny classification). Borrowed read-only from
+# OpenClaw's commands.ownerAllowFrom when it isn't already in bot.toml.
+python3 - "$BOT_TOML" "$CLIENT_ROOT" <<'PY' 2>/dev/null || true
+import json, os, re, sys
+out, client_root = sys.argv[1], sys.argv[2]
+cfg = json.load(open(os.path.join(client_root, "openclaw.json")))
+entries = cfg.get("commands", {}).get("ownerAllowFrom", []) or []
+owner = None
+for raw in entries or []:
+    raw = str(raw)
+    id_s = raw.split("discord:", 1)[1] if "discord:" in raw else raw
+    if id_s.strip().isdigit():
+        owner = id_s.strip()
+        break
+if owner:
+    try:
+        text = open(out).read()
+    except FileNotFoundError:
+        text = ""
+    if not re.search(r"^\[owner\]", text, re.M) and "owner_discord_id" not in text and "discord_id" not in text:
+        with open(out, "a") as f:
+            if text and not text.endswith("\n"):
+                f.write("\n")
+            f.write(f'[owner]\ndiscord_id = {owner}\n')
+        os.chmod(out, 0o600)
+        print(f"   owner gate: [owner] discord_id = {owner} staged into {out} (default-deny open to the owner)")
+    else:
+        print("   owner gate: bot.toml already carries an owner id — left untouched")
+else:
+    print("   owner gate: no OpenClaw ownerAllowFrom id found — system-level commands stay default-deny (set [owner] discord_id)")
+PY
+
 echo "==> 5/5 verify"
 sleep 6
 sysctl is-active jerith-node || true

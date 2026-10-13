@@ -21,5 +21,6 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]

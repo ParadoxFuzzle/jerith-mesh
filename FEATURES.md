@@ -95,7 +95,7 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Detections logged locally without raw values; stats on `/status`
   - Configured via `[guard]` in config.toml (`guard.enabled = false` to
     switch the whole gate off)
-- 📋 Default pre-packaged plugins: Context Squeeze, Juice Compact, Brave Search
+- 📋 Default pre-packaged plugins: Context Squeeze, Juice Compact (Brave Search web skills — ✅ live via `[websearch]`, migrated from OpenClaw) |
 - 📋 First-class skills `vision.*`, `memory.embed`, `memory.search`
 - 📋 Webhook / event hooks for plugin authors
 

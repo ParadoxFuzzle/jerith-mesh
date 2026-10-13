@@ -9,7 +9,7 @@
 //!    hit to verify we're alive and contributing (adds <1 ms CPU).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -54,6 +54,16 @@ pub struct Gateway {
     /// this id — or a placeholder — count as "unpinned" and are eligible
     /// for rerouting to a tier.
     pub base_model: Option<String>,
+    /// Web access skills (Brave search / URL fetch). None → disabled in
+    /// config; present-but-keyless search answers with a setup hint.
+    pub web: Option<Arc<crate::websearch::WebSearchService>>,
+    /// Co-hosted JerithChain node RPC (config `chain_url`). Some → the
+    /// /status snapshot carries a live `chain` section (read-only probe,
+    /// short timeout, null when unreachable).
+    pub chain_url: Option<String>,
+    /// Perf/cost meters (model-performance-benchmark + session-cost-tracker
+    /// ports): per-model latency/success/tokens from live traffic.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl Gateway {
@@ -72,6 +82,21 @@ impl Gateway {
                 "/v1/skills/memory/search",
                 post(skill_memory_search),
             )
+            .route(
+                "/v1/skills/memory/similar",
+                post(skill_memory_similar),
+            )
+            .route(
+                "/v1/skills/memory/stats",
+                get(skill_memory_stats),
+            )
+            .route(
+                "/v1/skills/lore/search",
+                post(skill_lore_search),
+            )
+            .route("/v1/skills/web/search", post(skill_web_search))
+            .route("/v1/skills/web/fetch", post(skill_web_fetch))
+            .route("/v1/metrics", get(metrics_handler))
             .with_state(state)
     }
 }
@@ -133,6 +158,251 @@ async fn skill_memory_search(
         Ok(hits) => (StatusCode::OK, Json(json!({"hits": hits}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// skill: memory.similar — semantic-memories port: rank stored entries by
+/// similarity to the entry with the given seed id. Body: {id, top_k?}.
+async fn skill_memory_similar(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(memory) = &gw.memory else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "memory backend not configured"})),
+        )
+            .into_response();
+    };
+    let Some(id) = body.get("id").and_then(Value::as_i64) else {
+        return bad_request("field 'id' (integer) is required");
+    };
+    let top_k = body
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .clamp(1, 25) as usize;
+    match memory.similar_to(id, top_k).await {
+        Ok(hits) => (StatusCode::OK, Json(json!({"hits": hits}))).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// skill: memory.stats — health-dashboard port: store size/dims/providers.
+async fn skill_memory_stats(State(gw): State<Arc<Gateway>>) -> Response {
+    let Some(memory) = &gw.memory else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "memory backend not configured"})),
+        )
+            .into_response();
+    };
+    match memory.stats().await {
+        Ok(stats) => (StatusCode::OK, Json(json!(stats))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/metrics — per-model perf/cost aggregates (benchmark + cost
+/// tracker port): requests, mean/max latency, success %, token totals,
+/// mesh attribution, plus the recent-completions ring.
+async fn metrics_handler(State(gw): State<Arc<Gateway>>) -> impl IntoResponse {
+    let snap = gw.metrics.snapshot();
+    // Latency/ok helpers rendered for each model (Serialize keeps the
+    // raw fields; these derived views ride alongside).
+    let mut models = serde_json::Map::new();
+    for (id, st) in &snap.models {
+        models.insert(
+            id.clone(),
+            json!({
+                "requests": st.requests,
+                "ok": st.ok,
+                "failed": st.failed,
+                "ok_percent": st.ok_percent(),
+                "latency_ms_mean": st.latency_ms_mean(),
+                "latency_ms_max": st.latency_ms_max,
+                "prompt_tokens": st.prompt_tokens,
+                "completion_tokens": st.completion_tokens,
+                "total_tokens": st.total_tokens,
+                "mesh_served": st.mesh_served,
+            }),
+        );
+    }
+    Json(json!({
+        "window_started_ms": snap.window_started_ms,
+        "requests_total": snap.requests_total,
+        "ok_total": snap.ok_total,
+        "failed_total": snap.failed_total,
+        "tokens_total": snap.tokens_total,
+        "models": models,
+        "recent": snap.recent,
+    }))
+}
+
+/// skill: lore.search — void-lore-index port over the configured vault
+/// (built on demand, ~/.openclaw borrow). Body: {query, top_k?}.
+async fn skill_lore_search(
+    State(_gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(query) = body
+        .get("query")
+        .or_else(|| body.get("q"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    else {
+        return bad_request("field 'query' is required");
+    };
+    let k = body
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .unwrap_or(4)
+        .clamp(1, 10) as usize;
+    let Some(vault) = crate::lore::default_vault_dir() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "no lore vault — set $JERITH_LORE_VAULT or the [lore] vault_dir in config.toml"})),
+        )
+            .into_response();
+    };
+    let index = match tokio::task::spawn_blocking(move || crate::lore::build(&vault)).await {
+        Ok(Ok(idx)) => idx,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("lore index build failed: {e}")})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("lore index task failed: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let hits = index.search(query, k);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "count": hits.len(),
+            "entries": index.len(),
+            "built_ms": index.built_ms(),
+            "hits": hits,
+        })),
+    )
+        .into_response()
+}
+
+fn web_disabled_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "web skills disabled — add `[websearch] enabled = true` to config.toml and restart",
+        })),
+    )
+        .into_response()
+}
+
+fn bad_request(msg: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": msg})),
+    )
+        .into_response()
+}
+
+/// skill: web.search — Brave Search API (web mode), OpenClaw brave-plugin
+/// port. Optional body fields: count, country, search_lang, ui_lang,
+/// freshness (day|week|month|year).
+async fn skill_web_search(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(web) = gw.web.clone() else {
+        return web_disabled_response();
+    };
+    let Some(query) = body
+        .get("query")
+        .or_else(|| body.get("q"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    else {
+        return bad_request("field 'query' is required");
+    };
+    let sq = crate::websearch::SearchQuery {
+        query: query.to_string(),
+        count: body.get("count").and_then(Value::as_u64).map(|c| c as u32),
+        country: body.get("country").and_then(Value::as_str).map(str::to_string),
+        search_lang: body
+            .get("search_lang")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ui_lang: body.get("ui_lang").and_then(Value::as_str).map(str::to_string),
+        freshness: body
+            .get("freshness")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    match web.search(&sq).await {
+        Ok(hits) => (
+            StatusCode::OK,
+            Json(json!({
+                "provider": "brave",
+                "mode": "web",
+                "count": hits.len(),
+                "results": hits,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// skill: web.fetch — download a URL and return readable page text
+/// (OpenClaw web_fetch port). Optional body field: max_chars.
+async fn skill_web_fetch(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(web) = gw.web.clone() else {
+        return web_disabled_response();
+    };
+    let Some(url) = body
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        return bad_request("field 'url' is required");
+    };
+    let max_chars = body
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .map(|c| c as usize)
+        .filter(|c| *c > 0);
+    match web.fetch_text(url, max_chars).await {
+        Ok(page) => (StatusCode::OK, Json(json!(page))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
@@ -282,7 +552,76 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "verify": verify_value,
         "guard": guard_value,
         "stake": stake_value,
+        "web": json!({
+            "enabled": gw.web.is_some(),
+            "provider": "brave",
+            "api_key_present": gw.web.as_ref().map(|w| w.has_api_key()).unwrap_or(false),
+        }),
+        "metrics": metrics_status(&gw.metrics.snapshot()),
+        "chain": chain_probe(gw.chain_url.as_deref(), crate::economics::read_token().as_deref()).await,
     }))
+}
+
+/// Compact per-model view for the /status `metrics` section (full detail
+/// lives on /v1/metrics).
+fn metrics_status(snap: &crate::metrics::MetricsSnapshot) -> Value {
+    let mut models = serde_json::Map::new();
+    for (id, st) in &snap.models {
+        models.insert(
+            id.clone(),
+            json!({
+                "requests": st.requests,
+                "ok_percent": st.ok_percent(),
+                "latency_ms_mean": st.latency_ms_mean(),
+                "total_tokens": st.total_tokens,
+                "mesh_served": st.mesh_served,
+            }),
+        );
+    }
+    json!({
+        "requests_total": snap.requests_total,
+        "ok_total": snap.ok_total,
+        "failed_total": snap.failed_total,
+        "tokens_total": snap.tokens_total,
+        "models": models,
+    })
+}
+
+/// Live probe of the co-hosted JerithChain node's `/status` (read-only).
+/// Every failure path degrades to Null — a downed chain must never take
+/// the mesh status page with it.
+async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
+    let (Some(base), Some(token)) = (base, token) else {
+        return Value::Null;
+    };
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() || token.trim().is_empty() {
+        return Value::Null;
+    }
+    let url = format!("{base}/status");
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()
+        .map(|c| c.get(&url).bearer_auth(token.trim()).send());
+    let Some(resp) = resp else { return Value::Null };
+    match resp.await {
+        Ok(r) => match r.json::<Value>().await {
+            Ok(body) => json!({
+                "reachable": true,
+                "url": base,
+                "height": body.pointer("/chain/height"),
+                "tip_hash": body.pointer("/chain/tip_hash"),
+                "circulating_jer": body.pointer("/chain/circulating_jer"),
+                "max_supply_jer": body.pointer("/chain/max_supply_jer"),
+                "wallets": body.pointer("/wallets"),
+                "miners": body.pointer("/mining/miners"),
+                "total_mined_uj": body.pointer("/mining/total_mined_uj"),
+            }),
+            Err(_) => json!({"reachable": false, "url": base, "error": "non-JSON chain response"}),
+        },
+        Err(e) => json!({"reachable": false, "url": base, "error": e.to_string()}),
+    }
 }
 
 /// OpenAI-style model list (mirrors the runtime's list when reachable).
@@ -348,6 +687,12 @@ async fn chat_completions(
         "{}/v1/chat/completions",
         gw.runtime_url.trim_end_matches('/')
     );
+    let request_started = Instant::now();
+    let requested_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
     // Model routing: image content → vision tier, complex prompt → deep
     // tier, basic chat → caller's model untouched. Only *unpinned*
     // requests (placeholder / advertised base model) are reroutable, so
@@ -434,6 +779,14 @@ async fn chat_completions(
                                 meters.expert_activations += 1;
                                 meters.bytes_relayed += content.len() as u64;
                             }
+                            // Perf meter: mesh-fallback stream wrap.
+                            gw.metrics.record_simple(
+                                &requested_model,
+                                request_started,
+                                200,
+                                None,
+                                served_by.as_deref(),
+                            );
                             let id = format!("mesh-{}", crate::bootstrap::now_ms());
                             let chunk = json!({
                                 "id": id,
@@ -483,6 +836,14 @@ async fn chat_completions(
                             meters.expert_activations += 1;
                             meters.bytes_relayed += content.len() as u64;
                         }
+                        // Perf meter: mesh-fallback completion.
+                        gw.metrics.record_simple(
+                            &requested_model,
+                            request_started,
+                            200,
+                            None,
+                            served_by.as_deref(),
+                        );
                         if served_by.is_some() {
                             tracing::info!(
                                 target: "mesh",
@@ -579,6 +940,20 @@ async fn chat_completions(
             let mut meters = gw.state.meters.lock().await;
             meters.tokens_served += total;
         }
+        // Perf/cost meters: one record per completion with the model the
+        // request actually carried (post-routing) plus its usage.
+        let effective_model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&requested_model)
+            .to_string();
+        gw.metrics.record_simple(
+            &effective_model,
+            request_started,
+            status.as_u16(),
+            body.get("usage"),
+            None,
+        );
         // Expert activations: Phase 2 will count real expert traffic; for now
         // we count one activation per completion as a placeholder hook.
         // Spec: every served inference has a chance to mine JER.
@@ -621,6 +996,9 @@ mod tests {
             guard: None,
             model_router: None,
             base_model: None,
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
     }
@@ -644,8 +1022,65 @@ mod tests {
             guard: Some(std::sync::Arc::new(guard)),
             model_router: None,
             base_model: None,
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("guarded test server")
+    }
+
+    #[tokio::test]
+    async fn metrics_record_model_latency_and_tokens_per_completion() {
+        // A runtime reply carrying usage (OpenAI shape) feeds the meters:
+        // one request, its tokens, its latency band, per-model aggregate.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "model": "qwen3:8b",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg = crate::config::NodeConfig::default();
+        cfg.runtime_url = format!("http://{addr}");
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg.clone()).expect("test mesh state");
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let gw = Gateway {
+            state,
+            runtime_url: cfg.runtime_url.clone(),
+            runtime_api_key: None,
+            miner: None,
+            memory: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            metrics: metrics.clone(),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("metrics test server");
+        // Drive the completion through the GATEWAY (which meters), with the
+        // mock runtime behind it.
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]}))
+            .await;
+        assert!(res.status_code().is_success());
+        let snap = metrics.snapshot();
+        assert_eq!(snap.requests_total, 1);
+        assert_eq!(snap.ok_total, 1);
+        // Model recorded is the RESPONSE's model (qwen3:8b), not caller x.
+        assert!(snap.models.contains_key("qwen3:8b"), "models: {:?}", snap.models.keys());
+        assert_eq!(snap.models["qwen3:8b"].total_tokens, 15);
+        assert!(snap.models["qwen3:8b"].latency_ms_max < 60_000);
     }
 
     #[tokio::test]

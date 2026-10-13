@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -33,6 +33,20 @@ pub enum EmbedProvider {
     Nomic,
     /// Deterministic offline fallback (hashing bag-of-words).
     HashFallback,
+}
+
+/// memory.stats payload — the health-dashboard view of the store.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryStats {
+    pub count: u64,
+    /// dimension → entry count (mixed dims show up here).
+    pub dims: Vec<(u32, u64)>,
+    /// provider → entry count (nomic vs hash fallback).
+    pub providers: Vec<(String, u64)>,
+    /// Approximate bytes held by embedding blobs.
+    pub embedding_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_created_ms: Option<u64>,
 }
 
 /// Where embeddings come from.
@@ -199,6 +213,96 @@ impl MemoryStore {
         let n = conn.execute("DELETE FROM memories WHERE id = ?1", [id])?;
         Ok(n > 0)
     }
+
+    /// memory.similar — semantic-memories port: rank stored entries by
+    /// cosine similarity to the entry with the given seed id ("find memories
+    /// like this one"). The seed itself is excluded from the results.
+    /// Unlike `search` this needs no new embedding call — the seed's stored
+    /// vector is compared against every stored vector, so it works offline
+    /// (hash-fallback stores included).
+    pub async fn similar_to(&self, seed_id: i64, top_k: usize) -> anyhow::Result<Vec<MemoryHit>> {
+        let seed_vec: Vec<f32> = {
+            let conn = self.conn.lock().await;
+            let row = conn
+                .query_row(
+                    "SELECT embedding FROM memories WHERE id = ?1",
+                    [seed_id],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .context(format!("no memory entry with id {seed_id}"))?;
+            unpack_vector(&row)
+        };
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT id, text, dim, embedding, provider, created_ms FROM memories WHERE id != ?1")
+            .context("preparing similar query")?;
+        let mut hits: Vec<MemoryHit> = stmt
+            .query_map([seed_id], |row| {
+                let bytes: Vec<u8> = row.get(3)?;
+                let provider_s: String = row.get(4)?;
+                let mut hit = MemoryHit {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    score: 0.0,
+                    dim: row.get::<_, i64>(2)? as usize,
+                    provider: provider_from_str(&provider_s),
+                    created_ms: row.get(5)?,
+                };
+                hit.score = cosine(&seed_vec, &unpack_vector(&bytes));
+                Ok(hit)
+            })
+            .context("scanning memories for similar")?
+            .filter_map(|r| r.ok())
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
+    /// memory.stats — health-dashboard port: count, dimensions, provider
+    /// split, newest entry, approximate store footprint. Powers
+    /// /v1/skills/memory/stats and the CLI's `memory stats`.
+    pub async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .context("counting memories")?;
+        let mut dims: std::collections::BTreeMap<i64, i64> = Default::default();
+        let mut providers: std::collections::BTreeMap<String, i64> = Default::default();
+        let mut bytes_total: i64 = 0;
+        let mut newest_ms: i64 = 0;
+        {
+            let mut stmt = conn
+                .prepare("SELECT dim, provider, LENGTH(embedding), created_ms FROM memories")
+                .context("preparing stats scan")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (dim, provider, bytes, created) in rows {
+                *dims.entry(dim).or_default() += 1;
+                *providers.entry(provider).or_default() += 1;
+                bytes_total += bytes;
+                newest_ms = newest_ms.max(created);
+            }
+        }
+        Ok(MemoryStats {
+            count: count as u64,
+            dims: dims.into_iter().map(|(d, n)| (d as u32, n as u64)).collect(),
+            providers: providers
+                .into_iter()
+                .map(|(p, n)| (p, n as u64))
+                .collect(),
+            embedding_bytes: bytes_total as u64,
+            newest_created_ms: if newest_ms > 0 { Some(newest_ms as u64) } else { None },
+        })
+    }
 }
 
 async fn ollama_embed(cfg: &EmbedConfig, text: &str) -> anyhow::Result<Vec<f32>> {
@@ -340,6 +444,49 @@ mod tests {
             EmbedProvider::Nomic | EmbedProvider::HashFallback
         ));
         assert_eq!(s.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn similar_ranks_against_the_seed_vector() {
+        let s = store();
+        let (a, _) = s.embed_and_store("how to bake sourdough bread at home").await.unwrap();
+        s.embed_and_store("quantum computing stock price forecast").await.unwrap();
+        s.embed_and_store("sourdough starter feeding schedule").await.unwrap();
+
+        let hits = s.similar_to(a, 2).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        // The seed itself is never returned.
+        assert!(hits.iter().all(|h| h.id != a));
+        // The sourdough sibling outranks the unrelated entry.
+        assert!(
+            hits.iter().any(|h| h.text.contains("sourdough")),
+            "expected a sourdough hit, got {:?}",
+            hits.iter().map(|h| h.text.as_str()).collect::<Vec<_>>()
+        );
+        // Unknown seed errors clearly.
+        assert!(s.similar_to(9999, 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stats_reports_counts_dims_providers_and_footprint() {
+        let s = store();
+        s.embed_and_store("alpha entry about kilns").await.unwrap();
+        s.embed_and_store("beta entry about kilns too").await.unwrap();
+        let st = s.stats().await.unwrap();
+        assert_eq!(st.count, 2);
+        assert_eq!(st.dims.len(), 1);
+        assert!(st.embedding_bytes > 0);
+        assert_eq!(st.providers.len(), 1);
+        assert!(st.newest_created_ms.is_some());
+        // Empty store: zeroed stats, no newest timestamp.
+        let empty = MemoryStore::open_in_memory(EmbedConfig {
+            dim: 64,
+            ..EmbedConfig::default()
+        })
+        .unwrap();
+        let st = empty.stats().await.unwrap();
+        assert_eq!(st.count, 0);
+        assert!(st.newest_created_ms.is_none());
     }
 
     #[tokio::test]

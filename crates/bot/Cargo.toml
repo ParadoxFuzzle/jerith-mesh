@@ -22,3 +22,5 @@ reqwest = { workspace = true }
 tokio-postgres = "0.7"
 
 [dev-dependencies]
+# Mock gateway for the chat tool-loop test (web skills integration).
+axum.workspace = true

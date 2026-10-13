@@ -12,35 +12,36 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// gateway's /status could not tell us the real runtime model.
 const MODEL_PLACEHOLDER: &str = "jerith-mesh";
 
-/// Resolved `(gateway_url, runtime_model)` pair, fetched once per process
-/// (the bot's config is fixed at startup, so the URL never changes under
-/// us). Sending the placeholder model verbatim to an Ollama/Colibri runtime
-/// gets `model 'jerith-mesh' not found` — the node actually serves whatever
+/// Resolved runtime model per gateway URL, fetched once per URL per
+/// process (a bot's config is fixed at startup; tests run several — the
+/// per-URL map keeps them from poisoning each other). Sending the
+/// placeholder model verbatim to an Ollama/Colibri runtime gets
+/// `model 'jerith-mesh' not found` — the node actually serves whatever
 /// its config.advertised model is, exposed on /status as `model`.
-static RESOLVED_MODEL: tokio::sync::OnceCell<(String, String)> =
-    tokio::sync::OnceCell::const_new();
+static RESOLVED_MODELS: tokio::sync::Mutex<
+    Option<std::collections::HashMap<String, String>>,
+> = tokio::sync::Mutex::const_new(None);
 
 /// The model id chat requests should carry: the node's advertised runtime
 /// model, or `None` when /status is unreachable (caller falls back to the
 /// placeholder and lets the gateway error surface verbatim).
 async fn runtime_model(cfg: &crate::config::BotConfig) -> Option<String> {
-    let (url, model) = RESOLVED_MODEL
-        .get_or_try_init(|| async {
-            let url = format!("{}/status", cfg.gateway_url.trim_end_matches('/'));
-            let resp = client()
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("/model status lookup failed at {url}"))?;
-            let body: Value = resp.json().await.context("model status: non-JSON body")?;
-            let model = model_from_status(&body)
-                .with_context(|| format!("model status: no usable model field at {url}"))?;
-            Ok::<(String, String), anyhow::Error>((cfg.gateway_url.clone(), model))
-        })
+    let mut guard = RESOLVED_MODELS.lock().await;
+    let map = guard.get_or_insert_with(Default::default);
+    if let Some(model) = map.get(&cfg.gateway_url) {
+        return Some(model.clone());
+    }
+    let url = format!("{}/status", cfg.gateway_url.trim_end_matches('/'));
+    let resp = client()
+        .get(&url)
+        .send()
         .await
+        .with_context(|| format!("/model status lookup failed at {url}"))
         .ok()?;
-    debug_assert_eq!(url, &cfg.gateway_url, "gateway url changed within process");
-    Some(model.clone())
+    let body: Value = resp.json().await.context("model status: non-JSON body").ok()?;
+    let model = model_from_status(&body)?;
+    map.insert(cfg.gateway_url.clone(), model.clone());
+    Some(model)
 }
 
 /// Pull the advertised model out of a gateway /status body: a non-empty
@@ -80,14 +81,36 @@ pub fn build_messages(
 pub async fn chat(
     cfg: &crate::config::BotConfig,
     prompt: &str,
-    history: &[Value],
+    raw_history: &[Value],
 ) -> Result<(String, Option<String>)> {
+    chat_with_usage(cfg, prompt, raw_history)
+        .await
+        .map(|(c, s, _t)| (c, s))
+}
+
+/// Chat with token accounting: returns `(reply, mesh_peer, tokens_used)` —
+/// the runtime's `usage.total_tokens` summed over all rounds of the chat
+/// (tool-loop when it engaged). 0 when the runtime omits figures.
+pub async fn chat_with_usage(
+    cfg: &crate::config::BotConfig,
+    prompt: &str,
+    raw_history: &[Value],
+) -> Result<(String, Option<String>, u64)> {
+    // Context squeeze (OpenClaw context-squeeze port): compact the history
+    // before it rides the request when it blows the configured budget.
+    // Pure pass first (drop-oldest-turns, head-trim) — the summary stage
+    // needs the caller's state handle and runs separately (squeeze.rs docs).
+    let history = if cfg.squeeze.enabled {
+        crate::squeeze::squeeze_passive(raw_history, cfg.squeeze.budget_chars)
+    } else {
+        raw_history.to_vec()
+    };
     // Guard screening covers user-side content only: history + prompt. The
     // persona system prompt is operator-owned static config and is attached
     // AFTER screening — the Guard's PII redaction could otherwise mangle
     // the owner's own security rules (e.g. IDs defined in bot.toml / SOUL)
     // that the persona quotes verbatim.
-    let mut messages = build_messages(history, prompt, None);
+    let mut messages = build_messages(&history, prompt, None);
 
     // Jerith Guard: screen OUTBOUND content before any provider call
     // (defense in depth — the gateway screens too, but the bot token can
@@ -156,34 +179,374 @@ pub async fn chat(
 
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
     let model = runtime_model(cfg).await.unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
-    let resp = client()
-        .post(&url)
-        .json(&json!({
+
+    // Web access (OpenClaw stack migration): the chat request declares the
+    // gateway's web skills as OpenAI tools, so a tool-capable runtime can
+    // web_search / web_fetch mid-answer. Unsupported model/runtimes get
+    // exactly one toolless retry below — web access degrades, never fails
+    // the chat.
+    const MAX_TOOL_ROUNDS: usize = 3;
+    // Tokens accumulated across rounds (session-cost-tracker port input).
+    let mut tokens_used: u64 = 0;
+    // Tools only for prompts that read as information requests. A shared
+    // story/paste (long, no question) must not make the model invent a
+    // web_search for it — observed live: a user posted a short story and
+    // the model web-searched a line out of it, then answered "{}".
+    let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt);
+
+    let mut rounds = 0usize;
+    loop {
+        let mut payload = json!({
             "model": model,
             "messages": messages,
-        }))
+        });
+        if tools_enabled {
+            payload["tools"] = Value::Array(web_tool_defs());
+        }
+        let resp = client()
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("gateway unreachable at {url}"))?;
+
+        let status = resp.status();
+        let body: Value = resp.json().await.context("gateway returned non-JSON")?;
+        if !status.is_success() {
+            // First-round failure with tools on: one toolless retry in case
+            // the runtime rejects the tools array wholesale.
+            if tools_enabled && rounds == 0 {
+                tools_enabled = false;
+                continue;
+            }
+            let err = body
+                .get("error")
+                .and_then(value_to_string)
+                .unwrap_or_else(|| status.to_string());
+            anyhow::bail!("gateway error {status}: {err}");
+        }
+        let mut tool_calls = body
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // Slop tolerance (OpenClaw-era runtimes): some OpenAI-compatible
+        // stacks — qwen3:8b via LiteLLM/Ollama on this vps — answer the
+        // tool intent as plain JSON content instead of native tool_calls.
+        // Detect `{"function_name": …, "arguments": …}` there and subject
+        // it to the same loop (same mock unit tests cover both shapes).
+        if tools_enabled && tool_calls.is_empty() && rounds < MAX_TOOL_ROUNDS {
+            match content_tool_intent(&body) {
+                Some((name, args)) => {
+                    tool_calls = vec![json!({
+                        "id": format!("iw{rounds}"),
+                        "type": "function",
+                        "function": {"name": name, "arguments": args.to_string()},
+                    })];
+                }
+                None => {}
+            }
+        }
+        // No tool use (or out of rounds): the plain chat answer — unless
+        // it is degenerate ("{}", braces-only JSON, empty): one toolless
+        // retry, then a graceful refusal, never braces rendered verbatim
+        // into the chat (observed live, see the share incident above).
+        if !tools_enabled || tool_calls.is_empty() || rounds >= MAX_TOOL_ROUNDS {
+            let content = body
+                .pointer("/choices/0/message/content")
+                .and_then(value_to_string)
+                .unwrap_or_default();
+            let served_by = body
+                .get("mesh_fallback")
+                .and_then(value_to_string)
+                .filter(|s| !s.is_empty());
+            tokens_used += body
+                .pointer("/usage/total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if answer_is_degenerate(&content) {
+                if tools_enabled && rounds == 0 {
+                    tools_enabled = false;
+                    continue;
+                }
+                return Ok((
+                    "⚠️ the runtime returned an empty answer — try rephrasing, or ask a direct question.".to_string(),
+                    served_by,
+                    tokens_used,
+                ));
+            }
+            return Ok((content, served_by, tokens_used));
+        }
+        tokens_used += body
+            .pointer("/usage/total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        // Execute each tool call against the gateway skill endpoints and
+        // append the results as `role: tool` messages for the next round.
+        let assistant = body
+            .pointer("/choices/0/message")
+            .cloned()
+            .unwrap_or(json!({"role": "assistant"}));
+        messages.push(assistant);
+        for tc in &tool_calls {
+            let id = tc
+                .get("id")
+                .and_then(value_to_string)
+                .unwrap_or_default();
+            let name = tc
+                .pointer("/function/name")
+                .and_then(value_to_string)
+                .unwrap_or_default();
+            let raw_args = tc.pointer("/function/arguments").cloned().unwrap_or(Value::Null);
+            let answer = run_web_tool(cfg, &name, &raw_args).await;
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "name": name,
+                "content": answer,
+            }));
+        }
+        rounds += 1;
+    }
+}
+
+/// OpenAI tool declarations for the node's web skills — parameter names
+/// mirror the OpenClaw web_search/web_fetch tools the old agent had.
+pub fn web_tool_defs() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the public web (Brave Search API) and return ranked results with title, url, description and page age. Use when the answer depends on external or recent information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 20, "description": "How many results (default 5)"},
+                        "freshness": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Time filter"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Download an http(s):// URL and return the page's readable text (HTML stripped, length-capped, private targets refused). Use after web_search to read a specific page.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "http(s):// URL to read"},
+                        "max_chars": {"type": "integer", "minimum": 200, "maximum": 16000, "description": "Text cap in characters (default 8000)"}
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+    ]
+}
+
+/// Parse Ollama/OpenAI tool-call arguments: per spec a JSON-encoded string,
+/// but tolerate an inline object.
+fn parse_tool_args(args: &Value) -> Value {
+    match args {
+        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+        v => v.clone(),
+    }
+}
+
+/// Tool names the content-intent path accepts — exactly the tool defs
+/// declared to the runtime, so a model can never summon arbitrary tools.
+const WEB_TOOL_NAMES: [&str; 2] = ["web_search", "web_fetch"];
+
+/// Does this prompt plausibly want live web data? Questions do — decided
+/// by a trailing "?" or an interrogative first word, deliberately NOT by
+/// "any '?' anywhere": the live incident prompt quoted dialogue with
+/// question marks inside a pasted story, which would otherwise have
+/// tripped the tool path. Creative/transform openers (write/summarize/…)
+/// and long shared prose (a story, lyrics, an article) go toolless so the
+/// model answers in its own words instead of web-searching the text.
+fn prompt_requests_web(prompt: &str) -> bool {
+    let p = prompt.trim();
+    if p.is_empty() {
+        return false;
+    }
+    if p.ends_with('?') {
+        return true;
+    }
+    let lower = p.to_ascii_lowercase();
+    // Strip a leading speaker tag ("Noodly: …") before the prefix check.
+    let body = lower
+        .strip_prefix(|c: char| !c.is_whitespace())
+        .and_then(|rest| rest.strip_prefix(':').map(|r| r.trim_start()))
+        .unwrap_or(&lower);
+    const NON_FACTUAL_OPENERS: [&str; 8] = [
+        "write", "summarize", "summarise", "translate", "continue", "rewrite", "rank", "explain",
+    ];
+    if NON_FACTUAL_OPENERS.iter().any(|w| body.starts_with(w)) {
+        return false;
+    }
+    const FACTUAL_OPENERS: [&str; 14] = [
+        "who", "what", "when", "where", "why", "how", "which", "is", "are", "does", "do", "can",
+        "should", "find",
+    ];
+    FACTUAL_OPENERS.iter().any(|w| body.starts_with(w)) || p.chars().count() < 200
+}
+
+/// An answer the model effectively failed to produce: empty, whitespace,
+/// or a braces-only JSON stub ("{}" / null fields) — never shown to users.
+pub fn answer_is_degenerate(content: &str) -> bool {
+    let t = content.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.starts_with('{') && t.ends_with('}') {
+        if let Ok(v) = serde_json::from_str::<Value>(t) {
+            let has_text = ["content", "text", "answer", "message"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(Value::as_str))
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            return !has_text;
+        }
+    }
+    false
+}
+
+/// Detect a model-declared tool intent hidden in the assistant's plain
+/// content: `{"function_name": "web_search", "arguments": {…}}` (also
+/// "tool"/"name" key variants, fenced code, and prose around the JSON).
+/// Returns the function name and parsed arguments.
+fn content_tool_intent(body: &Value) -> Option<(String, Value)> {
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)?;
+    // Slice out the outermost JSON object even when the model mumbles
+    // around it (```json fences, narration, or <think> preamble).
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&content[start..=end]).ok()?;
+    let name = v
+        .get("function_name")
+        .or_else(|| v.get("name"))
+        .or_else(|| v.get("tool"))
+        .and_then(Value::as_str)?;
+    if !WEB_TOOL_NAMES.contains(&name) {
+        return None;
+    }
+    let args = v
+        .get("arguments")
+        .cloned()
+        .or_else(|| v.get("parameters").cloned())
+        .unwrap_or(json!({}));
+    Some((name.to_string(), parse_tool_args(&args)))
+}
+
+/// Execute one model-requested web tool against the gateway skills and
+/// return the answer as the JSON string fed back to the model. Tool errors
+/// come back as `{"error": …}` so the model can recover instead of the
+/// whole chat failing.
+async fn run_web_tool(cfg: &crate::config::BotConfig, name: &str, raw_args: &Value) -> String {
+    let args = parse_tool_args(raw_args);
+    let res: Result<Value> = match name {
+        "web_search" => {
+            web_search_skill(
+                cfg,
+                args.get("query").and_then(Value::as_str).unwrap_or_default(),
+                args.get("count").and_then(Value::as_u64),
+                args.get("freshness").and_then(Value::as_str),
+            )
+            .await
+        }
+        "web_fetch" => {
+            let cap = args
+                .get("max_chars")
+                .and_then(Value::as_u64)
+                .map(|c| c as usize)
+                .unwrap_or(8000)
+                .clamp(200, 16000);
+            web_fetch_skill(
+                cfg,
+                args.get("url").and_then(Value::as_str).unwrap_or_default(),
+                Some(cap),
+            )
+            .await
+        }
+        other => Err(anyhow::anyhow!("unknown function {other:?}")),
+    };
+    match res {
+        Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
+/// POST /v1/skills/web/search on the gateway (Brave Search API, node side).
+pub async fn web_search_skill(
+    cfg: &crate::config::BotConfig,
+    query: &str,
+    count: Option<u64>,
+    freshness: Option<&str>,
+) -> Result<Value> {
+    if query.trim().is_empty() {
+        anyhow::bail!("empty search query");
+    }
+    let mut body = json!({ "query": query });
+    if let Some(c) = count {
+        body["count"] = json!(c);
+    }
+    if let Some(f) = freshness {
+        body["freshness"] = json!(f);
+    }
+    post_gateway_skill(
+        cfg,
+        "/v1/skills/web/search",
+        &body,
+    )
+    .await
+}
+
+/// POST /v1/skills/web/fetch on the gateway (URL download + text extract).
+pub async fn web_fetch_skill(
+    cfg: &crate::config::BotConfig,
+    url: &str,
+    max_chars: Option<usize>,
+) -> Result<Value> {
+    if url.trim().is_empty() {
+        anyhow::bail!("empty url");
+    }
+    let mut body = json!({ "url": url });
+    if let Some(m) = max_chars {
+        body["max_chars"] = json!(m);
+    }
+    post_gateway_skill(cfg, "/v1/skills/web/fetch", &body).await
+}
+
+/// Shared body for the two web skill calls: gateway JSON POST + `error`
+/// extraction on non-2xx.
+async fn post_gateway_skill(
+    cfg: &crate::config::BotConfig,
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
+    let url = format!("{}{path}", cfg.gateway_url);
+    let resp = client()
+        .post(&url)
+        .json(body)
         .send()
         .await
         .with_context(|| format!("gateway unreachable at {url}"))?;
-
     let status = resp.status();
     let body: Value = resp.json().await.context("gateway returned non-JSON")?;
     if !status.is_success() {
-        let err = body
-            .get("error")
-            .and_then(value_to_string)
-            .unwrap_or_else(|| status.to_string());
-        anyhow::bail!("gateway error {status}: {err}");
+        anyhow::bail!("{path} failed: {}", body_error(&body, status));
     }
-    let content = body
-        .pointer("/choices/0/message/content")
-        .and_then(value_to_string)
-        .unwrap_or_default();
-    let served_by = body
-        .get("mesh_fallback")
-        .and_then(value_to_string)
-        .filter(|s| !s.is_empty());
-    Ok((content, served_by))
+    Ok(body)
 }
 
 /// POST /v1/skills/memory/embed — store text in the node's private memory.
@@ -502,6 +865,63 @@ mod tests {
     }
 
     #[test]
+    fn prompt_web_detection_matches_live_incident_shapes() {
+        // The live incident: a pasted story share must NOT get tools.
+        let story = "Since you remembered that Noodly likes vampires, here is a nice little short story in that vein (pun not intended).\n\nThe night was old and tired when he first noticed her. She sat at the far end of the club, in the shadows where the cigarette smoke pooled thickest. Dark hair, pale skin, eyes that caught the dim light and held it. \"Can I join you?\" he said, sliding onto the stool beside her. She smiled. Her teeth were sharp. \"I'm Elena,\" she said. He told her his name was Joe. He told her about his job, his apartment, the loneliness that had settled into his bones like sediment.";
+        assert!(!prompt_requests_web(story));
+        // Questions/requests do.
+        assert!(prompt_requests_web("what is the latest jerithchain height?"));
+        assert!(prompt_requests_web("search for P2P mesh papers"));
+        assert!(prompt_requests_web("Noodly: how does isostatic pressing work?"));
+        assert!(!prompt_requests_web("write me a haiku about kilns"));
+        assert!(!prompt_requests_web("summarize this thread"));
+        assert!(!prompt_requests_web(""));
+        // Short non-question prompts still count as requests (lenient).
+        assert!(prompt_requests_web("jerk chicken recipe"));
+    }
+
+    #[test]
+    fn degenerate_answers_are_caught_and_real_answers_pass() {
+        assert!(answer_is_degenerate(""));
+        assert!(answer_is_degenerate("   \n"));
+        assert!(answer_is_degenerate("{}"));
+        assert!(answer_is_degenerate("{ \"tool\": \"web_search\" }"));
+        assert!(!answer_is_degenerate("{ \"content\": \"A real answer.\" }"));
+        assert!(!answer_is_degenerate("The kiln fires at 980 degrees."));
+        assert!(!answer_is_degenerate("{} is an empty set, in plain prose."));
+    }
+
+    #[test]
+    fn content_intent_shapes() {
+        let intent = |content: &str| {
+            content_tool_intent(&json!({
+                "choices": [{"message": {"role": "assistant", "content": content}}]
+            }))
+        };
+        // Canonical shape seen live on qwen3:8b via the LiteLLM/Ollama runtime.
+        let (name, args) = intent(
+            "{\"function_name\": \"web_search\", \"arguments\": {\"query\": \"kiln\"}}",
+        )
+        .unwrap();
+        assert_eq!(name, "web_search");
+        assert_eq!(args["query"], json!("kiln"));
+        // Fenced + narrated + web_fetch + string-encoded arguments.
+        let (name, args) = intent(
+            "Sure, checking.\n```json\n{\"function_name\": \"web_fetch\", \"arguments\": \"{\\\"url\\\": \\\"https://x\\\"}\"}\n```\n",
+        )
+        .unwrap();
+        assert_eq!(name, "web_fetch");
+        assert_eq!(args["url"], json!("https://x"));
+        // Unknown function names are ignored — only declared web tools.
+        assert!(intent(
+            "{\"function_name\": \"run_shell\", \"arguments\": {}}"
+        )
+        .is_none());
+        // Not JSON at all → no intent.
+        assert!(intent("I'll just answer directly.").is_none());
+    }
+
+    #[test]
     fn model_resolution_pulls_advertised_model() {
         assert_eq!(
             model_from_status(&json!({"model": "qwen3:8b", "node_id": "n"})),
@@ -614,5 +1034,219 @@ mod tests {
         // "Jerith Guard blocked").
         let err = chat(&cfg, "what is the weather", &[]).await.unwrap_err();
         assert!(!err.to_string().contains("Jerith Guard blocked"), "got: {err}");
+    }
+
+    /// Mock OpenAI-compatible gateway that drives the full web tool loop:
+    /// round 1 returns two tool_calls (web_search + web_fetch), the skills
+    /// endpoints answer with fixed payloads, round 2 (with the `role: tool`
+    /// results appended) returns the final content.
+    #[tokio::test]
+    async fn chat_tool_loop_executes_web_skills_and_finalizes() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TMutex;
+
+        let seen: Arc<TMutex<Vec<Value>>> = Arc::new(TMutex::new(Vec::new()));
+        let seen_chat = seen.clone();
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| {
+                    let seen_chat = seen_chat.clone();
+                    async move {
+                        seen_chat.lock().await.push(req.clone());
+                        let has_tool_result = req["messages"]
+                            .as_array()
+                            .map_or(false, |ms| {
+                                ms.iter()
+                                    .any(|m| m["role"] == json!("tool"))
+                            });
+                        let body = if has_tool_result {
+                            json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Kiln found; 1 result + page text gathered."
+                                    }
+                                }]
+                            })
+                        } else {
+                            json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": Value::Null,
+                                        "tool_calls": [
+                                            {"id": "c1", "type": "function", "function": {
+                                                "name": "web_search",
+                                                "arguments": "{\"query\": \"isopress kiln\", \"count\": 2}"
+                                            }},
+                                            {"id": "c2", "type": "function", "function": {
+                                                "name": "web_fetch",
+                                                "arguments": "{\"url\": \"https://example.com/kiln\"}"
+                                            }}
+                                        ]
+                                    }
+                                }]
+                            })
+                        };
+                        (axum::http::StatusCode::OK, axum::Json(body))
+                    }
+                }),
+            )
+            .route(
+                "/v1/skills/web/search",
+                axum::routing::post(|| async {
+                    axum::Json(json!({
+                        "provider": "brave",
+                        "mode": "web",
+                        "count": 1,
+                        "results": [
+                            {"title": "K", "url": "https://example.com/kiln", "description": "d"}
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/skills/web/fetch",
+                axum::routing::post(|| async {
+                    axum::Json(json!({
+                        "url": "https://example.com/kiln",
+                        "title": "Kiln",
+                        "text": "kiln spec text",
+                        "truncated": false,
+                        "status": 200
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+
+        let (reply, served_by) = chat(&cfg, "find the kiln", &[]).await.expect("tool-loop chat");
+        assert!(reply.contains("Kiln found"), "got {reply}");
+        assert!(served_by.is_none());
+
+        let seen = seen.lock().await;
+        assert!(seen.len() >= 2, "two chat rounds expected: {seen:?}");
+        assert!(seen[0].get("tools").is_some(), "round 1 must declare web tools");
+        let tool_round = seen
+            .iter()
+            .find(|r| {
+                r["messages"]
+                    .as_array()
+                    .map_or(false, |ms| ms.iter().any(|m| m["role"] == json!("tool")))
+            })
+            .expect("a round carrying tool results");
+        let tool_msgs: Vec<&Value> = tool_round["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == json!("tool"))
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "both tool calls answered: {tool_msgs:?}");
+        let both = tool_msgs
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default())
+            .collect::<String>();
+        assert!(
+            both.contains("\"title\":\"K\"") && both.contains("kiln spec text"),
+            "search + fetch results flowed back: {both}"
+        );
+    }
+
+    /// Runtime answers tool intents as plain JSON content (qwen3:8b via
+    /// LiteLLM/Ollama): the loop must accept and execute them too.
+    #[tokio::test]
+    async fn chat_tool_loop_accepts_json_intent_from_runtime() {
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| async move {
+                    let has_tool_result = req["messages"].as_array().map_or(false, |ms| {
+                        ms.iter().any(|m| m["role"] == json!("tool"))
+                    });
+                    if has_tool_result {
+                        axum::Json(json!({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "content": "Answer from the gathered results."
+                            }}]
+                        }))
+                    } else {
+                        // Real observed output shape (content IS the intent).
+                        axum::Json(json!({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "content": "{\"function_name\": \"web_search\", \"arguments\": {\"query\": \"kiln\"}}"
+                            }}]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/skills/web/search",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"results": [{"title": "K", "url": "https://k"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+        let (reply, _) = chat(&cfg, "find kiln", &[]).await.expect("intent loop chat");
+        assert_eq!(reply, "Answer from the gathered results.");
+    }
+
+    /// A runtime that rejects the tools array wholesale is retried once
+    /// toolless instead of failing the chat.
+    #[tokio::test]
+    async fn chat_tool_loop_degrades_to_toolless_on_runtime_rejection() {
+        use axum::response::IntoResponse as _;
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| async move {
+                    if req.get("tools").is_some() {
+                        (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!(
+                            {"error": "model not supported: tools"})))
+                            .into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(json!({
+                                "choices": [{"message": {"role": "assistant", "content": "plain no-tools answer"}}]
+                            })),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+        let (reply, _served_by) = chat(&cfg, "hi there", &[]).await.expect("toolless fallback");
+        assert_eq!(reply, "plain no-tools answer");
     }
 }

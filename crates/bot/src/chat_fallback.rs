@@ -104,9 +104,12 @@ pub async fn handle(
     let tagged = format!("{}{}", speaker_tag(&msg.author), prompt);
     tokio::spawn(async move {
         show_typing(&http_ctx, channel).await;
-        let history = state.history(user);
-        match api::chat(&cfg, &tagged, &history).await {
-            Ok((reply, served_by)) => {
+        // Context squeeze stage 3 before the chat (same as /ask).
+    let history =
+        crate::squeeze::squeeze_deep(&state, &cfg, user, &state.history(user)).await;
+        match api::chat_with_usage(&cfg, &tagged, &history).await {
+            Ok((reply, served_by, tokens)) => {
+                state.record_usage(user, tokens);
                 state.push_turn(user, &tagged, &reply);
                 let text = crate::commands::format_reply(&reply, served_by.as_deref());
                 let _ = send_long(&http_ctx, channel, &text).await;

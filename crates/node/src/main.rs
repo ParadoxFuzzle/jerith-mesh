@@ -102,6 +102,46 @@ enum Cmd {
         #[command(subcommand)]
         cmd: StakeCmd,
     },
+    /// Introspect the co-hosted JerithChain node (read-only).
+    Chain {
+        #[command(subcommand)]
+        cmd: ChainCmd,
+    },
+    /// Search the markdown lore vault (void-lore-index port).
+    Lore {
+        /// Canon question / terms.
+        query: String,
+        #[arg(long, default_value_t = 4)]
+        top_k: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChainCmd {
+    /// GET /status — height, supply, wallet counts, mining + security stats.
+    Status,
+    /// Wallet table straight from the chain's SQLite ledger (read-only).
+    Wallets {
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+        /// Sort by balance instead of address.
+        #[arg(long, default_value_t = false)]
+        by_balance: bool,
+    },
+    /// GET /balance for one wallet (Discord id or chain address).
+    Balance {
+        /// Discord id string or chain address.
+        who: String,
+    },
+    /// GET /mystate — mining leaderboard (top by total mined).
+    Miners {
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// GET /block/{height}.
+    Block { height: u64 },
+    /// GET /tx/{txid}.
+    Tx { txid: String },
 }
 
 #[derive(Subcommand)]
@@ -111,8 +151,18 @@ enum MemoryCmd {
     /// Vector-search local memory.
     Search { query: String, #[arg(long, default_value_t = 5)] top_k: usize },
     /// Number of stored entries.
-    Count,    /// Delete an entry by id.
+    Count,
+    /// Delete an entry by id.
     Forget { id: i64 },
+    /// Entries similar to a seed entry (no re-embedding needed, works offline).
+    Similar {
+        /// The seed entry's id (from `memory search` / `memory add`).
+        id: i64,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+    },
+    /// Store health: count, dimensions, providers, footprint.
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -184,7 +234,312 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Config { assignments } => config_cmd(assignments).await,
         Cmd::Memory { cmd } => memory_cmd(cmd).await,
         Cmd::Stake { cmd } => stake_cmd(cmd).await,
+        Cmd::Chain { cmd } => chain_cmd(cmd).await,
+        Cmd::Lore { query, top_k } => lore_cmd(&query, top_k).await,
     }
+}
+
+/// `jerith lore <query>` — sourced canon answers from the lore vault
+/// (void-lore-index port; vault default is the OpenClaw borrow).
+async fn lore_cmd(query: &str, top_k: usize) -> anyhow::Result<()> {
+    let vault = jerith_mesh_core::lore::default_vault_dir().context(
+        "no lore vault — set $JERITH_LORE_VAULT to a directory of .md files",
+    )?;
+    let index = jerith_mesh_core::lore::build(&vault)?;
+    let hits = index.search(query, top_k);
+    if hits.is_empty() {
+        println!("no lore matched \"{query}\" ({} entries indexed)", index.len());
+        return Ok(());
+    }
+    println!("{} entries indexed · top {}:\n", index.len(), hits.len());
+    for h in hits {
+        println!("📌 {}", h.id);
+        if let Some(t) = &h.heading {
+            println!("   section: {t}");
+        }
+        println!("   score {} · tags: {}", h.score, h.tags.join(", "));
+        println!("   {}\n", h.excerpt);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// JerithChain node integration — read-only introspection of the co-hosted
+// chain (`jerith-node-dev` on :8322). The mesh stack shares the chain api
+// token (economics::read_token: $JERITH_TOKEN → ~/.jerith-mesh/keys/api.token)
+// and, for the wallet table, opens the chain's SQLite ledger read-only.
+// ---------------------------------------------------------------------------
+
+/// Chain RPC base: $JERITH_CHAIN_URL override → config `chain_url` → the
+/// co-hosted default (127.0.0.1:8322).
+fn chain_base(cfg: Option<&NodeConfig>) -> String {
+    if let Ok(u) = std::env::var("JERITH_CHAIN_URL") {
+        let u = u.trim().trim_end_matches('/').to_string();
+        if !u.is_empty() {
+            return u;
+        }
+    }
+    match cfg {
+        Some(c) if !c.chain_url.trim().is_empty() => c.chain_url.trim().trim_end_matches('/').to_string(),
+        _ => "http://127.0.0.1:8322".to_string(),
+    }
+}
+
+/// Chain SQLite ledger path: config `chain_data_dir` → $JERITH_CHAIN_DATA
+/// → the co-hosted jerithchain repo layout (this machine's convention,
+/// matching deploy/start_jerith_node.sh's cwd). Always opened read-only.
+fn chain_ledger_path(cfg: Option<&NodeConfig>) -> anyhow::Result<std::path::PathBuf> {
+    let from_dir = |dir: &std::path::Path| dir.join("jerith.db");
+    let configured = cfg
+        .and_then(|c| c.chain_data_dir.clone())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| from_dir(std::path::Path::new(s.trim())));
+    if let Some(p) = configured {
+        anyhow::ensure!(p.exists(), "chain ledger not found at {}", p.display());
+        return Ok(p);
+    }
+    if let Ok(d) = std::env::var("JERITH_CHAIN_DATA") {
+        let d = d.trim().to_string();
+        if !d.is_empty() {
+            let p = from_dir(std::path::Path::new(&d));
+            anyhow::ensure!(p.exists(), "chain ledger not found at {}", p.display());
+            return Ok(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let p = from_dir(&std::path::Path::new(&home).join("Documents/Projects/jerithchain/data"));
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    bail!(
+        "chain ledger not found — set `chain_data_dir = \"<jerithchain repo>/data\"` \\
+         in config.toml or $JERITH_CHAIN_DATA"
+    )
+}
+
+/// GET one of the chain's token-authed JSON endpoints and return the body.
+async fn chain_get(_cfg: Option<&NodeConfig>, base: &str, path: &str, query: &[(&str, &str)]) -> anyhow::Result<serde_json::Value> {
+    let token = jerith_mesh_core::economics::read_token().context(
+        "no chain api token — stage ~/.jerith-mesh/keys/api.token (see docs/RUNBOOK.md) \\
+         or set $JERITH_TOKEN",
+    )?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let mut url = format!("{base}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(
+            &query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+    }
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("chain node unreachable at {url}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("chain node returned non-JSON")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "chain {path} failed ({status}): {}",
+            body.get("detail").and_then(|d| d.as_str()).unwrap_or("")
+        );
+    }
+    Ok(body)
+}
+
+/// One row of the chain's wallet table (balances ⟕ users ⟕ mining_state).
+#[derive(Debug, Clone, serde::Serialize)]
+struct ChainWalletRow {
+    address: String,
+    balance_uj: i64,
+    locked_uj: i64,
+    nonce: i64,
+    discord_id: Option<u64>,
+    total_mined_uj: i64,
+}
+
+/// Read the wallet table out of the chain ledger. Duck-typed to the live
+/// schema (balances ⟕ users.discord_id ⟕ mining_state); missing links stay
+/// None. Connection is expected read-only (mode=ro).
+fn load_chain_wallets(
+    conn: &rusqlite::Connection,
+    limit: u32,
+    by_balance: bool,
+) -> anyhow::Result<Vec<ChainWalletRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.address, b.balance, b.nonce, b.locked, u.discord_id, COALESCE(m.total_mined, 0)
+         FROM balances b
+         LEFT JOIN users u ON u.address = b.address
+         LEFT JOIN mining_state m ON m.discord_id = u.discord_id",
+    )?;
+    let mut rows: Vec<ChainWalletRow> = stmt
+        .query_map([], |r| {
+            let address: String = r.get(0)?;
+            let balance_uj: i64 = r.get(1)?;
+            let nonce: i64 = r.get(2)?;
+            let locked_uj: i64 = r.get(3)?;
+            let discord_id: Option<String> = r.get(4)?;
+            let total_mined_uj: i64 = r.get(5)?;
+            Ok(ChainWalletRow {
+                address,
+                balance_uj,
+                locked_uj,
+                nonce,
+                discord_id: discord_id
+                    .as_deref()
+                    .and_then(|s| s.parse::<u64>().ok()),
+                total_mined_uj,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    if by_balance {
+        rows.sort_by(|a, b| b.balance_uj.cmp(&a.balance_uj));
+    } else {
+        rows.sort_by(|a, b| a.address.cmp(&b.address));
+    }
+    rows.truncate((limit.max(1) as usize).min(500));
+    Ok(rows)
+}
+
+/// `jerith chain …` — the read-only chain introspection commands.
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn chain_wallet_rows_join_and_sort() {
+        let dir = std::env::temp_dir().join(format!("chain-cl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("jerith.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE balances (address TEXT PRIMARY KEY, balance INTEGER NOT NULL, nonce INTEGER NOT NULL, locked INTEGER NOT NULL);
+            CREATE TABLE users (discord_id TEXT, address TEXT UNIQUE, vk_hex TEXT, enc_sk TEXT, wrapped_sk TEXT, password_stored INTEGER, totp_enc TEXT, totp_confirmed INTEGER, auto_sign_limit INTEGER, daily_spent INTEGER);
+            CREATE TABLE mining_state (discord_id TEXT, last_success INTEGER, last_fail INTEGER, success_count INTEGER, fail_count INTEGER, total_mined INTEGER);
+            INSERT INTO balances VALUES ('jer1aaa', 2500000, 4, 1000000);
+            INSERT INTO balances VALUES ('jer1bbb', 12000000, 1, 0);
+            INSERT INTO users (discord_id, address) VALUES ('1001', 'jer1bbb');
+            INSERT INTO mining_state (discord_id, success_count, fail_count, total_mined) VALUES ('1001', 12, 1, 3000000);
+            "#,
+        )
+        .unwrap();
+        // Address-sort (default) LIMIT 1 keeps the lexicographically first.
+        let rows = load_chain_wallets(&conn, 10, false).unwrap();
+        assert_eq!(rows[0].address, "jer1aaa");
+        // Balance-sort brings the bigger wallet first, with the joined
+        // discord id + mined totals.
+        let rows = load_chain_wallets(&conn, 10, true).unwrap();
+        assert_eq!(rows[0].address, "jer1bbb");
+        assert_eq!(rows[0].discord_id, Some(1001));
+        assert_eq!(rows[0].total_mined_uj, 3_000_000);
+        assert_eq!(rows[1].discord_id, None);
+        // Limit applies.
+        assert_eq!(load_chain_wallets(&conn, 1, true).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+async fn chain_cmd(cmd: ChainCmd) -> anyhow::Result<()> {
+    let cfg = jerith_mesh_core::config::NodeConfig::load()?.unwrap_or_default();
+    match cmd {
+        ChainCmd::Status => {
+            let body = chain_get(Some(&cfg), &chain_base(Some(&cfg)), "/status", &[]).await?;
+            let s = serde_json::to_string_pretty(&body)?;
+            println!("{s}");
+        }
+        ChainCmd::Wallets { limit, by_balance } => {
+            let db = chain_ledger_path(Some(&cfg))?;
+            // Read-only open: a chain node writing WAL entries cannot be
+            // corrupted by our reads.
+            let uri = format!(
+                "file:{}?mode=ro",
+                db.display()
+                    .to_string()
+                    .replace('?', "%3F")
+            );
+            let conn = rusqlite::Connection::open_with_flags(
+                &uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .with_context(|| format!("opening chain ledger {db:?}"))?;
+            let rows = load_chain_wallets(&conn, limit, by_balance)?;
+            println!(
+                "{:<52} {:>14} {:>12} {:>12} {:>12} {}",
+                "address", "balance JER", "locked", "nonce", "mined", "discord"
+            );
+            for r in rows {
+                println!(
+                    "{:<52} {:>14.6} {:>12.6} {:>12} {:>12.6} {}",
+                    r.address,
+                    r.balance_uj as f64 / 1e6,
+                    r.locked_uj as f64 / 1e6,
+                    r.nonce,
+                    r.total_mined_uj as f64 / 1e6,
+                    r.discord_id
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                );
+            }
+        }
+        ChainCmd::Balance { who } => {
+            let is_discord_id = who.chars().all(|c| c.is_ascii_digit());
+            let query = if is_discord_id {
+                vec![("discord_id", who.as_str())]
+            } else {
+                vec![("address", who.as_str())]
+            };
+            let body = chain_get(Some(&cfg), &chain_base(Some(&cfg)), "/balance", &query).await?;
+            let s = serde_json::to_string_pretty(&body)?;
+            println!("{s}");
+        }
+        ChainCmd::Miners { limit } => {
+            let body = chain_get(
+                Some(&cfg),
+                &chain_base(Some(&cfg)),
+                "/mystate",
+                &[("limit", limit.to_string().as_str())],
+            )
+            .await?;
+            let s = serde_json::to_string_pretty(&body)?;
+            println!("{s}");
+        }
+        ChainCmd::Block { height } => {
+            let body = chain_get(
+                Some(&cfg),
+                &chain_base(Some(&cfg)),
+                &format!("/block/{height}"),
+                &[],
+            )
+            .await?;
+            let s = serde_json::to_string_pretty(&body)?;
+            println!("{s}");
+        }
+        ChainCmd::Tx { txid } => {
+            let body = chain_get(
+                Some(&cfg),
+                &chain_base(Some(&cfg)),
+                &format!("/tx/{txid}"),
+                &[],
+            )
+            .await?;
+            let s = serde_json::to_string_pretty(&body)?;
+            println!("{s}");
+        }
+    }
+    Ok(())
 }
 
 async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
@@ -223,6 +578,34 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
                 println!("forgot #{id}");
             } else {
                 println!("#{id} not found");
+            }
+        }
+        MemoryCmd::Similar { id, top_k } => {
+            let hits = store.similar_to(id, top_k).await?;
+            if hits.is_empty() {
+                println!("no other entries stored yet");
+            }
+            for h in hits {
+                println!(
+                    "#{:<4} {:>6.3}  {}",
+                    h.id,
+                    h.score,
+                    h.text.chars().take(80).collect::<String>()
+                );
+            }
+        }
+        MemoryCmd::Stats => {
+            let st = store.stats().await?;
+            println!("entries: {}", st.count);
+            for (dim, n) in &st.dims {
+                println!("dim {dim}: {n}");
+            }
+            for (p, n) in &st.providers {
+                println!("provider {p}: {n}");
+            }
+            println!("embedding bytes: {}", st.embedding_bytes);
+            if let Some(ms) = st.newest_created_ms {
+                println!("newest entry: {} ms epoch", ms);
             }
         }
     }
@@ -765,6 +1148,32 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         None
     };
 
+    // Web access skills (OpenClaw migration): Brave search + URL fetch.
+    // Disabled in config, or a search call simply reports "missing Brave
+    // API key" with the resolution order as the hint.
+    let web = if cfg.websearch.enabled {
+        let ws = cfg.websearch.clone();
+        if let Some(_key) = ws.resolved_api_key().as_ref() {
+            tracing::info!(provider = %ws.provider, "web skills enabled (brave search + url fetch)");
+        } else {
+            tracing::warn!(
+                "web skills enabled but no Brave API key found — set [websearch] api_key/api_key_path, \
+                 $JERITH_BRAVE_API_KEY, or copy the OpenClaw keyring to ~/.jerith-mesh/brave-key"
+            );
+        }
+        let svc = jerith_mesh_core::websearch::WebSearchService::new(
+            &ws.base_url,
+            ws.resolved_api_key(),
+            ws.default_count,
+            ws.max_count,
+            ws.fetch_max_chars,
+            ws.timeout_secs,
+        );
+        Some(std::sync::Arc::new(svc))
+    } else {
+        None
+    };
+
     // Gateway + web UI on one port.
     let gw = Gateway {
         state: state.clone(),
@@ -778,6 +1187,9 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             jerith_mesh_core::model_router::RouterModels::default(),
         )),
         base_model: cfg.model.as_ref().map(|m| m.id.clone()),
+        web,
+        chain_url: Some(cfg.chain_url.clone()),
+        metrics: std::sync::Arc::new(jerith_mesh_core::metrics::Metrics::new()),
     };
     let app = axum::Router::new()
         .merge(gw.router())

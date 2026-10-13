@@ -2,9 +2,11 @@
 //! reply. Formatting is split from IO so tests can cover it without a
 //! Discord connection.
 
+use anyhow::Context as _;
 use poise::serenity_prelude as serenityall;
 
 use crate::api;
+use crate::chat_fallback::clip_tail;
 use crate::config::BotConfig;
 use crate::state::BotState;
 
@@ -40,11 +42,20 @@ pub async fn ask(
 
     let history = ctx.data().state.history(user);
     let cfg = ctx.data().cfg.clone();
+    // Context squeeze stage 3 (deep collapse) before the chat when the
+    // passive pass still leaves the ring over the configured budget.
+    let history =
+        crate::squeeze::squeeze_deep(&ctx.data().state, &cfg, user, &history).await;
     // Individual-user recognition (same convention as the DM/@mention path):
     // every turn keeps its speaker so the model can tell owner from guests
     // and address people by name across the conversation.
     let prompt = format!("{}{}", crate::chat_fallback::speaker_tag(ctx.author()), prompt);
-    let (reply, served_by) = api::chat(&cfg, &prompt, &history).await?;
+    let (reply, served_by, tokens) = api::chat_with_usage(&cfg, &prompt, &history).await?;
+    // Session-cost-tracker port input: cumulative per-user tokens.
+    ctx.data().state.record_usage(user, tokens);
+    // Persist after chats too (not just /mine wins) so token spend and
+    // history survive restarts on chat-active bots.
+    persist_tally_after_win(ctx).await;
     ctx.data().state.push_turn(user, &prompt, &reply);
     let text = format_reply(&reply, served_by.as_deref());
     say_long(ctx, &text).await?;
@@ -106,7 +117,8 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     }
     ctx.defer().await?;
     let st = api::gateway_status(&ctx.data().cfg).await?;
-    ctx.say(format_status(&st)).await?;
+    let your_tokens = ctx.data().state.tokens_used(user_id(&ctx));
+    ctx.say(format_status_with_tokens(&st, Some(your_tokens))).await?;
     Ok(())
 }
 
@@ -230,11 +242,230 @@ pub async fn myjercraft(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Briefing of the watched threads (decisions + mesh digest).
+///
+/// The full what-did-i-miss port of OpenClaw's skill: sweeps each
+/// configured archiver channel's latest messages over Discord REST,
+/// extracts the decision/tech-note lines and adds a 3-line mesh reasoning
+/// digest. Read-only — no memory writes, no web round-trips.
+#[poise::command(slash_command, prefix_command, broadcast_typing)]
+pub async fn briefing(
+    ctx: Ctx<'_>,
+    #[description = "Hours to look back (1-72, default 24)"] hours: Option<i64>,
+) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    ctx.defer().await?;
+    let hours = hours.unwrap_or(24).clamp(1, 72);
+    let since_snowflake = discord_snowflake_for_hours_ago(hours);
+    let cfg = ctx.data().cfg.clone();
+    if cfg.archiver.channel_ids.is_empty() {
+        ctx.say("No archiver channels configured — add `[archiver] channel_ids` to bot.toml first.").await?;
+        return Ok(());
+    }
+    let client = crate::archiver::discord_client();
+    let mut lines: Vec<String> = Vec::new();
+    for cid in &cfg.archiver.channel_ids {
+        let msgs = match crate::archiver::fetch_messages(
+            &client,
+            &cfg.discord_token,
+            *cid,
+            Some(since_snowflake),
+            80,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(channel = cid, error = %e, "briefing channel fetch failed");
+                continue;
+            }
+        };
+        // Per-guild marker resolution needs the channel's owning guild.
+        let (label, guild) =
+            crate::archiver::thread_info(&client, &cfg.discord_token, *cid).await;
+        let markers = crate::archiver::effective_markers(&cfg.archiver, guild);
+        let notes = crate::archiver::extract_notes(
+            &msgs,
+            &markers.iter().map(String::as_str).collect::<Vec<_>>(),
+            6,
+            None,
+        );
+        if !notes.is_empty() {
+            lines.push(format!("**{label}**"));
+            lines.extend(notes.iter().take(4).map(|n| format!("- {n}")));
+        }
+    }
+    if lines.is_empty() {
+        ctx.say(format!("Nothing decision-shaped in the last {hours}h across the watched threads — quiet, or markers need tuning (see bot.toml [archiver] markers).")).await?;
+        return Ok(());
+    }
+    // A short mesh digest on top (a direct chat call — no tools in this
+    // path because the digest prompt is not a question, per the tool gate).
+    let digest = match api::chat(
+        &cfg,
+        &format!(
+            "You are briefing an operator. In at most 3 short lines, give the high-level state of this channel activity digest (no narration, no preamble):\n{}",
+            lines.join("\n")
+        ),
+        &[],
+    )
+    .await
+    {
+        Ok((text, _)) if !crate::api::answer_is_degenerate(&text) => {
+            format!("**Mesh digest:** {}\n\n", text.trim().lines().take(3).collect::<Vec<_>>().join(" "))
+        }
+        _ => String::new(),
+    };
+    ctx.say(clip_tail(&format!("{digest}{}", lines.join("\n")), 1900)).await?;
+    Ok(())
+}
+
+/// Discord snowflake for `hours` ago (snowflake epoch 2015-01-01T00:00Z).
+fn discord_snowflake_for_hours_ago(hours: i64) -> u64 {
+    const SNOWFLAKE_EPOCH_MS: u64 = 1_420_070_400_000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(SNOWFLAKE_EPOCH_MS);
+    let cutoff_ms = now_ms.saturating_sub((hours.max(0) as u64) * 3_600_000);
+    cutoff_ms.saturating_sub(SNOWFLAKE_EPOCH_MS) << 22
+}
+
+/// Search the lore vault (sourced excerpts, no model in the loop).
+#[poise::command(slash_command, prefix_command, broadcast_typing)]
+pub async fn lore(
+    ctx: Ctx<'_>,
+    #[description = "Canon question or terms"] query: String,
+) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    ctx.defer().await?;
+    let st = ctx.data().cfg.clone();
+    let hits = lore_search(&st, &query, 4).await?;
+    if hits.is_empty() {
+        ctx.say(format!("No lore matched \"{query}\" — the vault is indexed node-side with exact terms; try a proper noun."))
+            .await?;
+        return Ok(());
+    }
+    let mut out = format!("📚 **Lore — {query}**\n");
+    for h in hits.iter().take(3) {
+        out.push_str(&format!(
+            "\n**{}** · score {}\n> {}\n",
+            h["id"].as_str().unwrap_or("?"),
+            h["score"].as_u64().unwrap_or(0),
+            h["excerpt"].as_str().unwrap_or("")
+        ));
+    }
+    ctx.say(clip_tail(&out, 1900)).await?;
+    Ok(())
+}
+
+/// Call the gateway's lore skill and return the raw hits array.
+pub async fn lore_search(
+    cfg: &BotConfig,
+    query: &str,
+    top_k: u64,
+) -> Result<Vec<serde_json::Value>, Error> {
+    let url = format!("{}/v1/skills/lore/search", cfg.gateway_url);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&serde_json::json!({ "query": query, "top_k": top_k }))
+        .send()
+        .await
+        .with_context(|| format!("gateway unreachable at {url}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.context("lore: non-JSON body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "lore search failed: {}",
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+    }
+    Ok(body
+        .get("hits")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
 /// Show bot help.
 #[poise::command(slash_command, prefix_command)]
 pub async fn help(ctx: Ctx<'_>) -> Result<(), Error> {
     ctx.say(HELP_TEXT).await?;
     Ok(())
+}
+
+/// Guild-admin moderation lever — owner-DM only (default-deny gate).
+// Deliberately NOT in owner.rs's USER_COMMANDS — the default-deny gate
+// then enforces owner-DM only, which is the user's rule that the bot
+// never executes system-level changes outside an owner DM. Because the
+// invocation must be a DM, the guild and member arrive as explicit
+// arguments instead of being inferred from the calling channel.
+#[poise::command(slash_command, prefix_command)]
+pub async fn timeout(
+    ctx: Ctx<'_>,
+    #[description = "Guild (server) id that holds the member"] guild_id: u64,
+    #[description = "Member to time out (or to clear), as a user id"] member_id: u64,
+    #[description = "Timeout length in minutes (1–40320; Discord caps at 28 days)"] minutes: Option<u64>,
+    #[description = "Reason recorded in the guild's audit log"] reason: Option<String>,
+    #[description = "Clear the existing timeout instead of setting one"] clear: Option<bool>,
+) -> Result<(), Error> {
+    let clear = clear.unwrap_or(false);
+    let edit = if clear {
+        serenityall::builder::EditMember::new().enable_communication()
+    } else {
+        let minutes = minutes.context("minutes is required unless clear = true")?;
+        validate_timeout_minutes(minutes)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock before the unix epoch")?
+            .as_secs() as i64;
+        let until = serenityall::model::Timestamp::from_unix_timestamp(now + (minutes as i64) * 60)
+            .context("timeout end is not a valid timestamp")?;
+        serenityall::builder::EditMember::new().disable_communication_until_datetime(until)
+    };
+    let reason = reason.unwrap_or_else(|| "jerith-mesh owner moderation".to_string());
+    let edit = edit.audit_log_reason(&reason);
+    let http = ctx.serenity_context().http.clone();
+    let member = serenityall::GuildId::new(guild_id)
+        .edit_member(&http, serenityall::UserId::new(member_id), edit)
+        .await
+        .context("timeout failed — check the bot has Moderate Members in that guild and the ids are right")?;
+    let what = if clear { "cleared" } else { "set" };
+    ctx.say(timeout_reply(what, member_id, guild_id, member.communication_disabled_until)).await?;
+    Ok(())
+}
+
+/// Discord caps member timeouts at 28 days (40320 min); validate before
+/// the call so the owner gets a clear refusal instead of an HTTP 400.
+fn validate_timeout_minutes(minutes: u64) -> Result<(), Error> {
+    anyhow::ensure!(
+        (1..=28 * 24 * 60).contains(&minutes),
+        "minutes must be between 1 and 40320 (Discord's 28-day timeout cap)"
+    );
+    Ok(())
+}
+
+/// Owner-facing confirmation line (split for the unit test).
+fn timeout_reply(
+    action: &str,
+    member_id: u64,
+    guild_id: u64,
+    until: Option<serenityall::model::Timestamp>,
+) -> String {
+    match until {
+        Some(t) => format!(
+            "✅ Timeout {action} for <@{member_id}> in guild {guild_id} — active until <t:{}:f>.",
+            t.unix_timestamp()
+        ),
+        None => format!("✅ Timeout {action} for <@{member_id}> in guild {guild_id}."),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,16 +474,22 @@ pub async fn help(ctx: Ctx<'_>) -> Result<(), Error> {
 
 pub const HELP_TEXT: &str = "\
 **jerith-mesh bot**
-`/ask <prompt>` — chat with the mesh (mesh-peer fallback included)
+`/ask <prompt>` — chat with the mesh (mesh-peer fallback included; Jerith can search the web / read pages itself when the node serves the web skills)
 `/reset` — clear your conversation history
 `/remember <text>` — store a note in the node's private memory
 `/recall <query>` — search the node's private memory
+`/briefing [hours]` — what happened across the watched threads (decisions + mesh digest, OpenClaw what-did-i-miss port)
 `/status` — node + mesh status snapshot
 `/peers` — list live peers in the mesh
 `/mine` — try to mine JER on the local JerithChain node
 `/leaderboard` — JER mining leaderboard (top winners)
 `/myjercraft` — show your own JER balance on the chain
-`/help` — this message";
+`/timeout <guild_id> <member_id> [minutes] [clear]` — guild moderation, **owner-DM only**
+`/help` — this message
+
+System-level actions are **owner-DM only**: commands outside this list are
+refused for everyone except direct messages from the bot owner's account
+(OpenClaw trust model, default-deny for unclassified commands).";
 
 /// Append attribution when a mesh peer (not the local runtime) served it.
 pub fn format_reply(reply: &str, served_by: Option<&str>) -> String {
@@ -364,18 +601,60 @@ pub fn format_recall(query: &str, hits: &[serde_json::Value]) -> String {
 }
 
 /// Compact status summary.
+/// Token-less convenience wrapper — tests only; the live /status handler
+/// calls format_status_with_tokens directly (it carries the caller's own
+/// wallet token count).
+#[cfg(test)]
 pub fn format_status(st: &serde_json::Value) -> String {
+    format_status_with_tokens(st, None)
+}
+
+/// `/status` rendering with the caller's cumulative token spend (perf+
+/// session-cost-tracker port view). `tokens: None` keeps the older shape
+/// (tests).
+pub fn format_status_with_tokens(st: &serde_json::Value, tokens: Option<u64>) -> String {
     let get = |k: &str| st.get(k).cloned().unwrap_or(serde_json::Value::Null);
     let meter = |k: &str| {
         st.pointer(&format!("/meters/{k}"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     };
+    // Metrics line (per-model aggregates from the gateway meters).
+    let metrics_line = st
+        .pointer("/metrics/models")
+        .and_then(|v| v.as_object())
+        .map(|models| {
+            let mut parts: Vec<String> = models
+                .iter()
+                .take(3)
+                .map(|(id, m)| {
+                    format!(
+                        "{}: {} req · {}% ok · {} tok · {}ms avg",
+                        id,
+                        m.get("requests").and_then(|v| v.as_u64()).unwrap_or(0),
+                        m.get("ok_percent").and_then(|v| v.as_u64()).unwrap_or(0),
+                        m.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        m.get("latency_ms_mean").and_then(|v| v.as_u64()).unwrap_or(0),
+                    )
+                })
+                .collect();
+            parts.sort();
+            parts.join(" · ")
+        })
+        .unwrap_or_default();
+    let metrics_section = if metrics_line.is_empty() {
+        String::new()
+    } else {
+        format!("\nmetrics: {metrics_line}")
+    };
+    let you_line = tokens
+        .map(|t| format!("\nyour token spend (this bot, cumulative): {t}"))
+        .unwrap_or_default();
     format!(
         "📊 **node** `{}` · role `{}` · model `{}` ({})\n\
          peers: {} total / {} alive · contribution: {}%\n\
          served: {} tokens · {} expert activations · {} bytes relayed\n\
-         uptime: {}s · mines: {} attempted / {} won",
+         uptime: {}s · mines: {} attempted / {} won{}{}",
         get("node_id").as_str().unwrap_or("?"),
         get("role").as_str().unwrap_or("?"),
         get("model").as_str().unwrap_or("(none)"),
@@ -391,6 +670,8 @@ pub fn format_status(st: &serde_json::Value) -> String {
         st.pointer("/meters/mines_won")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        you_line,
+        metrics_section,
     )
 }
 
@@ -426,6 +707,26 @@ use serenityall as _serenity;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn timeout_minutes_capped_at_discords_28_days() {
+        assert!(validate_timeout_minutes(1).is_ok());
+        assert!(validate_timeout_minutes(40320).is_ok());
+        assert!(validate_timeout_minutes(0).is_err());
+        assert!(validate_timeout_minutes(40321).is_err());
+    }
+
+    #[test]
+    fn timeout_reply_mentions_member_guild_and_expiry() {
+        let t = serenityall::model::Timestamp::from_unix_timestamp(1_900_000_000).unwrap();
+        let s = timeout_reply("set", 42, 1337, Some(t));
+        assert!(s.contains("<@42>"));
+        assert!(s.contains("guild 1337"));
+        assert!(s.contains("1900000000"));
+        let cleared = timeout_reply("cleared", 42, 1337, None);
+        assert!(cleared.contains("cleared"));
+        assert!(!cleared.contains("until"));
+    }
 
     #[test]
     fn reply_attribution_line() {
