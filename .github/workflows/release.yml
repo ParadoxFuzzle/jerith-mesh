@@ -1,0 +1,67 @@
+name: release
+
+# Tag-push (v*) builds release binaries for both platforms and attaches
+# them, with sha256 checksums, to the matching GitHub release. The first
+# automated macOS binaries come from here — the macos test job proved the
+# debug profile; this workflow proves the release profile (lto = thin).
+#
+# workflow_dispatch (invoked without a tag ref) dry-runs the same builds
+# WITHOUT touching any release — use it to validate a platform change
+# before cutting a tag:
+#   gh workflow run release.yml --repo ParadoxFuzzle/jerith-mesh --ref main
+#
+# Operators verify via `sha256sum -c jerith-<os>-<arch>.sha256`.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: build ${{ matrix.artifact }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: jerith-linux-x86_64
+          - os: macos-latest
+            artifact: jerith-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      JERITH_OK_BEYOND_CAPACITY: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries (workspace)
+        run: cargo build --release --workspace
+      - name: Stage artifact + sha256
+        # sha256sum is not a native macOS binary — fall back to perl
+        # shasum with identical output format; either way the verify
+        # re-check must fail the step on a mismatch.
+        run: |
+          cp target/release/jerith "${{ matrix.artifact }}"
+          ( sha256sum "${{ matrix.artifact }}" || shasum -a 256 "${{ matrix.artifact }}" ) \
+            > "${{ matrix.artifact }}.sha256"
+          ( sha256sum -c "${{ matrix.artifact }}.sha256" || shasum -a 256 -c "${{ matrix.artifact }}.sha256" )
+          cat "${{ matrix.artifact }}.sha256"
+      - name: Upload binary + checksum to the tag's release
+        # Real releases only — a dispatch dry-run from a branch ref has no
+        # tag and must not touch any release object.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag \
+              --title "jerith-mesh $TAG" \
+              --notes "Automated release binaries for $TAG (source of truth: this tag; checksums per asset)."
+          gh release upload "$TAG" \
+            "${{ matrix.artifact }}" "${{ matrix.artifact }}.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
