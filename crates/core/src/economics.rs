@@ -70,7 +70,8 @@ impl MinerConfig {
 }
 
 /// Read the api token: env JERITH_TOKEN (raw) or the token file.
-fn read_token() -> Option<String> {
+/// Shared by the miner and the Phase 5 stake chain-wiring (stake.rs).
+pub fn read_token() -> Option<String> {
     if let Ok(t) = std::env::var("JERITH_TOKEN") {
         let t = t.trim().to_string();
         if !t.is_empty() {

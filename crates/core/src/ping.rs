@@ -71,10 +71,8 @@ impl MeshState {
     pub fn new(config: NodeConfig) -> anyhow::Result<(Arc<Self>, watch::Receiver<bool>)> {
         let (tx, rx) = watch::channel(true);
         let identity = config.identity()?;
-        let node_id = identity.node_id();
         let stake = crate::stake::StakeManager::new(
             &config.crypto,
-            &node_id,
             Some(identity.clone()),
         );
         let state = Arc::new(Self {
@@ -291,6 +289,13 @@ async fn run_loop(
             }
         }
 
+        // Phase 5 escrow wiring (live chain contract): sync the ledger to
+        // the chain's /stake view (honest join gate), then escrow exactly
+        // once per process. Both are quiet no-ops without the chain,
+        // api token, or when staking is disabled (required_uj = 0).
+        state.stake.refresh_from_chain().await;
+        state.stake.lock_required_once().await;
+
         if let Some(m) = &model {
             match bootstrap.fetch_peers(&m.id).await {
                 Ok(peers) => {
@@ -387,6 +392,12 @@ async fn run_loop(
                 if *shutdown_rx.borrow() { break; }
             }
         }
+    }
+    // Phase 5: return the escrow on the way out — best effort, the chain
+    // may be down (the persisted escrowed_uj marker keeps lock idempotent
+    // across restarts either way).
+    if state.stake.unlock_all().await {
+        tracing::info!(target: "economics", "stake escrow returned on shutdown");
     }
     tracing::info!("mesh loop stopped");
 }
