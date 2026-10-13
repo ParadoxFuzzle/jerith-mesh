@@ -548,7 +548,7 @@ async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
     };
 
     let seed = now_ms();
-    let (expert_id, mut input, expected) = crate::verify::ringer_task(seed);
+    let (expert_id, input, expected) = crate::verify::ringer_task(seed);
     let req_id = format!("ringer-{seed}");
     let mut req = crate::quic::NodeRpcRequest::ExpertQuery {
         req_id: req_id.clone(),
@@ -584,6 +584,9 @@ async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
                 tracing::warn!(target: "mesh", peer = %peer_id, got = %server_id, "ringer reply attribution mismatch");
                 return;
             }
+            // Same accounting as router-dispatched work (only after the
+            // attribution check passes).
+            state.verify.note_expert_result().await;
             if let Some(c) = &commitment {
                 let ok = crate::verify::verify_commitment(
                     &req_id,

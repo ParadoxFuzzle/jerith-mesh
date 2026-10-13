@@ -6,25 +6,33 @@
 //! Runs only with `--ignored --nocapture`. Skips gracefully when the
 //! environment isn't up, so normal `cargo test` stays green offline.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use jerith_mesh_core::quic::{
-    client_endpoint, server_endpoint, serve, sign_request, NodeRpcReply, NodeRpcRequest,
+    pinned_client_endpoint, sign_request, NodeRpcReply, NodeRpcRequest, PinMap,
 };
 use jerith_mesh_core::signing::SigningIdentity;
 
 #[tokio::test]
 #[ignore = "requires two running mesh nodes (dev E2E)"]
 async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
-    // Local listener (we don't serve, just need a client endpoint bound).
-    let client = client_endpoint().expect("client endpoint");
     let identity = SigningIdentity::generate();
 
     // Discover B's runtime-backed handler directly at its advertised RPC
     // address — the integration under test is the wire round-trip.
     let addr: SocketAddr = "127.0.0.1:8911".parse().unwrap();
+
+    // Cert pinning fails closed: the dial is pinned to node B's identity via
+    // EXPECT_NODE_B_ID, so the reply can only come from the node we meant.
+    let sni_node = std::env::var("EXPECT_NODE_B_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .expect("dev E2E: EXPECT_NODE_B_ID must carry node B's node_id");
+    let mut pins: PinMap = std::collections::HashMap::new();
+    pins.insert(sni_node.clone(), addr);
+    let client =
+        pinned_client_endpoint(std::sync::Arc::new(pins)).expect("pinned client endpoint");
 
     let mut req = NodeRpcRequest::ExpertQuery {
         req_id: "e2e-cross-1".into(),
@@ -36,8 +44,6 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
     };
     sign_request(&mut req, &identity);
 
-    let sni_node = std::env::var("EXPECT_NODE_B_ID")
-        .unwrap_or_else(|_| "unpinned-dev-peer".to_string());
     let reply = tokio::time::timeout(
         Duration::from_secs(10),
         jerith_mesh_core::quic::call(&client, addr, &sni_node, &req, &identity, Duration::from_secs(5)),
@@ -104,7 +110,4 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
         other => panic!("unexpected reply: {other:?}"),
     }
 
-    let _ = server_endpoint; // referenced so the import list stays honest
-    let _ = serve;
-    let _ = HashMap::<String, SocketAddr>::new();
 }
