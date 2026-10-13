@@ -73,6 +73,12 @@ cargo build --release
 # Local memory skills (SQLite + nomic embeddings, never leaves the node)
 ./target/release/jerith memory add "my note"
 ./target/release/jerith memory search "note"
+
+# One-command live two-node E2E: local bootstrap + stub runtime + nodes
+# A/B with verify_percent/ringer_percent = 100 (pinned dial, commitment
+# checks, ringer spot-counters) — builds, runs, reports counters, and
+# tears itself down:
+scripts/dev-e2e.sh
 ```
 
 ### What's live today
