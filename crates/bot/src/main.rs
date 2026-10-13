@@ -12,6 +12,7 @@
 //! overridden with `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`.
 
 mod api;
+mod chat_fallback;
 mod commands;
 mod config;
 mod state;
@@ -95,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
                 commands::myjercraft(),
                 commands::help(),
             ],
+            event_handler: |ctx, event| {
+                Box::pin(chat_fallback::handle(ctx, event))
+            },
             on_error: |err| {
                 Box::pin(async move {
                     if let Err(e) = poise::builtins::on_error(err).await {

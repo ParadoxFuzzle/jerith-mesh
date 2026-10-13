@@ -8,6 +8,48 @@ use serde_json::{json, Value};
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Legacy placeholder some code paths still carry — only used if the
+/// gateway's /status could not tell us the real runtime model.
+const MODEL_PLACEHOLDER: &str = "jerith-mesh";
+
+/// Resolved `(gateway_url, runtime_model)` pair, fetched once per process
+/// (the bot's config is fixed at startup, so the URL never changes under
+/// us). Sending the placeholder model verbatim to an Ollama/Colibri runtime
+/// gets `model 'jerith-mesh' not found` — the node actually serves whatever
+/// its config.advertised model is, exposed on /status as `model`.
+static RESOLVED_MODEL: tokio::sync::OnceCell<(String, String)> =
+    tokio::sync::OnceCell::const_new();
+
+/// The model id chat requests should carry: the node's advertised runtime
+/// model, or `None` when /status is unreachable (caller falls back to the
+/// placeholder and lets the gateway error surface verbatim).
+async fn runtime_model(cfg: &crate::config::BotConfig) -> Option<String> {
+    let (url, model) = RESOLVED_MODEL
+        .get_or_try_init(|| async {
+            let url = format!("{}/status", cfg.gateway_url.trim_end_matches('/'));
+            let resp = client()
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("/model status lookup failed at {url}"))?;
+            let body: Value = resp.json().await.context("model status: non-JSON body")?;
+            let model = model_from_status(&body)
+                .with_context(|| format!("model status: no usable model field at {url}"))?;
+            Ok::<(String, String), anyhow::Error>((cfg.gateway_url.clone(), model))
+        })
+        .await
+        .ok()?;
+    debug_assert_eq!(url, &cfg.gateway_url, "gateway url changed within process");
+    Some(model.clone())
+}
+
+/// Pull the advertised model out of a gateway /status body: a non-empty
+/// string `model` field (e.g. `{ "model": "qwen3:8b", ... }`).
+fn model_from_status(body: &Value) -> Option<String> {
+    let model = body.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(TIMEOUT)
@@ -50,10 +92,11 @@ pub async fn chat(
     }
 
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
+    let model = runtime_model(cfg).await.unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
     let resp = client()
         .post(&url)
         .json(&json!({
-            "model": "jerith-mesh",
+            "model": model,
             "messages": messages,
         }))
         .send()
@@ -368,6 +411,17 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_resolution_pulls_advertised_model() {
+        assert_eq!(
+            model_from_status(&json!({"model": "qwen3:8b", "node_id": "n"})),
+            Some("qwen3:8b".to_string())
+        );
+        assert_eq!(model_from_status(&json!({"model": "  "})), None);
+        assert_eq!(model_from_status(&json!({})), None);
+        assert_eq!(model_from_status(&json!({"model": 42})), None);
+    }
 
     #[test]
     fn my_balance_parsing_shapes() {
