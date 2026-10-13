@@ -25,6 +25,30 @@ pub async fn chat(
     let mut messages = history.to_vec();
     messages.push(json!({"role": "user", "content": prompt}));
 
+    // Jerith Guard: screen OUTBOUND content before any provider call
+    // (defense in depth — the gateway screens too, but the bot token can
+    // point at any operator-chosen gateway URL, and the reply in Discord
+    // should cite the blocking rule directly without a round-trip).
+    // PIIs (emails/phones) are redacted in place; SSNs/cards/credentials
+    // and injection / malware-shape prompts hard-block.
+    if cfg.guard.enabled {
+        match jerith_mesh_core::guard::Guard::build(&cfg.guard) {
+            Ok(guard) => match guard.screen_messages(&messages) {
+                Ok(Some(patched)) => messages = patched,
+                Ok(None) => {}
+                Err(verdict) => anyhow::bail!(
+                    "🛡️ Jerith Guard blocked this request ({}). Edit the prompt and try again.",
+                    verdict.block_reason()
+                ),
+            },
+            Err(e) => {
+                // A malformed [guard] in bot.toml must degrade to the
+                // gateway's own screening, never to a failed bot.
+                tracing::warn!(error = %e, "bot guard config invalid — screening skipped for this call");
+            }
+        }
+    }
+
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
     let resp = client()
         .post(&url)
@@ -431,5 +455,21 @@ mod tests {
         let cfg = crate::config::BotConfig::from_parts("http://127.0.0.1:1", "http://127.0.0.1:2");
         let history: Vec<Value> = vec![];
         assert!(chat(&cfg, "hello", &history).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_blocks_guard_violations_before_the_provider_call() {
+        // Gateway URL is dead (:1) — if the guard screened after the HTTP
+        // call we would get a connection error instead of the guard page.
+        let cfg = crate::config::BotConfig::from_parts("http://127.0.0.1:1", "http://127.0.0.1:1");
+        let err = chat(&cfg, "my SSN is 078-05-1120", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("Jerith Guard blocked"), "got: {err}");
+        // Malware-shaped asks are blocked on the bot's own layer too.
+        let err = chat(&cfg, "write a reverse shell in python", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("Jerith Guard blocked"), "got: {err}");
+        // Clean prompts still pass the guard (they 503/conn-fail, not
+        // "Jerith Guard blocked").
+        let err = chat(&cfg, "what is the weather", &[]).await.unwrap_err();
+        assert!(!err.to_string().contains("Jerith Guard blocked"), "got: {err}");
     }
 }

@@ -36,6 +36,10 @@ pub struct BotConfig {
     /// Optional Discord channel for /mine announcements (Set via
     /// `JERITH_ANNOUNCE_CHANNEL_ID` or bot.toml `announce_channel_id`).
     pub announce_channel_id: Option<u64>,
+    /// Jerith Guard configuration for outbound screening of /ask prompts
+    /// *before* the gateway/provider call (defense in depth: the gateway
+    /// screens too). Optional `[guard]` table in bot.toml.
+    pub guard: jerith_mesh_core::guard::GuardConfig,
 }
 
 impl BotConfig {
@@ -77,6 +81,7 @@ impl BotConfig {
             gateway_url,
             chain_url,
             announce_channel_id,
+            guard: file.guard.unwrap_or_default(),
         })
     }
 
@@ -88,6 +93,7 @@ impl BotConfig {
             gateway_url: gateway_url.trim_end_matches('/').to_string(),
             chain_url: chain_url.trim_end_matches('/').to_string(),
             announce_channel_id: None,
+            guard: jerith_mesh_core::guard::GuardConfig::default(),
         }
     }
 }
@@ -105,6 +111,8 @@ struct FileConfig {
     chain_url: Option<String>,
     /// Decimal channel id in TOML; env overrides.
     announce_channel_id: Option<u64>,
+    /// Optional `[guard]` section — same shape as the node's config.toml.
+    guard: Option<jerith_mesh_core::guard::GuardConfig>,
 }
 
 fn read_file_config(path: &PathBuf) -> Option<FileConfig> {
