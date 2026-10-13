@@ -60,7 +60,9 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   Chat replies carry `mesh_fallback` (node id when a mesh peer served it,
   explicit `null` otherwise — including 502s when neither the local runtime
   nor mesh peers are reachable: never a bare 500).
-- ✅ Discord bot (`crates/bot`, poise/serenity): `/ask` (mesh-peer fallback included),
+- ✅ Discord bot (`crates/bot`, poise/serenity): `/ask` (mesh-peer fallback included,
+  screened outbound by Jerith Guard before the gateway call — optional
+  `[guard]` in bot.toml),
   `/reset`, `/remember`, `/recall`, `/status`, `/peers`, `/mine`, `/help`;
   per-user chat history (in-memory, capped) + per-user cooldowns; token via
   `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via
@@ -138,6 +140,10 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
 - ✅ Graceful offline/degradation: the node starts and runs locally even if the bootstrap is unreachable
 - ✅ Local OpenAI-compatible endpoint so stock agent frameworks (Continue.dev, Open WebUI, LangChain…) work day one
 - 📋 Resource isolation (GPU/CPU pinning, RAM ceiling), emergency kill switch (Phase 1)
+- ✅ Dashboard verification + guard widgets: live Phase 4 counters
+  (commitment checks/failures, replay match rate, fraud reports flushed)
+  and Jerith Guard counters (screens, blocked, redacted, logged) on the
+  node status page, fed from `/status`
 - 📋 Dashboard with earnings/expert-hit-rate/latency views (Phase 2–3)
 - 📋 Bandwidth caps (soft/hard) and cost estimation (Phase 2)
 - 📋 Backup/restore/migrate full node state (Phase 2)

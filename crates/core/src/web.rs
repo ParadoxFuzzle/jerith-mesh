@@ -50,6 +50,8 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Role</h2><p id="role">—</p><div class="fine">contributor / requester / hybrid</div></div>
   <div class="card"><h2>Tokens served</h2><p id="tokens">—</p><div class="fine">for the mesh, this window</div></div>
   <div class="card"><h2>Expert activations</h2><p id="acts">—</p><div class="fine">loads served to peers</div></div>
+  <div class="card"><h2>Phase 4 verification</h2><p id="ccommit">—</p><div class="fine" id="ccommitfine">commitment checks</div></div>
+  <div class="card"><h2>Jerith Guard</h2><p id="guard">—</p><div class="fine" id="guardfine">outbound screens</div></div>
 </div>
 <footer>
   jerith-mesh · a P2P compute mesh for MoE models ·
@@ -68,6 +70,19 @@ async function refresh() {
     document.getElementById('role').textContent = j.role || '—';
     document.getElementById('tokens').textContent = j.meters?.tokens_served ?? '—';
     document.getElementById('acts').textContent = j.meters?.expert_activations ?? '—';
+    // Phase 4 verification widget.
+    const v = j.verify ?? {};
+    document.getElementById('ccommit').textContent = v.commitment_checks ?? '—';
+    document.getElementById('ccommitfine').textContent =
+      `commitment checks · failures ${v.commitment_failures ?? 0}` +
+      ` · replays ${v.replay_matches ?? 0}/${v.replays_dispatched ?? 0}` +
+      ` · fraud reports ${v.fraud_reports_flushed ?? 0}`;
+    // Jerith Guard widget (null = disabled in config).
+    const g = j.guard;
+    document.getElementById('guard').textContent = g ? (g.screens ?? '—') : 'off';
+    document.getElementById('guardfine').textContent = g
+      ? `outbound screens · blocked ${g.requests_blocked ?? 0} · redacted ${g.values_redacted ?? 0} · logged ${g.detections_logged ?? 0}`
+      : 'guard disabled in config.toml ([guard] enabled = false)';
   } catch (e) { /* node stopped */ }
 }
 refresh();
