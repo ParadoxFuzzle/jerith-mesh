@@ -22,7 +22,7 @@ sysctl() {
 
 echo "==> 1/5 stopping OpenClaw services (reversible — restart list at the end)"
 STOPPED=""
-for svc in openclaw-gateway openclaw-model-router litellm-proxy openclaw-sidecar \
+for svc in openclaw-gateway openclaw-model-router openclaw-sidecar \
            openclaw-watchdog.service openclaw-discord-listener.service \
            openclaw-watchdog.timer openclaw-discord-listener.timer \
            openclaw-backup.timer openclaw-reflect.timer openclaw-pg-memory-sync.timer; do
@@ -58,9 +58,32 @@ echo "   model: $MODEL"
 if [ ! -f "$NODE_CONFIG" ]; then
   ./target/release/jerith setup --model "$MODEL" --memory sqlite \
     --contribution 40 --role hybrid --crypto jerithchain --no-wait </dev/null
+  # Fresh setup default: runtime = local Ollama (explicit, since the binary's
+  # NodeConfig::default hardcodes :8000 — never rely on ambient defaults).
+  if [ -z "${JERITH_RUNTIME_URL:-}" ]; then
+    sed -i 's|^runtime_url = .*|runtime_url = "http://127.0.0.1:11434"|' "$NODE_CONFIG"
+  fi
 fi
-# Runtime = local ollama in both stacks
-sed -i 's|^runtime_url = .*|runtime_url = "http://127.0.0.1:11434"|' "$NODE_CONFIG"
+# Runtime choice: JERITH_RUNTIME_URL wins; a brand-new config defaults to
+# local Ollama (11434); an EXISTING config's runtime_url is left untouched
+# so a deliberate coupling (e.g. the authed LiteLLM proxy at :8000) survives
+# re-runs instead of being silently reverted here.
+if [ -n "${JERITH_RUNTIME_URL:-}" ]; then
+  sed -i "s|^runtime_url = .*|runtime_url = \"${JERITH_RUNTIME_URL}\"|" "$NODE_CONFIG"
+  echo "   runtime: $JERITH_RUNTIME_URL (JERITH_RUNTIME_URL)"
+fi
+# LiteLLM-proxy lifecycle follows the runtime choice: when the proxy IS the
+# runtime (coupling at :8000) it must stay up; otherwise it is exactly like
+# the rest of the OpenClaw stack — stopped reversibly.
+if grep -q 'runtime_url = "http://127.0.0.1:8000"' "$NODE_CONFIG"; then
+  echo "   runtime: LiteLLM proxy coupled — litellm-proxy stays running"
+else
+  if systemctl --user is-active --quiet litellm-proxy; then
+    systemctl --user stop litellm-proxy
+    STOPPED="$STOPPED litellm-proxy"
+    echo "   runtime: local Ollama — stopped unused litellm-proxy (reversible)"
+  fi
+fi
 
 echo "==> 4/5 services: node gateway + bot (user-level systemd)"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
