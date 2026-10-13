@@ -47,6 +47,11 @@ impl Default for BootstrapOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeadReport {
     node_id: String,
+    /// Signed attribution: who saw the node dead. Verified server-side —
+    /// an unauthenticated eviction vote is an internet-reachable
+    /// take-down of any peer (a node can also self-report honestly, so
+    /// this endpoint carries the same wire-auth contract as advertise).
+    reporter: String,
 }
 
 /// In-memory registry: node_id → (ad, last_refresh_ms, dead_votes, score).
@@ -279,8 +284,25 @@ async fn advertise(
 
 async fn report_dead(
     State((registry, _ttl_ms)): State<Shared>,
+    headers: axum::http::HeaderMap,
     Json(report): Json<DeadReport>,
 ) -> Response {
+    // Wire auth: the reporter signs `jerith-dead1|stamp|reporter|target`
+    // and the bootstrap checks identity/freshness/signature before the
+    // vote counts. Unsigned reports are refused (fail-closed) — otherwise
+    // anyone on the internet could evict any live peer with a handful of
+    // identical POSTs (DEAD_VOTES_TO_EVICTION-threshold doS).
+    let stamp = match headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+        Some(s) => s,
+        None => return unauthorized("missing or malformed stamp"),
+    };
+    if let Err(resp) = verify_report_auth(
+        &headers,
+        &report.reporter,
+        &crate::signing::dead_payload(&report.reporter, &report.node_id, stamp),
+    ) {
+        return resp;
+    }
     let mut entries = registry.entries.write().await;
     match entries.get_mut(&report.node_id) {
         None => (
@@ -312,6 +334,45 @@ impl Entry {
     }
 }
 
+/// Shared verification for the report endpoints: pull the wire-auth
+/// triple from headers, rebuild the caller-supplied canonical payload,
+/// and validate identity + stamp + signature against the REPORTER's
+/// node id (the report targets a third party — attribution is what
+/// makes dedupe/corroboration meaningful). Errors surface as a mounted
+/// 401 response.
+fn verify_report_auth(
+    headers: &axum::http::HeaderMap,
+    reporter_node_id: &str,
+    expected_payload: &str,
+) -> Result<(), Response> {
+    let (pubkey, stamp, sig) = match (
+        headers.get("x-jerith-pubkey").and_then(|v| v.to_str().ok()),
+        headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()),
+        headers.get("x-jerith-sig").and_then(|v| v.to_str().ok()),
+    ) {
+        (Some(p), Some(s), Some(g)) => (p.to_string(), s.to_string(), g.to_string()),
+        _ => return Err(unauthorized("missing wire-auth headers")),
+    };
+    let stamp_ms = match stamp.parse::<u64>() {
+        Ok(s) => s,
+        Err(_) => return Err(unauthorized("bad stamp")),
+    };
+    let auth = crate::signing::WireAuth { pubkey, stamp_ms, sig };
+    if let Err(e) = auth.validate(expected_payload.as_bytes(), reporter_node_id) {
+        tracing::warn!(reporter = %reporter_node_id, error = ?e, "rejected unsigned/forged report");
+        return Err(unauthorized(&format!("wire auth failed: {e:?}")));
+    }
+    Ok(())
+}
+
+fn unauthorized(msg: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": msg})),
+    )
+        .into_response()
+}
+
 /// Peer-submitted fraud evidence. Deduplicated per (reporter, target);
 /// corroborated by ≥2 distinct reporters counting double.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +387,7 @@ pub struct FraudReport {
 
 async fn report_fraud(
     State((registry, _ttl_ms)): State<Shared>,
+    headers: axum::http::HeaderMap,
     Json(rep): Json<FraudReport>,
 ) -> Response {
     if rep.node_id == rep.reporter || rep.reporter.is_empty() || rep.node_id.is_empty() {
@@ -341,6 +403,29 @@ async fn report_fraud(
             Json(serde_json::json!({"error": "unknown fraud kind"})),
         )
             .into_response();
+    }
+    // Wire auth: the client already signs `jerith-fraud1|{stamp}|{kind}|{reporter}|{target}`
+    // (bootstrap.rs report_fraud) — the server now actually verifies it.
+    // Without this check anyone on the internet could anonymous-slash any
+    // peer's reputation (each distinct reporter name costs the target a
+    // full penalty, and attacker-chosen names are free).
+    let stamp = match headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+        Some(s) => s,
+        None => return unauthorized("missing or malformed stamp"),
+    };
+    let payload = format!(
+        "jerith-fraud1|{stamp}|{}|{}|{}",
+        match rep.kind {
+            FraudKind::FailedWorker => "failed_worker",
+            FraudKind::Leeching => "leeching",
+            FraudKind::DishonestResults => "dishonest_results",
+            FraudKind::RateAbuse => "rate_abuse",
+        },
+        rep.reporter,
+        rep.node_id,
+    );
+    if let Err(resp) = verify_report_auth(&headers, &rep.reporter, &payload) {
+        return resp;
     }
     let mut entries = registry.entries.write().await;
     let Some(entry) = entries.get_mut(&rep.node_id) else {
@@ -559,22 +644,27 @@ mod tests {
             .await
             .unwrap();
 
-        // First vote: not evicted.
+        // First vote (signed by a different node's identity): not evicted.
+        let (r_id, _ra) = make_peer("glm-5.3");
+        let _ = _ra; // reporter identity comes from make_peer; r_id signs
+        let reporter = r_id.node_id();
         let r: serde_json::Value = client
             .post(format!("{base}/v1/report-dead"))
-            .json(&serde_json::json!({"node_id": a.node_id}))
+            .headers(dead_report_headers(&r_id, &reporter, &a.node_id))
+            .json(&serde_json::json!({"node_id": a.node_id, "reporter": reporter}))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert_eq!(r["evicted"], false);
+        assert_eq!(r["evicted"], false, "first signed vote must not evict");
 
         // Second vote: evicted.
         let r: serde_json::Value = client
             .post(format!("{base}/v1/report-dead"))
-            .json(&serde_json::json!({"node_id": a.node_id}))
+            .headers(dead_report_headers(&r_id, &reporter, &a.node_id))
+            .json(&serde_json::json!({"node_id": a.node_id, "reporter": reporter}))
             .send()
             .await
             .unwrap()
@@ -693,6 +783,44 @@ mod tests {
         h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
         h.insert("x-jerith-sig", auth.sig.parse().unwrap());
         h
+    }
+
+    /// Signed headers for the report endpoints (payload built by caller):
+    /// `report_signed_headers(&id, reporter, target, is_fraud...)` signs
+    /// the dead-report canonical payload; fraud tests build their own
+    /// `jerith-fraud1` payload via `signed_headers_for`.
+    fn signed_headers_for(
+        id: &crate::signing::SigningIdentity,
+        payload: &str,
+    ) -> axum::http::HeaderMap {
+        let stamp = crate::bootstrap::now_ms();
+        let auth = crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
+        h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+        h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+        h
+    }
+
+    fn dead_report_headers(
+        id: &crate::signing::SigningIdentity,
+        reporter: &str,
+        target: &str,
+    ) -> axum::http::HeaderMap {
+        let stamp = crate::bootstrap::now_ms();
+        let payload = crate::signing::dead_payload(reporter, target, stamp);
+        signed_headers_for(id, &payload)
+    }
+
+    fn fraud_report_headers(
+        id: &crate::signing::SigningIdentity,
+        kind_str: &str,
+        reporter: &str,
+        target: &str,
+    ) -> axum::http::HeaderMap {
+        let stamp = crate::bootstrap::now_ms();
+        let payload = format!("jerith-fraud1|{stamp}|{kind_str}|{reporter}|{target}");
+        signed_headers_for(id, &payload)
     }
 
     #[tokio::test]
@@ -832,6 +960,35 @@ mod tests {
         a.node_id
     }
 
+    /// POST a fraud report with the reporter's wire-auth headers. The
+    /// server now verifies signatures, so tests (and the real client in
+    /// bootstrap.rs) must sign `jerith-fraud1|stamp|{kind}|{reporter}|{target}`.
+    async fn post_fraud(
+        client: &reqwest::Client,
+        base: &str,
+        reporter_id: &crate::signing::SigningIdentity,
+        kind_str: &str,
+        target: &str,
+    ) -> reqwest::Response {
+        let reporter_name = reporter_id.node_id();
+        let stamp = crate::bootstrap::now_ms();
+        let payload = format!("jerith-fraud1|{stamp}|{kind_str}|{reporter_name}|{target}");
+        let auth = crate::signing::WireAuth::with_stamp(reporter_id, stamp, payload.as_bytes());
+        client
+            .post(format!("{base}/v1/report-fraud"))
+            .header("x-jerith-pubkey", auth.pubkey.clone())
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", auth.sig.clone())
+            .json(&serde_json::json!({
+                "node_id": target,
+                "reporter": reporter_name,
+                "kind": kind_str,
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn fraud_reports_penalize_and_halt() {
         let registry = Arc::new(Registry::default());
@@ -850,19 +1007,11 @@ mod tests {
         async fn post(
             client: &reqwest::Client,
             base: &str,
+            reporter_sig: &crate::signing::SigningIdentity,
+            kind_str: &str,
             target: &str,
-            reporter_id: &str,
         ) -> reqwest::Response {
-            client
-                .post(format!("{base}/v1/report-fraud"))
-                .json(&serde_json::json!({
-                    "node_id": target,
-                    "reporter": reporter_id,
-                    "kind": "failed_worker",
-                }))
-                .send()
-                .await
-                .unwrap()
+            post_fraud(client, base, reporter_sig, kind_str, target).await
         }
 
         // Self-report rejected.
@@ -881,7 +1030,7 @@ mod tests {
         // First report: -30 → already past the halt threshold (-20): a
         // single corroborated-or-not failed-worker signal stops mesh
         // dispatches immediately.
-        let v: serde_json::Value = post(&client, &base, &target, &r1.node_id())
+        let v: serde_json::Value = post(&client, &base, &r1, "failed_worker", &target)
             .await
             .json()
             .await
@@ -890,7 +1039,7 @@ mod tests {
         assert_eq!(v["halted"], true);
 
         // Same reporter repeats: deduped, no double penalty.
-        let v: serde_json::Value = post(&client, &base, &target, &r1.node_id())
+        let v: serde_json::Value = post(&client, &base, &r1, "failed_worker", &target)
             .await
             .json()
             .await
@@ -898,7 +1047,7 @@ mod tests {
         assert_eq!(v["score"], -30);
 
         // Second distinct reporter (corroboration): another -30 → -60 → halted.
-        let v: serde_json::Value = post(&client, &base, &target, &r2.node_id())
+        let v: serde_json::Value = post(&client, &base, &r2, "failed_worker", &target)
             .await
             .json()
             .await
@@ -919,32 +1068,16 @@ mod tests {
 
         // Different fraud kind adds a separate penalty once.
         let r3 = crate::signing::SigningIdentity::generate();
-        let v: serde_json::Value = client
-            .post(format!("{base}/v1/report-fraud"))
-            .json(&serde_json::json!({
-                "node_id": target,
-                "reporter": r3.node_id(),
-                "kind": "dishonest_results",
-            }))
-            .send()
+        let v: serde_json::Value = post_fraud(&client, &base, &r3, "dishonest_results", &target)
             .await
-            .unwrap()
             .json()
             .await
             .unwrap();
         assert_eq!(v["score"], -100); // -60 - 40, at the -25... floor check below
 
         // Floor: beyond it never goes.
-        let v2: serde_json::Value = client
-            .post(format!("{base}/v1/report-fraud"))
-            .json(&serde_json::json!({
-                "node_id": target,
-                "reporter": r2.node_id(),
-                "kind": "rate_abuse",
-            }))
-            .send()
+        let v2: serde_json::Value = post_fraud(&client, &base, &r2, "rate_abuse", &target)
             .await
-            .unwrap()
             .json()
             .await
             .unwrap();
@@ -966,16 +1099,8 @@ mod tests {
         let target = seed_live_peer(&registry, &base, &client, &accused).await;
 
         // One fraud report → -30.
-        let _: serde_json::Value = client
-            .post(format!("{base}/v1/report-fraud"))
-            .json(&serde_json::json!({
-                "node_id": target,
-                "reporter": reporter.node_id(),
-                "kind": "leeching",
-            }))
-            .send()
+        let _: serde_json::Value = post_fraud(&client, &base, &reporter, "leeching", &target)
             .await
-            .unwrap()
             .json()
             .await
             .unwrap();
@@ -1004,16 +1129,8 @@ mod tests {
         // Another report from a distinct peer: coroutine applies -20 on top
         // of -20 (decay is 0 immediately) → -40.
         let corroborator = crate::signing::SigningIdentity::generate();
-        let v: serde_json::Value = client
-            .post(format!("{base}/v1/report-fraud"))
-            .json(&serde_json::json!({
-                "node_id": target,
-                "reporter": corroborator.node_id(),
-                "kind": "leeching",
-            }))
-            .send()
+        let v: serde_json::Value = post_fraud(&client, &base, &corroborator, "leeching", &target)
             .await
-            .unwrap()
             .json()
             .await
             .unwrap();
@@ -1021,16 +1138,8 @@ mod tests {
 
         // Old reporter repeats after re-advertise: still deduped (history
         // carried across).
-        let v: serde_json::Value = client
-            .post(format!("{base}/v1/report-fraud"))
-            .json(&serde_json::json!({
-                "node_id": target,
-                "reporter": reporter.node_id(),
-                "kind": "leeching",
-            }))
-            .send()
+        let v: serde_json::Value = post_fraud(&client, &base, &reporter, "leeching", &target)
             .await
-            .unwrap()
             .json()
             .await
             .unwrap();

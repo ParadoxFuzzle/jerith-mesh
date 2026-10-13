@@ -102,6 +102,12 @@ impl Gateway {
 }
 
 /// skill: memory.embed — embed + store text locally. Never leaves the node.
+/// Input size is bounded: persistence-backed SQLite rows (plus whatever
+/// embed provider round-trip the text takes) mean an unbounded POST here
+/// would let one caller pin disk + sqlite locks. cap matches the archiver
+/// note scale; larger callers must chunk.
+const MEMORY_EMBED_TEXT_CAP_CHARS: usize = 64_000;
+
 async fn skill_memory_embed(
     State(gw): State<Arc<Gateway>>,
     Json(body): Json<Value>,
@@ -119,6 +125,20 @@ async fn skill_memory_embed(
             Json(json!({"error": "field 'text' is required"})),
         )
             .into_response();
+    };
+    let text = match text.chars().count() {
+        n if n <= MEMORY_EMBED_TEXT_CAP_CHARS => text,
+        _ => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({
+                    "error": format!(
+                        "text exceeds {MEMORY_EMBED_TEXT_CAP_CHARS} chars — chunk large documents"
+                    )
+                })),
+            )
+                .into_response()
+        }
     };
     match memory.embed_and_store(text).await {
         Ok((id, provider)) => (

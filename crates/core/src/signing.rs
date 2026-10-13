@@ -22,6 +22,7 @@ use crate::bootstrap::{now_ms, PeerAd};
 pub const ADV_PREFIX: &str = "jerith-adv1";
 pub const PING_PREFIX: &str = "jerith-ping1";
 pub const HEALTH_PREFIX: &str = "jerith-health1";
+pub const DEAD_PREFIX: &str = "jerith-dead1";
 
 /// Max acceptable age for a stamp (advertisement TTL is 90 s; the stamp
 /// window is tighter to block replays).
@@ -110,6 +111,13 @@ pub fn legacy_ad_excerpt(ad: &PeerAd, stamp_ms: u64) -> String {
         ad.last_seen_ms,
         role_str(ad.role),
     )
+}
+
+/// Canonical dead-report payload. Reports that can EVICT a peer from the
+/// registry must be attributed: reporter signs `prefix|stamp|target`, and
+/// the bootstrap verifies before counting a vote.
+pub fn dead_payload(reporter_node_id: &str, target_node_id: &str, stamp_ms: u64) -> String {
+    format!("{DEAD_PREFIX}|{stamp_ms}|{reporter_node_id}|{target_node_id}")
 }
 
 fn role_str(role: crate::config::NodeRole) -> &'static str {

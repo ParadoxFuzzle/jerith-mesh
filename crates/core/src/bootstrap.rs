@@ -271,11 +271,24 @@ impl BootstrapClient {
     }
 
     /// Report that a peer is dead (so the bootstrap deprecates it globally).
-    pub async fn report_dead(&self, node_id: &str) -> anyhow::Result<()> {
+    /// Signed: the bootstrap now requires `jerith-dead1|stamp|reporter|target`
+    /// wire-auth headers and refuses unsigned eviction votes (fail-closed).
+    pub async fn report_dead(
+        &self,
+        node_id: &str,
+        reporter_node_id: &str,
+        identity: &crate::signing::SigningIdentity,
+    ) -> anyhow::Result<()> {
+        let stamp = now_ms();
+        let payload = crate::signing::dead_payload(reporter_node_id, node_id, stamp);
+        let auth = crate::signing::WireAuth::with_stamp(identity, stamp, payload.as_bytes());
         let url = format!("{}/v1/report-dead", self.base_url.trim_end_matches('/'));
         self.inner
             .post(&url)
-            .json(&serde_json::json!({ "node_id": node_id }))
+            .json(&serde_json::json!({ "node_id": node_id, "reporter": reporter_node_id }))
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
             .send()
             .await?
             .error_for_status()?;

@@ -478,7 +478,11 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             reg.record_ping_fail(node_id);
             if was_alive && reg.state_of(node_id) == Some(PeerState::Deprecated) {
                 tracing::warn!(node = %node_id, "peer deprecated");
-                let _ = bootstrap.report_dead(node_id).await;
+                // Signed report (bootstrap now requires wire auth to count
+                // eviction votes).
+                let _ = bootstrap
+                    .report_dead(node_id, &state.identity.node_id(), &state.identity)
+                    .await;
             }
         }
         drop(reg);
