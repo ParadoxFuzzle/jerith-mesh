@@ -634,10 +634,57 @@ mod tests {
         assert!(list.peers.is_empty(), "expired entry must drop from the list");
     }
 
+    /// Regression test for the ms-boundary stamp race: rapid freshly-signed
+    /// advertises must ALL succeed. The pre-fix pattern (payload built with
+    /// one now_ms(), auth stamped with a second now_ms()) rejected ~1-in-many
+    /// requests whenever two clock reads straddled a millisecond, which
+    /// surfaced as the flaky reputation test under parallel load.
+    #[tokio::test]
+    async fn advertise_survives_rapid_freshly_signed_requests() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let id = crate::signing::SigningIdentity::generate();
+
+        const ROUNDS: usize = 50;
+        for round in 0..ROUNDS {
+            let a = PeerAd {
+                node_id: id.node_id(),
+                address: "127.0.0.1:9000".into(),
+                model_id: "glm-5.3".into(),
+                quant: "int4".into(),
+                contribution_percent: 30,
+                rpc_address: String::new(),
+                last_seen_ms: now_ms(),
+                role: NodeRole::Hybrid,
+            };
+            let r = client
+                .put(format!("{base}/v1/advertise"))
+                .headers(signed_headers(&id, &a))
+                .json(&a)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                r.status().is_success(),
+                "round {round}/{ROUNDS}: freshly-signed advertise was rejected ({}) — stamp race regression",
+                r.status()
+            );
+        }
+    }
+
     fn signed_headers(id: &crate::signing::SigningIdentity, a: &PeerAd) -> axum::http::HeaderMap {
         let stamp = crate::bootstrap::now_ms();
         let payload = crate::signing::advertise_payload(a, stamp);
-        let auth = crate::signing::WireAuth::now(id, payload.as_bytes());
+        // Stamp frozen: the flaky predecessor used WireAuth::now, which
+        // re-read the clock and signed a payload whose embedded stamp could
+        // differ from the header stamp by 1 ms under load → intermittent
+        // 401s. See signing::WireAuth::with_stamp.
+        let auth = crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
         let mut h = axum::http::HeaderMap::new();
         h.insert(
             "x-jerith-pubkey",

@@ -157,6 +157,23 @@ impl WireAuth {
         }
     }
 
+    /// Sign with an explicit, single-sourced stamp.
+    ///
+    /// REQUIRED whenever the message payload itself embeds the stamp (the
+    /// canonical advertise/ping/health/fraud payloads all do): the verifying
+    /// side rebuilds the payload from `stamp_ms`, so a caller that computes
+    /// the payload with one `now_ms()` and then calls `now()` — which stamps
+    /// AGAIN — signs a different byte-stream than the header claims when the
+    /// two clock reads straddle a millisecond boundary. Under load (parallel
+    /// tests, busy runtimes) that race produced intermittent 401s.
+    pub fn with_stamp(identity: &SigningIdentity, stamp_ms: u64, msg: &[u8]) -> Self {
+        Self {
+            pubkey: identity.pubkey_hex(),
+            stamp_ms,
+            sig: identity.sign(msg),
+        }
+    }
+
     /// Validate freshness + signature + node_id binding.
     /// `expected_node_id`: the identity the peer claims (its node_id must
     /// equal the pubkey fingerprint).

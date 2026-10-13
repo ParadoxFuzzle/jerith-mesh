@@ -392,7 +392,10 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
         let started = std::time::Instant::now();
         let stamp = now_ms();
         let payload = crate::signing::ping_payload(&my_id, &node_id, stamp);
-        let auth = crate::signing::WireAuth::now(&state.identity, payload.as_bytes());
+        // Freeze the stamp: the payload embeds it, so the header stamp and
+        // the signed bytes must come from the SAME clock read (ms-boundary
+        // races under load made pings intermittently rejected).
+        let auth = crate::signing::WireAuth::with_stamp(&state.identity, stamp, payload.as_bytes());
         let result = client
             .get(&url)
             .header("x-jerith-pubkey", &auth.pubkey)

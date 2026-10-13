@@ -255,7 +255,9 @@ impl BootstrapClient {
         let url = format!("{}/v1/advertise", self.base_url.trim_end_matches('/'));
         let stamp = now_ms();
         let payload = crate::signing::advertise_payload(ad, stamp);
-        let auth = crate::signing::WireAuth::now(identity, payload.as_bytes());
+        // Stamp frozen (see signing::WireAuth::with_stamp — the payload
+        // embeds the stamp; two clock reads race at ms boundaries).
+        let auth = crate::signing::WireAuth::with_stamp(identity, stamp, payload.as_bytes());
         self.inner
             .put(&url)
             .json(ad)
@@ -304,7 +306,8 @@ impl BootstrapClient {
             reporter_node_id,
             target_node_id,
         );
-        let auth = crate::signing::WireAuth::now(identity, payload.as_bytes());
+        // Stamp frozen with the payload (see signing::WireAuth::with_stamp).
+        let auth = crate::signing::WireAuth::with_stamp(identity, stamp, payload.as_bytes());
         let url = format!("{}/v1/report-fraud", self.base_url.trim_end_matches('/'));
         let resp = self
             .inner
