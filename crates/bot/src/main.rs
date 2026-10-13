@@ -62,7 +62,24 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = BotConfig::load()?;
+    let mut cfg = BotConfig::load()?;
+    // Persona fallback: personality lives in `~/.jerith-mesh/persona.md`
+    // (distilled from the migrated SOUL/IDENTITY/USER/USER_MODEL docs) when
+    // neither `JERITH_PERSONA` nor bot.toml's `system_prompt` was set. This
+    // is what makes the bot answer as Jerith instead of as a nameless model.
+    if cfg.system_prompt.is_none() {
+        let path = config::persona_file_path();
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            cfg.system_prompt = Some(config::cap_system_prompt(&raw, config::PERSONA_MAX_CHARS));
+            let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+            tracing::info!(file = %path.display(), chars, "persona system prompt loaded");
+        } else {
+            tracing::info!(
+                file = %path.display(),
+                "no persona file and no system_prompt configured — bot chats without a persona"
+            );
+        }
+    }
     let state = new_state();
     // Restore the persisted mine tally + chat history (best-effort: a
     // missing or corrupt file means a fresh tally, never a failed startup).

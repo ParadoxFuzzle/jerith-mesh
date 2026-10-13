@@ -59,13 +59,42 @@ fn client() -> reqwest::Client {
 
 /// POST /v1/chat/completions on the gateway. Returns the assistant text plus
 /// the `mesh_fallback` node id when the mesh (not the local runtime) served it.
+/// Message assembly for every chat shape the bot produces (`/ask`, DM and
+/// @mention fallbacks share this path). A persona system prompt goes first,
+/// then the conversation history, then the caller's prompt. Pure fn — tests
+/// cover ordering without a network or framework.
+pub fn build_messages(
+    history: &[Value],
+    prompt: &str,
+    persona: Option<&str>,
+) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::with_capacity(history.len() + 2);
+    if let Some(p) = persona.map(str::trim).filter(|p| !p.is_empty()) {
+        messages.push(json!({"role": "system", "content": p}));
+    }
+    messages.extend(history.iter().cloned());
+    messages.push(json!({"role": "user", "content": prompt}));
+    messages
+}
+
 pub async fn chat(
     cfg: &crate::config::BotConfig,
     prompt: &str,
     history: &[Value],
 ) -> Result<(String, Option<String>)> {
-    let mut messages = history.to_vec();
-    messages.push(json!({"role": "user", "content": prompt}));
+    // Guard screening covers user-side content only: history + prompt. The
+    // persona system prompt is operator-owned static config and is attached
+    // AFTER screening — the Guard's PII redaction could otherwise mangle
+    // the owner's own security rules (e.g. IDs defined in bot.toml / SOUL)
+    // that the persona quotes verbatim.
+    let mut messages = build_messages(history, prompt, None);
+
+    // Jerith Guard: screen OUTBOUND content before any provider call
+    // (defense in depth — the gateway screens too, but the bot token can
+    // point at any operator-chosen gateway URL, and the reply in Discord
+    // should cite the blocking rule directly without a round-trip).
+    // PIIs (emails/phones) are redacted in place; SSNs/cards/credentials
+    // and injection / malware-shape prompts hard-block.
 
     // Jerith Guard: screen OUTBOUND content before any provider call
     // (defense in depth — the gateway screens too, but the bot token can
@@ -88,6 +117,15 @@ pub async fn chat(
                 // gateway's own screening, never to a failed bot.
                 tracing::warn!(error = %e, "bot guard config invalid — screening skipped for this call");
             }
+        }
+    }
+
+    // Persona goes first, after user-side screening (see above). The bot
+    // answering "as Jerith" is exactly this message.
+    if let Some(p) = cfg.system_prompt.as_deref() {
+        let p = p.trim();
+        if !p.is_empty() {
+            messages.insert(0, json!({"role": "system", "content": p}));
         }
     }
 
@@ -411,6 +449,32 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_messages_places_persona_first_without_dupes() {
+        let history = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hey"}),
+        ];
+        let out = build_messages(&history, "who are you?", Some("You are Jerith.\n"));
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], json!("system"));
+        assert_eq!(out[0]["content"], json!("You are Jerith."));
+        assert_eq!(out[1]["role"], json!("user"));
+        assert_eq!(out[2]["role"], json!("assistant"));
+        assert_eq!(out[3]["role"], json!("user"));
+        assert_eq!(out[3]["content"], json!("who are you?"));
+    }
+
+    #[test]
+    fn build_messages_without_persona_skips_system() {
+        let out = build_messages(&[], "asf", None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], json!("user"));
+        // Whitespace-only persona is treated as absent.
+        let out = build_messages(&[], "asf", Some("   "));
+        assert_eq!(out.len(), 1);
+    }
 
     #[test]
     fn model_resolution_pulls_advertised_model() {
