@@ -286,6 +286,24 @@ impl ExpertRouter {
         Err(last_err)
     }
 
+    /// Collapse consecutive duplicate turns in a chat history before it
+    /// rides the mesh wire. OpenAI clients replay their whole history every
+    /// request, and retries/restored sessions can duplicate the tail turns;
+    /// the fallback dial loop then re-sends that array to *every* peer it
+    /// tries. Only back-to-back exact matches collapse to one — non-adjacent
+    /// repeats are kept (they can be intentional exemplar turns). The local
+    /// runtime path stays verbatim: dedup is a mesh-bandwidth concern only.
+    pub fn compact_chat_history(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+        for m in messages {
+            match out.last() {
+                Some(prev) if prev == m => continue, // consecutive duplicate turn
+                _ => out.push(m.clone()),
+            }
+        }
+        out
+    }
+
     /// QUIC-backed dispatch: same candidate plan, but remote candidates
     /// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
     /// `local_run` computes locally when the plan's first candidate is
@@ -333,7 +351,7 @@ impl ExpertRouter {
             };
             let mut req = NodeRpcRequest::ChatQuery {
                 req_id: req_id.to_string(),
-                messages: messages.to_vec(),
+                messages: Self::compact_chat_history(messages),
                 from_node_id: identity.node_id(),
                 stamp_ms: 0,
                 sig: String::new(),
@@ -2057,6 +2075,46 @@ mod tests {
             let content = self.content.clone();
             Box::pin(async move { Ok(content) })
         }
+    }
+
+    #[test]
+    fn compact_chat_history_collapses_consecutive_dups() {
+        // Back-to-back identical turns collapse to one — the retry tail and
+        // restored-session cases the mesh fallback re-dials peer by peer.
+        let dups = vec![
+            serde_json::json!({"role": "system", "content": "u are mesh"}),
+            serde_json::json!({"role": "system", "content": "u are mesh"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "mesh hello"}),
+        ];
+        let out = ExpertRouter::compact_chat_history(&dups);
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.iter().map(|m| m["role"].clone()).collect::<Vec<_>>(),
+            vec!["system", "user", "assistant"]
+        );
+
+        // Non-adjacent repeats are intentional history — kept verbatim.
+        let spaced = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "mesh hello"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        assert_eq!(ExpertRouter::compact_chat_history(&spaced).len(), 3);
+
+        // Empty and single-message inputs pass through untouched.
+        assert!(ExpertRouter::compact_chat_history(&[]).is_empty());
+        let one = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        assert_eq!(ExpertRouter::compact_chat_history(&one), one);
+
+        // Same text with a different role is NOT a duplicate turn.
+        let roles = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "hi"}),
+        ];
+        assert_eq!(ExpertRouter::compact_chat_history(&roles).len(), 2);
     }
 
     #[tokio::test]
