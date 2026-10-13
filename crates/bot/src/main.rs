@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.system_prompt.is_none() {
         let path = config::persona_file_path();
         if let Ok(raw) = std::fs::read_to_string(&path) {
-            cfg.system_prompt = Some(config::cap_system_prompt(&raw, config::PERSONA_MAX_CHARS));
+            cfg.system_prompt = Some(raw.trim().to_string());
             let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
             tracing::info!(file = %path.display(), chars, "persona system prompt loaded");
         } else {
@@ -79,6 +79,29 @@ async fn main() -> anyhow::Result<()> {
                 "no persona file and no system_prompt configured — bot chats without a persona"
             );
         }
+    }
+    // Known users: the jerith_people PostgreSQL database, exported live by
+    // the site cron (people + profile facts + trust levels + identity
+    // links). Appended to whatever persona the bot ended up with — this is
+    // the "reading its database" step the OpenClaw gateway did implicitly.
+    {
+        let path = config::known_users_file_path();
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let section = format!(
+                "\n\n## Known users (live export of the jerith_people database)\n\n{}",
+                raw.trim()
+            );
+            cfg.system_prompt = Some(match cfg.system_prompt.take() {
+                Some(existing) => format!("{existing}{section}"),
+                None => section,
+            });
+            let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+            tracing::info!(file = %path.display(), chars, "known-users database view appended to persona");
+        }
+    }
+    // Cap once, on the combined prompt (persona + known users together).
+    if let Some(p) = cfg.system_prompt.as_mut() {
+        *p = config::cap_system_prompt(p, config::PERSONA_MAX_CHARS);
     }
     let state = new_state();
     // Restore the persisted mine tally + chat history (best-effort: a

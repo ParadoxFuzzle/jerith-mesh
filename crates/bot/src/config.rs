@@ -28,10 +28,11 @@ pub const ANNOUNCE_CHANNEL_ENV: &str = "JERITH_ANNOUNCE_CHANNEL_ID";
 /// Inline persona/system prompt env var (wins over bot.toml + persona.md).
 pub const PERSONA_ENV: &str = "JERITH_PERSONA";
 /// Context budget for auto-loaded persona files (chars, not bytes).
-/// The composed live persona is ~10.4k chars and the runtime (qwen3:8b via
-/// LiteLLM/Ollama) exposes a 262k context — 16k leaves real headroom for a
-/// growing persona while still fencing pathological files.
-pub const PERSONA_MAX_CHARS: usize = 16000;
+/// The composed live persona (~10.4k) plus the known-users export (~5.3k)
+/// both ride under this, and the runtime (qwen3:8b via LiteLLM/Ollama)
+/// exposes a 262k context — 32k fences pathological files without ever
+/// being the binding constraint.
+pub const PERSONA_MAX_CHARS: usize = 32000;
 
 /// Default gateway URL: the local node's gateway port.
 pub const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8900";
@@ -133,6 +134,15 @@ pub fn token_file_path() -> PathBuf {
 pub fn persona_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".jerith-mesh").join("persona.md")
+}
+
+/// `~/.jerith-mesh/known-users.md` — live export of the `jerith_people`
+/// PostgreSQL database (site cron, every 5 min). Appended to the persona
+/// so the bot reads its people registry — the individual-user recognition
+/// source the OpenClaw gateway used to provide.
+pub fn known_users_file_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".jerith-mesh").join("known-users.md")
 }
 
 /// Cap a persona system prompt so an oversized persona file can never blow
