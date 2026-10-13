@@ -17,8 +17,11 @@
 
 /// Vision model: small, cheap, image-tuned ( interchangeable via config).
 pub const DEFAULT_VISION_MODEL: &str = "minicpm-v4.6:1b";
-/// Deep model: large reasoning tier for complex prompts.
-pub const DEFAULT_DEEP_MODEL: &str = "qwen3:30b";
+/// Deep model: the reasoning tier for complex prompts. Deliberately the
+/// same 8B by default: the 30B was measured to pin ~100% CPU for minutes
+/// on the typical operator box (a machine the owner actually uses), so
+/// raising the tier is an explicit per-node config choice, not a default.
+pub const DEFAULT_DEEP_MODEL: &str = "qwen3:8b";
 
 /// Total text across the conversation beyond which a prompt counts as
 /// "complex" (roughly: more than a screenful of live content).
@@ -160,11 +163,14 @@ pub fn reroute_for_gateway(
     } else {
         requested
     };
-    match route(messages, Some(anchor)) {
+    let next = match route(messages, Some(anchor)) {
         Some("vision") => Some(tiers.vision.clone()),
         Some("deep") => Some(tiers.deep.clone()),
         _ => None,
-    }
+    };
+    // A tier resolving to the model the caller already sent is a no-op —
+    // suppress the rewrite (and the misleading reroute journal line).
+    next.filter(|n| *n != requested)
 }
 
 #[cfg(test)]
@@ -205,12 +211,33 @@ mod tests {
         );
     }
 
+    /// Tiers whose deep model differs from the base — the realistic
+    /// upgraded-node configuration worth testing reroute behavior for.
+    fn upgraded_tiers() -> RouterModels {
+        RouterModels {
+            deep: "qwen3-large-test".to_string(),
+            ..RouterModels::default()
+        }
+    }
+
     #[test]
     fn long_conversation_routes_to_deep() {
         let msgs = vec![json!({"role": "user", "content": "x".repeat(DEEP_MIN_CHARS)})];
         assert_eq!(
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            Some("qwen3-large-test".to_string())
+        );
+    }
+
+    #[test]
+    fn deep_tier_equal_to_base_is_a_suppressed_no_op() {
+        // Default config: deep == base (the 30B was dropped — it pinned
+        // whole CPU cores). Complex prompts then keep the caller's model
+        // with NO rewrite (and no misleading journal line).
+        let msgs = vec![json!({"role": "user", "content": "x".repeat(DEEP_MIN_CHARS)})];
+        assert_eq!(
             reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
-            Some("qwen3:30b".to_string())
+            None
         );
     }
 
@@ -221,8 +248,8 @@ mod tests {
         )];
         assert!(is_complex(&msgs));
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
-            Some("qwen3:30b".to_string())
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            Some("qwen3-large-test".to_string())
         );
     }
 
@@ -232,8 +259,8 @@ mod tests {
             {"role": "user", "content": "compare mentors [DEEP]"}
         )];
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
-            Some("qwen3:30b".to_string())
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            Some("qwen3-large-test".to_string())
         );
     }
 
@@ -243,8 +270,8 @@ mod tests {
             .map(|i| json!({"role": "user", "content": format!("question {i}")}))
             .collect();
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
-            Some("qwen3:30b".to_string())
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            Some("qwen3-large-test".to_string())
         );
     }
 
@@ -275,12 +302,12 @@ mod tests {
             {"role": "user", "content": "Refactor the whole module [deep]"}
         )];
         assert_eq!(
-            reroute_for_gateway(Some("jerith-mesh"), Some("qwen3:8b"), &complex, &tiers()),
-            Some("qwen3:30b".to_string())
+            reroute_for_gateway(Some("jerith-mesh"), Some("qwen3:8b"), &complex, &upgraded_tiers()),
+            Some("qwen3-large-test".to_string())
         );
         assert_eq!(
-            reroute_for_gateway(None, Some("qwen3:8b"), &complex, &tiers()),
-            Some("qwen3:30b".to_string())
+            reroute_for_gateway(None, Some("qwen3:8b"), &complex, &upgraded_tiers()),
+            Some("qwen3-large-test".to_string())
         );
     }
 
