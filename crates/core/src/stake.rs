@@ -540,7 +540,7 @@ async fn stake_get(url: &str, token: &str) -> anyhow::Result<(u16, serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CryptoChain, NodeRole};
+    use crate::config::CryptoChain;
 
     fn crypto(required_uj: u64) -> CryptoConfig {
         CryptoConfig {

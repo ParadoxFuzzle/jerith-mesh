@@ -693,21 +693,6 @@ mod tests {
     use super::*;
     use crate::bootstrap::DEPRECATE_AFTER_FAILED_PINGS;
     use crate::config::*;
-    use crate::models::{ModelId, ModelSource};
-
-    fn cfg(model_id: Option<&str>) -> NodeConfig {
-        let mut c = NodeConfig::default();
-        c.node_id = "self".into();
-        c.ensure_identity().unwrap();
-        if let Some(id) = model_id {
-            c.model = Some(ModelId {
-                id: id.into(),
-                quant: "int4".into(),
-                source: ModelSource::Curated,
-            });
-        }
-        c
-    }
 
     #[test]
     fn meters_snapshot_resets() {
