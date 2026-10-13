@@ -115,11 +115,25 @@ if [ -d "$CLIENT_ROOT/workspace/scripts" ]; then
   rsync -a "$CLIENT_ROOT/workspace/scripts/" "$MW/scripts/"
   echo "   scripts: $(find "$MW/scripts" -maxdepth 1 -type f | wc -l) files → $MW/scripts"
 fi
-for doc in AGENTS.md IDENTITY.md MEMORY.md SOUL.md DREAMS.md grounding-protocol.md; do
-  if [ -f "$CLIENT_ROOT/workspace/$doc" ]; then
-    cp "$CLIENT_ROOT/workspace/$doc" "$MW/"
-    echo "   doc: $doc copied"
-  fi
+# Top-level workspace markdown: every persona/agent doc present (SOUL,
+# IDENTITY, USER, USER_MODEL, AGENTS, DREAMS, and anything else in *.md)
+# — a fixed-name list silently dropped docs like USER.md whenever the
+# agent stack renamed or grew them.
+for doc in "$CLIENT_ROOT"/workspace/*.md; do
+  [ -f "$doc" ] || continue
+  cp "$doc" "$MW/"
+  echo "   doc: $(basename "$doc") copied"
+done
+# Persona-doc variants kept per directory-scope (osdev/, main/, skills/*/…):
+# same canon names, one copy per scope, relative path preserved.
+for doc in $(find "$CLIENT_ROOT/workspace" -mindepth 2 \( -iname 'SOUL.md' \
+  -o -iname 'IDENTITY.md' -o -iname 'USER.md' -o -iname 'USER_MODEL.md' \
+  -o -iname 'AGENTS.md' -o -iname 'MEMORY.md' -o -iname 'DREAMS.md' \
+  -o -iname 'HEARTBEAT.md' -o -iname 'TOOLS.md' -o -iname 'grounding-protocol.md' \) 2>/dev/null); do
+  rel="${doc#$CLIENT_ROOT/workspace/}"
+  mkdir -p "$MW/$(dirname "$rel")"
+  cp "$doc" "$MW/$rel"
+  echo "   doc: $rel (scope variant) copied"
 done
 if [ -d "$CLIENT_ROOT/workspace/config" ]; then
   rsync -a "$CLIENT_ROOT/workspace/config/" "$MW/config/"
@@ -188,6 +202,78 @@ PY
 } > "$ASSETS_ROOT/workspace-services-manifest.tsv" 2>/dev/null || true
 echo "   workspace services → workspace-services-manifest.tsv"
 
+# Reuse the OpenClaw nightly-dump DB list if you hit a name you want:
+# community_memory jerith_people self_improving jerith mysqlclaw
+
+echo "==> 4c/5 PostgreSQL: detect stack usage, dump all its databases"
+# The OpenClaw memory stack runs PostgreSQL (scripts/shared/pg_pool.py:
+# root@127.0.0.1:5432, auth via ~/.pgpass). Capture the usage + a fresh
+# dump per database so nothing agent-memory-shaped is left behind.
+PG_DIR="$ASSETS_ROOT/postgres"
+mkdir -p "$PG_DIR"
+PGD_HOST="${PGD_HOST:-127.0.0.1}"
+PGD_PORT="${PGD_PORT:-5432}"
+PGD_USER="${PGD_USER:-root}"
+# DBs the migration must not fold into itself: system db + other services'
+# data (nmonit_identity belongs to the nmonit monitoring service).
+PGD_EXCLUDE="${PGD_EXCLUDE:-postgres nmonit_identity}"
+if psql -h "$PGD_HOST" -p "$PGD_PORT" -U "$PGD_USER" -d postgres \
+    -tAc "SELECT 1" >/dev/null 2>&1; then
+  LIVE_DBS=$(psql -h "$PGD_HOST" -p "$PGD_PORT" -U "$PGD_USER" -d postgres \
+      -tAc "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'")
+  dumped=""
+  for db in $LIVE_DBS; do
+    skip=0
+    for ex in $PGD_EXCLUDE; do
+      if [ "$db" = "$ex" ]; then skip=1; fi
+    done
+    if [ "$skip" = "1" ]; then
+      echo "   pg: $db — excluded (separate service/system)"
+      continue
+    fi
+    dump="$PG_DIR/$db.dump"
+    if pg_dump -h "$PGD_HOST" -p "$PGD_PORT" -U "$PGD_USER" -Fc -f "$dump" "$db"; then
+      dumped="$dumped $db"
+      echo "   pg: dumped $db ($(du -h "$dump" | cut -f1))"
+    else
+      echo "   pg: FAILED dumping $db (dump left out — check ~/.pgpass auth)"
+    fi
+  done
+  # Capture the connection details + auth: pgpass carries service:user
+  # passwords and must be 0600 for libpq to accept it.
+  if [ -f "$HOME/.pgpass" ]; then
+    cp "$HOME/.pgpass" "$PG_DIR/pgpass"
+    chmod 600 "$PG_DIR/pgpass"
+    echo "   pg: ~/.pgpass copied (auth for pg_restore)"
+  else
+    echo "   pg: no ~/.pgpass found — restore auth must be provided manually"
+  fi
+  PGDB_INFO=$(python3 - "$PG_DIR" "$PGD_HOST" "$PGD_PORT" "$PGD_USER" $dumped <<'PY'
+import json, os, sys
+a = (list(sys.argv) + [""] * 5)[1:6]
+pg_dir, host, port, user = a[:4]
+dumped = " ".join(sys.argv[5:])
+dbs = []
+for db in dumped.split():
+    p = os.path.join(pg_dir, f"{db}.dump")
+    if os.path.exists(p):
+        dbs.append({"name": db, "dump": os.path.basename(p), "size_bytes": os.path.getsize(p),
+                    "restore": f"pg_restore -h {host} -p {port} -U {user} --clean --if-exists --dbname={db} {p}"})
+json.dump({"source": {"host": host, "port": int(port), "user": user},
+           "auth": "~/.pgpass equivalent staged as pgpass (chmod 600; place at ~/.pgpass and restore works)",
+           "databases": dbs,
+           "note": "nmonit_identity excluded (belongs to the separate nmonit service). "
+                   "These DBs fed the OpenClaw memory stack (community_memory, self_improving, jerith_people…); "
+                   "jerith-mesh itself uses sqlite — restore these only to keep/reharvest agent memory."},
+          open(os.path.join(pg_dir, "databases-manifest.json"), "w"), indent=2)
+print(f"pg manifest: {len(dbs)} databases → databases-manifest.json")
+PY
+)
+  echo "   $PGDB_INFO"
+else
+  echo "   pg: no reachable PostgreSQL at $PGD_HOST:$PGD_PORT as $PGD_USER — skipped (not in use?)"
+fi
+
 echo "==> 5/5 verify"
 sleep 6
 sysctl is-active jerith-node || true
@@ -196,4 +282,6 @@ curl -fsS -m5 http://127.0.0.1:8900/status >/dev/null && echo "   gateway :8900 
 echo
 echo "Done. To undo entirely:"
 echo "  systemctl --user disable --now jerith-bot jerith-node"
-[ -n "$STOPPED" ] && echo "  systemctl --user start$STOPPED  # restore OpenClaw"
+if [ -n "$STOPPED" ]; then
+  echo "  systemctl --user start$STOPPED  # restore OpenClaw"
+fi
