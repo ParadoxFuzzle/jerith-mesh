@@ -25,6 +25,9 @@ pub struct Gateway {
     pub state: Arc<MeshState>,
     /// Base URL of the local Colibri/Ollama runtime.
     pub runtime_url: String,
+    /// Optional bearer key forwarded to the runtime (authed LiteLLM).
+    /// None → runtime calls go out with no Authorization header.
+    pub runtime_api_key: Option<String>,
     /// Optional JER miner (present when crypto chain = JerithChain).
     pub miner: Option<JerithMiner>,
     /// Local memory store backing the memory.* skills.
@@ -270,7 +273,11 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
 async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
     let url = format!("{}/v1/models", gw.runtime_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    match client.get(&url).send().await {
+    let mut req = client.get(&url);
+    if let Some(k) = &gw.runtime_api_key {
+        req = req.bearer_auth(k);
+    }
+    match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or_else(|_| json!({"data": []}));
             (StatusCode::OK, Json(body)).into_response()
@@ -327,12 +334,14 @@ async fn chat_completions(
     );
     let client = reqwest::Client::new();
     let payload = body.to_string();
-    let send = client
+    let mut send = client
         .post(&url)
         .header("content-type", "application/json")
-        .body(payload)
-        .send()
-        .await;
+        .body(payload);
+    if let Some(k) = &gw.runtime_api_key {
+        send = send.bearer_auth(k);
+    }
+    let send = send.send().await;
 
     let resp = match send {
         Ok(r) => r,
@@ -546,6 +555,7 @@ mod tests {
         let gw = Gateway {
             state: state.clone(),
             runtime_url: runtime_url.to_string(),
+            runtime_api_key: None,
             miner: None,
             memory: None,
             mesh_fallback: if fallback {
@@ -570,6 +580,7 @@ mod tests {
         let gw = Gateway {
             state: state.clone(),
             runtime_url: runtime_url.to_string(),
+            runtime_api_key: None,
             miner: None,
             memory: None,
             mesh_fallback: None,

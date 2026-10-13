@@ -769,6 +769,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     let gw = Gateway {
         state: state.clone(),
         runtime_url: cfg.runtime_url.clone(),
+        runtime_api_key: cfg.runtime_api_key.clone(),
         miner,
         memory: memory.clone(),
         mesh_fallback,
@@ -792,7 +793,13 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         .as_ref()
         .map(|m| m.id.clone())
         .unwrap_or_default();
-    match jerith_mesh_core::quic::RuntimeExpert::discover(&cfg.runtime_url, &model_name).await {
+    match jerith_mesh_core::quic::RuntimeExpert::discover(
+        &cfg.runtime_url,
+        &model_name,
+        cfg.runtime_api_key.as_deref(),
+    )
+    .await
+    {
         Ok(handler) => {
             // Identity-bound QUIC cert: the transport cert key IS the node's
             // Ed25519 identity, letting peers pin node_id ↔ cert.
@@ -986,6 +993,7 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             "runtime_url" => cfg.runtime_url = v.to_string(),
+            "runtime_api_key" => cfg.runtime_api_key = Some(v.to_string()),
             "bootstrap_url" => cfg.bootstrap_url = v.to_string(),
             other => bail!("unknown config key {other:?}"),
         }

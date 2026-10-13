@@ -1251,6 +1251,9 @@ pub struct RuntimeExpert {
     pub runtime_url: String,
     /// Model to invoke (mesh model by default).
     pub model: String,
+    /// Optional bearer key for OpenAI-compatible runtimes that require
+    /// auth (e.g. an authed LiteLLM proxy). None → no header is sent.
+    pub api_key: Option<String>,
     /// HTTP client (shared, pooled).
     client: reqwest::Client,
 }
@@ -1258,13 +1261,20 @@ pub struct RuntimeExpert {
 impl RuntimeExpert {
     /// Discover the runtime: probe `{url}/v1/models` and confirm the
     /// requested model is being served. Returns the handler on success.
-    pub async fn discover(runtime_url: &str, model: &str) -> anyhow::Result<Self> {
+    pub async fn discover(
+        runtime_url: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let url = format!("{}/v1/models", runtime_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
-        let resp = client
-            .get(&url)
+        let mut req = client.get(&url);
+        if let Some(k) = api_key {
+            req = req.bearer_auth(k);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("runtime unreachable at {url}: {e}"))?
@@ -1289,6 +1299,7 @@ impl RuntimeExpert {
         Ok(Self {
             runtime_url: runtime_url.to_string(),
             model: model.to_string(),
+            api_key: api_key.map(|k| k.to_string()),
             client,
         })
     }
@@ -1323,6 +1334,7 @@ impl RuntimeExpert {
         let this = Self {
             runtime_url: self.runtime_url.clone(),
             model: self.model.clone(),
+            api_key: self.api_key.clone(),
             client: self.client.clone(),
         };
         let expert_id = expert_id.to_string();
@@ -1340,6 +1352,7 @@ impl RuntimeExpert {
         Self {
             runtime_url: runtime_url.to_string(),
             model: model.to_string(),
+            api_key: None,
             client: reqwest::Client::new(),
         }
     }
@@ -1352,9 +1365,11 @@ impl RuntimeExpert {
         );
         // Never forward a tool/system context we didn't intend; the
         // messages are the caller's privacy-scoped payload verbatim.
-        let resp = self
-            .client
-            .post(&url)
+        let mut req = self.client.post(&url);
+        if let Some(k) = &self.api_key {
+            req = req.bearer_auth(k);
+        }
+        let resp = req
             .json(&serde_json::json!({
                 "model": self.model,
                 "messages": messages,
@@ -1394,9 +1409,11 @@ impl RuntimeExpert {
             "{}/v1/chat/completions",
             self.runtime_url.trim_end_matches('/')
         );
-        let resp = self
-            .client
-            .post(&url)
+        let mut req = self.client.post(&url);
+        if let Some(k) = &self.api_key {
+            req = req.bearer_auth(k);
+        }
+        let resp = req
             .json(&serde_json::json!({
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
@@ -2179,6 +2196,45 @@ mod tests {
             .map(|m| m["role"].as_str().unwrap_or("?").to_string())
             .collect();
         assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+    }
+
+    #[tokio::test]
+    async fn discover_sends_bearer_only_when_configured() {
+        let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = captured.clone();
+        let route_capture = captured.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let sink = route_capture.clone();
+                async move {
+                    *sink.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    axum::Json(serde_json::json!({
+                        "data": [{"id": "glm-5.3-flash"}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Key configured → the Bearer header rides the discovery probe.
+        RuntimeExpert::discover(&base, "glm-5.3-flash", Some("k"))
+            .await
+            .expect("discover succeeds with auth");
+        assert_eq!(sink.lock().unwrap().as_deref(), Some("Bearer k"));
+
+        // No key configured → the header must not appear at all.
+        *captured.lock().unwrap() = None;
+        RuntimeExpert::discover(&base, "glm-5.3-flash", None)
+            .await
+            .expect("discover succeeds without auth");
+        assert!(captured.lock().unwrap().is_none());
     }
 
     #[tokio::test]

@@ -165,6 +165,12 @@ pub struct NodeConfig {
     pub rpc_port: Option<u16>,
     /// Colibri / Ollama base URL to forward chat completions to.
     pub runtime_url: String,
+    /// Optional bearer key for OpenAI-compatible runtimes that enforce
+    /// auth (e.g. a LiteLLM proxy with a master key). None → runtime
+    /// calls (discover, completions, gateway forward) go out with no
+    /// Authorization header, exactly as before.
+    #[serde(default)]
+    pub runtime_api_key: Option<String>,
     /// Phase 4: probability (percent) of redundantly replaying a remote
     /// expert result on a second node before trusting it. Spec range:
     /// 5–15 %; 0 disables replay (commitments always checked).
@@ -205,6 +211,7 @@ impl Default for NodeConfig {
             specialists: SpecialistConfig::default(),
             gateway_port: 8900,
             rpc_port: None,
+            runtime_api_key: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
             ringer_percent: default_ringer_percent(),
