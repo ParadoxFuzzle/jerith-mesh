@@ -28,7 +28,7 @@ use crate::ping::MeshState;
 /// open-endedly; past this bound the request flows into mesh fallback
 /// exactly like a connection failure. Only the header wait is bounded — a
 /// proper SSE body is streamed through without a byte deadline.
-const RUNTIME_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNTIME_HEADERS_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct Gateway {
     pub state: Arc<MeshState>,
@@ -47,6 +47,13 @@ pub struct Gateway {
     /// Jerith Guard: outbound content filter screening every chat payload
     /// before it leaves the node (local forward AND mesh fallback).
     pub guard: Option<Arc<crate::guard::Guard>>,
+    /// Model routing tiers (vision/deep). None → every request forwards
+    /// with the caller's model verbatim.
+    pub model_router: Option<Arc<crate::model_router::RouterModels>>,
+    /// The advertised base model id (from `/status`); requests carrying
+    /// this id — or a placeholder — count as "unpinned" and are eligible
+    /// for rerouting to a tier.
+    pub base_model: Option<String>,
 }
 
 impl Gateway {
@@ -341,6 +348,29 @@ async fn chat_completions(
         "{}/v1/chat/completions",
         gw.runtime_url.trim_end_matches('/')
     );
+    // Model routing: image content → vision tier, complex prompt → deep
+    // tier, basic chat → caller's model untouched. Only *unpinned*
+    // requests (placeholder / advertised base model) are reroutable, so
+    // explicit model choices always win.
+    if let (Some(router), Some(messages)) = (
+        &gw.model_router,
+        body.get("messages").and_then(|m| m.as_array()),
+    ) {
+        let requested = body.get("model").and_then(|m| m.as_str());
+        if let Some(next) = crate::model_router::reroute_for_gateway(
+            requested,
+            gw.base_model.as_deref(),
+            messages,
+            router,
+        ) {
+            tracing::info!(
+                from = requested.unwrap_or("(none)"),
+                to = %next,
+                "model router: rerouted chat request"
+            );
+            body["model"] = serde_json::Value::String(next);
+        }
+    }
     let client = reqwest::Client::builder()
         // Distinguishes "host down" from "host up but wedged": a dead route
         // fails fast here, while a slow/hung runtime is caught by the
@@ -589,6 +619,8 @@ mod tests {
                 None
             },
             guard: None,
+            model_router: None,
+            base_model: None,
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
     }
@@ -610,6 +642,8 @@ mod tests {
             memory: None,
             mesh_fallback: None,
             guard: Some(std::sync::Arc::new(guard)),
+            model_router: None,
+            base_model: None,
         };
         TestServer::new(gw.router().into_make_service()).expect("guarded test server")
     }

@@ -9,6 +9,7 @@ pub mod gateway;
 pub mod guard;
 pub mod hw;
 pub mod memory;
+pub mod model_router;
 pub mod models;
 pub mod ping;
 pub mod quic;

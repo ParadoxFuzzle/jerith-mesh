@@ -1254,6 +1254,11 @@ pub struct RuntimeExpert {
     /// Optional bearer key for OpenAI-compatible runtimes that require
     /// auth (e.g. an authed LiteLLM proxy). None → no header is sent.
     pub api_key: Option<String>,
+    /// Peer-chat tier routing (same policy as the gateway): when set,
+    /// image content routes to the vision model and complex prompts to
+    /// the deep model; base model otherwise. Empty string disables a tier.
+    pub vision_model: Option<String>,
+    pub deep_model: Option<String>,
     /// HTTP client (shared, pooled).
     client: reqwest::Client,
 }
@@ -1300,6 +1305,8 @@ impl RuntimeExpert {
             runtime_url: runtime_url.to_string(),
             model: model.to_string(),
             api_key: api_key.map(|k| k.to_string()),
+            vision_model: None,
+            deep_model: None,
             client,
         })
     }
@@ -1335,6 +1342,8 @@ impl RuntimeExpert {
             runtime_url: self.runtime_url.clone(),
             model: self.model.clone(),
             api_key: self.api_key.clone(),
+            vision_model: self.vision_model.clone(),
+            deep_model: self.deep_model.clone(),
             client: self.client.clone(),
         };
         let expert_id = expert_id.to_string();
@@ -1353,6 +1362,8 @@ impl RuntimeExpert {
             runtime_url: runtime_url.to_string(),
             model: model.to_string(),
             api_key: None,
+            vision_model: None,
+            deep_model: None,
             client: reqwest::Client::new(),
         }
     }
@@ -1369,9 +1380,25 @@ impl RuntimeExpert {
         if let Some(k) = &self.api_key {
             req = req.bearer_auth(k);
         }
+        // Tier routing for peer-dispatched chat: vision for image
+        // content, deep for complex prompts, base model otherwise (a
+        // tier disabled by config `""` never engages).
+        let vision = self.vision_model.as_ref().filter(|s| !s.is_empty());
+        let deep = self.deep_model.as_ref().filter(|s| !s.is_empty());
+        let model = if vision.is_some()
+            && crate::model_router::has_image_content(messages)
+        {
+            vision.unwrap().clone()
+        } else if deep.is_some()
+            && crate::model_router::is_complex(messages)
+        {
+            deep.unwrap().clone()
+        } else {
+            self.model.clone()
+        };
         let resp = req
             .json(&serde_json::json!({
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "max_tokens": 512,
             }))

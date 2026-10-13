@@ -774,6 +774,10 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         memory: memory.clone(),
         mesh_fallback,
         guard,
+        model_router: Some(std::sync::Arc::new(
+            jerith_mesh_core::model_router::RouterModels::default(),
+        )),
+        base_model: cfg.model.as_ref().map(|m| m.id.clone()),
     };
     let app = axum::Router::new()
         .merge(gw.router())
@@ -800,7 +804,11 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     )
     .await
     {
-        Ok(handler) => {
+        Ok(mut handler) => {
+            // Tier routing for peer-dispatched chat (same policy as the
+            // gateway): tiers come from config; an empty string disables one.
+            handler.vision_model = cfg.runtime_vision_model.clone();
+            handler.deep_model = cfg.runtime_deep_model.clone();
             // Identity-bound QUIC cert: the transport cert key IS the node's
             // Ed25519 identity, letting peers pin node_id ↔ cert.
             let rpc_identity = cfg.identity()?;

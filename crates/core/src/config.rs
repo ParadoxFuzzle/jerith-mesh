@@ -171,6 +171,14 @@ pub struct NodeConfig {
     /// Authorization header, exactly as before.
     #[serde(default)]
     pub runtime_api_key: Option<String>,
+    /// Model router: vision tier for image-content chats (see
+    /// `model_router`). Default on; an empty string disables the tier.
+    #[serde(default = "default_vision_router_model")]
+    pub runtime_vision_model: Option<String>,
+    /// Model router: deep tier for complex prompts (reasoning keywords,
+    /// long context, explicit `[deep]` tag). Default on; "" disables.
+    #[serde(default = "default_deep_router_model")]
+    pub runtime_deep_model: Option<String>,
     /// Phase 4: probability (percent) of redundantly replaying a remote
     /// expert result on a second node before trusting it. Spec range:
     /// 5–15 %; 0 disables replay (commitments always checked).
@@ -195,6 +203,14 @@ fn default_ringer_percent() -> u32 {
     10
 }
 
+fn default_vision_router_model() -> Option<String> {
+    Some(crate::model_router::DEFAULT_VISION_MODEL.to_string())
+}
+
+fn default_deep_router_model() -> Option<String> {
+    Some(crate::model_router::DEFAULT_DEEP_MODEL.to_string())
+}
+
 
 
 impl Default for NodeConfig {
@@ -212,6 +228,12 @@ impl Default for NodeConfig {
             gateway_port: 8900,
             rpc_port: None,
             runtime_api_key: None,
+            runtime_vision_model: Some(
+                crate::model_router::DEFAULT_VISION_MODEL.to_string(),
+            ),
+            runtime_deep_model: Some(
+                crate::model_router::DEFAULT_DEEP_MODEL.to_string(),
+            ),
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
             ringer_percent: default_ringer_percent(),
