@@ -40,35 +40,48 @@ pub async fn handle(
     let bot_id = ctx.bot_id().get();
     let is_dm = msg.guild_id.is_none();
 
-    let prompt = match strip_leading_bot_mention(&msg.content, bot_id) {
-        Some(rest) => {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                // Bare "@bot" with no text: answer inline instead of sending
-                // an empty prompt to the gateway.
-                let _ = msg
-                    .channel_id
-                    .say(ctx.serenity_context, HINT)
-                    .await;
-                return Ok(());
-            }
-            // A leading mention that names a real command (@bot /ask hi,
-            // @bot help, …) belongs to the framework: don't double-handle.
-            if first_token_is_command(rest, &ctx.options().commands) {
-                return Ok(());
-            }
-            Some(rest.to_string())
+    // "Contacted" = the bot is mentioned anywhere in the message. The
+    // serenity `mentions` list is authoritative (covers <@id> and <@!id>)
+    // and arrives fully populated in guild channels even without the
+    // privileged message-content intent. `leading` matters for hand-off:
+    // a leading mention naming a real command belongs to the framework.
+    let leading = strip_leading_bot_mention(&msg.content, bot_id).is_some();
+    let contacted = leading
+        || msg.mentions.iter().any(|u| u.id.get() == bot_id);
+
+    let prompt = if !contacted {
+        if is_dm {
+            // Bare DM text (no mention possible medium-less): fully
+            // conversational, like the old agent stack behaved.
+            Some(msg.content.trim().to_string())
+        } else {
+            // Guild message not addressed to us: stay quiet. (Wider
+            // "answer every channel message" would need Discord's
+            // privileged Message Content intent — see the readme.)
+            None
         }
-        None => {
-            if is_dm {
-                // Bare DM text (no mention possible medium-less): fully
-                // conversational, like the old agent stack behaved.
-                Some(msg.content.trim().to_string())
-            } else {
-                // Guild message not addressed to us: stay quiet.
-                None
-            }
+    } else {
+        // Mentioned anywhere in a DM or server: strip every bot-mention
+        // token (leading or mid-sentence) and treat the remainder as the
+        // prompt, so "check @Jerith status ok?" converses naturally.
+        let cleaned = strip_bot_mentions(&msg.content, bot_id).trim().to_string();
+        if cleaned.is_empty() {
+            // Bare "@bot" with no text: answer inline instead of sending an
+            // empty prompt to the gateway.
+            let _ = msg
+                .channel_id
+                .say(ctx.serenity_context, HINT)
+                .await;
+            return Ok(());
         }
+        // A LEADING mention that names a real command (@bot ask hi,
+        // @bot help, …) belongs to the framework: don't double-handle.
+        // Mid-sentence mentions are conversational by definition here —
+        // poise never sees them (it only dispatches on a leading glyph).
+        if leading && first_token_is_command(&cleaned, &ctx.options().commands) {
+            return Ok(());
+        }
+        Some(cleaned)
     };
     let Some(prompt) = prompt else { return Ok(()) };
 
@@ -85,12 +98,16 @@ pub async fn handle(
     let channel = msg.channel_id;
     let state = data.state.clone();
     let cfg = data.cfg.clone();
+    // Individual-user recognition: every turn keeps its speaker, so the
+    // model (whose persona encodes the owner's id) can tell owner from
+    // guests and address people by name across the conversation.
+    let tagged = format!("{}{}", speaker_tag(&msg.author), prompt);
     tokio::spawn(async move {
         show_typing(&http_ctx, channel).await;
         let history = state.history(user);
-        match api::chat(&cfg, &prompt, &history).await {
+        match api::chat(&cfg, &tagged, &history).await {
             Ok((reply, served_by)) => {
-                state.push_turn(user, &prompt, &reply);
+                state.push_turn(user, &tagged, &reply);
                 let text = crate::commands::format_reply(&reply, served_by.as_deref());
                 let _ = send_long(&http_ctx, channel, &text).await;
             }
@@ -128,6 +145,30 @@ fn first_token_is_command(text: &str, commands: &[poise::Command<Data, Error>]) 
         c.name.as_ref().eq_ignore_ascii_case(tok)
             || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(tok))
     })
+}
+
+/// Remove every occurrence of this bot's mention tokens (both `<@id>` and
+/// `<@!id>` spellings, anywhere in the text), leaving other users' mentions
+/// and the surrounding text intact.
+pub fn strip_bot_mentions(content: &str, bot_user_id: u64) -> String {
+    let mut out = content.to_string();
+    for pat in [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")] {
+        out = out.replace(pat.as_str(), "");
+    }
+    out
+}
+
+/// Tag the caller's identity onto their message so the model sees WHO is
+/// talking (the persona already encodes the owner's Discord id, giving it
+/// the same individual-user awareness the OpenClaw gateway had). Kept in
+/// history, so each stored turn carries its speaker across the conversation.
+pub fn speaker_tag(user: &serenityall::User) -> String {
+    let display = user
+        .global_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&user.name);
+    format!("[Discord user: {} (username {}, id {})]\n", display, user.name, user.id.get())
 }
 
 fn first_token(text: &str) -> Option<&str> {
@@ -190,5 +231,31 @@ mod tests {
         assert!(clipped.starts_with('…'));
         assert!(clipped.ends_with('x'));
         assert_eq!(clip_tail("short", 1990), "short");
+    }
+
+    #[test]
+    fn strip_all_bot_mentions_mid_text_and_variants() {
+        // Leading mention (the old focus) plus mid-sentence and trailing.
+        assert_eq!(strip_bot_mentions("<@42> check the mesh", 42), " check the mesh");
+        assert_eq!(strip_bot_mentions("hey <@42> what's up", 42), "hey  what's up");
+        assert_eq!(strip_bot_mentions("ping <@!42>?", 42), "ping ?");
+        assert_eq!(strip_bot_mentions("<@42><@!42> bounce", 42), " bounce");
+        // Other users' mentions stay intact.
+        assert_eq!(strip_bot_mentions("a <@7> b <@42> c", 42), "a <@7> b  c");
+    }
+
+    #[test]
+    fn speaker_tag_carries_display_name_username_and_id() {
+        let mut u = serenityall::User::default();
+        u.id = serenityall::UserId::new(12345);
+        u.name = "noodly_handle".into();
+        u.global_name = Some("NoodlyPanda".into());
+        assert_eq!(
+            speaker_tag(&u),
+            "[Discord user: NoodlyPanda (username noodly_handle, id 12345)]\n"
+        );
+        // Falls back to the username when there is no display name.
+        u.global_name = None;
+        assert!(speaker_tag(&u).starts_with("[Discord user: noodly_handle "));
     }
 }

@@ -40,6 +40,10 @@ pub async fn ask(
 
     let history = ctx.data().state.history(user);
     let cfg = ctx.data().cfg.clone();
+    // Individual-user recognition (same convention as the DM/@mention path):
+    // every turn keeps its speaker so the model can tell owner from guests
+    // and address people by name across the conversation.
+    let prompt = format!("{}{}", crate::chat_fallback::speaker_tag(ctx.author()), prompt);
     let (reply, served_by) = api::chat(&cfg, &prompt, &history).await?;
     ctx.data().state.push_turn(user, &prompt, &reply);
     let text = format_reply(&reply, served_by.as_deref());
