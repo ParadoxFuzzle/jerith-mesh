@@ -335,8 +335,10 @@ async fn run_loop(
             }
         }
 
-        // Phase 4: flush queued DishonestResults fraud evidence to the
-        // bootstrap on the loop's regular cadence (never on the hot path).
+        // Phase 4: ringer spot-check (per config) against a random alive
+        // peer, THEN (same cadence) flush queued DishonestResults evidence
+        // to the bootstrap — never on the inference hot path.
+        maybe_spot_check_ringer(&state).await;
         let flushed = state.verify.flush_fraud_reports(&state).await;
         if flushed > 0 {
             tracing::info!(target: "mesh", flushed, "verification evidence flushed");
@@ -468,6 +470,128 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
                     ),
                 }
             }
+        }
+    }
+}
+
+/// Phase 4 ringer spot-check: with `ringer_percent` probability per tick,
+/// send a signed builtin known-answer expert query to one random alive peer
+/// and grade the exact answer. A mismatch (or tampered commitment) queues
+/// DishonestResults evidence — timeouts and infra failures do NOT, they
+/// only say nothing. Runs off the inference hot path (loop cadence).
+async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
+    let percent = state.config.read().await.ringer_percent;
+    if percent == 0 || rand::random::<u32>() % 100 >= percent.min(100) {
+        return;
+    }
+    // Pick a random alive peer that offers QUIC work.
+    let mut candidates: Vec<(String, SocketAddr)> = {
+        let reg = state.registry.lock().await;
+        reg.all_ads()
+            .into_iter()
+            .filter(|ad| ad.node_id != state.identity.node_id())
+            .filter_map(|ad| {
+                let alive = reg
+                    .health_of(&ad.node_id)
+                    .map(|h| h.state != PeerState::Deprecated)
+                    .unwrap_or(false);
+                if !alive {
+                    return None;
+                }
+                ad.rpc_address.parse::<SocketAddr>().ok().map(|a| (ad.node_id.clone(), a))
+            })
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let pick = rand::random::<usize>() % candidates.len();
+    let (peer_id, addr) = candidates.swap_remove(pick);
+
+    // Pin only this peer: cert must prove the node we mean to dial.
+    let mut pins: crate::quic::PinMap = HashMap::new();
+    pins.insert(peer_id.clone(), addr);
+    let endpoint = match crate::quic::pinned_client_endpoint(std::sync::Arc::new(pins)) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(target: "mesh", error = %e, "ringer endpoint unavailable");
+            return;
+        }
+    };
+
+    let seed = now_ms();
+    let (expert_id, mut input, expected) = crate::verify::ringer_task(seed);
+    let req_id = format!("ringer-{seed}");
+    let mut req = crate::quic::NodeRpcRequest::ExpertQuery {
+        req_id: req_id.clone(),
+        expert_id: expert_id.to_string(),
+        input: input.clone(),
+        from_node_id: state.identity.node_id(),
+        stamp_ms: 0,
+        sig: String::new(),
+    };
+    crate::quic::sign_request(&mut req, &state.identity);
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        crate::quic::call(
+            &endpoint,
+            addr,
+            &peer_id,
+            &req,
+            &state.identity,
+            Duration::from_secs(5),
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(crate::quic::NodeRpcReply::ExpertResult {
+            req_id: rid,
+            output,
+            node_id: server_id,
+            commitment,
+        })) => {
+            if server_id != peer_id || rid != req_id {
+                // Attribution failure alone is not proof of dishonesty in
+                // this path (could be glitched bootstrap entries); log it.
+                tracing::warn!(target: "mesh", peer = %peer_id, got = %server_id, "ringer reply attribution mismatch");
+                return;
+            }
+            if let Some(c) = &commitment {
+                let ok = crate::verify::verify_commitment(
+                    &req_id,
+                    expert_id,
+                    &server_id,
+                    &input,
+                    &output,
+                    c,
+                );
+                state.verify.note_commitment(&server_id, ok).await;
+                if !ok {
+                    return; // already flagged by note_commitment
+                }
+            }
+            let agree = crate::verify::outputs_agree(&expected, &output, 0.0);
+            state.verify.note_replay(agree).await;
+            if agree {
+                tracing::debug!(target: "mesh", peer = %peer_id, "ringer challenge passed");
+            } else {
+                state.verify.flag_dishonest(&[&peer_id]).await;
+                tracing::warn!(
+                    target: "mesh",
+                    peer = %peer_id,
+                    "ringer challenge FAILED — dishonest-result evidence queued"
+                );
+            }
+        }
+        Ok(Ok(crate::quic::NodeRpcReply::Error { req_id: _, message })) => {
+            tracing::debug!(target: "mesh", peer = %peer_id, message = %message, "ringer rejected by peer");
+        }
+        Ok(Ok(other)) => {
+            tracing::debug!(target: "mesh", peer = %peer_id, "unexpected ringer reply: {other:?}");
+        }
+        _ => {
+            // Timeout / transport failure: not evidence of dishonesty.
+            tracing::debug!(target: "mesh", peer = %peer_id, "ringer dispatch failed (infra)");
         }
     }
 }

@@ -166,6 +166,11 @@ pub struct NodeConfig {
     /// 5–15 %; 0 disables replay (commitments always checked).
     #[serde(default = "default_verify_percent")]
     pub verify_percent: u32,
+    /// Phase 4: spot-check (ringer) challenge probability per ping tick —
+    /// a signed builtin known-answer expert query is sent to one random
+    /// alive peer; a wrong answer queues DishonestResults evidence.
+    #[serde(default = "default_ringer_percent")]
+    pub ringer_percent: u32,
     /// Jerith Guard: outbound content filter (PII redaction/blocking,
     /// prompt-injection and malware-request blocklists). See guard.rs.
     #[serde(default)]
@@ -173,6 +178,10 @@ pub struct NodeConfig {
 }
 
 fn default_verify_percent() -> u32 {
+    10
+}
+
+fn default_ringer_percent() -> u32 {
     10
 }
 
@@ -194,6 +203,7 @@ impl Default for NodeConfig {
             rpc_port: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
+            ringer_percent: default_ringer_percent(),
             guard: crate::guard::GuardConfig::default(),
         }
     }

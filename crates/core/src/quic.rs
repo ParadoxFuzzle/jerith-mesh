@@ -1277,6 +1277,16 @@ impl RuntimeExpert {
 }
 
 impl ExpertHandler for RuntimeExpert {
+    fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
+        // Builtin/ringer experts are answered without the runtime: a pure
+        // deterministic function every mesh node can compute and verify in
+        // microseconds (Phase 4 spot-check challenges).
+        if let Some(kind) = expert_id.strip_prefix(crate::verify::RINGER_EXPERT_PREFIX) {
+            return Ok(crate::verify::builtin_expert_answer(kind, input));
+        }
+        self.run_expert(expert_id, input)
+    }
+
     fn chat<'a>(
         &'a self,
         messages: &'a [serde_json::Value],
@@ -1284,9 +1294,14 @@ impl ExpertHandler for RuntimeExpert {
         Box::pin(async move { self.chat_impl(messages).await })
     }
 
-    fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
-        // Real expert execution is async HTTP; bridge the sync trait with
-        // a block-on worker and a strict timeout (never blocks a pass).
+}
+
+impl RuntimeExpert {
+    /// Runtime-backed expert execution (builtin/ringer experts are handled
+    /// in the trait impl above before reaching here). Real expert execution
+    /// is async HTTP; bridge the sync trait with a block-on worker and a
+    /// strict timeout (never blocks a pass).
+    fn run_expert(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
         let this = Self {
             runtime_url: self.runtime_url.clone(),
             model: self.model.clone(),
@@ -1300,9 +1315,17 @@ impl ExpertHandler for RuntimeExpert {
             })
         })
     }
-}
 
-impl RuntimeExpert {
+    /// Test-only direct construction (production discovers via /v1/models).
+    #[cfg(test)]
+    fn for_tests(runtime_url: &str, model: &str) -> Self {
+        Self {
+            runtime_url: runtime_url.to_string(),
+            model: model.to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
     /// Synchronous-first chat implementation (also the trait method body).
     async fn chat_impl(&self, messages: &[serde_json::Value]) -> anyhow::Result<String> {
         let url = format!(
@@ -1805,6 +1828,66 @@ mod tests {
             )
             .await;
         assert!(err.is_err());
+    }
+
+    // --- Phase 4: ringer (builtin known-answer expert) over the wire ---
+
+    #[tokio::test]
+    async fn builtin_ringer_expert_served_without_runtime() {
+        // RuntimeExpert with a dead runtime URL — builtin experts must still
+        // be served exactly (they never reach the runtime).
+        let handler = RuntimeExpert::for_tests("http://127.0.0.1:1", "stub");
+        let (addr, server_identity, pins) =
+            test_server_and_pins(Arc::new(handler)).await.unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let (expert_id, input, expected) =
+            crate::verify::ringer_task(crate::bootstrap::now_ms());
+        let req_id = "ringer-wire-1";
+        let mut req = NodeRpcRequest::ExpertQuery {
+            req_id: req_id.into(),
+            expert_id: expert_id.to_string(),
+            input: input.clone(),
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut req, &identity);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(
+                &client,
+                addr,
+                &server_identity.node_id(),
+                &req,
+                &identity,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match reply {
+            NodeRpcReply::ExpertResult {
+                output,
+                commitment,
+                node_id: server_id,
+                req_id: rid,
+            } => {
+                assert_eq!(rid, req_id);
+                assert_eq!(output, expected, "builtin answer must be bit-exact");
+                let commitment = commitment.expect("commitment on ringer reply");
+                assert!(crate::verify::verify_commitment(
+                    req_id,
+                    expert_id,
+                    &server_id,
+                    &input,
+                    &output,
+                    &commitment
+                ));
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
     }
 
     // --- Phase 4: redundant replay verification ---

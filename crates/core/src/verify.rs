@@ -256,6 +256,45 @@ impl VerificationTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ringer challenges (spot-checks with known answers)
+// ---------------------------------------------------------------------------
+
+/// Builtin expert namespace: expert ids under this prefix are answered
+/// deterministically by any mesh node *without touching the runtime* — a
+/// pure function both the server and the pinger can compute in microseconds.
+pub const RINGER_EXPERT_PREFIX: &str = "jerith-builtin/";
+
+/// The builtin expert functions (single source of truth for both sides).
+/// All arithmetic is exact in IEEE f32 (integer-valued inputs, power-of-two
+/// scaling) so peers agree bit-for-bit — a wrong node's gamble is detectable
+/// with zero tolerance.
+pub fn builtin_expert_answer(kind: &str, input: &[f32]) -> Vec<f32> {
+    match kind {
+        // Scale by 2 (power of two — bit-exact) and reverse the order.
+        "reverse2" | "" => {
+            let mut out: Vec<f32> = input.iter().map(|x| x * 2.0).collect();
+            out.reverse();
+            out
+        }
+        // Scale by 4, keep order.
+        "scale4" => input.iter().map(|x| x * 4.0).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A ringer task derived from a seed (varies per round so a dishonest node
+/// cannot precompute/replay answers): input is exact integer-valued f32s in
+/// [-48, 49), the expected output is `builtin_expert_answer("reverse2", …)`.
+/// Returns (expert_id, input, expected_output).
+pub fn ringer_task(seed: u64) -> (&'static str, Vec<f32>, Vec<f32>) {
+    let input: Vec<f32> = (0..8)
+        .map(|i| (((seed.wrapping_mul(1103515245).wrapping_add(12345 + i as u64 * 77)) % 97) as f32) - 48.0)
+        .collect();
+    let expected = builtin_expert_answer("reverse2", &input);
+    ("jerith-builtin/reverse2", input, expected)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -338,6 +377,35 @@ mod tests {
         let _ = t.flush_fraud_reports(&state).await;
         let s2 = t.stats().await;
         assert!(s2.fraud_reports_flushed <= 1);
+    }
+
+    #[test]
+    fn ringer_task_is_deterministic_and_seed_varying() {
+        let (e1, in1, out1) = ringer_task(42);
+        let (e2, in2, out2) = ringer_task(42);
+        assert_eq!(e1, e2);
+        assert_eq!(e1, "jerith-builtin/reverse2");
+        assert_eq!(in1, in2);
+        assert_eq!(out1, out2);
+        // Varies across seeds (a cached answer cannot pass every round).
+        let (_, in3, _) = ringer_task(43);
+        assert_ne!(in1, in3);
+        // Inputs stay integer-valued and covered by builtin answer.
+        for v in &in1 {
+            assert!(v.fract() == 0.0 && (*v >= -48.0) && (*v < 49.0), "ringer input exact: {v}");
+        }
+        assert_eq!(out1, builtin_expert_answer("reverse2", &in1));
+        // Bit-exact power-of-two scaling: reverse + ×2.
+        assert_eq!(out1[0], in1[7] * 2.0);
+        assert_eq!(out1[7], in1[0] * 2.0);
+    }
+
+    #[test]
+    fn builtin_answers_are_exact_and_bounded() {
+        let input = [1.5, -3.0, 7.0];
+        assert_eq!(builtin_expert_answer("scale4", &input), vec![6.0, -12.0, 28.0]);
+        assert_eq!(builtin_expert_answer("reverse2", &input), vec![14.0, -6.0, 3.0]);
+        assert!(builtin_expert_answer("unknown-kind", &input).is_empty());
     }
 
     #[tokio::test]

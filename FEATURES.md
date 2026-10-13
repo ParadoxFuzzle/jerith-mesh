@@ -118,7 +118,13 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   alone when the local arbiter decides) flagged as `DishonestResults`,
   evidence signed and submitted to the bootstrap, ambiguous remote-vs-remote
   disputes abort the remaining remote candidates for that req_id
-- 📋 Spot-check “ringer” tasks with known answers (Phase 4)
+- ✅ Spot-check “ringer” tasks with known answers (`ringer_percent`, default
+  10 % of ping ticks): a signed builtin expert query
+  (`jerith-builtin/reverse2` — bit-exact f32 reverse-and-scale, seed-varying
+  inputs that no runtime/model touches) is sent to one random alive peer; the
+  exact answer + tamper-proof commitment are graded locally. Mismatches queue
+  `DishonestResults` evidence to the bootstrap; timeouts and infra failures
+  are never treated as dishonesty
 - 📋 Statistical freerider detection (latency-vs-claim, activation patterns, work ratios) (Phase 4)
 - 📋 Reputation system with gossiped signed scores (Phase 4–5)
 - 📋 TEE attestation & selective ZK proofs (Phase 5+, research-grade)
