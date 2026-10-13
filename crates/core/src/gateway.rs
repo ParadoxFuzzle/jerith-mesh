@@ -9,6 +9,7 @@
 //!    hit to verify we're alive and contributing (adds <1 ms CPU).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -20,6 +21,14 @@ use serde_json::{json, Value};
 use crate::economics::JerithMiner;
 use crate::memory::SharedMemory;
 use crate::ping::MeshState;
+
+/// How long the gateway waits for the local runtime's response headers
+/// before treating it as unavailable. A runtime that accepts TCP but never
+/// replies (hung process, wedged renderer) would otherwise hold the caller
+/// open-endedly; past this bound the request flows into mesh fallback
+/// exactly like a connection failure. Only the header wait is bounded — a
+/// proper SSE body is streamed through without a byte deadline.
+const RUNTIME_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Gateway {
     pub state: Arc<MeshState>,
@@ -332,7 +341,13 @@ async fn chat_completions(
         "{}/v1/chat/completions",
         gw.runtime_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        // Distinguishes "host down" from "host up but wedged": a dead route
+        // fails fast here, while a slow/hung runtime is caught by the
+        // header-wait bound below instead.
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("gateway runtime client builder");
     let payload = body.to_string();
     let mut send = client
         .post(&url)
@@ -341,7 +356,17 @@ async fn chat_completions(
     if let Some(k) = &gw.runtime_api_key {
         send = send.bearer_auth(k);
     }
-    let send = send.send().await;
+    // Bound only the wait for response headers: on expiry the hung runtime
+    // is treated as unreachable so mesh fallback can engage (see the match
+    // arm below). Headers arrive => body/SSE streams unbounded.
+    let send: Result<reqwest::Response, anyhow::Error> =
+        match tokio::time::timeout(RUNTIME_HEADERS_TIMEOUT, send.send()).await {
+            Ok(result) => result.map_err(anyhow::Error::from),
+            Err(_) => Err(anyhow::anyhow!(
+                "timed out after {}s waiting for runtime response headers (runtime hung?)",
+                RUNTIME_HEADERS_TIMEOUT.as_secs()
+            )),
+        };
 
     let resp = match send {
         Ok(r) => r,
