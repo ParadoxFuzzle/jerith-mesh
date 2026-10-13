@@ -32,6 +32,9 @@ pub struct Gateway {
     /// Optional mesh-fallback chat handle (QUIC client endpoint + peer
     /// address map). Present when the node runs a server endpoint.
     pub mesh_fallback: Option<Arc<crate::ping::MeshFallbackChat>>,
+    /// Jerith Guard: outbound content filter screening every chat payload
+    /// before it leaves the node (local forward AND mesh fallback).
+    pub guard: Option<Arc<crate::guard::Guard>>,
 }
 
 impl Gateway {
@@ -202,6 +205,31 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
     let reg = gw.state.registry.lock().await;
     let meters = gw.state.meters.lock().await;
     let alive = reg.connectable().len();
+    // Hoisted: json! cannot host statement blocks.
+    let verify = gw.state.verify.stats().await;
+    let verify_value = json!({
+        "expert_results_received": verify.expert_results_received,
+        "commitment_checks": verify.commitment_checks,
+        "commitment_failures": verify.commitment_failures,
+        "replays_dispatched": verify.replays_dispatched,
+        "replay_matches": verify.replay_matches,
+        "replay_mismatches": verify.replay_mismatches,
+        "fraud_reports_flushed": verify.fraud_reports_flushed,
+    });
+    let guard_value = gw
+        .guard
+        .as_ref()
+        .map(|g| {
+            let (screens, blocked, redacted, logged) = g.stats().snapshot();
+            json!({
+                "enabled": true,
+                "screens": screens,
+                "requests_blocked": blocked,
+                "values_redacted": redacted,
+                "detections_logged": logged,
+            })
+        })
+        .unwrap_or(Value::Null);
     Json(json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -224,6 +252,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
                 .unwrap_or(0),
         },
         "runtime_url": gw.runtime_url,
+        "verify": verify_value,
+        "guard": guard_value,
     }))
 }
 
@@ -253,8 +283,35 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
 /// Streaming responses are passed through byte-for-byte.
 async fn chat_completions(
     State(gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
+    // Jerith Guard: screen everything about to leave the node — this gate
+    // covers both the local runtime forward and mesh fallback below.
+    if let Some(guard) = &gw.guard {
+        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+            match guard.screen_messages(messages) {
+                Ok(Some(patched)) => {
+                    body["messages"] = Value::Array(patched);
+                    tracing::debug!(target: "guard", "outbound payload redacted before forwarding");
+                }
+                Ok(None) => {} // clean payload, pass touch-free
+                Err(verdict) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": verdict.block_reason(),
+                            "guard": {
+                                "blocked": true,
+                                "detections": verdict.detections,
+                            },
+                            "mesh_fallback": Value::Null,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
     let url = format!(
         "{}/v1/chat/completions",
         gw.runtime_url.trim_end_matches('/')
@@ -487,8 +544,86 @@ mod tests {
             } else {
                 None
             },
+            guard: None,
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
+    }
+
+    /// Test server with the default-configured Jerith Guard armed.
+    fn spawn_guarded(runtime_url: String) -> TestServer {
+        let runtime_url: &'static str = Box::leak(runtime_url.into_boxed_str());
+        let mut cfg = crate::config::NodeConfig::default();
+        cfg.runtime_url = runtime_url.to_string();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let guard = crate::guard::Guard::build(&crate::guard::GuardConfig::default())
+            .expect("default guard config compiles");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: runtime_url.to_string(),
+            miner: None,
+            memory: None,
+            mesh_fallback: None,
+            guard: Some(std::sync::Arc::new(guard)),
+        };
+        TestServer::new(gw.router().into_make_service()).expect("guarded test server")
+    }
+
+    #[tokio::test]
+    async fn guard_blocks_sensitive_request_at_the_gate() {
+        // Local runtime would 502 — a 400 means the Guard answered first.
+        let server = spawn_guarded("http://127.0.0.1:1".into());
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "my SSN is 078-05-1120"}]
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let body: Value = res.json();
+        assert!(
+            body["error"].as_str().unwrap().contains("blocked by jerith-guard"),
+            "error must name the guard, got {body}"
+        );
+        // Detection report present, raw value never echoed back.
+        assert_eq!(body["guard"]["blocked"], Value::Bool(true));
+        assert!(!body.to_string().contains("078-05-1120"));
+    }
+
+    #[tokio::test]
+    async fn guard_redacts_payload_before_it_reaches_the_runtime() {
+        // Minimal downstream runtime that records exactly what it received.
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let recv = received.clone();
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let recv = recv.clone();
+                async move {
+                    *recv.lock().await = body;
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.expect("runtime up") });
+
+        let server = spawn_guarded(format!("http://{addr}"));
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "ping bob@corp.example please"}]
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let got = received.lock().await.clone();
+        assert!(got.contains("[REDACTED_EMAIL]"), "runtime saw: {got}");
+        assert!(!got.contains("bob@corp.example"), "runtime saw: {got}");
     }
 
     #[tokio::test]

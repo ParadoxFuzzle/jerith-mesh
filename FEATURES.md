@@ -80,7 +80,20 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 
 ## 8. Plugin / Skill System
 - 📋 OpenClaw-style modular plugin and skill architecture (Phase 3)
-- 📋 Default pre-packaged plugins: Context Squeeze, Juice Compact, Jerith Guard, Brave Search
+- ✅ Jerith Guard (pre-packaged content filter) — outbound screening gate on
+  every `/v1/chat/completions` (local forward AND mesh fallback):
+  - Per-category PII actions (off/log/redact/block) with spec defaults:
+    SSN + payment cards (Luhn-validated) + credentials hard-
+    block; emails + phones redacted with stable placeholders
+    (`[REDACTED_EMAIL]`…); name/address/medical heuristics opt-in
+  - Prompt-injection / jailbreak blocklist + malware-shape request
+    blocklist ("this is not a malware creation system")
+  - Owner controls: custom regex blocklist, do-not-exfiltrate substrings,
+    allowlist of never-PII values
+  - Detections logged locally without raw values; stats on `/status`
+  - Configured via `[guard]` in config.toml (`guard.enabled = false` to
+    switch the whole gate off)
+- 📋 Default pre-packaged plugins: Context Squeeze, Juice Compact, Brave Search
 - 📋 First-class skills `vision.*`, `memory.embed`, `memory.search`
 - 📋 Webhook / event hooks for plugin authors
 

@@ -596,6 +596,20 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         }
     };
 
+    // Jerith Guard: compiled outbound content filter (PII redaction,
+    // prompt-injection / malware blocklists, do-not-exfiltrate rules).
+    let guard = if cfg.guard.enabled {
+        match jerith_mesh_core::guard::Guard::build(&cfg.guard) {
+            Ok(g) => Some(std::sync::Arc::new(g)),
+            Err(e) => {
+                tracing::warn!(error = %e, "jerith-guard config invalid — guard DISABLED (outbound screening off)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Gateway + web UI on one port.
     let gw = Gateway {
         state: state.clone(),
@@ -603,6 +617,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         miner,
         memory: memory.clone(),
         mesh_fallback,
+        guard,
     };
     let app = axum::Router::new()
         .merge(gw.router())

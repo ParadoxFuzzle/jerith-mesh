@@ -6,6 +6,7 @@ pub mod bootstrap_server;
 pub mod config;
 pub mod economics;
 pub mod gateway;
+pub mod guard;
 pub mod hw;
 pub mod memory;
 pub mod models;

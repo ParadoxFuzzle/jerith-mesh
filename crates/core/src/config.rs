@@ -166,6 +166,10 @@ pub struct NodeConfig {
     /// 5–15 %; 0 disables replay (commitments always checked).
     #[serde(default = "default_verify_percent")]
     pub verify_percent: u32,
+    /// Jerith Guard: outbound content filter (PII redaction/blocking,
+    /// prompt-injection and malware-request blocklists). See guard.rs.
+    #[serde(default)]
+    pub guard: crate::guard::GuardConfig,
 }
 
 fn default_verify_percent() -> u32 {
@@ -190,6 +194,7 @@ impl Default for NodeConfig {
             rpc_port: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
+            guard: crate::guard::GuardConfig::default(),
         }
     }
 }
