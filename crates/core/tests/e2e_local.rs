@@ -5,7 +5,7 @@
 //! Under test: dead local runtime → QUIC fallback → reply with content +
 //! `mesh_fallback` = the peer id that actually answered (true attribution).
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 

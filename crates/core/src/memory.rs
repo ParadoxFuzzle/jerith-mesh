@@ -80,6 +80,11 @@ pub struct MemoryHit {
     pub created_ms: u64,
 }
 
+/// Retention cap on the memories table. The store is append-only with no
+/// delete cadence, so without a ceiling a chat-driven embed loop grows disk
+/// without bound. Oldest rows are pruned at insert time once past this.
+const MAX_MEMORY_ROWS: i64 = 10_000;
+
 /// SQLite-backed memory store.
 pub struct MemoryStore {
     conn: Mutex<Connection>,
@@ -135,18 +140,28 @@ impl MemoryStore {
     }
 
     /// memory.embed — embed text and store it. Returns the row id.
+    /// Rows are retention-capped: see `prune_beyond`.
     pub async fn embed_and_store(&self, text: &str) -> anyhow::Result<(i64, EmbedProvider)> {
         let (vector, provider) = self.embed_text(text).await?;
         let dim = vector.len();
         let bytes = pack_vector(&vector);
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO memories (text, dim, embedding, provider, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![text, dim as i64, bytes, provider_str(provider), crate::bootstrap::now_ms()],
-        )
-        .context("inserting memory")?;
-        Ok((conn.last_insert_rowid(), provider))
+        let rowid = {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "INSERT INTO memories (text, dim, embedding, provider, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![text, dim as i64, bytes, provider_str(provider), crate::bootstrap::now_ms()],
+            )
+            .context("inserting memory")?;
+            conn.last_insert_rowid()
+        };
+        // Retention cap: the table is append-only with no delete cadence, so
+        // an embed loop would grow disk without bound. Once past the cap,
+        // every insert prunes the oldest rows (recent rows always win).
+        if rowid > MAX_MEMORY_ROWS {
+            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        }
+        Ok((rowid, provider))
     }
 
     /// memory.search — embed the query and return the most similar hits.
@@ -205,6 +220,21 @@ impl MemoryStore {
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
             .context("counting memories")?;
         Ok(n as u64)
+    }
+
+    /// Prune all but the `max_rows` most recent rows. Returns rows removed.
+    /// Split out for testability: the retention cap stays exercised here
+    /// with a small `max_rows` instead of ten thousand inserts.
+    async fn prune_beyond(&self, max_rows: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "DELETE FROM memories WHERE id NOT IN (
+                     SELECT id FROM memories ORDER BY id DESC LIMIT ?1)",
+                rusqlite::params![max_rows],
+            )
+            .context("pruning memories")?;
+        Ok(n as usize)
     }
 
     /// "Forget this conversation" support: delete by id.
@@ -430,6 +460,29 @@ mod tests {
             ..EmbedConfig::default()
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prune_beyond_keeps_most_recent_rows() {
+        let s = store();        let mut ids = Vec::new();
+        for i in 0..6 {
+            let (id, _) = s.embed_and_store(&format!("memory row {i}")).await.unwrap();
+            ids.push(id);
+        }
+
+        // Drop the two oldest; keep the four most recent.
+        let removed = s.prune_beyond(4).await.unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(s.count().await.unwrap(), 4);
+        let conn = s.conn.lock().await;
+        let surviving: Vec<i64> = conn
+            .prepare("SELECT id FROM memories ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(surviving.as_slice(), &ids[2..], "newest rows survive");
     }
 
     #[tokio::test]

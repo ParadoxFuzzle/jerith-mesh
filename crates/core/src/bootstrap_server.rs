@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -28,6 +29,12 @@ use crate::bootstrap::{now_ms, PeerAd, PeerListResponse};
 
 /// How long an advertisement stays live without refresh.
 pub const DEFAULT_ADVERTISE_TTL_MS: u64 = 90_000;
+
+/// Anonymous-read budget (GET /v1/peers, /v1/models/counts, /health): per
+/// client IP per 60s window. A peer's own refresh cadence polls far below
+/// this; the cap exists to keep one source from running endless sweeps
+/// (every read re-tenders + scores the whole live set).
+const ANON_READ_LIMIT_PER_MIN: u32 = 240;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapOptions {
@@ -55,9 +62,61 @@ struct DeadReport {
 }
 
 /// In-memory registry: node_id → (ad, last_refresh_ms, dead_votes, score).
-#[derive(Default)]
 struct Registry {
     entries: RwLock<HashMap<String, Entry>>,
+    /// Maximum live node identities retained (NEW ads beyond this are
+    /// refused with 503; refreshes always succeed).
+    max_entries: usize,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            max_entries: MAX_REGISTRY_ENTRIES,
+        }
+    }
+}
+
+/// Field-length sanity on an incoming advertisement. Length-only checks —
+/// semantic validation (signature, identity binding) happens later in the
+/// handler; this gate runs BEFORE any crypto work so oversized junk is
+/// refused without spending CPU.
+fn validate_ad_fields(ad: &PeerAd) -> Result<(), Response> {
+    let too_long = |field: &str, cap| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("field '{field}' exceeds {cap} chars")
+            })),
+        )
+            .into_response()
+    };
+    if ad.node_id.chars().count() > AD_NODE_ID_CAP_CHARS {
+        return Err(too_long("node_id", AD_NODE_ID_CAP_CHARS));
+    }
+    if ad.model_id.chars().count() > AD_MODEL_CAP_CHARS {
+        return Err(too_long("model_id", AD_MODEL_CAP_CHARS));
+    }
+    if ad.quant.chars().count() > AD_QUANT_CAP_CHARS {
+        return Err(too_long("quant", AD_QUANT_CAP_CHARS));
+    }
+    if ad.address.chars().count() > AD_ADDRESS_CAP_CHARS {
+        return Err(too_long("address", AD_ADDRESS_CAP_CHARS));
+    }
+    if ad.rpc_address.chars().count() > AD_ADDRESS_CAP_CHARS {
+        return Err(too_long("rpc_address", AD_ADDRESS_CAP_CHARS));
+    }
+    if ad.contribution_percent > 100 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "field 'contribution_percent' must be 0-100"
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +133,18 @@ struct Entry {
 }
 
 const DEAD_VOTES_TO_EVICTION: u32 = 2;
+
+/// Wire-format sanity caps. Identity creation is free, so without these an
+/// identity holder could stuff megabyte-sized string fields into the
+/// registry — every entry is re-serialized into each /v1/peers response,
+/// scaling both memory and bandwidth with one oversized ad.
+const AD_NODE_ID_CAP_CHARS: usize = 64;
+const AD_MODEL_CAP_CHARS: usize = 64;
+const AD_QUANT_CAP_CHARS: usize = 32;
+const AD_ADDRESS_CAP_CHARS: usize = 128;
+/// Total registry entries retained. Refreshes of existing node ids are
+/// exempt — only NEW identities count against the cap.
+const MAX_REGISTRY_ENTRIES: usize = 20_000;
 
 // --- Fraud scoring (peer-reported evidence + decay) -------------------
 
@@ -125,6 +196,19 @@ fn entry_default_fields(ad: PeerAd) -> Entry {
 }
 
 fn router(state: Arc<Registry>, ttl_ms: u64) -> Router {
+    let limiter = Arc::new(crate::ratelimit::RateLimiter::new(
+        ANON_READ_LIMIT_PER_MIN,
+        Duration::from_secs(60),
+    ));
+    router_with_limiter(state, ttl_ms, limiter)
+}
+
+/// Split-out so tests can mount a tiny-budget limiter and reach 429s.
+fn router_with_limiter(
+    state: Arc<Registry>,
+    ttl_ms: u64,
+    limiter: Arc<crate::ratelimit::RateLimiter>,
+) -> Router {
     Router::new()
         .route("/health", get(bootstrap_health))
         .route("/v1/peers", get(peers))
@@ -133,6 +217,10 @@ fn router(state: Arc<Registry>, ttl_ms: u64) -> Router {
         .route("/v1/report-fraud", post(report_fraud))
         .route("/v1/models/counts", get(model_counts))
         .with_state((state, ttl_ms))
+        .layer(axum::middleware::from_fn_with_state(
+            limiter,
+            crate::ratelimit::axum_guard,
+        ))
 }
 
 type Shared = (Arc<Registry>, u64);
@@ -173,6 +261,16 @@ async fn sweep_live_scored(registry: &Registry, ttl_ms: u64) -> Vec<Entry> {
     live
 }
 
+/// One background-sweep pass: drop entries stale beyond `ttl_ms`.
+/// Returns how many rows were removed (for the sweeper's log line).
+async fn sweep_expired(registry: &Registry, ttl_ms: u64) -> usize {
+    let now = now_ms();
+    let mut w = registry.entries.write().await;
+    let before = w.len();
+    w.retain(|_, e| now.saturating_sub(e.last_refresh_ms) < ttl_ms);
+    before - w.len()
+}
+
 /// Remove expired entries; returns a snapshot of live ones.
 async fn sweep_live(registry: &Registry, ttl_ms: u64) -> Vec<Entry> {
     let now = now_ms();
@@ -211,6 +309,9 @@ async fn advertise(
             Json(serde_json::json!({"error": "node_id and model_id are required"})),
         )
             .into_response();
+    }
+    if let Err(resp) = validate_ad_fields(&ad) {
+        return resp;
     }
 
     // --- Wire auth: Ed25519 signature over the canonical payload ---
@@ -268,6 +369,16 @@ async fn advertise(
     ad.last_seen_ms = client_seen.max(now_ms().saturating_sub(1_000));
 
     let mut entries = registry.entries.write().await;
+    // Registry capacity: keypair generation is free, so an uncapped entry
+    // map lets one client pin memory and inflate /v1/peers. Existing ids
+    // always refresh; only NEW identities are refused once full.
+    if !entries.contains_key(&ad.node_id) && entries.len() >= registry.max_entries {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "registry at capacity — refreshes only"})),
+        )
+            .into_response();
+    }
     // Preserve score/history across re-advertise (identity is stable).
     let entry = entries.remove(&ad.node_id).unwrap_or_else(|| entry_default_fields(ad.clone()));
     entries.insert(
@@ -518,11 +629,29 @@ async fn model_counts(State((registry, ttl_ms)): State<Shared>) -> Response {
 /// Serve the bootstrap node until the process exits.
 pub async fn serve(options: BootstrapOptions) -> anyhow::Result<()> {
     let registry = Arc::new(Registry::default());
-    let app = router(registry, options.advertise_ttl_ms);
+    let app = router(registry.clone(), options.advertise_ttl_ms);
+    // Background TTL sweeper: expiry otherwise only happens while a read
+    // endpoint is polled, so an idle bootstrap would retain every stale
+    // advertisement forever. Half-TTL cadence, floored at 15s.
+    let sweeper = registry;
+    let ttl_ms = options.advertise_ttl_ms;
+    tokio::spawn(async move {
+        let interval = Duration::from_millis((ttl_ms / 2).clamp(15_000, 30_000));
+        loop {
+            tokio::time::sleep(interval).await;
+            let dropped = sweep_expired(&sweeper, ttl_ms).await;
+            if dropped > 0 {
+                tracing::debug!(dropped, "registry sweep dropped expired ads");
+            }
+        }
+    });
     let addr = SocketAddr::from(([0, 0, 0, 0], options.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(port = options.port, "bootstrap node listening");
-    axum::serve(listener, app).await?;
+    // Peer connect info is required for the per-IP rate limiter's fallback
+    // attribution (headers take precedence when present, e.g. behind the
+    // tunnel).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -812,17 +941,6 @@ mod tests {
         signed_headers_for(id, &payload)
     }
 
-    fn fraud_report_headers(
-        id: &crate::signing::SigningIdentity,
-        kind_str: &str,
-        reporter: &str,
-        target: &str,
-    ) -> axum::http::HeaderMap {
-        let stamp = crate::bootstrap::now_ms();
-        let payload = format!("jerith-fraud1|{stamp}|{kind_str}|{reporter}|{target}");
-        signed_headers_for(id, &payload)
-    }
-
     #[tokio::test]
     async fn advertise_requires_valid_signature() {
         let registry = Arc::new(Registry::default());
@@ -933,8 +1051,175 @@ mod tests {
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    #[tokio::test]
+    async fn advertise_rejects_oversized_fields() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        // Every string field over its sanity cap → 400, rejected BEFORE any
+        // signature work (no headers needed: validation precedes wire auth).
+        let bad = serde_json::to_value(make_peer("glm-5.3").1).unwrap();
+        for field in ["node_id", "model_id", "quant", "address", "rpc_address"] {
+            let mut candidate = bad.clone();
+            candidate[field] = serde_json::json!("x".repeat(2_000));
+            let r = client
+                .put(format!("{base}/v1/advertise"))
+                .json(&candidate)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "field {field}");
+        }
+
+        // contribution_percent is only meaningful 0-100.
+        let mut pct = serde_json::to_value(make_peer("glm-5.3").1).unwrap();
+        pct["contribution_percent"] = serde_json::json!(150);
+        let r = client
+            .put(format!("{base}/v1/advertise"))
+            .json(&pct)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        // Positive control: an untouched ad is still accepted.
+        let (id, good) = make_peer("glm-5.3");
+        let r = client
+            .put(format!("{base}/v1/advertise"))
+            .headers(signed_headers(&id, &good))
+            .json(&good)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "untouched ad must be accepted");
+    }
+
+    #[tokio::test]
+    async fn advertise_caps_new_entries_but_allows_refresh() {
+        // Capacity-bound registry of ONE entry for a test-scale probe.
+        let registry = Arc::new(Registry {
+            entries: RwLock::new(HashMap::new()),
+            max_entries: 1,
+        });
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/advertise");
+
+        // First identity: accepted.
+        let (id1, ad1) = make_peer("glm-5.3");
+        let r = client
+            .put(&url)
+            .headers(signed_headers(&id1, &ad1))
+            .json(&ad1)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "first ad accepted");
+
+        // Refresh of the SAME id: never counts against the cap.
+        let r = client
+            .put(&url)
+            .headers(signed_headers(&id1, &ad1))
+            .json(&ad1)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "refresh must bypass the cap");
+
+        // A NEW identity beyond the cap: refused with 503.
+        let (id2, ad2) = make_peer("qwen3.8-flash-next");
+        let r = client
+            .put(&url)
+            .headers(signed_headers(&id2, &ad2))
+            .json(&ad2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("at capacity"));
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_drops_stale_only() {
+        let registry = Arc::new(Registry::default());
+        let (_, ad_fresh) = make_peer("glm-5.3");
+        let fresh_id = ad_fresh.node_id.clone();
+        registry.entries.write().await.insert(
+            fresh_id.clone(),
+            Entry {
+                ad: ad_fresh,
+                last_refresh_ms: now_ms(),
+                dead_votes: 0,
+                score: 0,
+                fraud_reports: HashMap::new(),
+            },
+        );
+        let (_, ad_stale) = make_peer("qwen3.8-flash-next");
+        let stale_id = ad_stale.node_id.clone();
+        registry.entries.write().await.insert(
+            stale_id.clone(),
+            Entry {
+                ad: ad_stale,
+                last_refresh_ms: now_ms().saturating_sub(DEFAULT_ADVERTISE_TTL_MS + 1_000),
+                dead_votes: 0,
+                score: 0,
+                fraud_reports: HashMap::new(),
+            },
+        );
+
+        let dropped = sweep_expired(&registry, DEFAULT_ADVERTISE_TTL_MS).await;
+        assert_eq!(dropped, 1);
+        let entries = registry.entries.read().await;
+        assert!(entries.contains_key(&fresh_id), "fresh entry kept");
+        assert!(!entries.contains_key(&stale_id), "stale entry dropped");
+    }
+
+    #[tokio::test]
+    async fn anonymous_reads_rate_limited_per_ip() {
+        use crate::ratelimit::RateLimiter;
+        let registry = Arc::new(Registry::default());
+        // Budget of 3/60s for a test-scale probe.
+        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
+        let app = router_with_limiter(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS, limiter);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Connect info must be wired like production serve() does — the
+        // limiter's socket-fallback attribution depends on it.
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/models/counts");
+
+        for _ in 0..3 {
+            assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::OK);
+        }
+        let r = client.get(&url).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            r.headers().get("retry-after").and_then(|v| v.to_str().ok()).is_some(),
+            "429 must carry Retry-After"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("rate limit"));
+    }
+
     async fn seed_live_peer(
-        registry: &Arc<Registry>,
+        _registry: &Arc<Registry>,
         base: &str,
         client: &reqwest::Client,
         identity: &crate::signing::SigningIdentity,

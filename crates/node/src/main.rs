@@ -1264,7 +1264,13 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     println!(
         "\nReady: web UI http://{addr}/ · OpenAI API http://{addr}/v1\nCtrl+C to stop."
     );
-    axum::serve(listener, app).await?;
+    // Connect info required for the gateway per-IP rate limiter's socket
+    // fallback (headers take precedence when present, e.g. behind a proxy).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

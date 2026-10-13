@@ -69,6 +69,15 @@ pub struct Gateway {
 impl Gateway {
     pub fn router(self) -> Router {
         let state = Arc::new(self);
+        // Per-IP budget over ALL routes. The honest local caller (the bot +
+        // web UI) uses a small fraction of this; the ceiling exists because
+        // chat forwards a model round-trip and the skill endpoints hit
+        // SQLite — one source shouldn't be able to run either hot.
+        const GATEWAY_LIMIT_PER_MIN: u32 = 600;
+        let limiter = Arc::new(crate::ratelimit::RateLimiter::new(
+            GATEWAY_LIMIT_PER_MIN,
+            Duration::from_secs(60),
+        ));
         Router::new()
             .route("/health", get(health))
             .route("/status", get(status))
@@ -98,6 +107,10 @@ impl Gateway {
             .route("/v1/skills/web/fetch", post(skill_web_fetch))
             .route("/v1/metrics", get(metrics_handler))
             .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                crate::ratelimit::axum_guard,
+            ))
     }
 }
 
@@ -107,6 +120,14 @@ impl Gateway {
 /// would let one caller pin disk + sqlite locks. cap matches the archiver
 /// note scale; larger callers must chunk.
 const MEMORY_EMBED_TEXT_CAP_CHARS: usize = 64_000;
+
+/// Cap on the serialized /v1/chat/completions payload we forward to the
+/// local runtime (and mirror to mesh peers on fallback). The gateway is an
+/// unauthenticated local-network surface; without a ceiling a single giant
+/// body pins this node's memory, the runtime's, and every mesh relay hop.
+/// Honest multimodal+history payloads land far below this; larger callers
+/// must chunk.
+const CHAT_FORWARD_CAP_BYTES: usize = 1_000_000;
 
 async fn skill_memory_embed(
     State(gw): State<Arc<Gateway>>,
@@ -744,6 +765,18 @@ async fn chat_completions(
         .build()
         .expect("gateway runtime client builder");
     let payload = body.to_string();
+    if payload.len() > CHAT_FORWARD_CAP_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!(
+                    "chat payload exceeds {CHAT_FORWARD_CAP_BYTES} bytes — chunk large conversations"
+                ),
+                "mesh_fallback": serde_json::Value::Null,
+            })),
+        )
+            .into_response();
+    }
     let mut send = client
         .post(&url)
         .header("content-type", "application/json")
@@ -1158,6 +1191,31 @@ mod tests {
         let got = received.lock().await.clone();
         assert!(got.contains("[REDACTED_EMAIL]"), "runtime saw: {got}");
         assert!(!got.contains("bob@corp.example"), "runtime saw: {got}");
+    }
+
+    #[tokio::test]
+    async fn chat_oversized_payload_is_413_not_forwarded() {
+        // Nothing listens on :1 — any success below would mean the payload
+        // slipped past the cap toward the (dead) runtime.
+        let server = spawn_plain("http://127.0.0.1:1", false);
+        let pad = "x".repeat(CHAT_FORWARD_CAP_BYTES + 10);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": pad}]
+            }))
+            .await;
+        assert_eq!(
+            res.status_code(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let body: Value = res.json();
+        assert!(
+            body["error"].as_str().unwrap().contains("exceeds"),
+            "got: {body}"
+        );
+        assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
     }
 
     #[tokio::test]

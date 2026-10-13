@@ -202,6 +202,56 @@ curl -s -H "Authorization: Bot $(grep '^discord_token' ~/.jerith-mesh/bot.toml \
   | grep -o '"name":"timeout"'
 ```
 
+## Security hardening log
+
+Round 3 (`9493165`): wire-auth verification for `/v1/report-dead` and
+`/v1/report-fraud`; guard screens multimodal content arrays;
+`/v1/skills/memory/embed` text cap (64k chars → 413).
+
+Round 4 (this round) — unbounded-growth + flood tightening:
+
+- **Bootstrap registry bounds**: `PeerAd` string fields capped
+  (node_id 64, model_id 64, quant 32, address/rpc_address 128; rejected
+  400 BEFORE signature work), `contribution_percent` 0–100 sanity, and a
+  20 000-entry registry cap (NEW node ids beyond the cap → 503;
+  refreshes always pass).
+- **Background TTL sweeper**: registry expiry no longer depends on
+  someone polling `/v1/peers` — `serve()` sweeps at half the advertise
+  TTL (floor 15 s), so an idle bootstrap cannot accumulate stale ads.
+- **Chat forward cap**: `/v1/chat/completions` refuses serialized
+  payloads > 1 000 000 bytes with 413 before touching the runtime or
+  mesh fallback.
+- **Memory retention**: the local SQLite memories table prunes the
+  oldest rows at insert once past `MAX_MEMORY_ROWS` (10 000) — the
+  append-only table can no longer grow without bound.
+- **Per-IP rate limiting** (`core/ratelimit.rs`, fixed 60 s windows):
+  bootstrap anonymous reads 240/min/IP, gateway all-routes 600/min/IP.
+  429s carry `Retry-After`. Attribution: `CF-Connecting-IP` / first
+  XFF hop trusted ONLY from loopback peers (the local tunnel proxy) —
+  a directly-reachable origin cannot spoof client IPs to hide behind
+  or drain other buckets; everyone else is pinned to their socket peer.
+
+```bash
+# Verify round 4 (should show ~240 OK then 429s; window = 60 s):
+for i in $(seq 1 250); do curl -s -o /dev/null -w "%{http_code}\n" \
+  http://127.0.0.1:8901/v1/models/counts; done | sort | uniq -c
+# Oversize probes:
+#   413 node:  any chat body > 1 MB serialized.
+#   400 bootstrap: PUT /v1/advertise with model_id 2 000 chars (no
+#   wire-auth headers needed — validation precedes crypto).
+```
+
+Known remaining limitations (accepted, bounded):
+
+- Signed-but-malicious identity holders can still file dead/fraud
+  reports; per-(reporter, kind) dedupe + reputation floor bound the
+  damage by design.
+- Header-attribution trusts the loopback tunnel proxy; a compromised
+  local process could impersonate other buckets' clients (host-level
+  trust, same as the tunnel itself).
+- Rate limits are per-process in-memory: a bootstrap restart resets
+  every window (a client's burst budget re-arms briefly).
+
 ## Escalation pointers
 
 - Tunnel misroute (CNAME pointed at the wrong tunnel UUID): see the
