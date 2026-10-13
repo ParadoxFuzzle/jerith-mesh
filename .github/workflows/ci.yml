@@ -7,10 +7,24 @@ on:
     branches: [main]
 
 jobs:
-  tests:
-    name: cargo test --workspace
+  tests-linux:
+    name: cargo test --workspace (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the full workspace test suite
+        run: cargo test --workspace
+
+  tests-macos:
+    # macOS parity for the test suite (first-install operators on Apple
+    # hardware rely on the same code paths: rusqlite bundled, quinn, sysinfo
+    # probing with its non-inxi fallback). The E2E stays Linux-only.
+    name: cargo test --workspace (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
