@@ -14,10 +14,14 @@
 //!
 //! SSRF stance (as upstream): non-HTTP(S) schemes and loopback/private/
 //! link-local/metadata host literals are rejected before any request is
-//! made. Full DNS-resolution pinning (OpenClaw's `ssrf-runtime`) is not
-//! reproduced here — an internal host that rebinds a public DNS name to a
-//! private IP can still slip through — so treat fetch targets as untrusted
-//! and keep Jerith Guard screening the chat payloads that reference them.
+//! made. Redirects are never auto-followed (`redirect::Policy::none`) —
+//! reqwest's default follows up to 10 hops *without* re-running this
+//! preflight, so a public page 302-ing to 169.254.169.254 would otherwise
+//! bypass the guard entirely. Full DNS-resolution pinning (OpenClaw's
+//! `ssrf-runtime`) is not reproduced here — an internal host that rebinds a
+//! public DNS name to a private IP can still slip through — so treat fetch
+//! targets as untrusted and keep Jerith Guard screening the chat payloads
+//! that reference them.
 //!
 //! Never mesh-facing: these skills stay local to the node — only the
 //! gateway's own callers (Discord bot tool loop, CLI scripts) hit
@@ -218,6 +222,13 @@ impl WebSearchService {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_secs.max(5)))
                 .user_agent(USER_AGENT)
+                // SSRF hardening: never auto-follow redirects — reqwest's
+                // default follows up to 10 hops without re-running the
+                // private-host preflight, so a public page 302-ing to
+                // 169.254.169.254 would bypass the fetch-time guard
+                // entirely. With Policy::none a 3xx just surfaces as its
+                // HTTP status (handled below in fetch_text).
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("static reqwest client config"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -316,7 +327,9 @@ impl WebSearchService {
             .await
             .with_context(|| format!("fetch failed for {raw_url}"))?;
         let status = resp.status().as_u16();
-        if !(200..400).contains(&status) {
+        // Redirects are NOT auto-followed (SSRF guard re-preflight would be
+        // needed per hop); surface them at face value instead.
+        if !(200..300).contains(&status) {
             bail!("fetch got HTTP {status} for {raw_url}");
         }
         // Bounded read: stop after the cap — `chunk()` keeps even a
