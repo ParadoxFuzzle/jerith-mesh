@@ -122,29 +122,29 @@ pub fn render_report(results: &[CheckResult]) -> Option<String> {
 // The checks (std-only)
 // ---------------------------------------------------------------------------
 
-/// Disk usage for the mesh home filesystem (statvfs via /proc or direct
-/// syscall-free approximation: `df`-like reading of statfs is unavailable
-/// std-only, so we read /proc/mounts-style usage is not exposed either —
-/// use the `df -P` line parse, which is stable everywhere).
+/// Disk usage for the mesh home filesystem via `df -P` (POSIX output,
+/// stable everywhere; Use% is the 5th field per the -P format).
 fn check_disk(limits: &MonitorLimits) -> CheckResult {
     // The mesh home's filesystem.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let target = Path::new(&home);
     let output = std::process::Command::new("df")
         .arg("-P")
-        .arg("--output=pcent,target")
         .arg(target)
         .output();
     match output {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);
+            // "Filesystem 1024-blocks Used Available Capacity Mounted on"
+            // (POSIX -P header) + matching data line; Use% is field 4,
+            // mount point field 5 (they never split — no -h suffixes).
             let line = text.lines().nth(1).unwrap_or_default();
-            let pct: u64 = line
-                .split_whitespace()
-                .next()
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let pct: u64 = parts
+                .get(4)
                 .and_then(|p| p.trim_end_matches('%').parse().ok())
-                .unwrap_or(0);
-            let mount = line.split_whitespace().nth(1).unwrap_or("?").to_string();
+                .unwrap_or_default();
+            let mount = parts.get(5).copied().unwrap_or("?").to_string();
             if pct >= limits.disk_warn_percent {
                 CheckResult {
                     check: "disk",
@@ -180,11 +180,16 @@ fn check_disk(limits: &MonitorLimits) -> CheckResult {
     }
 }
 
-/// SSL cert expiry for the boot/public host via `openssl s_client`.
+/// SSL cert expiry for the boot/public host via `openssl s_client` +
+/// `openssl x509 -noout -enddate` (the s_client verbose dump doesn't print
+/// notAfter on this OpenSSL build; the x509 filter pipe does, verbatim).
+const SSL_PROBE_SCRIPT: &str = "printf '' | openssl s_client -connect {host}:443 -servername {host} 2>/dev/null | openssl x509 -noout -enddate";
+
 fn check_ssl(limits: &MonitorLimits) -> CheckResult {
     let host = "p2p.jerithai.com";
+    let script = SSL_PROBE_SCRIPT.replace("{host}", host);
     let output = std::process::Command::new("timeout")
-        .args(["/9", "openssl", "s_client", "-servername", host, "-connect", &format!("{host}:443")])
+        .args(["15", "sh", "-c", &script])
         .stdin(std::process::Stdio::null())
         .output();
     let Ok(o) = output else {
