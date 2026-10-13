@@ -109,6 +109,29 @@ jerith-node-dev`). Its state lives in `data/` + `keys/` and survives
 restarts; schema migrations are additive (`CREATE TABLE IF NOT EXISTS`),
 so older binaries reading a newer DB must be reviewed before a downgrade.
 
+## Secrets handling (Discord token)
+
+The bot token lives **not** in bot.toml but in a 0600 env file the user
+service imports:
+
+- File: `~/.config/systemd/user/jerith-bot.service.d/token.env`
+  (`JERITH_DISCORD_TOKEN=...`, mode 0600, directory 0700).
+- Drop-in: `.../override.conf` sets `EnvironmentFile=` to that path;
+  the bot's config resolves `$JERITH_DISCORD_TOKEN` first and bot.toml
+  is a fallback — bot.toml carries no token anymore.
+
+```bash
+# Rotate: edit token.env, then:
+systemctl --user daemon-reload && systemctl --user restart jerith-bot
+# Verify:
+systemctl --user show jerith-bot -p EnvironmentFiles
+journalctl --user -u jerith-bot | grep "slash commands"
+```
+
+The web skill's fetch path also DNS-pins: a custom reqwest resolver
+refuses any hostname whose resolved addresses are private/loopback
+(SSRF round 2, closes DNS-rebinding); see websearch.rs.
+
 ## Bot-facing ops (lore index, monitor scaffold, guild-admin)
 
 ### Lore index (OpenClaw void-lore vault port)

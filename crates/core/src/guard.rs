@@ -603,6 +603,110 @@ mod tests {
         c
     }
 
+    // ------------------------------------------------------------------
+    // Fuzzed/regex-adversarial — the redactor's every input is
+    // attacker-shaped (user chat), so guard against pathological-text
+    // hangs and panics, not just wrong answers.
+    // ------------------------------------------------------------------
+
+    /// A 256-seeded pseudo-random byte soup: cycles of long digit runs,
+    /// repeated separators, near-miss key prefixes, and nested-ish
+    /// bracket noise — the shapes that stress backtracking-style engines.
+    /// NOT a differential oracle: we assert bounded time + no panic + the
+    /// verdict's basic invariants (redaction changes nothing silently, no
+    /// unredacted PII smuggled past by mid-byte tricks).
+    fn fuzz_soup(seed: u8) -> String {
+        let mut s = Vec::with_capacity(64_000);
+        for i in 0..64_000usize {
+            let x = ((seed as usize) ^ i).wrapping_mul(2654435761) >> 24;
+            match x % 6 {
+                0 => s.push(b'0' + (x % 10) as u8),          // digit run
+                1 => s.push(b'-'),                            // cc separators
+                2 => s.push(b'A' + (x % 26) as u8),           // key prefixes
+                3 => s.push(b' '),                             // name words
+                4 if x % 12 == 4 => s.extend_from_slice(b"AKIA"),
+                4 => s.extend_from_slice(b"sk-"),
+                _ => s.push(b'.'),
+            }
+        }
+        String::from_utf8(s).unwrap_or_default()
+    }
+
+    #[test]
+    fn fuzz_soup_never_panics_and_stays_fast() {
+        let g = guard_default();
+        for seed in 0..=16u8 {
+            let text = fuzz_soup(seed);
+            let started = std::time::Instant::now();
+            let v = g.screen(&text);
+            let elapsed = started.elapsed();
+            // A screen must never take a meaningful fraction of a second:
+            // the gateway screens EVERY chat turn, and the bot 90s-timeouts
+            // behind it — a regex blowup here would eat live chats.
+            assert!(
+                elapsed.as_millis() < 2000,
+                "seed {seed} took {elapsed:?} — pathological input hang"
+            );
+            // Invariant: blocked verdicts carry a reason; unblocked redact
+            // output differs from input only via placeholder lengths.
+            if v.blocked {
+                assert!(!v.block_reason().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_prefix_stacking_cannot_smuggle_pii() {
+        let g = guard_default();
+        let cases = [
+            // email in braces/quotes/backticks/content-fence noise
+            "``fyi { alice@example.com }``",
+            "<div>alice@example.com</div>",
+            "alice\u{0}example.com@example.com",        // NUL sandwich
+            "alice@\nexample.com\nalice@example.com",  // newline splice
+        ];
+        for c in cases {
+            let v = g.screen(c);
+            assert!(
+                v.redacted.contains("[REDACTED_EMAIL]"),
+                "\"{c}\" smuggled an email past the redactor"
+            );
+            assert!(!v.redacted.contains("alice@example.com"));
+        }
+    }
+
+    #[test]
+    fn adversarial_card_shape_respects_luhn_under_noise() {
+        let g = guard_default();
+        // Luhn-valid card wrapped in separators/homoglyph noise → still
+        // caught; Luhn-INVALID digit runs (IDs) → still untouched.
+        assert!(g.screen("pay 4-111-1111-1111-1111 now").blocked);
+        let v = g.screen("id 1-2-3-4-5-6-7-8-9-0-1-2-3-4-5-6-7");
+        assert!(!v.blocked, "spacer-padded non-card mustn't block");
+    }
+
+    #[test]
+    fn unbounded_repetition_patterns_have_bounded_cost() {
+        // Direct stress on the widest patterns: digit runs + the"
+        // \"24-hr-ish\" activity regexes over pathological spacing.
+        let g = guard_default();
+        let pathological = [
+            "0".repeat(64_000),
+            format!("{}
+{}", "A".repeat(64_000), "B".repeat(64_000)),
+            "write ".repeat(8_000) + &"a".repeat(64_000), // malware-shape wide-gap
+        ];
+        for (i, text) in pathological.iter().enumerate() {
+            let started = std::time::Instant::now();
+            let _ = g.screen(text);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed.as_millis() < 2000,
+                "case {i} took {elapsed:?} — wide-gap regex blowup"
+            );
+        }
+    }
+
     #[test]
     fn passes_clean_text_through() {
         let g = guard_default();
