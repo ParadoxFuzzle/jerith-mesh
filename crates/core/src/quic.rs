@@ -300,7 +300,9 @@ impl ExpertRouter {
                 sig: String::new(),
             };
             sign_request(&mut req, identity);
-            match call(endpoint, *addr, &req, identity, self.options.dispatch_timeout).await {
+            match call(endpoint, *addr, &node_id, &req, identity, self.options.dispatch_timeout)
+                .await
+            {
                 Ok(NodeRpcReply::ChatResult {
                     req_id: rid,
                     content,
@@ -373,8 +375,15 @@ impl ExpertRouter {
                                 sig: String::new(),
                             };
                             sign_request(&mut req, identity);
-                            match call(endpoint, *addr, &req, identity, self.options.dispatch_timeout)
-                                .await
+                            match call(
+                                endpoint,
+                                *addr,
+                                node_id,
+                                &req,
+                                identity,
+                                self.options.dispatch_timeout,
+                            )
+                            .await
                             {
                                 Ok(NodeRpcReply::ExpertResult {
                                     req_id: rid,
@@ -434,8 +443,43 @@ pub struct NodeCert {
     pub key_der: rustls::pki_types::PrivateKeyDer<'static>,
 }
 
-/// Generate a self-signed certificate for this node (Phase 1: QUIC cert is
-/// transport-only; identity proof is the Ed25519 signature per message).
+/// Generate a self-signed certificate *derived from the node's Ed25519
+/// signing identity*. The TLS keypair is the same Ed25519 seed that produces
+/// `node_id`, so the transport cert and the application identity are the same
+/// secret — there is nothing to re-bind at connect time.
+///
+/// Phase 1 used a random cert (identity proof was per-message Ed25519 only).
+/// This closes the transport-level gap noted in UPGRADE.md / FEATURES.
+pub fn generate_node_cert_for(identity: &crate::signing::SigningIdentity) -> anyhow::Result<NodeCert> {
+    // ring's Ed25519KeyPair::generate_pkcs8 serializes the 32-byte seed as a
+    // PKCS#8 v2 doc; rcgen consumes the same form for Ed25519 (PKCS_ED25519
+    // alg). ed25519-dalek's SigningKey.to_bytes() is that same seed.
+    //
+    // rcgen wants the key as PKCS#8 DER; ring's seed roundtrip yields exactly
+    // that when we use Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der) under
+    // the hood via KeyPair::from_pkcs8_der_and_sign_algo(PKCS_ED25519).
+    //
+    // Build the PKCS#8 v1 wrapper around the raw 32-byte seed:
+    let seed = identity.secret_bytes();
+    let pkcs8 = ed25519_pkcs8_from_seed(&seed);
+    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8),
+        &rcgen::PKCS_ED25519,
+    )
+    .map_err(|e| anyhow::anyhow!("ed25519 cert key derivation failed: {e}"))?;
+    let params = rcgen::CertificateParams::new(vec!["jerith-mesh-node".to_string()])
+        .map_err(|e| anyhow::anyhow!("cert params failed: {e}"))?;
+    let cert = params.self_signed(&key_pair)
+        .map_err(|e| anyhow::anyhow!("self-signed cert failed: {e}"))?;
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+    );
+    Ok(NodeCert { cert_der, key_der })
+}
+
+/// Legacy entrypoint kept for callers without an identity handy (tests).
+/// Random cert — the pinning verifier rejects it for any node_id.
 pub fn generate_node_cert() -> anyhow::Result<NodeCert> {
     let ck = rcgen::generate_simple_self_signed(vec!["jerith-mesh-node".to_string()])
         .map_err(|e| anyhow::anyhow!("cert generation failed: {e}"))?;
@@ -446,20 +490,97 @@ pub fn generate_node_cert() -> anyhow::Result<NodeCert> {
     Ok(NodeCert { cert_der, key_der })
 }
 
-/// Accept-any-certificate verifier for the Phase 1 overlay. Documented
-/// risk: replaced by per-node cert pinning in Phase 2.
-#[derive(Debug)]
-struct DangerVerifier;
+/// Build the PKCS#8 v1 "no attributes, ed25519" wrapper around a raw
+/// 32-byte Ed25519 seed, as RFC 5958 requires for ed25519 keys.
+///
+///   0x30 0x2e                 SEQUENCE, 46 bytes
+///     0x02 0x01 0x00          INTEGER 0 (version)
+///     0x30 0x05               SEQUENCE, 5 bytes  (alg id)
+///       0x06 0x03 0x2b 0x65 0x70   OID 1.3.101.112 (ed25519)
+///     0x04 0x22               OCTET STRING, 34
+///       0x04 0x20             OCTET STRING, 32 (the seed)
+fn ed25519_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&[0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05,
+                             0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20]);
+    out.extend_from_slice(seed);
+    out
+}
 
-impl rustls::client::danger::ServerCertVerifier for DangerVerifier {
+/// SHA-256 of the certificate's DER, hex — the fingerprint a verifier pins.
+#[allow(dead_code)] // reserved for future pin-by-fingerprint mode
+fn cert_fingerprint(cert: &rustls::pki_types::CertificateDer<'_>) -> String {
+    use std::fmt::Write;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(cert.as_ref());
+    let mut hexs = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        write!(hexs, "{b:02x}").unwrap();
+    }
+    hexs
+}
+
+/// Identity-pinning verifier: accepts a certificate only when the cert's
+/// Ed25519 subject key matches the node_id the client expects — pins are
+/// keyed by the dial-time SNI, which `call` sets to the destination node_id.
+///
+/// Binding rule (matches `SigningIdentity::node_id`): node_id = first 16 hex
+/// chars of the Ed25519 pubkey. The cert is self-signed ed25519 whose SPKI
+/// key IS the node's identity key, so a successful check means "this
+/// transport is provably the node we meant to dial" — a MITM cannot present
+/// a different cert for the same node_id, and a stolen random cert fails.
+#[derive(Debug)]
+struct PinningVerifier {
+    /// key: node_id (16 hex chars) → the SocketAddr the registry last
+    /// advertised for it (pinning by SNI: `call` dials with node_id as SNI).
+    pins: Arc<PinMap>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinningVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Extract the Ed25519 subject public key from the certificate.
+        let key_hex = match extract_ed25519_spki_hex(end_entity) {
+            Ok(h) => h,
+            Err(e) => {
+                return Err(rustls::Error::Other(rustls::OtherError(Arc::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("cert spki extraction failed: {e}"),
+                    ),
+                ))));
+            }
+        };
+        let sn_str = server_name.to_str().into_owned();
+        // SNI carries the destination node_id (set by `call`).
+        let Some(addr) = self.pins.get(&sn_str) else {
+            // No pin for this destination — fail closed (Phase 2: strict).
+            return Err(rustls::Error::Other(rustls::OtherError(Arc::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("no pin for destination {sn_str}"),
+                ),
+            ))));
+        };
+        let expected = sn_str;
+        let _ = addr; // future: also verify transport addr matches registry
+        // node_id is the 16-hex prefix of the pubkey — compare the prefix.
+        if !key_hex.starts_with(expected.as_str()) {
+            return Err(rustls::Error::Other(rustls::OtherError(Arc::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "cert identity mismatch: presented key {}… does not match pinned node_id {expected}",
+                        &key_hex[..8.min(key_hex.len())]
+                    ),
+                ),
+            ))));
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -498,12 +619,94 @@ impl rustls::client::danger::ServerCertVerifier for DangerVerifier {
     }
 }
 
-/// Build a client endpoint config that skips cert verification.
+/// Console client endpoints that skip verification remain available for
+/// offline tests only; production paths use `pinned_client_endpoint`.
 pub fn client_endpoint() -> anyhow::Result<quinn::Endpoint> {
+    build_client_endpoint(Arc::new(HashMap::new()))
+}
+
+/// Pin map: node_id → is implicit (the key IS the node_id); the value is
+/// reserved for a future fingerprint pin (see `cert_fingerprint`).
+/// Dialing a node must be answered by a cert whose Ed25519 key's 16-hex
+/// prefix equals the node_id dialed.
+pub type PinMap = HashMap<String, SocketAddr>;
+
+pub fn pinned_client_endpoint(pins: Arc<PinMap>) -> anyhow::Result<quinn::Endpoint> {
+    build_client_endpoint(pins)
+}
+
+/// Pins behind a live RwLock so the registry can update them between dials
+/// without rebuilding the endpoint. The verifier reads the current map at
+/// each handshake.
+pub type SharedPinMap = Arc<tokio::sync::RwLock<PinMap>>;
+
+pub fn pinned_client_endpoint_dyn(pins: SharedPinMap) -> anyhow::Result<quinn::Endpoint> {
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    struct DynVerifier(SharedPinMap);
+    impl std::fmt::Debug for DynVerifier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DynVerifier")
+        }
+    }
+    impl rustls::client::danger::ServerCertVerifier for DynVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            // Runs inside quinn's driver — cannot block. Pins are
+            // refreshed between dials; on a rare concurrent refresh,
+            // fail closed instead of panicking the runtime.
+            let pins = match self.0.try_read() {
+                Ok(g) => g.clone(),
+                Err(_) => {
+                    return Err(rustls::Error::Other(rustls::OtherError(Arc::new(
+                        std::io::Error::other("pin map busy"),
+                    ))));
+                }
+            };
+            let v = PinningVerifier { pins: Arc::new(pins) };
+            v.verify_server_cert(end_entity, _intermediates, server_name, _ocsp_response, _now)
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            digest: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                digest,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            digest: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                digest,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(DangerVerifier))
+        .with_custom_certificate_verifier(Arc::new(DynVerifier(pins.clone())))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"jerith-rpc/1".to_vec()];
     let config = quinn::ClientConfig::new(Arc::new(
@@ -513,9 +716,101 @@ pub fn client_endpoint() -> anyhow::Result<quinn::Endpoint> {
     Ok(endpoint)
 }
 
-/// Build a server endpoint on `addr`.
+fn build_client_endpoint(pins: Arc<PinMap>) -> anyhow::Result<quinn::Endpoint> {
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinningVerifier { pins }))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"jerith-rpc/1".to_vec()];
+    let config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    ));
+    endpoint.set_default_client_config(config);
+    Ok(endpoint)
+}
+
+/// Extract the Ed25519 subject public key (raw 32 bytes) from a DER cert and
+/// return its hex. Errors on any non-ed25519 SPKI.
+fn extract_ed25519_spki_hex(
+    cert: &rustls::pki_types::CertificateDer<'_>,
+) -> anyhow::Result<String> {
+    // OID 1.3.101.112 (ed25519): 06 03 2b 65 70. SPKI: SEQUENCE { SEQ(alg), BITSTRING(key) }
+    //
+    // The OID appears twice in a self-signed Ed25519 cert: once in
+    // tbsCertificate.signature (algorithm) and once in the SPKI. Only the
+    // SPKI occurrence is followed by a 33-byte BIT STRING key, so scan
+    // each occurrence and accept the one with that shape.
+    let der = cert.as_ref();
+    let needle: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
+    let mut key_hex = None;
+    let mut search_from = 0usize;
+    while let Some(oid_pos) = der[search_from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + search_from)
+    {
+        let mut i = oid_pos + 5;
+        // Skip a possible 0x05 0x00 NULL inside the alg id (not expected
+        // for ed25519, but harmless to allow).
+        if der.get(i) == Some(&0x05) {
+            if let Some(l) = der.get(i + 1).copied() {
+                i += 2 + l as usize;
+            }
+        }
+        // A BIT STRING of exactly 33 bytes (1 unused-bits byte + 32 key)
+        // right after the alg id = this is the SPKI. (The signature's BIT
+        // STRING is 65 bytes: 1 unused byte + 64 ed25519 sig.)
+        let is_spki_bitstring = der.get(i) == Some(&0x03)
+            && der
+                .get(i + 1)
+                .map(|len| *len == 33)
+                .unwrap_or(false);
+        if is_spki_bitstring {
+            match der.get(i + 2) {
+                Some(0x00) => {}
+                other => anyhow::bail!("unexpected SPKI unused-bits byte {other:?}"),
+            }
+            let start = i + 3;
+            let key: [u8; 32] = der
+                .get(start..start + 32)
+                .ok_or_else(|| anyhow::anyhow!("truncated key bytes"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("key copy failed"))?;
+            key_hex = Some(hex::encode(key));
+            break;
+        }
+        search_from = oid_pos + 1;
+    }
+    let Some(key_hex) = key_hex else {
+        anyhow::bail!("cert is not an Ed25519 SPKI");
+    };
+    Ok(key_hex)
+}
+
+
+/// Build a server endpoint on `addr` with a random cert. Kept for offline
+/// tests; production code uses `server_endpoint_for` (identity-bound cert).
 pub fn server_endpoint(addr: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
     let cert = generate_node_cert()?;
+    rustls_server_endpoint_from_cert(cert, addr)
+}
+
+/// Identity-bound server endpoint: the TLS cert key IS the node's Ed25519
+/// identity key, so the presented cert cryptographically ties the transport
+/// to `node_id` — the client's pinning verifier can prove "who answered".
+pub fn server_endpoint_for(
+    identity: &crate::signing::SigningIdentity,
+    addr: SocketAddr,
+) -> anyhow::Result<quinn::Endpoint> {
+    let cert = generate_node_cert_for(identity)?;
+    rustls_server_endpoint_from_cert(cert, addr)
+}
+
+fn rustls_server_endpoint_from_cert(
+    cert: NodeCert,
+    addr: SocketAddr,
+) -> anyhow::Result<quinn::Endpoint> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert.cert_der], cert.key_der)?;
@@ -836,15 +1131,19 @@ impl RuntimeExpert {
 }
 
 /// One-shot RPC client: connect, send a signed request, await the reply.
+/// `server_node_id` doubles as the SNI so the pinning verifier can look up
+/// the pin for the node we *mean* to reach — the cert must then carry that
+/// node's identity key (PinningVerifier), binding wire node_id to transport.
 pub async fn call(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
+    server_node_id: &str,
     req: &NodeRpcRequest,
     _identity: &SigningIdentity,
     timeout: Duration,
 ) -> anyhow::Result<NodeRpcReply> {
     let connecting = endpoint
-        .connect(addr, "jerith-mesh-node")
+        .connect(addr, server_node_id)
         .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
     let connection = tokio::time::timeout(timeout, connecting)
         .await
@@ -871,6 +1170,7 @@ pub async fn call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::client::danger::ServerCertVerifier as _;
 
     fn peers() -> Vec<(String, u64, bool, bool)> {
         vec![
@@ -1027,16 +1327,32 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn quic_expert_query_roundtrip() {
-        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    /// Spawn an identity-bound server and return its addr + identity +
+    /// a dynamic pin map preloaded with `node_id -> addr`, matching the
+    /// node_id-keyed lookup the production client path uses.
+    async fn test_server_and_pins(
+        handler: Arc<dyn ExpertHandler>,
+    ) -> anyhow::Result<(SocketAddr, SigningIdentity, SharedPinMap)> {
+        let identity = SigningIdentity::generate();
+        let server = server_endpoint_for(&identity, "127.0.0.1:0".parse().unwrap())?;
         let addr = server.local_addr().unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(false);
+        let node_id = identity.node_id();
+        let mut pins: PinMap = HashMap::new();
+        pins.insert(node_id.clone(), addr);
         tokio::spawn(async move {
-            serve(server, Arc::new(TimesTwo), "test-server".to_string(), rx).await
+            let _ = serve(server, handler, node_id, rx).await;
         });
+        let pins: SharedPinMap = Arc::new(RwLock::new(pins));
+        Ok((addr, identity, pins))
+    }
 
-        let client = client_endpoint().unwrap();
+    #[tokio::test]
+    async fn quic_expert_query_roundtrip() {
+        let (addr, server_identity, pins) =
+            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut req = NodeRpcRequest::ExpertQuery {
             req_id: "e2e-1".into(),
@@ -1049,7 +1365,14 @@ mod tests {
         sign_request(&mut req, &identity);
         let reply = tokio::time::timeout(
             Duration::from_secs(10),
-            call(&client, addr, &req, &identity, Duration::from_secs(5)),
+            call(
+                &client,
+                addr,
+                &server_identity.node_id(),
+                &req,
+                &identity,
+                Duration::from_secs(5),
+            ),
         )
         .await
         .unwrap()
@@ -1065,14 +1388,8 @@ mod tests {
 
     #[tokio::test]
     async fn quic_ping_roundtrip() {
-        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            serve(server, Arc::new(TimesTwo), "test-server".to_string(), rx).await
-        });
-
-        let client = client_endpoint().unwrap();
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut req = NodeRpcRequest::Ping {
             from_node_id: identity.node_id(),
@@ -1080,9 +1397,16 @@ mod tests {
             sig: String::new(),
         };
         sign_request(&mut req, &identity);
-        let reply = call(&client, addr, &req, &identity, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let reply = call(
+            &client,
+            addr,
+            &server_identity.node_id(),
+            &req,
+            &identity,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert!(matches!(reply, NodeRpcReply::Pong { .. }));
     }
 
@@ -1096,37 +1420,35 @@ mod tests {
         }
     }
 
-    async fn spawn_expert_server(
-        factor: f32,
-        node_id: &str,
-    ) -> anyhow::Result<SocketAddr> {
-        let server = server_endpoint("127.0.0.1:0".parse().unwrap())?;
-        let addr = server.local_addr().unwrap();
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        let node_id = node_id.to_string();
-        tokio::spawn(async move {
-            serve(server, Arc::new(Multiplier { factor }), node_id, rx).await
-        });
-        Ok(addr)
-    }
-
     #[tokio::test]
     async fn router_execute_over_quic_prefers_local_and_falls_through() {
         // Two remote servers: near (×3, rtt 5) and far (×7, rtt 200).
-        let near_addr = spawn_expert_server(3.0, "near").await.unwrap();
-        let far_addr = spawn_expert_server(7.0, "far").await.unwrap();
+        let (near_addr, near_identity, pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let (far_addr, far_identity, far_pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        {
+            let far_map = far_pins.try_read().expect("far pins readable").clone();
+            let mut wl = pins.try_write().expect("pins writable");
+            wl.extend(far_map);
+        }
+        let near_node_id = near_identity.node_id();
+        let far_node_id = far_identity.node_id();
 
         let r = router(50); // nearby threshold 50ms
-        let node_id = SigningIdentity::generate().node_id();
         let peers = vec![
-            ("near".to_string(), 5, true, true),
-            ("far".to_string(), 200, true, true),
+            (near_node_id.clone(), 5, true, true),
+            (far_node_id.clone(), 200, true, true),
         ];
         let mut addrs = HashMap::new();
-        addrs.insert("near".to_string(), near_addr);
-        addrs.insert("far".to_string(), far_addr);
+        addrs.insert(near_node_id.clone(), near_addr);
+        addrs.insert(far_node_id.clone(), far_addr);
 
-        let client = client_endpoint().unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut completed = HashMap::new();
 
@@ -1186,7 +1508,7 @@ mod tests {
         // → far ×7 serves.
         r.unregister_local_expert("exp.test").await;
         let mut addrs2 = addrs.clone();
-        addrs2.remove("near");
+        addrs2.remove(&near_node_id);
         let out4 = r
             .execute_over_quic(
                 &client,
@@ -1240,28 +1562,19 @@ mod tests {
 
     #[tokio::test]
     async fn chat_over_quic_falls_back_to_peer() {
-        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        let server_id = "peer-b".to_string();
-        tokio::spawn(async move {
-            serve(
-                server,
-                Arc::new(ChatAnswer {
-                    content: "mesh hello".into(),
-                }),
-                server_id,
-                rx,
-            )
-            .await
-        });
+        let (addr, server_identity, pins) = test_server_and_pins(
+            Arc::new(ChatAnswer { content: "mesh hello".into() }),
+        )
+        .await
+        .unwrap();
+        let node_id = server_identity.node_id();
 
         let r = router(50);
-        let client = client_endpoint().unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut addrs = HashMap::new();
-        addrs.insert("peer-b".to_string(), addr);
-        let peers = vec![("peer-b".to_string(), 8, true, true)];
+        addrs.insert(node_id.clone(), addr);
+        let peers = vec![(node_id.clone(), 8, true, true)];
 
         // Local runtime down → falls back to the mesh peer, attributed.
         let (content, served_by) = r
@@ -1276,8 +1589,9 @@ mod tests {
             )
             .await
             .unwrap();
+        let _ = &node_id;
         assert_eq!(content, "mesh hello");
-        assert_eq!(served_by, "peer-b"); // the node that actually answered
+        assert_eq!(served_by, node_id); // the node that actually answered
 
         // Local healthy → mesh never used, no remote attribution.
         let (content2, served_by2) = r
@@ -1312,14 +1626,9 @@ mod tests {
 
     #[tokio::test]
     async fn quic_rejects_stale_stamp() {
-        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
-            serve(server, Arc::new(TimesTwo), "test-server".to_string(), rx).await
-        });
-
-        let client = client_endpoint().unwrap();
+        let (addr, server_identity, pins) =
+            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let req = NodeRpcRequest::Ping {
             from_node_id: identity.node_id(),
@@ -1328,10 +1637,120 @@ mod tests {
                 - 5_000,
             sig: identity.sign(b"whatever").to_string(),
         };
-        let reply = call(&client, addr, &req, &identity, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let reply = call(
+            &client,
+            addr,
+            &server_identity.node_id(),
+            &req,
+            &identity,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert!(matches!(reply, NodeRpcReply::Error { .. }));
+    }
+
+    // --- Negative tests for the pinning verifier itself ---
+
+    fn verifier_with(pins: PinMap) -> PinningVerifier {
+        PinningVerifier { pins: Arc::new(pins) }
+    }
+
+    /// SNI as `call` sets it: the destination node_id string.
+    fn server_name_for(node_id: &str) -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::try_from(node_id.to_string())
+            .expect("node_id is a valid SNI string")
+    }
+
+    fn identity_cert(identity: &SigningIdentity) -> rustls::pki_types::CertificateDer<'static> {
+        generate_node_cert_for(identity).unwrap().cert_der
+    }
+
+    #[test]
+    fn verifier_rejects_unpinned_destination() {
+        let identity = SigningIdentity::generate();
+        let cert = identity_cert(&identity);
+        let v = verifier_with(PinMap::new()); // no pin at all
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &server_name_for(&identity.node_id()),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_err(), "unpinned destination must fail closed");
+    }
+
+    #[test]
+    fn verifier_rejects_forged_non_ed25519_cert() {
+        // rcgen's default RSA path produces a cert whose SPKI is not
+        // Ed25519 — the extractor must refuse it.
+        let ck = rcgen::generate_simple_self_signed(vec!["forged".to_string()]).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec());
+        let pinned_id = SigningIdentity::generate();
+        let mut pins = PinMap::new();
+        // Pin for the node we dialed (SNI) exists but the cert is RSA.
+        pins.insert(pinned_id.node_id(), "127.0.0.1:1".parse().unwrap());
+        let v = verifier_with(pins);
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &server_name_for(&pinned_id.node_id()),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_err(), "non-Ed25519 cert must be rejected");
+    }
+
+    #[test]
+    fn verifier_rejects_wrong_node_mismatch() {
+        // Cert is a valid identity cert for node Y, but the pin for that
+        // addr names node X — must reject.
+        let y = SigningIdentity::generate();
+        let x_node_id = SigningIdentity::generate().node_id();
+        let cert = identity_cert(&y);
+        let mut pins = PinMap::new();
+        // SNI says node X but the cert is node Y's identity key.
+        pins.insert(x_node_id.clone(), "127.0.0.1:1".parse().unwrap());
+        let v = verifier_with(pins);
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &server_name_for(&x_node_id),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_err(), "mismatched node_id must be rejected");
+    }
+
+    #[test]
+    fn verifier_accepts_matching_pin() {
+        let id = SigningIdentity::generate();
+        let cert = identity_cert(&id);
+        let mut pins = PinMap::new();
+        // SNI = node's own id, cert = that node's identity key: accept.
+        pins.insert(id.node_id(), "127.0.0.1:1".parse().unwrap());
+        let v = verifier_with(pins);
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &server_name_for(&id.node_id()),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_ok(), "matching pin must be accepted: {res:?}");
+    }
+    #[test]
+    fn extractor_decodes_identity_cert_key() {
+        let id = SigningIdentity::generate();
+        let cert = identity_cert(&id);
+        let key_hex = extract_ed25519_spki_hex(&cert).expect("extractor decodes");
+        assert_eq!(
+            key_hex.starts_with(&id.node_id()),
+            true,
+            "extracted key {key_hex} must extend node_id {}",
+            id.node_id()
+        );
     }
 
     #[test]

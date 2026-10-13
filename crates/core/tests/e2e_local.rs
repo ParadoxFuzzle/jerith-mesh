@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use jerith_mesh_core::bootstrap::{PeerAd, PeerRegistry};
 use jerith_mesh_core::config::{NodeConfig, NodeRole};
 use jerith_mesh_core::ping::{MeshFallbackChat, MeshState};
-use jerith_mesh_core::quic::{server_endpoint, serve, ExpertHandler, ExpertRouter, RouterOptions};
+use jerith_mesh_core::quic::{server_endpoint_for, serve, ExpertHandler, ExpertRouter, RouterOptions};
 use jerith_mesh_core::signing::SigningIdentity;
 
 /// Peer-side handler: deterministic chat answer, real identity + signing.
@@ -37,10 +37,10 @@ impl ExpertHandler for PeerChat {
 #[tokio::test]
 async fn mesh_chat_falls_back_over_quic_with_real_attribution() {
     // 1. Spawn a real QUIC peer serving a chat-capable handler.
-    let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+    let peer_identity = SigningIdentity::generate();
+    let server = server_endpoint_for(&peer_identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let peer_addr = server.local_addr().unwrap();
     let (_tx, rx) = tokio::sync::watch::channel(false);
-    let peer_identity = SigningIdentity::generate();
     let peer_node_id = peer_identity.node_id();
     let peer_id_for_registry = peer_node_id.clone();
     tokio::spawn(async move {

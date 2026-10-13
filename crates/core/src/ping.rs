@@ -81,18 +81,39 @@ impl MeshState {
 pub struct MeshFallbackChat {
     pub endpoint: quinn::Endpoint,
     pub router: std::sync::Arc<crate::quic::ExpertRouter>,
+    /// Live pins (node_id → rpc addr); replaced wholesale from the registry
+    /// so the cert-pinning verifier always judges against current mesh state.
+    pub pins: std::sync::Arc<tokio::sync::RwLock<crate::quic::PinMap>>,
 }
 
 impl MeshFallbackChat {
+    /// Spawn with fresh pins from the registry: rpc address → node_id, so
+    /// the QUIC transport's cert pinning verifier can prove "who answered".
+    /// Pins are refreshed from the live registry before each dial batch via
+    /// `set_pins`.
     pub fn spawn() -> anyhow::Result<Arc<Self>> {
-        let endpoint = crate::quic::client_endpoint()?;
+        let pins = std::sync::Arc::new(tokio::sync::RwLock::new(Default::default()));
+        let endpoint = crate::quic::pinned_client_endpoint_dyn(pins.clone())
+            .map_err(|e| anyhow::anyhow!("pinned client endpoint: {e}"))?;
         let router = std::sync::Arc::new(crate::quic::ExpertRouter::new(
             crate::quic::RouterOptions {
                 nearby_rtt_ms: 50,
                 dispatch_timeout: Duration::from_secs(30),
             },
         ));
-        Ok(Arc::new(Self { endpoint, router }))
+        Ok(Arc::new(Self { endpoint, router, pins }))
+    }
+
+    /// Rebuild endpoint config pins from current registry rpc addresses.
+    async fn refresh_pins(&self, state: &Arc<MeshState>) {
+        let reg = state.registry.lock().await;
+        let mut pins = self.pins.write().await;
+        pins.clear();
+        for ad in reg.all_ads() {
+            if let Ok(addr) = ad.rpc_address.parse::<SocketAddr>() {
+                pins.insert(ad.node_id.clone(), addr);
+            }
+        }
     }
 
     /// Build inputs for the router from live registry state: connectable
@@ -138,6 +159,7 @@ impl MeshFallbackChat {
         req_id_tracker();
         let req_id = format!("chat-{}", crate::bootstrap::now_ms());
         let (peers, addrs) = self.mesh_view(state).await;
+        self.refresh_pins(state).await;
         let local_attempt = local_try();
         let router = self.router.clone();
         let endpoint = self.endpoint.clone();

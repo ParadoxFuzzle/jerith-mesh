@@ -620,7 +620,10 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         .unwrap_or_default();
     match jerith_mesh_core::quic::RuntimeExpert::discover(&cfg.runtime_url, &model_name).await {
         Ok(handler) => {
-            match jerith_mesh_core::quic::server_endpoint(rpc_addr) {
+            // Identity-bound QUIC cert: the transport cert key IS the node's
+            // Ed25519 identity, letting peers pin node_id ↔ cert.
+            let rpc_identity = cfg.identity()?;
+            match jerith_mesh_core::quic::server_endpoint_for(&rpc_identity, rpc_addr) {
                 Ok(endpoint) => {
                     let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
                     let node_id = cfg.node_id.clone();

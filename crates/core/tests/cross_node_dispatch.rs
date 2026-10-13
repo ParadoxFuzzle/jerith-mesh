@@ -36,9 +36,11 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
     };
     sign_request(&mut req, &identity);
 
+    let sni_node = std::env::var("EXPECT_NODE_B_ID")
+        .unwrap_or_else(|_| "unpinned-dev-peer".to_string());
     let reply = tokio::time::timeout(
         Duration::from_secs(10),
-        jerith_mesh_core::quic::call(&client, addr, &req, &identity, Duration::from_secs(5)),
+        jerith_mesh_core::quic::call(&client, addr, &sni_node, &req, &identity, Duration::from_secs(5)),
     )
     .await
     .expect("dispatch timeout")
@@ -67,6 +69,7 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
             let reply2 = jerith_mesh_core::quic::call(
                 &client,
                 addr,
+                &sni_node,
                 &req,
                 &identity,
                 Duration::from_secs(5),
