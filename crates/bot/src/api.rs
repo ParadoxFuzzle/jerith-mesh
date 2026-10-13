@@ -122,10 +122,35 @@ pub async fn chat(
 
     // Persona goes first, after user-side screening (see above). The bot
     // answering "as Jerith" is exactly this message.
-    if let Some(p) = cfg.system_prompt.as_deref() {
-        let p = p.trim();
-        if !p.is_empty() {
-            messages.insert(0, json!({"role": "system", "content": p}));
+    let persona_first = cfg
+        .system_prompt
+        .as_deref()
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false);
+    if persona_first {
+        messages.insert(
+            0,
+            json!({"role": "system", "content": cfg.system_prompt.clone().unwrap_or_default()}),
+        );
+    }
+
+    // Live identity: resolve the tagged speaker against the jerith_people
+    // registry (direct Postgres — same contract as the OpenClaw stack:
+    // root@127.0.0.1:5432, password via ~/.pgpass). The freshest row is
+    // attached as a second system message; an unreachable database or an
+    // unknown speaker just means the chat proceeds without it.
+    if let Some(pg) = cfg.postgres.as_ref().filter(|p| p.enabled) {
+        if let Some(discord_id) = crate::people::extract_speaker_id(&prompt) {
+            match crate::people::lookup(pg, &discord_id).await {
+                Ok(Some(block)) => messages.insert(
+                    if persona_first { 1 } else { 0 },
+                    json!({"role": "system", "content": block}),
+                ),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "people-db lookup skipped — chatting without speaker context");
+                }
+            }
         }
     }
 

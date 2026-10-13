@@ -56,6 +56,10 @@ pub struct BotConfig {
     /// passed through the Guard: it is static config, and its PII redaction
     /// could mangle the owner's own security rules quoted inside it.
     pub system_prompt: Option<String>,
+    /// Optional `[postgres]` table — live jerith_people lookup per chat turn
+    /// (OpenClaw-stack defaults; password resolved from ~/.pgpass). Degrades
+    /// silently to no context when the DB is unreachable.
+    pub postgres: Option<crate::people::PgConfig>,
 }
 
 impl BotConfig {
@@ -105,6 +109,7 @@ impl BotConfig {
             announce_channel_id,
             guard: file.guard.unwrap_or_default(),
             system_prompt,
+            postgres: file.postgres,
         })
     }
 
@@ -118,6 +123,7 @@ impl BotConfig {
             announce_channel_id: None,
             guard: jerith_mesh_core::guard::GuardConfig::default(),
             system_prompt: None,
+            postgres: None,
         }
     }
 }
@@ -171,6 +177,8 @@ struct FileConfig {
     /// Inline persona/system prompt (TOML string); env `JERITH_PERSONA`
     /// wins; persona.md file is the last fallback (handled in main.rs).
     system_prompt: Option<String>,
+    /// Optional `[postgres]` table — live jerith_people lookup per chat turn.
+    postgres: Option<crate::people::PgConfig>,
     /// Optional `[guard]` section — same shape as the node's config.toml.
     guard: Option<jerith_mesh_core::guard::GuardConfig>,
 }

@@ -15,6 +15,7 @@ mod api;
 mod chat_fallback;
 mod commands;
 mod config;
+mod people;
 mod state;
 
 use poise::serenity_prelude as serenityall;
