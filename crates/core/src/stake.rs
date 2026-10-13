@@ -199,28 +199,35 @@ impl StakeManager {
 
     // ---- chain wiring (the escrow contract live on jerith_node.py) -----
 
+    /// Raw `GET /stake` body for this node's identity (Some on success).
+    /// Shared by the tick sync and the `jerith stake status` CLI view.
+    pub async fn chain_view(&self) -> Option<serde_json::Value> {
+        let identity = self.identity.as_ref()?;
+        let base = self.chain_base.as_deref()?;
+        let token = self.token.clone()?;
+        let url = format!(
+            "{}/stake?discord_id={}",
+            base.trim_end_matches('/'),
+            identity.node_id()
+        );
+        let (status, body) = stake_get(&url, &token).await.ok()?;
+        if !(200..300).contains(&status) {
+            tracing::debug!(target: "economics", status, "chain /stake view unavailable");
+            return None;
+        }
+        Some(body)
+    }
+
     /// Trues the ledger up against the live `GET /stake` view each mesh
     /// tick: a slash the chain applied against us surfaces as a lower
     /// `staked_uj` (the join gate gets honest), `slashed_total_uj` syncs to
     /// the chain's own accounting. Quiet no-op without chain/token/identity
     /// or when the wallet hasn't been chain-created yet (404).
     pub async fn refresh_from_chain(&self) -> bool {
-        let Some(identity) = self.identity.as_ref() else { return false };
-        let Some(base) = self.chain_base.as_deref() else { return false };
-        let Some(token) = self.token.clone() else { return false };
-        let url = format!(
-            "{}/stake?discord_id={}",
-            base.trim_end_matches('/'),
-            identity.node_id()
-        );
-        let (status, body) = match stake_get(&url, &token).await {
-            Ok(r) => r,
-            Err(_) => return false, // chain down — keep local truth, quiet
+        let body = match self.chain_view().await {
+            Some(b) => b,
+            None => return false, // chain down — keep local truth, quiet
         };
-        if !(200..300).contains(&status) {
-            tracing::debug!(target: "economics", status, "chain /stake view unavailable");
-            return false;
-        }
         let staked = body.get("staked_uj").and_then(|v| v.as_u64()).unwrap_or(0);
         let slashed = body
             .get("slashed_total_uj")
@@ -239,9 +246,10 @@ impl StakeManager {
         true
     }
 
-    /// Escrow the join stake — exactly one attempt per mesh process, warm
-    /// stopped actually no restart test nary: with no requirement zero, not chain-wired, or
-    /// already covered, this never POSTs; see `lock_required`.
+    /// Escrow the join stake — exactly one attempt per mesh process
+    /// (restarts reset the flag and re-verify against chain truth): a no-op
+    /// when staking is disabled, the chain isn't wired, or the requirement
+    /// is already covered. See `lock_required`.
     pub async fn lock_required_once(&self) {
         if self
             .lock_attempted
@@ -252,18 +260,10 @@ impl StakeManager {
         self.lock_required().await;
     }
 
-    /// One escrow attempt (directly callable; tests drive this): POST
-    /// /stake/lock with the shortfall against the refreshed view, the
-    /// chain auto-creating the wallet on first 404 via /wallet/create.
-    /// The chain clamps to what it actually escrows, so the returned
-    /// `staked_uj` is recorded verbatim and the idempotency marker follows.
+    /// Escrow the configured requirement: posts only the shortfall against
+    /// the refreshed view. True when the requirement is covered afterwards
+    /// (already-covered inputs short-circuit without a POST).
     pub async fn lock_required(&self) -> bool {
-        let Some(identity) = self.identity.as_ref() else { return false };
-        let Some(base) = self.chain_base.as_deref() else { return false };
-        let Some(token) = self.token.clone() else {
-            tracing::debug!(target: "economics", "stake lock skipped: no chain api token");
-            return false;
-        };
         let required = self.config.required_uj;
         if required == 0 {
             return false; // staking off — never escrow
@@ -275,16 +275,34 @@ impl StakeManager {
         if covered >= required {
             return true; // escrow already in place (marker or live view)
         }
-        let shortfall = required - covered;
+        self.lock_topup(required - covered).await
+    }
+
+    /// Explicit escrow attempt (drives `lock_required`, and CLI top-ups):
+    /// POST /stake/lock for exactly `amount_uj`, the chain auto-creating
+    /// the wallet on first 404 via /wallet/create. The chain clamps to what
+    /// it actually escrows, so the returned `staked_uj` is recorded
+    /// verbatim and the idempotency marker follows along.
+    pub async fn lock_topup(&self, amount_uj: u64) -> bool {
+        let Some(identity) = self.identity.as_ref() else { return false };
+        let Some(base) = self.chain_base.as_deref() else { return false };
+        let Some(token) = self.token.clone() else {
+            tracing::debug!(target: "economics", "stake lock skipped: no chain api token");
+            return false;
+        };
+        if amount_uj == 0 {
+            tracing::debug!(target: "economics", "stake lock skipped: zero amount");
+            return true; // nothing requested — nothing to do
+        }
         let discord_id = identity.node_id();
         let body = serde_json::json!({
             "discord_id": discord_id,
-            "amount_jer": shortfall as f64 / 1_000_000.0,
+            "amount_jer": amount_uj as f64 / 1_000_000.0,
         });
         match stake_post(base, "/stake/lock", &token, &body).await {
             Ok((200..=299, reply)) => {
                 self.record_chain_stake(&reply);
-                tracing::info!(target: "economics", escrowed_uj = shortfall, "stake escrowed on chain");
+                tracing::info!(target: "economics", escrowed_uj = amount_uj, "stake escrowed on chain");
                 true
             }
             Ok((404, _)) => {
@@ -296,7 +314,7 @@ impl StakeManager {
                         match stake_post(base, "/stake/lock", &token, &body).await {
                             Ok((200..=299, reply)) => {
                                 self.record_chain_stake(&reply);
-                                tracing::info!(target: "economics", escrowed_uj = shortfall, "wallet created; stake escrowed on chain");
+                                tracing::info!(target: "economics", escrowed_uj = amount_uj, "wallet created; stake escrowed on chain");
                                 true
                             }
                             other => {
@@ -344,9 +362,6 @@ impl StakeManager {
     /// chain clamps to what actually remains after slashes, and both
     /// `staked_uj` and the idempotency marker true up to the response.
     pub async fn unlock_all(&self) -> bool {
-        let Some(identity) = self.identity.as_ref() else { return false };
-        let Some(base) = self.chain_base.as_deref() else { return false };
-        let Some(token) = self.token.clone() else { return false };
         let escrowed = {
             let ledger = self.ledger.lock().unwrap();
             ledger.escrowed_uj
@@ -354,9 +369,23 @@ impl StakeManager {
         if escrowed == 0 {
             return false; // never escrowed here — nothing to unwind
         }
+        self.unlock_amount(escrowed).await
+    }
+
+    /// Explicit unlock attempt (drives `unlock_all`, and CLI unlocks): POST
+    /// /stake/unlock for exactly `amount_uj` of this node's escrow. Both
+    /// ledger values true up to the response, so a partial chain-side
+    /// clamp lands as live truth.
+    pub async fn unlock_amount(&self, amount_uj: u64) -> bool {
+        let Some(identity) = self.identity.as_ref() else { return false };
+        let Some(base) = self.chain_base.as_deref() else { return false };
+        let Some(token) = self.token.clone() else { return false };
+        if amount_uj == 0 {
+            return true; // nothing requested — nothing to do
+        }
         let body = serde_json::json!({
             "discord_id": identity.node_id(),
-            "amount_jer": escrowed as f64 / 1_000_000.0,
+            "amount_jer": amount_uj as f64 / 1_000_000.0,
         });
         match stake_post(base, "/stake/unlock", &token, &body).await {
             Ok((200..=299, reply)) => {
@@ -364,7 +393,7 @@ impl StakeManager {
                 true
             }
             other => {
-                tracing::warn!(target: "economics", reply = ?other, "stake unlock on shutdown failed — escrow persists");
+                tracing::warn!(target: "economics", reply = ?other, "stake unlock failed — escrow persists");
                 false
             }
         }
@@ -731,6 +760,53 @@ mod tests {
         let ledger = mgr.snapshot();
         assert_eq!(ledger.escrowed_uj, 0);
         assert_eq!(ledger.staked_uj, 0);
+    }
+
+    #[tokio::test]
+    async fn lock_topup_posts_explicit_amount_even_when_covered() {
+        let stub = ChainStub::spawn(Some(2_700_000)).await;
+        let mgr = manager_with_stub(&stub);
+        // An operator top-up posts regardless of the gate's covered math —
+        // `jerith stake lock <amount>` is an instruction, not gate logic.
+        assert!(mgr.lock_topup(700_000).await);
+        let hits = stub.hits.lock().unwrap().clone();
+        let (_, body) = hits
+            .iter()
+            .find(|(p, _)| p == "POST /stake/lock")
+            .cloned()
+            .expect("explicit lock posted");
+        assert!((body["amount_jer"].as_f64().unwrap() - 0.7).abs() < 1e-9);
+        // Chain truth recorded verbatim (stub reports 2_700_000).
+        let ledger = mgr.snapshot();
+        assert_eq!(ledger.staked_uj, 2_700_000);
+        assert_eq!(ledger.escrowed_uj, 2_700_000);
+        // lock_required itself is now covered by the chain's reply.
+        assert!(mgr.lock_required().await);
+        assert_eq!(stub.path_hits().iter().filter(|p| *p == "POST /stake/lock").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unlock_amount_posts_explicit_partial_then_marker_covers_rest() {
+        let stub = ChainStub::spawn(Some(0)).await;
+        let mgr = manager_with_stub(&stub);
+        {
+            let mut l = mgr.ledger.lock().unwrap();
+            l.staked_uj = 400_000;
+            l.escrowed_uj = 400_000;
+        }
+        // Partial unlock: the exact body goes out, and the response zeroes
+        // both ledger values (chain truth wins over the marker).
+        assert!(mgr.unlock_amount(200_000).await);
+        let hits = stub.hits.lock().unwrap().clone();
+        let (_, body) = hits
+            .iter()
+            .find(|(p, _)| p == "POST /stake/unlock")
+            .cloned()
+            .expect("partial unlock posted");
+        assert!((body["amount_jer"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        let ledger = mgr.snapshot();
+        assert_eq!(ledger.staked_uj, 0);
+        assert_eq!(ledger.escrowed_uj, 0);
     }
 
     #[tokio::test]

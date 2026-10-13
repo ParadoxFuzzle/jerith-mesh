@@ -7,6 +7,7 @@
 //!   peers       list peers in this model's mesh
 //!   model       show or switch the active model (disconnects all peers)
 //!   config      get/set config values (contribution_percent, etc.)
+//!   stake       show or drive the stake escrow (status | lock | unlock)
 
 use std::io::{BufRead, Write as _};
 use std::time::Duration;
@@ -96,6 +97,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Show or drive the stake escrow (Phase 5 tier).
+    Stake {
+        #[command(subcommand)]
+        cmd: StakeCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,9 +111,27 @@ enum MemoryCmd {
     /// Vector-search local memory.
     Search { query: String, #[arg(long, default_value_t = 5)] top_k: usize },
     /// Number of stored entries.
-    Count,
-    /// Delete an entry by id.
+    Count,    /// Delete an entry by id.
     Forget { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum StakeCmd {
+    /// Fetch the live chain escrow view and true-up the local ledger.
+    Status,
+    /// Escrow to the chain. Without an amount: top up the shortfall towards
+    /// the configured `[crypto.stake] required_uj` (the run loop does this
+    /// automatically once per process; this commands it by hand).
+    Lock {
+        /// Amount in JER (fractional, e.g. 2.5).
+        amount_jer: Option<f64>,
+    },
+    /// Return escrow to the wallet. Without an amount: everything this
+    /// node's marker says it escrowed.
+    Unlock {
+        /// Amount in JER (fractional, e.g. 2.5).
+        amount_jer: Option<f64>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -159,6 +183,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Model { new_model } => model_cmd(new_model).await,
         Cmd::Config { assignments } => config_cmd(assignments).await,
         Cmd::Memory { cmd } => memory_cmd(cmd).await,
+        Cmd::Stake { cmd } => stake_cmd(cmd).await,
     }
 }
 
@@ -198,6 +223,107 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
                 println!("forgot #{id}");
             } else {
                 println!("#{id} not found");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// stake (Phase 5 escrow tier)
+// ---------------------------------------------------------------------------
+
+/// Amount → µJER with a positive guard.
+fn jer_to_uj(amount_jer: f64) -> anyhow::Result<u64> {
+    if amount_jer <= 0.0 {
+        bail!("amount must be positive (JER)");
+    }
+    Ok((amount_jer * 1_000_000.0).round() as u64)
+}
+
+async fn stake_cmd(cmd: StakeCmd) -> anyhow::Result<()> {
+    let cfg = NodeConfig::load()?.context("no config — run setup first")?;
+    if cfg.crypto.chain != jerith_mesh_core::config::CryptoChain::Jerithchain {
+        bail!("staking rides jerithchain only — set crypto = \"jerithchain\" (and JERITH_TOKEN or keys/api.token) first");
+    }
+    let identity = cfg.identity()?;
+    let stake =
+        jerith_mesh_core::stake::StakeManager::new(&cfg.crypto, Some(identity));
+    match cmd {
+        StakeCmd::Status => {
+            stake.refresh_from_chain().await;
+            match stake.chain_view().await {
+                Some(v) => {
+                    let staked = v["staked_uj"].as_u64().unwrap_or(0);
+                    println!(
+                        "chain: staked {staked} µJ ({:.3} JER) | slashed {} µJ | escrow wallet {}",
+                        staked as f64 / 1e6,
+                        v["slashed_total_uj"].as_u64().unwrap_or(0),
+                        v["escrow_address"].as_str().unwrap_or("?"),
+                    );
+                }
+                None => println!(
+                    "chain /stake view unavailable (chain down, wallet absent, or token) — showing local ledger"
+                ),
+            }
+            let snap = stake.snapshot();
+            println!(
+                "local: staked {} µJ | escrowed {} µJ | slashed {} µJ | required {} µJ | gate_clear {}",
+                snap.staked_uj,
+                snap.escrowed_uj,
+                snap.slashed_total_uj,
+                stake.required_uj(),
+                stake.clears_gate(),
+            );
+        }
+        StakeCmd::Lock { amount_jer } => {
+            stake.refresh_from_chain().await;
+            let uj = match amount_jer {
+                Some(a) => jer_to_uj(a)?,
+                None => {
+                    let required = stake.required_uj();
+                    if required == 0 {
+                        bail!(
+                            "[crypto.stake] required_uj is 0 — enable the tier or pass an explicit amount"
+                        );
+                    }
+                    let snap = stake.snapshot();
+                    required.saturating_sub(snap.staked_uj.max(snap.escrowed_uj))
+                }
+            };
+            if uj == 0 {
+                println!("requirement already covered — nothing to lock");
+                return Ok(());
+            }
+            println!("locking {uj} µJ ({:.3} JER)…", uj as f64 / 1e6);
+            if stake.lock_topup(uj).await {
+                println!(
+                    "✓ escrow live: staked {} µJ | gate_clear {}",
+                    stake.snapshot().staked_uj,
+                    stake.clears_gate()
+                );
+            } else {
+                bail!("lock failed — the chain's answer is in the log");
+            }
+        }
+        StakeCmd::Unlock { amount_jer } => {
+            stake.refresh_from_chain().await;
+            let uj = match amount_jer {
+                Some(a) => jer_to_uj(a)?,
+                None => stake.snapshot().escrowed_uj,
+            };
+            if uj == 0 {
+                println!("nothing marked as escrowed locally — nothing to return");
+                return Ok(());
+            }
+            println!("unlocking {uj} µJ ({:.3} JER)…", uj as f64 / 1e6);
+            if stake.unlock_amount(uj).await {
+                println!(
+                    "✓ unlocked; chain now reports staked {} µJ",
+                    stake.snapshot().staked_uj
+                );
+            } else {
+                bail!("unlock failed — the chain's answer is in the log");
             }
         }
     }

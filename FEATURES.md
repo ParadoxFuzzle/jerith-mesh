@@ -104,14 +104,20 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - 📋 Optional Bitcoin, Ethereum, Dogecoin, Monero (user supplies own miner/wallet endpoints) (Phase 4)
 - ✅ Interval metering hooks (tokens, expert activations, bandwidth, uptime) wired through the ping loop
 - 📋 Automatic JER mining attempt on each served inference (Phase 4)
-- ✅ Optional staking + slashing tier (Phase 5, off by default):
-  `[crypto.stake] required_uj` (µJER escrow line for Contributor/Hybrid —
-  insufficient/unreachable chain balance demotes the session to Requester,
-  config untouched so it self-restores), `slash_percent_per_offense`
-  (default 25 %) penalized per bootstrap-verified offense with a persisted
-  slash ledger (`data/stake.json`, audit ring + totals in `/status`), and
-  signed slash notices POSTed to the chain's `stake/slash` contract
-  (feature-tolerant until the chain side lands)
+- ✅ Optional staking + slashing tier (Phase 5, off by default) — live
+  against the JerithChain escrow contract (`/stake/lock`, `/stake/unlock`,
+  `GET /stake`, `/stake/slash`):
+  `[crypto.stake] required_uj` (µJER escrow line for Contributor/Hybrid);
+  each mesh process escrows the shortfall exactly once (chain wallet
+  auto-created on first 404, persisted `escrowed_uj` marker keeps restarts
+  idempotent) and returns it on shutdown; the local ledger trues up to the
+  chain's `GET /stake` view every tick, so `/status` shows chain truth
+  (the old fake "assume staked" gate seed is gone);
+  `slash_percent_per_offense` (default 25 %) penalized per
+  bootstrap-verified offense — recorded in the persisted slash ledger
+  (`data/stake.json`, audit ring + totals in `/status`) and POSTed as an
+  Ed25519-signed `stake/slash` notice; `jerith stake status|lock|unlock`
+  drives the same escrow by hand
 
 ## 10. Contribution Proof & Anti-Fraud
 Phased — see ARCHITECTURE.md §8 for the full layered plan:
