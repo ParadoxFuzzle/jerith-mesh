@@ -2117,6 +2117,70 @@ mod tests {
         assert_eq!(ExpertRouter::compact_chat_history(&roles).len(), 2);
     }
 
+    /// Serves chat over QUIC while recording exactly what the wire
+    /// delivered — the assertion surface for the compaction transform.
+    struct ChatCapture(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    impl ExpertHandler for ChatCapture {
+        fn run(&self, _expert_id: &str, _input: &[f32]) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        fn chat<'a>(
+            &'a self,
+            messages: &'a [serde_json::Value],
+        ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+            *self.0.lock().unwrap() = messages.to_vec();
+            Box::pin(async move { Ok("recorded".to_string()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_query_wire_carries_compacted_history() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (addr, server_identity, pins) =
+            test_server_and_pins(Arc::new(ChatCapture(sink.clone()))).await.unwrap();
+        let node_id = server_identity.node_id();
+        let r = router(50);
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut addrs = HashMap::new();
+        addrs.insert(node_id.clone(), addr);
+        let peers = vec![(node_id.clone(), 8, true, true)];
+
+        // 5 messages, one back-to-back duplicate: the local closure fails
+        // so the request must ride the wire, carrying exactly the compacted
+        // 4 (the trailing user "q1" is NOT a duplicate of the assistant
+        // turn — non-adjacent repeats are intentional history).
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "q1"}),
+        ];
+        let (_content, served_by) = r
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "chat-cap",
+                &msgs,
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served_by, node_id); // wire path, not local
+        let got = sink.lock().unwrap().clone();
+        assert_eq!(got.len(), 4, "wire must carry the compacted history");
+        let roles: Vec<String> = got
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+    }
+
     #[tokio::test]
     async fn chat_over_quic_falls_back_to_peer() {
         let (addr, server_identity, pins) = test_server_and_pins(
