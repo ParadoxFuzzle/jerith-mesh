@@ -13,6 +13,11 @@
 //! `into_make_service_with_connect_info`). Requests we cannot attribute
 //! are allowed through unlimited — limping-by rather than locking out
 //! every isolated test client and headerless proxy hop.
+//!
+//! Both processes (node gateway + standalone bootstrap) share this
+//! module; each 429 emitted here bumps the process-local
+//! `metrics::RATE_LIMITED_429_TOTAL` counter (surfaced in the node's
+//! /status and the bootstrap's /health).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -144,6 +149,7 @@ pub async fn enforce(
 }
 
 fn too_many_response(limiter: &RateLimiter, ip: IpAddr) -> Response {
+    crate::metrics::bump(&crate::metrics::RATE_LIMITED_429_TOTAL);
     let ra = limiter.retry_after_secs(ip);
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -174,6 +180,8 @@ pub async fn axum_guard(
 ) -> Response {
     enforce(&limiter, client_ip(&req), req, next).await
 }
+
+/// Module tests: attribution semantics, per-IP windows, counter bump.
 
 #[cfg(test)]
 mod tests {
@@ -224,6 +232,25 @@ mod tests {
         // Window roll-over restores the budget.
         std::thread::sleep(Duration::from_millis(60));
         assert!(rl.allow(ip(1)));
+    }
+
+    #[test]
+    fn rejected_hits_bump_the_429_counter() {
+        // Parallel test streams share the process-local counter, so assert
+        // on a delta — and make it large enough that our own rejections
+        // dominate it.
+        let before = crate::metrics::RATE_LIMITED_429_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let rl = RateLimiter::new(1, Duration::from_millis(50));
+        assert!(rl.allow(ip(8)));
+        for _ in 0..10 {
+            let resp = too_many_response(&rl, ip(8));
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        let bumped = crate::metrics::RATE_LIMITED_429_TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - before;
+        assert!(bumped >= 10, "counter must move with every 429, got {bumped}");
     }
 
     #[test]

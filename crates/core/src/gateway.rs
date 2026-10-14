@@ -150,6 +150,7 @@ async fn skill_memory_embed(
     let text = match text.chars().count() {
         n if n <= MEMORY_EMBED_TEXT_CAP_CHARS => text,
         _ => {
+            crate::metrics::bump(&crate::metrics::OVERSIZE_MEMORY_REJECTS);
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json!({
@@ -198,6 +199,7 @@ async fn skill_memory_search(
     // context is ~8k tokens anyway) — don't pay an unbounded one per hit.
     const SEARCH_QUERY_CAP_CHARS: usize = 10_000;
     if query.chars().count() > SEARCH_QUERY_CAP_CHARS {
+        crate::metrics::bump(&crate::metrics::OVERSIZE_MEMORY_REJECTS);
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(json!({
@@ -620,6 +622,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
             "api_key_present": gw.web.as_ref().map(|w| w.has_api_key()).unwrap_or(false),
         }),
         "metrics": metrics_status(&gw.metrics.snapshot()),
+        "security": serde_json::to_value(crate::metrics::security_snapshot())
+            .expect("security counters serialize"),
         "chain": chain_probe(gw.chain_url.as_deref(), crate::economics::read_token().as_deref()).await,
     }))
 }
@@ -787,6 +791,7 @@ async fn chat_completions(
         .expect("gateway runtime client builder");
     let payload = body.to_string();
     if payload.len() > CHAT_FORWARD_CAP_BYTES {
+        crate::metrics::bump(&crate::metrics::OVERSIZE_CHAT_REJECTS);
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(json!({
@@ -1296,6 +1301,49 @@ mod tests {
             res.status_code(),
             axum::http::StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_security_counters() {
+        use std::sync::atomic::Ordering;
+
+        let server = spawn_with_memory();
+        let mem_before = crate::metrics::OVERSIZE_MEMORY_REJECTS
+            .load(Ordering::Relaxed);
+        // One oversize rejection so the /status section has a live,
+        // nonzero breakdown value to read back.
+        let big = "z".repeat(10_001);
+        let res = server
+            .post("/v1/skills/memory/search")
+            .json(&json!({"query": big}))
+            .await;
+        assert_eq!(
+            res.status_code(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(
+            crate::metrics::OVERSIZE_MEMORY_REJECTS.load(Ordering::Relaxed)
+                >= mem_before + 1,
+            "memory oversize counter must reflect the 413"
+        );
+
+        // The /status snapshot exposes the same process-local counters.
+        let res = server.get("/status").await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let body: Value = res.json();
+        let sec = body.get("security").expect("security section in /status");
+        for key in [
+            "rate_limited_429_total",
+            "oversize_reject_total",
+            "oversize_chat_rejects",
+            "oversize_memory_rejects",
+            "oversize_bootstrap_rejects",
+        ] {
+            assert!(
+                sec[key].is_u64(),
+                "security.{key} must be a u64 counter, got {sec}"
+            );
+        }
     }
 
     #[tokio::test]

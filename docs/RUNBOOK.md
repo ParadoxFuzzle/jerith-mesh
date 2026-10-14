@@ -232,6 +232,12 @@ Round 4 (this round) — unbounded-growth + flood tightening:
   or drain other buckets; everyone else is pinned to their socket peer.
 
 ```bash
+# Security-reject metrics: the node /status carries a `security` section
+# (rate_limited_429_total, oversize_reject_total, oversize_chat_rejects,
+# oversize_memory_rejects, oversize_bootstrap_rejects); the standalone
+# bootstrap /health carries the same section for its own process. The
+# bootstrap's counters never appear in the node's /status — they are
+# separate processes.
 # Verify round 4 (should show ~240 OK then 429s; window = 60 s):
 for i in $(seq 1 250); do curl -s -o /dev/null -w "%{http_code}\n" \
   http://127.0.0.1:8901/v1/models/counts; done | sort | uniq -c
@@ -280,6 +286,8 @@ Known remaining limitations (accepted, bounded):
   is load-sensitive under full-suite parallel load (handshake timing)
   and can fail the rare run; passes in isolation and on retry.
   Pre-existing, unrelated to round 4.
+
+
 
 ## Escalation pointers
 

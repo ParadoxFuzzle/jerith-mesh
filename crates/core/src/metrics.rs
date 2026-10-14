@@ -18,6 +18,7 @@
 //! is bot-side (`state.record_usage`), fed from this same `usage` data.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -25,6 +26,60 @@ use serde::Serialize;
 
 /// Ring cap: recent completions retained verbatim (oldest dropped).
 const RING_CAP: usize = 500;
+
+// ---- Security-reject counters (process-local, monotonic) ----
+//
+// 429s from the shared rate limiter and size-bound rejections (chat
+// forward cap, memory caps, bootstrap ad-field caps + registry cap), so
+// ops can read attack pressure straight off /status instead of
+// grepping journal logs. Statics rather than state on `Gateway`
+// because: (a) rejection sites span two processes (the node gateway
+// and the standalone bootstrap), (b) several bump sites have no
+// Gateway handle, and (c) they are process-local by definition — the
+// node's /status and the bootstrap's /health each report their own
+// process's counters. Relaxed ordering: these are observability
+// counters, exact cross-thread sequencing is irrelevant.
+
+pub static RATE_LIMITED_429_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Chat payloads over `CHAT_FORWARD_CAP_BYTES` (gateway).
+pub static OVERSIZE_CHAT_REJECTS: AtomicU64 = AtomicU64::new(0);
+/// Memory embed text / search query over their char caps (gateway).
+pub static OVERSIZE_MEMORY_REJECTS: AtomicU64 = AtomicU64::new(0);
+/// Bootstrap ad-field length caps + registry-entry-cap refusals.
+pub static OVERSIZE_BOOTSTRAP_REJECTS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SecurityCounters {
+    pub rate_limited_429_total: u64,
+    pub oversize_reject_total: u64,
+    pub oversize_chat_rejects: u64,
+    pub oversize_memory_rejects: u64,
+    pub oversize_bootstrap_rejects: u64,
+}
+
+/// Bump one counter (relaxed ordering fine for observability).
+pub fn bump(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+fn peek(counter: &AtomicU64) -> u64 {
+    counter.load(Ordering::Relaxed)
+}
+
+/// Current security-reject counters, for the /status `security` section
+/// and the bootstrap /health `security` section.
+pub fn security_snapshot() -> SecurityCounters {
+    let chat = peek(&OVERSIZE_CHAT_REJECTS);
+    let memory = peek(&OVERSIZE_MEMORY_REJECTS);
+    let bootstrap = peek(&OVERSIZE_BOOTSTRAP_REJECTS);
+    SecurityCounters {
+        rate_limited_429_total: peek(&RATE_LIMITED_429_TOTAL),
+        oversize_reject_total: chat + memory + bootstrap,
+        oversize_chat_rejects: chat,
+        oversize_memory_rejects: memory,
+        oversize_bootstrap_rejects: bootstrap,
+    }
+}
 
 /// One completed (or failed) chat completion, as the gateway saw it.
 #[derive(Debug, Clone, Serialize)]

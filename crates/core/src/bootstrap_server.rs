@@ -84,6 +84,7 @@ impl Default for Registry {
 /// refused without spending CPU.
 fn validate_ad_fields(ad: &PeerAd) -> Result<(), Response> {
     let too_long = |field: &str, cap| {
+        crate::metrics::bump(&crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS);
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -226,7 +227,15 @@ fn router_with_limiter(
 type Shared = (Arc<Registry>, u64);
 
 async fn bootstrap_health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true, "service": "jerith-bootstrap" }))
+    // `security` carries this process's reject counters (429s from the
+    // limiter + oversize ad/registry refusals). Additive-only fields:
+    // existing health consumers may ignore unknown keys.
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "jerith-bootstrap",
+        "security": serde_json::to_value(crate::metrics::security_snapshot())
+            .expect("security counters serialize"),
+    }))
 }
 
 /// attitude decay: +2 reputation per full day since the last report, capped at 0.
@@ -373,6 +382,7 @@ async fn advertise(
     // map lets one client pin memory and inflate /v1/peers. Existing ids
     // always refresh; only NEW identities are refused once full.
     if !entries.contains_key(&ad.node_id) && entries.len() >= registry.max_entries {
+        crate::metrics::bump(&crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "registry at capacity — refreshes only"})),
@@ -1063,6 +1073,9 @@ mod tests {
 
         // Every string field over its sanity cap → 400, rejected BEFORE any
         // signature work (no headers needed: validation precedes wire auth).
+        // Each rejection also bumps the process-local oversize counter.
+        let before = crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS
+            .load(std::sync::atomic::Ordering::Relaxed);
         let bad = serde_json::to_value(make_peer("glm-5.3").1).unwrap();
         for field in ["node_id", "model_id", "quant", "address", "rpc_address"] {
             let mut candidate = bad.clone();
@@ -1074,6 +1087,36 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(r.status(), StatusCode::BAD_REQUEST, "field {field}");
+        }
+        // Parallel test streams share the counter: a delta >= 5 proves OUR
+        // five rejections each bumped it (monotonic counter).
+        assert!(
+            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= before + 5,
+            "five field-cap rejections must bump the oversize counter"
+        );
+
+        // /health surfaces this process's security counters (additive
+        // fields; shape check only).
+        let health: serde_json::Value = client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sec = health.get("security").expect("security section in /health");
+        for key in [
+            "rate_limited_429_total",
+            "oversize_reject_total",
+            "oversize_bootstrap_rejects",
+        ] {
+            assert!(
+                sec[key].is_u64(),
+                "security.{key} must be a u64 counter, got {sec}"
+            );
         }
 
         // contribution_percent is only meaningful 0-100.
@@ -1146,6 +1189,16 @@ mod tests {
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body: serde_json::Value = r.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("at capacity"));
+
+        // The registry-cap refusal is size-bounding too: it bumps the
+        // same process-local oversize counter (delta >= 1; the earlier
+        // accepted/refresh ads must not have bumped it).
+        assert!(
+            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "registry-cap refusal must bump the oversize counter"
+        );
     }
 
     #[tokio::test]
