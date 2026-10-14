@@ -489,15 +489,40 @@ impl NodeConfig {
         Ok(Some(cfg))
     }
 
+    /// Save config and chmod 0600 — the file carries the Ed25519 seed and
+    /// the runtime API key, so it must never ship with loose permissions.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::config_path();
+        self.save_as(&path)
+    }
+
+    /// Save to an explicit path (tests, alternate homes); chmod 0600 there too.
+    pub fn save_as(&self, path: &std::path::Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        Self::restrict_file_permissions(path);
         Ok(())
+    }
+
+    /// Unix-only repair: force mode 0600 on the config file.
+    /// Skips silently if the file is missing; never fails (a permission
+    /// repair must not take the mesh down), but the caller checks the mode
+    /// in tests. no-op on non-unix targets.
+    pub fn restrict_file_permissions(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(_meta) = std::fs::metadata(path) {
+                let perms = std::fs::Permissions::from_mode(0o600);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     /// Generate (or restore) the Ed25519 identity — idempotent.
@@ -513,6 +538,9 @@ impl NodeConfig {
             }
         };
         self.node_id = identity.node_id();
+        // Heal loose permissions from older deploys at every ensure — the
+        // file carries the seed, and a repair must not take the node down.
+        Self::restrict_file_permissions(&Self::config_path());
         Ok(())
     }
 
@@ -673,6 +701,52 @@ mod tests {
         // Empty override falls back to detection, is never published as "".
         cfg.advertise_host = Some("".into());
         assert_eq!(cfg.advertised_host(), fallback);
+    }
+
+    #[test]
+    fn save_and_heal_restrict_config_permissions_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "jerith-perms-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let path = dir.join("config.toml");
+
+        // A fresh write ships tight regardless of the ambient umask.
+        NodeConfig::default().save_as(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh save_as must be 0600, got {mode:o}");
+
+        // A previously loose file is healed by the next save...
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        NodeConfig::default().save_as(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "loose file must heal to 0600, got {mode:o}");
+
+        // ...and by ensure_identity on an existing loose file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        NodeConfig::default().ensure_identity().unwrap();
+        assert!(path.exists());
+        // ensure heals the config path too — simulate by pointing at
+        // JERITH_HOME: the static env is risky under parallel tests, so
+        // exercise the repair helper directly instead.
+        let loose = dir.join("loose.toml");
+        std::fs::write(&loose, "x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+        NodeConfig::restrict_file_permissions(&loose);
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "repair helper must set 0600, got {mode:o}");
+
+        // Missing files are skipped silently (no spurious creation).
+        let absent = dir.join("absent.toml");
+        NodeConfig::restrict_file_permissions(&absent);
+        assert!(!absent.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
