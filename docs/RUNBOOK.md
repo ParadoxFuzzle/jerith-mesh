@@ -230,6 +230,26 @@ Round 4 (this round) — unbounded-growth + flood tightening:
   XFF hop trusted ONLY from loopback peers (the local tunnel proxy) —
   a directly-reachable origin cannot spoof client IPs to hide behind
   or drain other buckets; everyone else is pinned to their socket peer.
+- **Edge layer (recommended, not yet configured)**: a Cloudflare WAF
+  **rate limiting rule** on the zone complements the origin limiter —
+  it absorbs floods before they cost origin CPU/runtimes and stays
+  alive across origin restarts (which reset the local windows). It is
+  NOT a replacement: it only covers the tunnelled zone path (the
+  direct-reachable bootstrap + gateway surfaces and QUIC NodeRPC see
+  only the origin limiter), its counters are approximate and
+  per-data-center (no global counter, so N PoPs ≈ N× budget), and its
+  enforcement delay makes the exact-origin budget (240/min, verified)
+  an origin-side property. Free-plan rule recipe (dashboard →
+  Security → WAF → Rate limiting rules):
+  - expression:
+    `not cf.client.bot and (starts_with(http.request.uri.path, "/v1/peers") or http.request.uri.path eq "/v1/advertise" or http.request.uri.path eq "/health")`
+  - counting: same IP; period **10 s** (free-plan max); threshold
+    **100** requests — ~half the origin budget's sustained rate
+    (240/min ≈ 40–240 bursts per 60 s), far above a legit TTL
+    heartbeat (~4 req/min); action **Block**, mitigation **10 s**.
+  - Pro upgrade: period 60 s, threshold 200, mitigation 1 h (2 rules
+    — add a gateway-lane rule if a public gateway hostname ever
+    exists).
 
 ```bash
 # QUIC dispatch flood hardening: the RPC server now bounds —
