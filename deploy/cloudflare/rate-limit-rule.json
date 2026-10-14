@@ -1,0 +1,20 @@
+{
+  "name": "jerith edge shield — bootstrap flood cap",
+  "kind": "zone",
+  "phase": "http_ratelimit",
+  "description": "Edge-layer rate limit complementing the origin per-IP limiter (RUNBOOK 'Edge layer'): absorbs floods before they cost origin CPU, and outlives origin restarts (which reset local windows). NOT a replacement — direct-reachable surfaces and QUIC NodeRPC are origin-limiter-only.",
+  "rules": [
+    {
+      "description": "bootstrap public reads: <= 100 req/10s per IP, block 10s (free-plan parameters; Pro upgrade: period 60, requests_per_period 200, mitigation_timeout 3600)",
+      "enabled": true,
+      "expression": "(not cf.client.bot) and (starts_with(http.request.uri.path, \"/v1/peers\") or http.request.uri.path eq \"/v1/advertise\" or http.request.uri.path eq \"/health\")",
+      "action": "block",
+      "ratelimit": {
+        "characteristics": ["cf.colo.id", "ip.src"],
+        "period": 10,
+        "requests_per_period": 100,
+        "mitigation_timeout": 10
+      }
+    }
+  ]
+}

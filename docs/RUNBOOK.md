@@ -250,6 +250,8 @@ Round 4 (this round) — unbounded-growth + flood tightening:
   - Pro upgrade: period 60 s, threshold 200, mitigation 1 h (2 rules
     — add a gateway-lane rule if a public gateway hostname ever
     exists).
+  - As code: the API-shaped ruleset + apply/verify commands live in
+    `deploy/cloudflare/` (`rate-limit-rule.json` + README).
 
 ```bash
 # QUIC dispatch flood hardening: the RPC server now bounds —
