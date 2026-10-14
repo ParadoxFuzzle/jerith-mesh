@@ -116,8 +116,21 @@ pub async fn handle(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "conversational fallback chat failed");
+                // Surface the actual cause (/ask already does — it propagates
+                // the anyhow error). A generic "couldn't reach the mesh" hid
+                // real distinctions: gateway-restart windows, a 401 from an
+                // authed runtime lane, or a 90-s slow-answer timeout — each
+                // needs a different fix from the operator, and "401" answers
+                // "try again in a moment" with silence forever.
+                let mut reason = e.to_string().replace('\n', "; ");
+                if reason.chars().count() > 160 {
+                    reason = format!("…{}", reason.chars().skip(reason.chars().count() - 160).collect::<String>());
+                }
                 let _ = channel
-                    .say(&http_ctx, "⚠️ couldn't reach the mesh just now — try `@bot ask <question>` in a moment.")
+                    .say(
+                        &http_ctx,
+                        format!("⚠️ the mesh didn't answer just now — {reason}\ntry `@bot ask <question>` again in a moment."),
+                    )
                     .await;
             }
         }
