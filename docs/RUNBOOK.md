@@ -232,6 +232,12 @@ Round 4 (this round) — unbounded-growth + flood tightening:
   or drain other buckets; everyone else is pinned to their socket peer.
 
 ```bash
+# Web UI hardening: the node dashboard (/) ships hash-pinned CSP (the
+# inline script/style digests are recomputed from the page itself at
+# first request — page edits re-pin automatically, no 'unsafe-inline'),
+# plus nosniff / no-referrer / no-store; /status answers no-store too.
+# The whole gateway + UI bind 127.0.0.1:<gateway_port> — loopback only;
+# the only internet-exposed mesh surface remains p2p.jerithai.com:8901.
 # Security-reject metrics: the node /status carries a `security` section
 # (rate_limited_429_total, oversize_reject_total, oversize_chat_rejects,
 # oversize_memory_rejects, oversize_bootstrap_rejects); the standalone

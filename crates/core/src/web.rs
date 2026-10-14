@@ -2,24 +2,105 @@
 //!
 //! Phase 0 scope: live status cards (model, contribution %, peers, meters).
 //! Later phases turn this into the full observability dashboard.
+//!
+//! Hardening: the page is served with a strict security-header set —
+//! `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+//! `Referrer-Policy: no-referrer`, and a CSP that pins the inline
+//! `<script>`/`<style>` blocks by their sha256 digests (no
+//! `'unsafe-inline'`), locks `frame-ancestors` to 'none' (clickjacking),
+//! and drops `base-uri`/`form-action`/`object-src` to nothing. The
+//! digests are computed from `PAGE` itself at first request, so page
+//! edits re-pin automatically instead of roting into a mismatch.
 
 use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 use crate::ping::MeshState;
 
 pub fn router(state: std::sync::Arc<MeshState>) -> Router {
-    Router::new()
-        .route("/", get(index))
-        .with_state(state)
+    Router::new().route("/", get(index)).with_state(state)
+}
+
+/// The inline block of PAGE between `<tag>` and `</tag>` (tag without
+/// attributes; must exist or the CSP builder falls back).
+fn inline_block(page: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = page.find(&open)? + open.len();
+    let end = start + page.get(start..)?.find(&close)?;
+    Some(page.get(start..end)?.to_string())
+}
+
+/// Standard base64 (RFC 4648, with `=` padding) — what CSP hash-sources
+/// expect. Kept local to avoid a `base64` dependency for ~20 lines.
+fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// `"sha256-<digest>"` for one inline block.
+fn hash_source(block: &str) -> String {
+    let digest = Sha256::digest(block.as_bytes());
+    format!("sha256-{}", b64(&digest))
+}
+
+/// The full CSP built from PAGE's own inline blocks. Falls back to
+/// `'unsafe-inline'` per source if the markers ever move (defense must
+/// survive edits that reshape the HTML).
+fn build_csp(page: &str) -> String {
+    let script = match inline_block(page, "script") {
+        Some(s) => hash_source(&s),
+        None => "'unsafe-inline'".to_string(),
+    };
+    let style = match inline_block(page, "style") {
+        Some(s) => hash_source(&s),
+        None => "'unsafe-inline'".to_string(),
+    };
+    format!(
+        "default-src 'none'; script-src {script}; style-src {style}; \
+         connect-src 'self'; img-src 'self'; object-src 'none'; \
+         base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
+}
+
+static CSP: OnceLock<String> = OnceLock::new();
+
+fn csp_header_value() -> &'static str {
+    CSP.get_or_init(|| build_csp(PAGE))
 }
 
 async fn index(State(_gw): State<std::sync::Arc<MeshState>>) -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // A status page must never sit in any cache (heuristic
+            // caching included), must never be MIME-sniffed, and must
+            // not leak referrers. The CSP carries no remote content at
+            // all: everything the page loads is same-origin static.
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::CONTENT_SECURITY_POLICY, csp_header_value()),
+        ],
         PAGE,
     )
 }
@@ -91,3 +172,82 @@ setInterval(refresh, 3000);
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+
+    fn spawn() -> TestServer {
+        let mut cfg = crate::config::NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        TestServer::new(router(state).into_make_service()).expect("test server")
+    }
+
+    #[test]
+    fn b64_matches_rfc4648_reference_vectors() {
+        let d = |s: &str| b64(&Sha256::digest(s.as_bytes()));
+        // sha256("abc") / sha256("hello world") in standard base64,
+        // cross-checked against an independent Python implementation.
+        assert_eq!(d("abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_eq!(d("hello world"), "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=");
+    }
+
+    #[test]
+    fn csp_pins_the_actual_inline_blocks() {
+        let csp = build_csp(PAGE);
+        assert!(
+            !csp.contains("'unsafe-inline'"),
+            "page ships marker blocks — CSP must hash-pin them, got: {csp}"
+        );
+        let script = inline_block(PAGE, "script").expect("script marker");
+        assert!(
+            csp.contains(&hash_source(&script)),
+            "CSP must pin the served script digest: {csp}"
+        );
+        let style = inline_block(PAGE, "style").expect("style marker");
+        assert!(
+            csp.contains(&hash_source(&style)),
+            "CSP must pin the served style digest: {csp}"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("connect-src 'self'"));
+    }
+
+    #[tokio::test]
+    async fn page_serves_with_security_headers() {
+        let server = spawn();
+        let res = server.get("/").await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let t = res.headers();
+        assert_eq!(
+            t.get("x-content-type-options").unwrap(),
+            "nosniff",
+            "nosniff required"
+        );
+        assert_eq!(
+            t.get("referrer-policy").unwrap(),
+            "no-referrer",
+            "no-referrer required"
+        );
+        assert_eq!(
+            t.get("cache-control").unwrap(),
+            "no-store",
+            "status page must not cache"
+        );
+        let csp = t.get("content-security-policy").expect("CSP required");
+        let csp = csp.to_str().unwrap();
+        assert!(
+            csp.contains("frame-ancestors 'none'") && csp.contains("sha256-"),
+            "CSP must hash-pin the inline blocks and bar framing: {csp}"
+        );
+        // No cookies are ever set: the UI is unauthenticated (loopback
+        // bind) on purpose — this pins the absence of credential state.
+        assert_eq!(
+            t.get("set-cookie"),
+            None,
+            "the page must not introduce cookie state"
+        );
+    }
+}

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -553,7 +553,7 @@ async fn health(
 }
 
 /// Human/CLI-facing status snapshot.
-async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
+async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     let cfg = gw.state.config.read().await;
     let reg = gw.state.registry.lock().await;
     let meters = gw.state.meters.lock().await;
@@ -591,7 +591,7 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
             })
         })
         .unwrap_or(Value::Null);
-    Json(json!({
+    let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
         "model": cfg.model.as_ref().map(|m| m.id.clone()),
@@ -625,7 +625,14 @@ async fn status(State(gw): State<Arc<Gateway>>) -> Json<Value> {
         "security": serde_json::to_value(crate::metrics::security_snapshot())
             .expect("security counters serialize"),
         "chain": chain_probe(gw.chain_url.as_deref(), crate::economics::read_token().as_deref()).await,
-    }))
+    });
+    // Live counters: a heuristically cached stale snapshot would make the
+    // web dashboard (and any monitor) read lagged values.
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(value),
+    )
+        .into_response()
 }
 
 /// Compact per-model view for the /status `metrics` section (full detail
