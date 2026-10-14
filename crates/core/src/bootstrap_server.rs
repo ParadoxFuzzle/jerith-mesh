@@ -791,6 +791,7 @@ mod tests {
             rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
+            resources: None,
         };
         (id, a)
     }
@@ -993,6 +994,7 @@ mod tests {
                 rpc_address: String::new(),
                 last_seen_ms: now_ms(),
                 role: NodeRole::Hybrid,
+                resources: None,
             };
             let r = client
                 .put(format!("{base}/v1/advertise"))
@@ -1495,6 +1497,7 @@ mod tests {
             rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
+            resources: None,
         };
         let r = client
             .put(format!("{base}/v1/advertise"))
@@ -1662,6 +1665,7 @@ mod tests {
             rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
+            resources: None,
         };
         // Re-sign with the accused's identity (same key, same node_id).
         let r = client
@@ -1705,6 +1709,7 @@ mod tests {
                 rpc_address: String::new(),
                 last_seen_ms: 0,
                 role: NodeRole::Hybrid,
+                resources: None,
             },
             last_refresh_ms: 0,
             dead_votes: 0,
@@ -1755,6 +1760,7 @@ mod tests {
             rpc_address: "127.0.0.1:9001".into(),
             last_seen_ms: 1_000,
             role: NodeRole::Hybrid,
+            resources: None,
         };
         // Two stamps: a fixed one for shape determinism, a fresh one for
         // the wire-auth freshness checks.

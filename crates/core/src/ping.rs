@@ -58,6 +58,10 @@ pub struct MeshState {
     /// Set when the contribution ratio dips below the minimum (rolling).
     pub contribution_healthy: watch::Sender<bool>,
     pub started_at: std::time::Instant,
+    /// What THIS node can offer right now — refreshed at ping cadence
+    /// (see hw::sample) and shipped inside our advertise (resource
+    /// pooling, Phase 1): peers read it for placement + fleet census.
+    pub resources: Mutex<Option<crate::hw::ResourceSample>>,
     /// Phase 4 verification counters; the ping loop flushes queued
     /// DishonestResults evidence to the bootstrap on its regular cadence.
     pub verify: SharedVerifyTracker,
@@ -77,6 +81,7 @@ impl MeshState {
             identity,
             contribution_healthy: tx,
             started_at: std::time::Instant::now(),
+            resources: Mutex::new(None),
             verify: crate::verify::VerificationTracker::shared(),
             stake,
         });
@@ -143,20 +148,24 @@ impl MeshFallbackChat {
     }
 
     /// Build inputs for the router from live registry state: connectable
-    /// peers (rtt, alive) + their advertised QUIC rpc addresses.
+    /// peers (rtt, alive, advertised resources) + their advertised QUIC
+    /// rpc addresses.
     async fn mesh_view(
         &self,
         state: &Arc<MeshState>,
-    ) -> (Vec<(String, u64, bool, bool)>, HashMap<String, SocketAddr>) {
+    ) -> (
+        Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)>,
+        HashMap<String, SocketAddr>,
+    ) {
         let reg = state.registry.lock().await;
-        let peers: Vec<(String, u64, bool, bool)> = reg
+        let peers: Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)> = reg
             .all_ads()
             .into_iter()
             .filter_map(|ad| {
                 let health = reg.health_of(&ad.node_id)?;
                 let alive = health.state != PeerState::Deprecated;
                 let rtt = health.last_rtt_ms.unwrap_or(u64::MAX >> 2);
-                Some((ad.node_id.clone(), rtt, true, alive))
+                Some((ad.node_id.clone(), rtt, true, alive, ad.resources.clone()))
             })
             .collect();
         let addrs: HashMap<String, SocketAddr> = reg
@@ -334,6 +343,15 @@ async fn run_loop(
             // Ping every connectable peer.
             ping_all(&state, &bootstrap).await;
 
+            // Resource pooling (Phase 1): refresh OUR live sample right
+            // before advertising so the mesh always placement-decides on
+            // fresh data. Blocking bits (nvidia-smi exec, sysinfo refresh)
+            // run off the loop thread.
+            let sample = tokio::task::spawn_blocking(crate::hw::sample)
+                .await
+                .unwrap_or_default();
+            *state.resources.lock().await = Some(sample);
+
             // Advertise ourselves (signed); the addresses point at our
             // routable interface (advertise_host override or the
             // default-route detection) so OTHER nodes can dial us directly
@@ -349,6 +367,7 @@ async fn run_loop(
                 contribution_percent: cfg.contribution_percent,
                 last_seen_ms: now_ms(),
                 role: cfg.role,
+                resources: state.resources.lock().await.clone(),
             };
             let identity = state.identity.clone();
             if let Err(e) = bootstrap.advertise(&ad, &identity).await {

@@ -12,15 +12,15 @@
 use std::io::{BufRead, Write as _};
 use std::time::Duration;
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use jerith_mesh_core::bootstrap::BootstrapClient;
 use jerith_mesh_core::config::{
-    default_model, MemoryBackend, NodeConfig, NodeRole, SetupChoices, MIN_CONTRIBUTION_PERCENT,
+    MIN_CONTRIBUTION_PERCENT, MemoryBackend, NodeConfig, NodeRole, SetupChoices, default_model,
 };
 use jerith_mesh_core::gateway::Gateway;
 use jerith_mesh_core::hw;
-use jerith_mesh_core::models::{detect_capable_models, recommended_model, ModelId, ModelSource};
+use jerith_mesh_core::models::{ModelId, ModelSource, detect_capable_models, recommended_model};
 use jerith_mesh_core::ping::MeshState;
 use jerith_mesh_core::web;
 use serde_json::json;
@@ -30,7 +30,7 @@ use serde_json::json;
     name = "jerith",
     about = "jerith-mesh node — P2P compute mesh for MoE LLMs",
     version,
-    propagate_version = true,
+    propagate_version = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -149,7 +149,11 @@ enum MemoryCmd {
     /// Embed + store a text entry.
     Add { text: String },
     /// Vector-search local memory.
-    Search { query: String, #[arg(long, default_value_t = 5)] top_k: usize },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+    },
     /// Number of stored entries.
     Count,
     /// Delete an entry by id.
@@ -187,8 +191,7 @@ enum StakeCmd {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -242,13 +245,15 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
 /// `jerith lore <query>` — sourced canon answers from the lore vault
 /// (void-lore-index port; vault default is the OpenClaw borrow).
 async fn lore_cmd(query: &str, top_k: usize) -> anyhow::Result<()> {
-    let vault = jerith_mesh_core::lore::default_vault_dir().context(
-        "no lore vault — set $JERITH_LORE_VAULT to a directory of .md files",
-    )?;
+    let vault = jerith_mesh_core::lore::default_vault_dir()
+        .context("no lore vault — set $JERITH_LORE_VAULT to a directory of .md files")?;
     let index = jerith_mesh_core::lore::build(&vault)?;
     let hits = index.search(query, top_k);
     if hits.is_empty() {
-        println!("no lore matched \"{query}\" ({} entries indexed)", index.len());
+        println!(
+            "no lore matched \"{query}\" ({} entries indexed)",
+            index.len()
+        );
         return Ok(());
     }
     println!("{} entries indexed · top {}:\n", index.len(), hits.len());
@@ -280,7 +285,9 @@ fn chain_base(cfg: Option<&NodeConfig>) -> String {
         }
     }
     match cfg {
-        Some(c) if !c.chain_url.trim().is_empty() => c.chain_url.trim().trim_end_matches('/').to_string(),
+        Some(c) if !c.chain_url.trim().is_empty() => {
+            c.chain_url.trim().trim_end_matches('/').to_string()
+        }
         _ => "http://127.0.0.1:8322".to_string(),
     }
 }
@@ -319,7 +326,12 @@ fn chain_ledger_path(cfg: Option<&NodeConfig>) -> anyhow::Result<std::path::Path
 }
 
 /// GET one of the chain's token-authed JSON endpoints and return the body.
-async fn chain_get(_cfg: Option<&NodeConfig>, base: &str, path: &str, query: &[(&str, &str)]) -> anyhow::Result<serde_json::Value> {
+async fn chain_get(
+    _cfg: Option<&NodeConfig>,
+    base: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> anyhow::Result<serde_json::Value> {
     let token = jerith_mesh_core::economics::read_token().context(
         "no chain api token — stage ~/.jerith-mesh/keys/api.token (see docs/RUNBOOK.md) \\
          or set $JERITH_TOKEN",
@@ -345,10 +357,7 @@ async fn chain_get(_cfg: Option<&NodeConfig>, base: &str, path: &str, query: &[(
         .await
         .with_context(|| format!("chain node unreachable at {url}"))?;
     let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .context("chain node returned non-JSON")?;
+    let body: serde_json::Value = resp.json().await.context("chain node returned non-JSON")?;
     if !status.is_success() {
         anyhow::bail!(
             "chain {path} failed ({status}): {}",
@@ -396,9 +405,7 @@ fn load_chain_wallets(
                 balance_uj,
                 locked_uj,
                 nonce,
-                discord_id: discord_id
-                    .as_deref()
-                    .and_then(|s| s.parse::<u64>().ok()),
+                discord_id: discord_id.as_deref().and_then(|s| s.parse::<u64>().ok()),
                 total_mined_uj,
             })
         })?
@@ -465,14 +472,11 @@ async fn chain_cmd(cmd: ChainCmd) -> anyhow::Result<()> {
             // corrupted by our reads.
             let uri = format!(
                 "file:{}?mode=ro",
-                db.display()
-                    .to_string()
-                    .replace('?', "%3F")
+                db.display().to_string().replace('?', "%3F")
             );
             let conn = rusqlite::Connection::open_with_flags(
                 &uri,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
             .with_context(|| format!("opening chain ledger {db:?}"))?;
             let rows = load_chain_wallets(&conn, limit, by_balance)?;
@@ -627,11 +631,12 @@ fn jer_to_uj(amount_jer: f64) -> anyhow::Result<u64> {
 async fn stake_cmd(cmd: StakeCmd) -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?.context("no config — run setup first")?;
     if cfg.crypto.chain != jerith_mesh_core::config::CryptoChain::Jerithchain {
-        bail!("staking rides jerithchain only — set crypto = \"jerithchain\" (and JERITH_TOKEN or keys/api.token) first");
+        bail!(
+            "staking rides jerithchain only — set crypto = \"jerithchain\" (and JERITH_TOKEN or keys/api.token) first"
+        );
     }
     let identity = cfg.identity()?;
-    let stake =
-        jerith_mesh_core::stake::StakeManager::new(&cfg.crypto, Some(identity));
+    let stake = jerith_mesh_core::stake::StakeManager::new(&cfg.crypto, Some(identity));
     match cmd {
         StakeCmd::Status => {
             stake.refresh_from_chain().await;
@@ -904,7 +909,10 @@ fn setup_flow(
             }
         }
         let _ = bootstrap_counts;
-        prompt("\nModel to run? (id, or huggingface:<repo> / ollama:<name> / path:<file>)", "recommendation")?
+        prompt(
+            "\nModel to run? (id, or huggingface:<repo> / ollama:<name> / path:<file>)",
+            "recommendation",
+        )?
     } else {
         bail!("--model is required in non-interactive mode")
     };
@@ -936,9 +944,7 @@ fn setup_flow(
     // 3. Memory backend.
     let memory_spec = match memory {
         Some(m) => m,
-        None if interactive => {
-            prompt("\nMemory backend? (sqlite | postgres)", "sqlite")?
-        }
+        None if interactive => prompt("\nMemory backend? (sqlite | postgres)", "sqlite")?,
         None => bail!("--memory is required in non-interactive mode"),
     };
     let memory_backend = parse_memory(&memory_spec)?;
@@ -972,7 +978,10 @@ fn setup_flow(
     let crypto = match crypto {
         Some(c) => parse_crypto(&c)?,
         None if interactive => {
-            let s = prompt("\nCrypto for earnings? (jerithchain | bitcoin | ethereum | dogecoin | monero | none)", "jerithchain")?;
+            let s = prompt(
+                "\nCrypto for earnings? (jerithchain | bitcoin | ethereum | dogecoin | monero | none)",
+                "jerithchain",
+            )?;
             parse_crypto(&s)?
         }
         None => jerith_mesh_core::config::CryptoConfig::default(),
@@ -996,7 +1005,10 @@ fn setup_flow(
     // Touch the memory DB path so data dir exists.
     std::fs::create_dir_all(NodeConfig::data_dir())?;
 
-    println!("\n[5/5] Done. Config: {}", NodeConfig::config_path().display());
+    println!(
+        "\n[5/5] Done. Config: {}",
+        NodeConfig::config_path().display()
+    );
     println!("\nNext: ./jerith run   (or set up wallets with `jerith config`)");
 
     Ok(())
@@ -1016,8 +1028,7 @@ fn futures_block_on<F: std::future::Future>(fut: F) -> F::Output {
 // ---------------------------------------------------------------------------
 
 async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
-    let mut cfg = NodeConfig::load()?
-        .context("no config found — run `jerith setup` first")?;
+    let mut cfg = NodeConfig::load()?.context("no config found — run `jerith setup` first")?;
     if let Some(spec) = switch_model {
         let mid = parse_model_spec(&spec)?;
         cfg.set_model(mid);
@@ -1065,20 +1076,14 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     );
     println!("   bootstrap   {}", cfg.bootstrap_url);
     println!("   memory      {}", cfg.memory_backend.label());
-    println!(
-        "   crypto      {}",
-        crypto_label(cfg.crypto.chain)
-    );
+    println!("   crypto      {}", crypto_label(cfg.crypto.chain));
     println!("   gateway     http://127.0.0.1:{}", cfg.gateway_port);
 
     let (state, _health_watch) = MeshState::new(cfg.clone())?;
 
     // JER miner: active when crypto chain is JerithChain (spec default).
-    let miner = jerith_mesh_core::economics::MinerConfig::from_crypto(
-        &cfg.crypto,
-        &cfg.node_id,
-    )
-    .map(|mc| jerith_mesh_core::economics::JerithMiner::new(mc, &cfg.node_id));
+    let miner = jerith_mesh_core::economics::MinerConfig::from_crypto(&cfg.crypto, &cfg.node_id)
+        .map(|mc| jerith_mesh_core::economics::JerithMiner::new(mc, &cfg.node_id));
     match &miner {
         Some(_) => {
             println!(
@@ -1117,7 +1122,8 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     };
 
     // Spawn the mesh loop (discovery + pings + meters).
-    let _loop_handle = jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
+    let _loop_handle =
+        jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
 
     // Mesh fallback for chat: a QUIC client endpoint + router, wired into
     // the gateway so /v1/chat/completions can fail over to runtime-backed
@@ -1205,11 +1211,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     // stays discoverable but is not offered remote expert work).
     let quic_port = cfg.effective_rpc_port();
     let rpc_addr: std::net::SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
-    let model_name = cfg
-        .model
-        .as_ref()
-        .map(|m| m.id.clone())
-        .unwrap_or_default();
+    let model_name = cfg.model.as_ref().map(|m| m.id.clone()).unwrap_or_default();
     match jerith_mesh_core::quic::RuntimeExpert::discover(
         &cfg.runtime_url,
         &model_name,
@@ -1230,8 +1232,9 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
                     let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
                     let node_id = cfg.node_id.clone();
                     tokio::spawn(async move {
-                        let handler_handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
-                            std::sync::Arc::new(handler);
+                        let handler_handler: std::sync::Arc<
+                            dyn jerith_mesh_core::quic::ExpertHandler,
+                        > = std::sync::Arc::new(handler);
                         if let Err(e) = jerith_mesh_core::quic::serve(
                             endpoint,
                             handler_handler,
@@ -1262,9 +1265,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    println!(
-        "\nReady: web UI http://{addr}/ · OpenAI API http://{addr}/v1\nCtrl+C to stop."
-    );
+    println!("\nReady: web UI http://{addr}/ · OpenAI API http://{addr}/v1\nCtrl+C to stop.");
     // Connect info required for the gateway per-IP rate limiter's socket
     // fallback (headers take precedence when present, e.g. behind a proxy).
     axum::serve(
@@ -1363,12 +1364,10 @@ async fn peers_cmd() -> anyhow::Result<()> {
 async fn model_cmd(new_model: Option<String>) -> anyhow::Result<()> {
     let mut cfg = NodeConfig::load()?.context("no config — run setup first")?;
     match new_model {
-        None => {
-            match &cfg.model {
-                Some(m) => println!("{} ({}) — mesh: {} peers in model mesh", m.id, m.quant, ""),
-                None => println!("no model set"),
-            }
-        }
+        None => match &cfg.model {
+            Some(m) => println!("{} ({}) — mesh: {} peers in model mesh", m.id, m.quant, ""),
+            None => println!("no model set"),
+        },
         Some(spec) => {
             let mid = parse_model_spec(&spec)?;
             let from = cfg.model.as_ref().map(|m| m.id.clone());

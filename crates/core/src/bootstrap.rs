@@ -31,6 +31,13 @@ pub struct PeerAd {
     /// Serialization-defaulted for pre-RPC peers; empty string = absent.
     #[serde(default)]
     pub rpc_address: String,
+    /// Live resource offering (RAM / VRAM / GPU / CPU) for pooling:
+    /// placement ordering + the fleet census read this. Wire-compatible
+    /// with pre-pooling peers — omitted on serialize when unreported,
+    /// defaulted on deserialize when absent, so old nodes and old
+    /// bootstraps exchange ads unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::hw::ResourceSample>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,7 +452,49 @@ mod tests {
             rpc_address: String::new(),
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
+            resources: None,
         }
+    }
+
+    #[test]
+    fn resources_field_is_wire_compatible_with_pre_pooling_peers() {
+        // (1) an old ad WITHOUT the field deserializes (default None) and
+        // re-serializes omitting it — old ↔ new nodes exchange ads unchanged
+        let legacy = r#"{"node_id":"a","address":"127.0.0.1:1","model_id":"glm-5.3-flash","quant":"default","contribution_percent":25,"last_seen_ms":1,"role":"hybrid","rpc_address":""}"#;
+        let ad: PeerAd = serde_json::from_str(legacy).expect("legacy ad parses");
+        assert!(ad.resources.is_none());
+        // Re-serialization omits the field entirely → old peers see
+        // byte-identical shapes, no compat shim needed.
+        assert!(
+            serde_json::to_string(&ad)
+                .map(|s| !s.contains("resources"))
+                .unwrap_or(false)
+        ); // (2) a new ad with a sample round-trips intact
+        let full = serde_json::json!({
+            "node_id": "b",
+            "address": "127.0.0.1:2",
+            "model_id": "glm-5.3-flash",
+            "quant": "default",
+            "contribution_percent": 40,
+            "last_seen_ms": 2,
+            "role": "hybrid",
+            "rpc_address": "127.0.0.1:9000",
+            "resources": {
+                "ram_total_bytes": 32_000_000_000u64,
+                "ram_available_bytes": 16_000_000_000u64,
+                "swap_total_bytes": 0,
+                "cpu_logical_cores": 8,
+                "gpus": [{"name": "RTX 4060", "vram_total_bytes": 8_000_000_000u64,
+                           "vram_used_bytes": 5_000_000_000u64, "vram_free_bytes": 3_000_000_000u64}],
+                "sampled_at_ms": 99,
+            }
+        })
+        .to_string();
+        let ad2: PeerAd = serde_json::from_str(&full).expect("pooled ad parses");
+        assert_eq!(
+            ad2.resources.as_ref().unwrap().vram_free_total(),
+            Some(3_000_000_000)
+        );
     }
 
     #[test]

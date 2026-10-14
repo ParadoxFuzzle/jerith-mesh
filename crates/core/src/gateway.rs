@@ -561,6 +561,41 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             })
         })
         .unwrap_or(Value::Null);
+    // Fleet resource census (resource pooling, Phase 1): our latest sample
+    // + whatever connectable peers advertised inside their PeerAd. Unknown
+    // amounts are excluded from sums (unknown ≠ zero — same rule as the
+    // placement ordering).
+    let own_sample = gw.state.resources.lock().await.clone();
+    let mut samples: Vec<(String, crate::hw::ResourceSample)> = Vec::new();
+    if let Some(own) = &own_sample {
+        samples.push((cfg.node_id.clone(), own.clone()));
+    }
+    for (ad, _) in reg.connectable() {
+        if let Some(res) = &ad.resources {
+            samples.push((ad.node_id.clone(), res.clone()));
+        }
+    }
+    let ram_total_bytes: u64 = samples.iter().map(|(_, s)| s.ram_total_bytes).sum();
+    let ram_available_bytes: u64 = samples.iter().map(|(_, s)| s.ram_available_bytes).sum();
+    let vram_free_known: Vec<u64> = samples
+        .iter()
+        .filter_map(|(_, s)| s.vram_free_total())
+        .collect();
+    let vram_total_known: Vec<u64> = samples
+        .iter()
+        .filter_map(|(_, s)| s.vram_total_total())
+        .collect();
+    let fleet_value = json!({
+        "reporting_nodes": samples.len(),
+        "ram_total_bytes": ram_total_bytes,
+        "ram_available_bytes": ram_available_bytes,
+        "vram_free_bytes": vram_free_known.first().map(|_| vram_free_known.iter().sum::<u64>()),
+        "vram_total_bytes": vram_total_known.first().map(|_| vram_total_known.iter().sum::<u64>()),
+        "nodes": samples
+            .iter()
+            .map(|(id, s)| json!({"node_id": id, "census": s.census()}))
+            .collect::<Vec<_>>(),
+    });
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -586,6 +621,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         // Runaway-generation cap state (armed via config `runtime_num_predict`;
         // the site dashboard surfaces it so an operator can see it live).
         "runtime_num_predict": gw.runtime_num_predict,
+        // Resource pooling (Phase 1): live fleet census.
+        "fleet_resources": fleet_value,
         "verify": verify_value,
         "guard": guard_value,
         "stake": stake_value,

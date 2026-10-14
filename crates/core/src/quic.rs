@@ -259,26 +259,29 @@ impl ExpertRouter {
 
     /// Order candidate locations for a dispatch:
     /// 1. local (if we host it),
-    /// 2. nearby peers (rtt <= nearby_rtt_ms), lowest RTT first,
-    /// 3. remaining peers, lowest RTT first.
-    /// Deprecated peers and peers that don't have the expert never appear.
+    /// 2. peers holding the expert — reported computers first (most free
+    ///    VRAM, then most free RAM, RTT tiebreak: resource pooling Phase 1),
+    ///    then unreported peers by pure RTT; deprecated peers and peers
+    ///    without the expert never appear.
     pub async fn plan_dispatch(
         &self,
         expert_id: &str,
-        peers: &[(String, u64, bool, bool)], // (node_id, rtt_ms, has_expert, alive)
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
     ) -> Vec<ExpertLocation> {
         let mut plan = Vec::new();
         if self.hosts_locally(expert_id).await {
             plan.push(ExpertLocation::Local);
         }
-        // Sorted ascending by RTT: nearby peers naturally precede far ones.
-        let mut remotes: Vec<(String, u64)> = peers
+        // Reported-with-capacity peers first, then unreported by RTT.
+        let mut remotes: Vec<(String, u64, Option<crate::hw::ResourceSample>)> = peers
             .iter()
-            .filter(|(_, _, has, alive)| *has && *alive)
-            .map(|(id, rtt, _, _)| (id.clone(), *rtt))
+            .filter(|(_, _, has, alive, _)| *has && *alive)
+            .map(|(id, rtt, _, _, res)| (id.clone(), *rtt, res.clone()))
             .collect();
-        remotes.sort_by_key(|(_, rtt)| *rtt);
-        for (id, rtt) in remotes {
+        remotes.sort_by_key(|(id, rtt, res)| {
+            (Self::placement_sort_key(*rtt, res.as_ref()), id.clone())
+        });
+        for (id, rtt, _) in remotes {
             plan.push(ExpertLocation::Remote {
                 node_id: id,
                 rtt_ms: rtt,
@@ -296,7 +299,7 @@ impl ExpertRouter {
         req_id: &str,
         expert_id: &str,
         _input: &[f32],
-        peers: &[(String, u64, bool, bool)],
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
         completed: &mut HashMap<String, Vec<f32>>,
         mut dispatch: impl FnMut(ExpertLocation, Duration) -> anyhow::Result<Vec<f32>>,
     ) -> anyhow::Result<Vec<f32>> {
@@ -337,6 +340,19 @@ impl ExpertRouter {
         out
     }
 
+    /// Order key for mesh-chat remotes (resource pooling, Phase 1). Pure
+    /// helper — unit-tested: reported peers beat unreported, biggest free
+    /// VRAM first, then free RAM, RTT as the tiebreak; all-unreported meshes
+    /// degenerate to pure-RTT order.
+    fn placement_sort_key(rtt_ms: u64, res: Option<&crate::hw::ResourceSample>) -> (u64, u64, u64) {
+        let (vram_free, ram_free) = match res {
+            Some(r) => (r.vram_free_total().unwrap_or(0), r.ram_available_bytes),
+            None => (0, 0),
+        };
+        // sort ascending, so descending capacity inverts: MAX - x
+        (u64::MAX - vram_free, u64::MAX - ram_free, rtt_ms)
+    }
+
     /// QUIC-backed dispatch: same candidate plan, but remote candidates
     /// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
     /// `local_run` computes locally when the plan's first candidate is
@@ -353,7 +369,7 @@ impl ExpertRouter {
         peer_addrs: &HashMap<String, SocketAddr>,
         req_id: &str,
         messages: &[serde_json::Value],
-        peers: &[(String, u64, bool, bool)],
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
         local_chat: impl FnOnce() -> anyhow::Result<String>,
     ) -> anyhow::Result<(String, String)> {
         // Returns (content, answering_node_id). Local answers attribute to the
@@ -369,16 +385,22 @@ impl ExpertRouter {
             "local runtime unavailable for chat — attempting mesh fallback"
         );
 
-        // Remotes in lowest-RTT order (same ordering principle as experts).
-        let mut remotes: Vec<(String, u64)> = peers
+        // Remotes in RESOURCE-AWARE order (resource pooling, Phase 1):
+        // reported computers offer compute NOW — most free VRAM first, then
+        // most free RAM, RTT as tiebreak; peers without a report sink behind
+        // reported ones and order by RTT among themselves (an all-unreported
+        // mesh — pre-pooling peers — keeps the pure-RTT behaviour).
+        let mut remotes: Vec<(String, u64, Option<crate::hw::ResourceSample>)> = peers
             .iter()
-            .filter(|(_, _, has, alive)| *has && *alive)
-            .map(|(id, rtt, _, _)| (id.clone(), *rtt))
+            .filter(|(_, _, has, alive, _)| *has && *alive)
+            .map(|(id, rtt, _, _, res)| (id.clone(), *rtt, res.clone()))
             .collect();
-        remotes.sort_by_key(|(_, rtt)| *rtt);
+        remotes.sort_by_key(|(id, rtt, res)| {
+            (Self::placement_sort_key(*rtt, res.as_ref()), id.clone())
+        });
 
         let mut last_err = anyhow::anyhow!("no peers available for mesh chat fallback");
-        for (node_id, _rtt) in remotes {
+        for (node_id, _rtt, _res) in remotes {
             let Some(addr) = peer_addrs.get(&node_id) else {
                 continue;
             };
@@ -440,6 +462,7 @@ impl ExpertRouter {
         Err(last_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_over_quic(
         &self,
         endpoint: &quinn::Endpoint,
@@ -448,7 +471,7 @@ impl ExpertRouter {
         req_id: &str,
         expert_id: &str,
         input: &[f32],
-        peers: &[(String, u64, bool, bool)],
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
     ) -> anyhow::Result<Vec<f32>> {
@@ -1644,14 +1667,14 @@ mod tests {
     use super::*;
     use rustls::client::danger::ServerCertVerifier as _;
 
-    fn peers() -> Vec<(String, u64, bool, bool)> {
+    fn peers() -> Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)> {
         vec![
-            ("near-a".into(), 10, true, true),
-            ("near-b".into(), 25, true, true),
-            ("far-c".into(), 180, true, true),
-            ("far-d".into(), 240, true, true),
-            ("dead-e".into(), 5, true, false), // not alive → excluded
-            ("noexp-f".into(), 3, false, true), // lacks expert → excluded
+            ("near-a".into(), 10, true, true, None),
+            ("near-b".into(), 25, true, true, None),
+            ("far-c".into(), 180, true, true, None),
+            ("far-d".into(), 240, true, true, None),
+            ("dead-e".into(), 5, true, false, None), // not alive → excluded
+            ("noexp-f".into(), 3, false, true, None), // lacks expert → excluded
         ]
     }
 
@@ -1690,6 +1713,68 @@ mod tests {
         );
         assert!(
             matches!(plan[2], ExpertLocation::Remote { ref node_id, rtt_ms: 25 } if node_id == "near-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_ranks_reported_capacity_above_rtt() {
+        // Resource pooling (Phase 1): far-with-free-VRAM beats near-but-full.
+        let r = router(50);
+        let rich = crate::hw::ResourceSample {
+            gpus: vec![crate::hw::GpuSample {
+                name: "A".into(),
+                vram_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                vram_used_bytes: Some(2 * 1024 * 1024 * 1024),
+                vram_free_bytes: Some(6 * 1024 * 1024 * 1024),
+            }],
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+            ram_available_bytes: 24 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let poor = crate::hw::ResourceSample {
+            gpus: vec![crate::hw::GpuSample {
+                name: "B".into(),
+                vram_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                vram_used_bytes: Some(7 * 1024 * 1024 * 1024),
+                vram_free_bytes: Some(1024 * 1024 * 1024),
+            }],
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+            ram_available_bytes: 4 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let peers = vec![
+            ("rich-far".into(), 190, true, true, Some(rich)),
+            ("poor-near".into(), 12, true, true, Some(poor)),
+            ("no-report".into(), 5, true, true, None),
+        ];
+        let plan = r.plan_dispatch("exp-1", &peers).await;
+        let ids: Vec<&str> = plan
+            .iter()
+            .filter_map(|l| match l {
+                ExpertLocation::Remote { node_id, .. } => Some(node_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Reported peers rank above any unreported one (they offer compute
+        // NOW); among reported, most free VRAM wins over RTT entirely.
+        assert_eq!(ids, vec!["rich-far", "poor-near", "no-report"]);
+    }
+
+    #[test]
+    fn placement_sort_key_reported_beats_unreported_ties_on_rtt() {
+        use crate::hw::ResourceSample;
+        let with = ResourceSample {
+            ram_available_bytes: 1,
+            ..Default::default()
+        };
+        // A reported host beats ANY unreported one…
+        assert!(
+            ExpertRouter::placement_sort_key(9_999, Some(&with))
+                < ExpertRouter::placement_sort_key(1, None)
+        );
+        // …and unreported hosts degenerate to pure RTT order.
+        assert!(
+            ExpertRouter::placement_sort_key(1, None) < ExpertRouter::placement_sort_key(2, None)
         );
     }
 
@@ -2174,8 +2259,8 @@ mod tests {
 
         let r = router(50); // nearby threshold 50ms
         let peers = vec![
-            (near_node_id.clone(), 5, true, true),
-            (far_node_id.clone(), 200, true, true),
+            (near_node_id.clone(), 5, true, true, None),
+            (far_node_id.clone(), 200, true, true, None),
         ];
         let mut addrs = HashMap::new();
         addrs.insert(near_node_id.clone(), near_addr);
@@ -2354,8 +2439,8 @@ mod tests {
 
         let r = router_with_verify(50, 100);
         let peers = vec![
-            (near_id.clone(), 5, true, true),
-            (far_id.clone(), 200, true, true),
+            (near_id.clone(), 5, true, true, None),
+            (far_id.clone(), 200, true, true, None),
         ];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
@@ -2408,8 +2493,8 @@ mod tests {
 
         let r = router_with_verify(50, 100);
         let peers = vec![
-            (near_id.clone(), 5, true, true),
-            (far_id.clone(), 200, true, true),
+            (near_id.clone(), 5, true, true, None),
+            (far_id.clone(), 200, true, true, None),
         ];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
@@ -2460,7 +2545,7 @@ mod tests {
         // (transient outage) — plan falls through to the remote, whose
         // result is then arbitrated by the recovered local expert.
         r.register_local_expert("exp.test").await;
-        let peers = vec![(near_id.clone(), 5, true, true)];
+        let peers = vec![(near_id.clone(), 5, true, true, None)];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
         let client = pinned_client_endpoint_dyn(pins).unwrap();
@@ -2585,7 +2670,7 @@ mod tests {
         let identity = SigningIdentity::generate();
         let mut addrs = HashMap::new();
         addrs.insert(node_id.clone(), addr);
-        let peers = vec![(node_id.clone(), 8, true, true)];
+        let peers = vec![(node_id.clone(), 8, true, true, None)];
 
         // 5 messages, one back-to-back duplicate: the local closure fails
         // so the request must ride the wire, carrying exactly the compacted
@@ -2673,7 +2758,7 @@ mod tests {
         let identity = SigningIdentity::generate();
         let mut addrs = HashMap::new();
         addrs.insert(node_id.clone(), addr);
-        let peers = vec![(node_id.clone(), 8, true, true)];
+        let peers = vec![(node_id.clone(), 8, true, true, None)];
 
         // Local runtime down → falls back to the mesh peer, attributed.
         let (content, served_by) = r

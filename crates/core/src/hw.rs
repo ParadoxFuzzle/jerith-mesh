@@ -253,12 +253,216 @@ pub fn total_discrete_vram(hw: &HardwareReport) -> u64 {
 }
 
 // ============================================================================
+// Live resource sampling (resource pooling, Phase 1)
+// ============================================================================
+
+/// Live VRAM picture of one GPU (from nvidia-smi). Every field optional:
+/// a GPU that can't report absence of drivers/vendors gracefully degrades
+/// to "unknown" instead of inventing zeros that would rank peers wrong.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GpuSample {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_free_bytes: Option<u64>,
+}
+
+/// What this node can offer the mesh RIGHT NOW — the resource-pooling
+/// counterpart of the setup-time `HardwareReport`, refreshed at ping
+/// cadence and shipped inside the signed `PeerAd`. Placement (mesh-fallback
+/// remote ordering) and the fleet census on /status both read this.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResourceSample {
+    pub ram_total_bytes: u64,
+    /// Available RAM (snapshot) — the honest figure: caches can be
+    /// reclaimed, but a node loading a model sees this shrink first.
+    pub ram_available_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub cpu_logical_cores: u32,
+    pub gpus: Vec<GpuSample>,
+    /// Unix ms when the snapshot was taken.
+    pub sampled_at_ms: u64,
+}
+
+impl ResourceSample {
+    /// Free VRAM summed over GPUs that report it. None when NO GPU reports
+    /// (unknown ≠ zero: an unknown peer must not rank below a busy one).
+    pub fn vram_free_total(&self) -> Option<u64> {
+        let known: Vec<_> = self.gpus.iter().filter_map(|g| g.vram_free_bytes).collect();
+        (!known.is_empty()).then(|| known.into_iter().sum())
+    }
+
+    /// Total VRAM summed over GPUs that report it (None = unknown).
+    pub fn vram_total_total(&self) -> Option<u64> {
+        let known: Vec<_> = self
+            .gpus
+            .iter()
+            .filter_map(|g| g.vram_total_bytes)
+            .collect();
+        (!known.is_empty()).then(|| known.into_iter().sum())
+    }
+
+    /// One-line census: "16.4/31.8 GiB RAM · RTX 4060 6.7/7.6 GiB VRAM free".
+    pub fn census(&self) -> String {
+        let mut s = format!(
+            "{:.1}/{:.1} GiB RAM",
+            self.ram_available_bytes as f64 / GIB as f64,
+            self.ram_total_bytes as f64 / GIB as f64
+        );
+        if let (Some(free), Some(total)) = (self.vram_free_total(), self.vram_total_total()) {
+            s.push_str(&format!(
+                " · {:.1}/{:.1} GiB VRAM free",
+                free as f64 / GIB as f64,
+                total as f64 / GIB as f64
+            ));
+        }
+        s
+    }
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Parse `nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free
+/// --format=csv,noheader,nounits` rows (name[, values in MiB]). Malformed
+/// or empty output yields an empty vec — never an invented GPU.
+fn parse_nvidia_smi_query(out: &str) -> Vec<GpuSample> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut parts = line.split(',').map(str::trim);
+            let name = parts.next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let mut vram = [None; 3];
+            for slot in vram.iter_mut() {
+                *slot = parts
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|mib| (mib * 1024.0 * 1024.0) as u64);
+            }
+            // A garbage line (no reads at all) is not a GPU — never invent
+            // one just because some config comments found their way in.
+            if vram.iter().all(|v| v.is_none()) {
+                return None;
+            }
+            // nounits MiB → bytes; [total, used, free]
+            Some(GpuSample {
+                name,
+                vram_total_bytes: vram[0],
+                vram_used_bytes: vram[1],
+                vram_free_bytes: vram[2],
+            })
+        })
+        .collect()
+}
+
+/// Shared sysinfo System: `System::new_all()` walks every process, which
+/// is silly at ping cadence — one instance, memory/CPU refresh only.
+fn shared_system() -> &'static std::sync::Mutex<System> {
+    use std::sync::OnceLock;
+    static SYS: OnceLock<std::sync::Mutex<System>> = OnceLock::new();
+    SYS.get_or_init(|| std::sync::Mutex::new(System::new()))
+}
+
+/// Sample live resources. Cheap at ping cadence (§ placement refresh);
+/// call from `spawn_blocking` when an async loop drives it.
+/// GPU VRAM comes from nvidia-smi when present (any vendor without a
+/// CLI there simply reports unknown); RAM/CPU always present.
+pub fn sample() -> ResourceSample {
+    let now = crate::bootstrap::now_ms();
+    let (ram_total, ram_available, swap_total, cores) = {
+        let mut sys = shared_system().lock().expect("sysinfo lock");
+        sys.refresh_memory();
+        sys.refresh_cpu_all();
+        (
+            sys.total_memory(),
+            sys.available_memory(),
+            sys.total_swap(),
+            sys.cpus().len() as u32,
+        )
+    };
+    let gpus = std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=name,memory.total,memory.used,memory.free")
+        .arg("--format=csv,noheader,nounits")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .map(|out| parse_nvidia_smi_query(&out))
+        .unwrap_or_default();
+    ResourceSample {
+        ram_total_bytes: ram_total,
+        ram_available_bytes: ram_available,
+        swap_total_bytes: swap_total,
+        cpu_logical_cores: cores,
+        gpus,
+        sampled_at_ms: now,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_returns_plausible_live_values() {
+        let s = sample();
+        assert!(s.sampled_at_ms > 0, "timestamp set");
+        assert!(s.ram_total_bytes >= 64 * 1024 * 1024, "live RAM seen");
+        assert!(s.ram_available_bytes <= s.ram_total_bytes);
+        // Census is human-readable either way (GPU or GPU-less host).
+        assert!(s.census().contains("GiB RAM"));
+    }
+
+    #[test]
+    fn nvidia_smi_query_rows_parse_to_gpu_samples() {
+        let out = "NVIDIA GeForce RTX 4060, 8188, 4096, 4092\n";
+        let gpus = parse_nvidia_smi_query(out);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 4060");
+        assert_eq!(gpus[0].vram_total_bytes, Some(8188 * 1024 * 1024));
+        assert_eq!(gpus[0].vram_used_bytes, Some(4096 * 1024 * 1024));
+        assert_eq!(gpus[0].vram_free_bytes, Some(4092 * 1024 * 1024));
+    }
+
+    #[test]
+    fn nvidia_smi_query_absent_or_garbage_is_not_a_gpu() {
+        // driver missing → empty; garbage rows → ignored, never invented
+        assert!(parse_nvidia_smi_query("").is_empty());
+        assert!(parse_nvidia_smi_query("no drivers\n").is_empty());
+        // two GPUs parse side by side (multi-GPU hosts)
+        let two = parse_nvidia_smi_query("A, 100, 10, 90\nB, 200, 50, 150\n");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[1].vram_free_bytes, Some(150 * 1024 * 1024));
+    }
+
+    #[test]
+    fn vram_totals_are_unknown_when_no_gpu_reports() {
+        // unknown ≠ zero: an unreported host must not rank below a busy one
+        let none = ResourceSample::default();
+        assert_eq!(none.vram_free_total(), None);
+        assert_eq!(none.vram_total_total(), None);
+        let egpu = ResourceSample {
+            gpus: vec![GpuSample {
+                name: "RTX".into(),
+                vram_total_bytes: Some(8 * GIB),
+                vram_used_bytes: Some(6 * GIB),
+                vram_free_bytes: Some(2 * GIB),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(egpu.vram_free_total(), Some(2 * GIB));
+        assert_eq!(egpu.vram_total_total(), Some(8 * GIB));
+        assert!(egpu.census().contains("2.0/8.0 GiB VRAM free"));
+    }
 
     #[test]
     fn probe_returns_a_complete_report() {

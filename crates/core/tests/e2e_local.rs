@@ -77,6 +77,7 @@ async fn mesh_chat_falls_back_over_quic_with_real_attribution() {
             contribution_percent: 50,
             last_seen_ms: jerith_mesh_core::bootstrap::now_ms(),
             role: NodeRole::Hybrid,
+            resources: None,
             rpc_address: peer_addr.to_string(),
         });
         reg.record_ping_ok(&peer_id_for_registry, 5);

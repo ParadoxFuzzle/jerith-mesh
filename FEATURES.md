@@ -7,8 +7,13 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 ## 1. Core Distributed Compute
 - ✅ Model-homogeneous peer meshes: nodes connect only to others running the *same* model & quantization
 - ✅ Colibri-style MoE runtime integration (Phase 0: single-node expert streaming; local primitive)
-- 📋 Resource pooling of RAM, VRAM, GPU, CPU across the mesh (Phase 1–2)
-- 📋 Hybrid local + remote expert execution with locality-aware placement (Phase 2)
+- ✅ Resource pooling of RAM, VRAM, GPU, CPU across the mesh (Phase 1)
+  - Peers advertise live `ResourceSample` snapshots (free/total RAM, swap,
+    logical cores, per-GPU VRAM) inside their signed ads at every ping cycle
+  - Placement orders candidates by the pool: reported-capacity peers first
+    (most free VRAM → RAM → RTT tiebreak), then unreported peers by pure RTT
+  - Wire-compatible: pre-pooling ads deserialize fine (missing field → None)
+- 🔄 Hybrid local + remote expert execution with locality-aware placement (Phase 2: planning is resource-aware; tensor transport still stubbed)
 - 📋 Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
 - 📋 Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
 - 📋 Speculative decoding + expert budgeting + prefetching (Phase 3)

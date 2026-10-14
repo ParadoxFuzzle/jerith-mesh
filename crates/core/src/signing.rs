@@ -248,6 +248,7 @@ mod tests {
             rpc_address: String::new(),
             last_seen_ms: 1_000,
             role: NodeRole::Hybrid,
+            resources: None,
         }
     }
 
