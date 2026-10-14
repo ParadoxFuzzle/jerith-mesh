@@ -475,6 +475,34 @@ impl ExpertStore {
         Ok(())
     }
 
+    /// Raw container bytes for one expert (Phase 2 transfer: a peer
+    /// pulling a replica). Reading the file rather than a resident copy
+    /// keeps chunk serving allocation-cheap; the OS page cache makes the
+    /// hot path cheap anyway.
+    ///
+    /// `offset`/`len` are clamped to the file, so a requester can never
+    /// read past the end and an oversized ask is a short read rather than
+    /// an error (the client detects completion by `total_bytes`).
+    pub fn bytes_of(&self, expert_id: &str, offset: u64, len: u32) -> Result<(Vec<u8>, u64)> {
+        let path = self.path_for(expert_id);
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("reading expert {}", path.display()))?;
+        let total = bytes.len() as u64;
+        let start = offset.min(total) as usize;
+        let end = (start + len as usize).min(bytes.len());
+        Ok((bytes[start..end].to_vec(), total))
+    }
+
+    /// Ingest a received expert container (Phase 2 replication). The bytes
+    /// are parsed **before** anything touches the store, so a truncated or
+    /// tampered transfer is rejected by the container checksum and the
+    /// published file is always a whole, valid expert.
+    pub fn put_bytes(&self, bytes: &[u8]) -> Result<ExpertWeights> {
+        let weights = ExpertWeights::from_bytes(bytes)?;
+        self.put(&weights)?;
+        Ok(weights)
+    }
+
     /// Serve one expert query: load on demand, run the SwiGLU forward pass.
     pub fn run(&self, expert_id: &str, input: &[f32]) -> Result<Vec<f32>> {
         let weights = self.get(expert_id)?;
@@ -693,6 +721,46 @@ mod tests {
             "got {err}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn byte_ranges_are_clamped_and_put_bytes_round_trips() {
+        let (dir, store) = tmp_store(16);
+        let w = ExpertWeights::synthetic("L4.E5", 4, 3);
+        let container = w.to_bytes().unwrap();
+        store.put(&w).unwrap();
+
+        // Whole file, a middle slice, and an over-long ask.
+        let (all, total) = store.bytes_of("L4.E5", 0, container.len() as u32).unwrap();
+        assert_eq!(total, container.len() as u64);
+        assert_eq!(all, container);
+        let (mid, _) = store.bytes_of("L4.E5", 16, 8).unwrap();
+        assert_eq!(mid, container[16..24]);
+        let (tail, _) = store.bytes_of("L4.E5", 8, u32::MAX).unwrap();
+        assert_eq!(tail, container[8..], "oversized ask must be a short read");
+        // Past the end is an empty read, not a panic or a leak.
+        let (past, _) = store
+            .bytes_of("L4.E5", container.len() as u64 + 99, 16)
+            .unwrap();
+        assert!(past.is_empty());
+
+        // A fresh node ingests the transferred bytes and computes identically.
+        let (dir2, store2) = tmp_store(16);
+        let ingested = store2.put_bytes(&all).unwrap();
+        assert_eq!(ingested, w);
+        let x = vec![0.1f32, 0.2, -0.3, 0.4];
+        assert_eq!(
+            store2.run("L4.E5", &x).unwrap(),
+            store.run("L4.E5", &x).unwrap()
+        );
+        // Truncated transfer → refused before anything is published.
+        let err = format!("{:#}", store2.put_bytes(&all[..all.len() - 5]).unwrap_err());
+        assert!(
+            err.contains("truncated") || err.contains("checksum"),
+            "got {err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
     }
 
     #[test]

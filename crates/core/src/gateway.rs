@@ -603,6 +603,21 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         Some(store) => {
             let s = store.stats();
             let hosted = store.hosted();
+            // Phase 2 replication: the demand signal behind the hot/cold
+            // split, and the shard ring's owner for the cold tail — so an
+            // operator can see *why* this node holds what it holds.
+            let stats = gw.state.expert_stats_snapshot();
+            let percent = cfg.experts.hot_percent;
+            let hot = stats.hot_set(percent);
+            let cold = stats.cold_set(percent);
+            let ring = crate::replication::ShardMap::from_ads(&cfg.node_id, &reg.all_ads());
+            // Bounded sample: the tail can be long and /status is polled.
+            let cold_placements: Vec<Value> = cold
+                .iter()
+                .take(16)
+                .map(|id| json!({"expert_id": id, "cold_shard_owner": ring.primary_owner(id)}))
+                .collect();
+            let policy = cfg.experts.replication_config();
             json!({
                 "dir": store.dir().display().to_string(),
                 "hosted": hosted.len(),
@@ -614,6 +629,21 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
                 "loads": s.loads,
                 "evictions": s.evictions,
                 "load_errors": s.load_errors,
+                // Demand signal + placement policy (Phase 2 replication).
+                "activations_total": stats.total(),
+                "activations_distinct": stats.distinct(),
+                "counts": stats.snapshot()["counts"],
+                "hot_percent": percent,
+                "hot": hot,
+                "cold": cold.len(),
+                "cold_placements": cold_placements,
+                "shard_ring_nodes": ring.members().len(),
+                "replication": {
+                    "enabled": cfg.experts.replication_enabled,
+                    "holders_wanted": policy.replication_factor,
+                    "interval_seconds": cfg.experts.replication_interval_secs,
+                    "max_fetches_per_round": policy.max_actions_per_round,
+                },
             })
         }
         None => Value::Null,

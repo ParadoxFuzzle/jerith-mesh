@@ -364,6 +364,46 @@ pub struct ExpertStoreConfig {
     /// to a peer that really holds the expert.
     #[serde(default = "default_experts_tensors_only")]
     pub tensors_only: bool,
+    /// Phase 2 replicas: replicate the top `hot_percent` of activated
+    /// experts (the spec's 10–20 %; `expert_stats` clamps the band).
+    #[serde(default = "default_hot_percent")]
+    pub hot_percent: u32,
+    /// Desired mesh-wide holders per hot expert (≥ 2; a single holder is
+    /// not a replica).
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
+    /// Seconds between replication decision rounds. Replication is
+    /// background work; the default is unhurried.
+    #[serde(default = "default_replication_interval_secs")]
+    pub replication_interval_secs: u64,
+    /// Fetches started per round, so a new node trickles its replicas in
+    /// instead of saturating the link.
+    #[serde(default = "default_replication_max_actions")]
+    pub replication_max_actions_per_round: usize,
+    /// Switch the replication loop off entirely (weight transfer stays
+    /// available to peers either way).
+    #[serde(default = "default_replication_enabled")]
+    pub replication_enabled: bool,
+}
+
+fn default_hot_percent() -> u32 {
+    crate::expert_stats::DEFAULT_HOT_PERCENT
+}
+
+fn default_replication_factor() -> usize {
+    3
+}
+
+fn default_replication_interval_secs() -> u64 {
+    300
+}
+
+fn default_replication_max_actions() -> usize {
+    2
+}
+
+fn default_replication_enabled() -> bool {
+    true
 }
 
 fn default_expert_cache_mb() -> usize {
@@ -380,11 +420,25 @@ impl Default for ExpertStoreConfig {
             dir: None,
             cache_mb: default_expert_cache_mb(),
             tensors_only: default_experts_tensors_only(),
+            hot_percent: default_hot_percent(),
+            replication_factor: default_replication_factor(),
+            replication_interval_secs: default_replication_interval_secs(),
+            replication_max_actions_per_round: default_replication_max_actions(),
+            replication_enabled: default_replication_enabled(),
         }
     }
 }
 
 impl ExpertStoreConfig {
+    /// The replication policy this config expresses.
+    pub fn replication_config(&self) -> crate::replication::ReplicationConfig {
+        crate::replication::ReplicationConfig {
+            hot_percent: self.hot_percent,
+            replication_factor: self.replication_factor.max(2),
+            max_actions_per_round: self.replication_max_actions_per_round,
+        }
+    }
+
     /// Effective expert directory (config override or the `~/.jerith-mesh`
     /// default).
     pub fn effective_dir(&self) -> PathBuf {

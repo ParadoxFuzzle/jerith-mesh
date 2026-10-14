@@ -72,6 +72,13 @@ pub struct MeshState {
     /// hosting advertisement, the router's local-first plan, and the
     /// `/status` store stats.
     pub experts: Mutex<Option<std::sync::Arc<crate::expert_store::ExpertStore>>>,
+    /// Phase 2 replication: how often each expert was actually activated
+    /// (served here, or dispatched from here). The hot/cold split and the
+    /// shard ring both read it.
+    pub expert_stats: crate::expert_stats::SharedExpertStats,
+    /// Where those counters persist (see
+    /// [`set_expert_stats`](Self::set_expert_stats)).
+    expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
 }
 
 impl MeshState {
@@ -90,6 +97,10 @@ impl MeshState {
             verify: crate::verify::VerificationTracker::shared(),
             stake,
             experts: Mutex::new(None),
+            expert_stats: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::expert_stats::ExpertStats::load(&crate::expert_stats::default_stats_path()),
+            )),
+            expert_stats_path: std::sync::Mutex::new(crate::expert_stats::default_stats_path()),
         });
         Ok((state, rx))
     }
@@ -106,12 +117,133 @@ impl MeshState {
         self.experts.lock().await.clone()
     }
 
+    /// Count one expert activation (Phase 2 demand signal): served here or
+    /// dispatched from here, either way the expert is hot for this node.
+    pub fn record_activation(&self, expert_id: &str) {
+        if let Ok(mut stats) = self.expert_stats.lock() {
+            stats.record(expert_id);
+        }
+    }
+
+    /// A copy of the activation counters.
+    pub fn expert_stats_snapshot(&self) -> crate::expert_stats::ExpertStats {
+        self.expert_stats
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the demand counters and where they persist. Tests (and any
+    /// embedding caller) use this to keep a run's numbers out of a live
+    /// node's `<data>/expert-stats.json`.
+    pub fn set_expert_stats(
+        &self,
+        stats: crate::expert_stats::ExpertStats,
+        path: std::path::PathBuf,
+    ) {
+        if let Ok(mut current) = self.expert_stats.lock() {
+            *current = stats;
+        }
+        if let Ok(mut current) = self.expert_stats_path.lock() {
+            *current = path;
+        }
+    }
+
+    /// Persist the counters (best-effort; statistics are advisory).
+    pub fn save_expert_stats(&self) {
+        let snapshot = self.expert_stats_snapshot();
+        let path = self
+            .expert_stats_path
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| crate::expert_stats::default_stats_path());
+        if let Err(e) = snapshot.save(&path) {
+            tracing::warn!(target: "mesh", error = %e, "expert stats not persisted");
+        }
+    }
+
     /// Expert ids this node serves with real tensors (sorted; empty when
     /// no store is attached).
     pub async fn hosted_experts(&self) -> Vec<String> {
         match self.experts.lock().await.as_ref() {
             Some(store) => store.hosted(),
             None => Vec::new(),
+        }
+    }
+}
+
+/// Background replication loop (Phase 2): periodically ask "which hot
+/// experts are under-replicated?" and pull the missing ones from a holder.
+///
+/// Separate from the ping loop on purpose — replication moves real bytes
+/// and must never delay liveness, and a node with no store (or with
+/// replication switched off) simply never spawns it.
+pub struct ReplicaManager {
+    shutdown_tx: watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ReplicaManager {
+    /// Spawn the loop. Call [`shutdown`](Self::shutdown) to stop it — or
+    /// simply drop the manager: the loop notices the closed channel.
+    pub fn spawn(
+        state: Arc<MeshState>,
+        chat: Arc<MeshFallbackChat>,
+        interval: Duration,
+        config: crate::replication::ReplicationConfig,
+    ) -> Self {
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        // Demand recorded since the last write. The signal has to survive a
+        // restart even when *nothing* replicates (a lone node, or an
+        // all-cold mesh), so activation counts are flushed on their own —
+        // not only alongside a fetch. Read before the task starts, so an
+        // activation that lands between `spawn` and the first poll is not
+        // folded into the baseline and forgotten.
+        let mut persisted_total = state.expert_stats_snapshot().total();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // First tick fires immediately; skipping it keeps boot quiet
+            // (nothing is discovered yet anyway).
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let actions = chat.replication_tick(&state, config).await;
+                        let total = state.expert_stats_snapshot().total();
+                        if !actions.is_empty() || total != persisted_total {
+                            state.save_expert_stats();
+                            persisted_total = total;
+                        }
+                    }
+                    // A stop signal, or the manager going away (closed
+                    // channel): both end the loop, after persisting the
+                    // demand signal one last time. A closed channel must
+                    // end it too — otherwise `changed()` returns instantly
+                    // forever and the loop spins.
+                    _ = shutdown.changed() => {
+                        state.save_expert_stats();
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            shutdown_tx,
+            handle,
+        }
+    }
+
+    /// Stop the loop and wait (bounded) for its final stats flush. A
+    /// transfer already in flight is given a moment, never waited on
+    /// indefinitely — the tick's own timeout bounds it anyway.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let mut handle = self.handle;
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
         }
     }
 }
@@ -242,7 +374,56 @@ impl MeshFallbackChat {
         expert_id: &str,
         input: &[f32],
     ) -> anyhow::Result<(Vec<f32>, Option<String>)> {
-        let (peers, addrs) = self.mesh_view(state, Some(expert_id)).await;
+        let (mut peers, addrs) = self.mesh_view(state, Some(expert_id)).await;
+        // Cold-expert sharding (Phase 2): when nobody *advertises* this
+        // expert, the deterministic shard ring says which node owns it. We
+        // ask that owner rather than giving up — it either has the weights
+        // (and answers) or honestly refuses, which is still better than
+        // never trying. The ring is computed from the same ads every node
+        // sees, so all nodes pick the same owner.
+        // One registry read for both facts (ads + pings): the ring must be
+        // computed from the same advertisement set every node sees, and the
+        // lock is released before hashing or reading config.
+        let (ads, rtts) = {
+            let reg = state.registry.lock().await;
+            let ads = reg.all_ads();
+            let rtts: HashMap<String, u64> = ads
+                .iter()
+                .map(|ad| {
+                    let rtt = reg
+                        .health_of(&ad.node_id)
+                        .and_then(|h| h.last_rtt_ms)
+                        .unwrap_or(u64::MAX >> 2);
+                    (ad.node_id.clone(), rtt)
+                })
+                .collect();
+            (ads, rtts)
+        };
+        let advertised = ads.iter().any(|ad| ad.explicitly_hosts(expert_id));
+        if !advertised {
+            let own_id = state.config.read().await.node_id.clone();
+            let ring = crate::replication::ShardMap::from_ads(&own_id, &ads);
+            if let Some(owner) = ring.primary_owner(expert_id) {
+                if owner != own_id && !peers.iter().any(|(id, ..)| *id == owner) {
+                    let rtt = rtts.get(&owner).copied().unwrap_or(u64::MAX >> 2);
+                    let resources = ads
+                        .iter()
+                        .find(|ad| ad.node_id == owner)
+                        .and_then(|ad| ad.resources.clone());
+                    tracing::debug!(
+                        target: "mesh",
+                        expert = %expert_id,
+                        owner = %owner,
+                        "no advertised holder — asking the cold-shard owner"
+                    );
+                    // Behind any advertised holder (there are none) and
+                    // ahead of nothing: the owner is the candidate.
+                    peers.push((owner, rtt, true, true, resources));
+                }
+            }
+        }
+        // Demand signal: this node wants this expert.
+        state.record_activation(expert_id);
         self.refresh_pins(state).await;
         let req_id = format!("expert-{}-{}", expert_id, crate::bootstrap::now_ms());
         let store = state.expert_store().await;
@@ -271,6 +452,111 @@ impl MeshFallbackChat {
             )
             .await?;
         Ok((out, served_by))
+    }
+
+    /// One replication decision round (Phase 2): read demand, compare the
+    /// mesh's advertised holders against the desired factor, and pull the
+    /// missing hot experts from a holder that actually advertises them.
+    ///
+    /// Returns the actions performed (for logs/tests). Failures are
+    /// per-expert and never fatal: the next round retries.
+    pub async fn replication_tick(
+        &self,
+        state: &Arc<MeshState>,
+        config: crate::replication::ReplicationConfig,
+    ) -> Vec<crate::replication::ReplicationAction> {
+        let Some(store) = state.expert_store().await else {
+            return Vec::new();
+        };
+        let level = state.config.read().await.experts.replication_config();
+        let stats = state.expert_stats_snapshot();
+        let hot = stats.hot_set(config.hot_percent);
+        if hot.is_empty() {
+            return Vec::new();
+        }
+        // Addresses to dial: the expert-agnostic mesh view (chat/None), so
+        // a peer is reachable for a transfer regardless of which experts it
+        // advertises.
+        let (_, addrs) = self.mesh_view(state, None).await;
+        let reg = state.registry.lock().await;
+        let ads = reg.all_ads();
+        let replica_peers: Vec<crate::replication::ReplicaPeer> = ads
+            .iter()
+            .filter(|ad| {
+                addrs.contains_key(&ad.node_id)
+                    && reg
+                        .health_of(&ad.node_id)
+                        .map(|h| h.state != PeerState::Deprecated)
+                        .unwrap_or(false)
+            })
+            .map(|ad| crate::replication::ReplicaPeer {
+                node_id: ad.node_id.clone(),
+                rtt_ms: reg
+                    .health_of(&ad.node_id)
+                    .and_then(|h| h.last_rtt_ms)
+                    .unwrap_or(u64::MAX >> 2),
+                hosted_experts: ad.hosted_experts.clone(),
+                alive: true,
+            })
+            .collect();
+        drop(reg);
+        let local_hosted = store.hosted();
+        let actions = crate::replication::plan_replication(
+            &hot,
+            &local_hosted,
+            &replica_peers,
+            crate::replication::ReplicationConfig {
+                hot_percent: config.hot_percent,
+                replication_factor: config.replication_factor,
+                max_actions_per_round: level.max_actions_per_round,
+            },
+        );
+        if actions.is_empty() {
+            return actions;
+        }
+        self.refresh_pins(state).await;
+        for action in &actions {
+            let Some(addr) = addrs.get(&action.source_node).copied() else {
+                continue;
+            };
+            match crate::quic::fetch_expert(
+                &self.endpoint,
+                addr,
+                &action.source_node,
+                &state.identity,
+                &action.expert_id,
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                Ok(bytes) => match store.put_bytes(&bytes) {
+                    Ok(weights) => tracing::info!(
+                        target: "mesh",
+                        expert = %action.expert_id,
+                        source = %action.source_node,
+                        bytes = bytes.len(),
+                        held_by = action.holders_before,
+                        "replicated hot expert ({} hidden × {} intermediate)",
+                        weights.hidden,
+                        weights.intermediate
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "mesh",
+                        expert = %action.expert_id,
+                        error = %e,
+                        "replicated expert rejected — checksum/format failure"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    target: "mesh",
+                    expert = %action.expert_id,
+                    source = %action.source_node,
+                    error = %e,
+                    "hot-expert replication transfer failed (retried next round)"
+                ),
+            }
+        }
+        actions
     }
 
     /// Try local-strict chat (the gateway's existing forward); on failure

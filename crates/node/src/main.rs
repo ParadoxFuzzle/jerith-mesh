@@ -1297,6 +1297,33 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         }
     };
 
+    // Phase 2 replication: pull under-replicated hot experts from peers
+    // that hold them. Runs only when a store is attached and the config
+    // leaves it on; weight transfer itself stays available either way.
+    //
+    // Bound for the whole run on purpose: dropping the manager stops its
+    // loop, so a temporary binding would spawn it and immediately end it.
+    let _replicas = match (&expert_store, &mesh_fallback) {
+        (Some(_), Some(fb)) if cfg.experts.replication_enabled => {
+            let interval = Duration::from_secs(cfg.experts.replication_interval_secs.max(30));
+            let policy = cfg.experts.replication_config();
+            println!(
+                "   replicas    hot {}% (factor {}) every {}s, ≤{} fetch/round",
+                policy.hot_percent,
+                policy.replication_factor,
+                interval.as_secs(),
+                policy.max_actions_per_round
+            );
+            Some(jerith_mesh_core::ping::ReplicaManager::spawn(
+                state.clone(),
+                fb.clone(),
+                interval,
+                policy,
+            ))
+        }
+        _ => None,
+    };
+
     // Jerith Guard: compiled outbound content filter (PII redaction,
     // prompt-injection / malware blocklists, do-not-exfiltrate rules).
     let guard = if cfg.guard.enabled {
@@ -1401,6 +1428,9 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             store: expert_store.clone(),
             runtime,
             tensors_only: cfg.experts.tensors_only,
+            // Demand signal: every expert this node actually runs feeds the
+            // hot set that drives replication.
+            stats: Some(state.expert_stats.clone()),
         };
         let banner = serving.describe();
         // Identity-bound QUIC cert: the transport cert key IS the node's

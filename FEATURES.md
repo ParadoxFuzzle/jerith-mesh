@@ -45,7 +45,32 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     MeshLoop `dispatch_expert` entry that reports which node answered
   - Quantized shards (Q4_K/Q8_0 dequant, mmap'd GGUF export) are the next
     step; the store boundary (`run(expert_id, input) -> Vec<f32>`) holds
-- 📋 Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
+- ✅ Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
+  - Demand is *measured*, not guessed: every expert this node serves or
+    dispatches is counted (`expert_stats`, persisted to
+    `data/expert-stats.json`); the hot set is the top slice of the
+    *distinct* experts observed, at `[experts] hot_percent` (clamped to
+    the spec's 10–20 % band, deterministic ties)
+  - Under-replicated hot experts are pulled in as replicas from the
+    nearest peer that **advertises** holding them: `ReplicaManager` runs
+    one background round every `replication_interval_secs` (off with
+    `replication_enabled = false`), starting at most
+    `replication_max_actions_per_round` fetches and aiming at
+    `replication_factor` holders mesh-wide; a peer whose hosting is only
+    unknown (legacy ad) counts toward the factor but is never a source
+  - The transfer is chunked and checksummed end to end: one signed
+    `ExpertFetch` per 256 KiB slice (1 MiB server-side chunk cap, 512 MiB
+    container cap) on a single QUIC stream, and the replica is only
+    published after the container parses — magic/dims/id/checksum — so a
+    truncated or tampered transfer is refused, never served or advertised
+  - Cold experts (the long tail) get exactly one owner from a rendezvous
+    (highest-random-weight) ring over the live node ids: every node
+    derives the same owner from the ads it already has — no coordinator —
+    and a departing node reassigns only its own experts; `dispatch_expert`
+    asks that owner when nobody advertises the expert
+  - Operator surfaces: `/status.experts` reports the activation counts,
+    the hot set, the cold size, each sampled cold expert's shard owner,
+    the ring size and the live replication policy
 - 📋 Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
 - 📋 Speculative decoding + expert budgeting + prefetching (Phase 3)
 - 📋 Asynchronous, timeout-tolerant forward passes; graceful degradation (Phase 3)

@@ -161,6 +161,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
         store: Some(store.clone()),
         runtime: None,
         tensors_only: true,
+        stats: None,
     });
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
@@ -291,4 +292,427 @@ fn reference_swiglu(w: &jerith_mesh_core::expert_store::ExpertWeights, x: &[f32]
         y[out] = acc;
     }
     y
+}
+
+/// Phase 2 hot-expert replication, end to end over real QUIC: node B holds
+/// an expert and advertises it, node A has recorded demand for it (so it is
+/// hot) and pulls a replica with one `replication_tick` — after which A
+/// serves the same numbers locally, without B in the picture.
+#[tokio::test]
+async fn hot_expert_replication_pulls_a_replica_over_quic() {
+    use jerith_mesh_core::bootstrap::{PeerAd, PeerRegistry};
+    use jerith_mesh_core::config::{NodeConfig, NodeRole};
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+    use jerith_mesh_core::ping::{MeshFallbackChat, MeshState};
+    use jerith_mesh_core::quic::{ExpertHandler, ExpertServing, SharedPinMap};
+    use jerith_mesh_core::replication::ReplicationConfig;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir_b = std::env::temp_dir().join(format!("jerith-repl-src-{}", std::process::id()));
+    let dir_a = std::env::temp_dir().join(format!("jerith-repl-dst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_a);
+
+    // --- Node B: holds the expert and advertises exactly that -----------
+    let store_b = Arc::new(ExpertStore::new(&dir_b, 8).unwrap());
+    let weights = ExpertWeights::synthetic("L3.E17", 8, 6);
+    store_b.put(&weights).unwrap();
+    let identity_b = SigningIdentity::generate();
+    let server =
+        jerith_mesh_core::quic::server_endpoint_for(&identity_b, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+    let addr_b = server.local_addr().unwrap();
+    let node_b = identity_b.node_id();
+    let serving_b: Arc<dyn ExpertHandler> = Arc::new(ExpertServing {
+        store: Some(store_b.clone()),
+        runtime: None,
+        tensors_only: true,
+        stats: None,
+    });
+    let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
+    {
+        let node_b = node_b.clone();
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve(server, serving_b, node_b, rx_b).await;
+        });
+    }
+
+    // --- Node A: knows B's ad, has demand for the expert, holds nothing --
+    assert!(
+        NodeConfig::default().identity().is_err(),
+        "default config must not carry an identity until we set one"
+    );
+    let cfg_a = NodeConfig {
+        node_id: "node-a".into(),
+        secret_key_hex: Some(SigningIdentity::generate().secret_bytes().to_vec()),
+        model: Some(jerith_mesh_core::config::default_model("glm-5.3")),
+        role: NodeRole::Hybrid,
+        contribution_percent: 40,
+        ..NodeConfig::default()
+    };
+    let (state_a, _rx_a) = MeshState::new(cfg_a).unwrap();
+    let store_a = Arc::new(ExpertStore::new(&dir_a, 8).unwrap());
+    state_a.set_expert_store(store_a.clone()).await;
+    state_a.record_activation("L3.E17");
+    assert!(store_a.hosted().is_empty(), "A starts with no weights");
+
+    // B's signed ad, including the expert it serves. The registry is
+    // created the way the ping loop creates it (from the configured
+    // model), since a registry with no model refuses every ad.
+    let (hosted, count) = PeerAd::advertise_hosted_experts(&["L3.E17".to_string()]);
+    {
+        let mut reg = PeerRegistry::new(Some(jerith_mesh_core::config::default_model("glm-5.3")));
+        assert!(
+            reg.upsert(PeerAd {
+                node_id: node_b.clone(),
+                address: format!("{}", addr_b),
+                model_id: "glm-5.3".into(),
+                quant: "int4".into(),
+                contribution_percent: 40,
+                last_seen_ms: jerith_mesh_core::bootstrap::now_ms(),
+                role: NodeRole::Hybrid,
+                rpc_address: addr_b.to_string(),
+                resources: None,
+                hosted_experts: hosted,
+                hosted_expert_count: count,
+            }),
+            "a same-model peer ad must pass the model-homogeneous gate"
+        );
+        reg.record_ping_ok(&node_b, 3);
+        *state_a.registry.lock().await = reg;
+    }
+    // A's chat handle: pins must let the transfer dial B.
+    let mut pins: jerith_mesh_core::quic::PinMap = HashMap::new();
+    pins.insert(node_b.clone(), addr_b);
+    let shared_pins: SharedPinMap = Arc::new(tokio::sync::RwLock::new(pins));
+    let fb = Arc::new(MeshFallbackChat {
+        endpoint: jerith_mesh_core::quic::pinned_client_endpoint_dyn(shared_pins)
+            .expect("client endpoint"),
+        router: Arc::new(jerith_mesh_core::quic::ExpertRouter::new(
+            jerith_mesh_core::quic::RouterOptions::default(),
+        )),
+        pins: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+    });
+
+    // --- One replication round ------------------------------------------
+    let actions = fb
+        .replication_tick(
+            &state_a,
+            ReplicationConfig {
+                hot_percent: 15,
+                replication_factor: 3,
+                max_actions_per_round: 4,
+            },
+        )
+        .await;
+    assert_eq!(actions.len(), 1, "the hot expert must be pulled once");
+    assert_eq!(actions[0].expert_id, "L3.E17");
+    assert_eq!(actions[0].source_node, node_b);
+
+    // The replica is on A's disk, complete and valid…
+    assert_eq!(store_a.hosted(), vec!["L3.E17".to_string()]);
+    let replica = store_a.get("L3.E17").expect("replica readable");
+    assert_eq!(
+        *replica, weights,
+        "replicated weights must be bit-identical"
+    );
+
+    // …and A now serves the same activations *locally*, with no peer needed.
+    let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
+    let served_locally = store_a.run("L3.E17", &input).unwrap();
+    assert_eq!(served_locally, reference_swiglu(&weights, &input));
+
+    // Demand accounting: A's hot set now names the replicated expert.
+    let stats = state_a.expert_stats_snapshot();
+    assert!(stats.hot_set(15).contains(&"L3.E17".to_string()));
+
+    // A second round is a no-op: the replica already exists, so the policy
+    // does not re-fetch (and the factor still counts B + A).
+    let again = fb
+        .replication_tick(
+            &state_a,
+            ReplicationConfig {
+                hot_percent: 15,
+                replication_factor: 3,
+                max_actions_per_round: 4,
+            },
+        )
+        .await;
+    assert!(
+        again.is_empty(),
+        "replication must be idempotent per expert"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// The cold-shard path: with the expert hot but no advertised holder, the
+/// replication policy has no source and does nothing (rather than dialing
+/// a peer that would refuse) — and the shard ring still names an owner for
+/// placement to try.
+#[tokio::test]
+async fn cold_shard_ring_names_an_owner_when_nothing_is_advertised() {
+    use jerith_mesh_core::bootstrap::{PeerAd, PeerRegistry};
+    use jerith_mesh_core::config::NodeRole;
+    use jerith_mesh_core::replication::{
+        ReplicaPeer, ReplicationConfig, ShardMap, plan_replication,
+    };
+
+    let peers = vec![
+        ReplicaPeer {
+            node_id: "peer-1".into(),
+            rtt_ms: 5,
+            hosted_experts: Some(vec![]), // advertises holding nothing
+            alive: true,
+        },
+        ReplicaPeer {
+            node_id: "peer-2".into(),
+            rtt_ms: 9,
+            hosted_experts: Some(vec![]),
+            alive: true,
+        },
+    ];
+    let actions = plan_replication(
+        &["L8.E3".to_string()],
+        &[],
+        &peers,
+        ReplicationConfig {
+            hot_percent: 15,
+            replication_factor: 3,
+            max_actions_per_round: 2,
+        },
+    );
+    assert!(
+        actions.is_empty(),
+        "no advertised holder ⇒ no fetch source: {actions:?}"
+    );
+
+    // The shard ring still answers "who should own it" — deterministically.
+    let ads: Vec<PeerAd> = peers
+        .iter()
+        .map(|p| PeerAd {
+            node_id: p.node_id.clone(),
+            address: "127.0.0.1:1".into(),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 40,
+            last_seen_ms: 0,
+            role: NodeRole::Hybrid,
+            rpc_address: "127.0.0.1:9001".into(),
+            resources: None,
+            hosted_experts: p.hosted_experts.clone(),
+            hosted_expert_count: Some(0),
+        })
+        .collect();
+    let ring_a = ShardMap::from_ads("node-a", &ads);
+    let owner = ring_a.primary_owner("L8.E3").expect("ring names an owner");
+    assert!(ring_a.members().iter().any(|m| m == &owner));
+    assert!(ring_a.owns(&owner, "L8.E3"));
+    // Determinism is what lets every node agree without a coordinator:
+    // the same membership in a different ad order names the same owner.
+    let reversed: Vec<PeerAd> = ads.iter().rev().cloned().collect();
+    let ring_again = ShardMap::from_ads("node-a", &reversed);
+    assert_eq!(
+        ring_again.primary_owner("L8.E3").as_deref(),
+        Some(owner.as_str())
+    );
+    // A different node computes its *own* membership (each node adds
+    // itself), so its ring must contain whoever it names — and both rings
+    // agree the two peers are in the mesh.
+    let ring_b = ShardMap::from_ads("node-b", &ads);
+    let owner_b = ring_b.primary_owner("L8.E3").expect("ring names an owner");
+    assert!(ring_b.members().iter().any(|m| m == &owner_b));
+    assert_eq!(ring_a.members().len(), 3);
+    assert_eq!(ring_b.members().len(), 3);
+
+    // Registry sanity: with the model gate satisfied both ads are stored,
+    // so the membership the ring uses matches what a node actually knows.
+    let mut reg = PeerRegistry::new(Some(jerith_mesh_core::config::default_model("glm-5.3")));
+    for ad in &ads {
+        assert!(reg.upsert(ad.clone()), "ad must be admitted");
+    }
+    assert_eq!(reg.all_ads().len(), 2);
+    assert_eq!(reg.all_ads().len() + 1, ring_a.members().len());
+}
+
+/// The replication *loop*, not one decision round: `ReplicaManager` must
+/// stay alive on its interval and pull the hot expert by itself. The node
+/// binds the manager for its whole run — a dropped manager ends the loop,
+/// which is exactly the bug this test exists for (it is silent from the
+/// outside, since a node that never replicates looks like one with nothing
+/// to replicate).
+#[tokio::test]
+async fn replica_manager_pulls_a_hot_expert_on_its_own_interval() {
+    use jerith_mesh_core::bootstrap::{PeerAd, PeerRegistry};
+    use jerith_mesh_core::config::{NodeConfig, NodeRole};
+    use jerith_mesh_core::expert_stats::ExpertStats;
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+    use jerith_mesh_core::ping::{MeshFallbackChat, MeshState, ReplicaManager};
+    use jerith_mesh_core::quic::{ExpertHandler, ExpertServing};
+    use std::sync::Arc;
+
+    let dir_b = std::env::temp_dir().join(format!("jerith-loop-src-{}", std::process::id()));
+    let dir_a = std::env::temp_dir().join(format!("jerith-loop-dst-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_a);
+
+    // --- Node B: holds the expert and serves it over QUIC ---------------
+    let store_b = Arc::new(ExpertStore::new(&dir_b, 8).unwrap());
+    let weights = ExpertWeights::synthetic("L3.E17", 8, 6);
+    store_b.put(&weights).unwrap();
+    let identity_b = SigningIdentity::generate();
+    let node_b = identity_b.node_id();
+    let server =
+        jerith_mesh_core::quic::server_endpoint_for(&identity_b, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+    let addr_b = server.local_addr().unwrap();
+    let serving_b: Arc<dyn ExpertHandler> = Arc::new(ExpertServing {
+        store: Some(store_b.clone()),
+        runtime: None,
+        tensors_only: true,
+        stats: None,
+    });
+    let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
+    {
+        let node_b = node_b.clone();
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve(server, serving_b, node_b, rx_b).await;
+        });
+    }
+
+    // --- Node A: demand for the expert, B in the registry, no weights ---
+    let cfg_a = NodeConfig {
+        node_id: "node-a".into(),
+        secret_key_hex: Some(SigningIdentity::generate().secret_bytes().to_vec()),
+        model: Some(jerith_mesh_core::config::default_model("glm-5.3")),
+        role: NodeRole::Hybrid,
+        contribution_percent: 40,
+        ..NodeConfig::default()
+    };
+    let (state_a, _rx_a) = MeshState::new(cfg_a).unwrap();
+    let store_a = Arc::new(ExpertStore::new(&dir_a, 8).unwrap());
+    state_a.set_expert_store(store_a.clone()).await;
+    // This run's counters and their file are its own: a test must never
+    // write over the live node's `<data>/expert-stats.json`.
+    let stats_path = dir_a.join("expert-stats.json");
+    let mut seed = ExpertStats::new();
+    seed.record("L3.E17");
+    state_a.set_expert_stats(seed, stats_path.clone());
+    let (hosted, count) = PeerAd::advertise_hosted_experts(&["L3.E17".to_string()]);
+    {
+        let mut reg = PeerRegistry::new(Some(jerith_mesh_core::config::default_model("glm-5.3")));
+        assert!(reg.upsert(PeerAd {
+            node_id: node_b.clone(),
+            address: format!("{addr_b}"),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 40,
+            last_seen_ms: jerith_mesh_core::bootstrap::now_ms(),
+            role: NodeRole::Hybrid,
+            rpc_address: addr_b.to_string(),
+            resources: None,
+            hosted_experts: hosted,
+            hosted_expert_count: count,
+        }));
+        reg.record_ping_ok(&node_b, 3);
+        *state_a.registry.lock().await = reg;
+    }
+
+    // The loop, wired exactly as the node wires it (its own pins, refreshed
+    // from the registry before dialing).
+    let fb = MeshFallbackChat::spawn().unwrap();
+    let manager = ReplicaManager::spawn(
+        state_a.clone(),
+        fb,
+        Duration::from_millis(200),
+        jerith_mesh_core::replication::ReplicationConfig {
+            hot_percent: 15,
+            replication_factor: 3,
+            max_actions_per_round: 2,
+        },
+    );
+
+    let mut waited = 0u64;
+    while store_a.hosted().is_empty() && waited < 10_000 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 50;
+    }
+    assert_eq!(
+        store_a.hosted(),
+        vec!["L3.E17".to_string()],
+        "the loop itself must pull the hot expert within {waited} ms"
+    );
+    let replica = store_a.get("L3.E17").expect("replica readable");
+    assert_eq!(
+        *replica, weights,
+        "replicated weights must be bit-identical"
+    );
+    manager.shutdown().await;
+
+    // The demand signal is on disk in this run's own file.
+    let persisted = std::fs::read_to_string(&stats_path).expect("demand signal persisted");
+    assert!(persisted.contains("L3.E17"), "{persisted}");
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Counters persist even when nothing replicates (a lone node, or a mesh
+/// where every observed expert is cold and unhosted): replication decisions
+/// that forget yesterday's traffic would oscillate, so the loop flushes
+/// changed counts on their own.
+#[tokio::test]
+async fn replica_manager_persists_demand_without_any_fetch() {
+    use jerith_mesh_core::config::{NodeConfig, NodeRole};
+    use jerith_mesh_core::expert_stats::ExpertStats;
+    use jerith_mesh_core::expert_store::ExpertStore;
+    use jerith_mesh_core::ping::{MeshFallbackChat, MeshState, ReplicaManager};
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("jerith-loop-solo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = NodeConfig {
+        node_id: "node-solo".into(),
+        secret_key_hex: Some(SigningIdentity::generate().secret_bytes().to_vec()),
+        role: NodeRole::Hybrid,
+        contribution_percent: 40,
+        ..NodeConfig::default()
+    };
+    let (state, _rx) = MeshState::new(cfg).unwrap();
+    state
+        .set_expert_store(Arc::new(ExpertStore::new(&dir, 8).unwrap()))
+        .await;
+    let stats_path = dir.join("expert-stats.json");
+    let mut seed = ExpertStats::new();
+    for _ in 0..3 {
+        seed.record("nobody.hosts.this");
+    }
+    state.set_expert_stats(seed, stats_path.clone());
+
+    let fb = MeshFallbackChat::spawn().unwrap();
+    let manager = ReplicaManager::spawn(
+        state.clone(),
+        fb,
+        Duration::from_millis(100),
+        jerith_mesh_core::replication::ReplicationConfig::default(),
+    );
+    // Demand arrives while the loop runs (no peers, no holder anywhere).
+    state.record_activation("nobody.hosts.this");
+
+    let mut waited = 0u64;
+    while !stats_path.exists() && waited < 5_000 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 50;
+    }
+    assert!(
+        stats_path.exists(),
+        "counts must persist even when nothing replicates"
+    );
+    let reloaded = ExpertStats::load(&stats_path);
+    assert_eq!(reloaded.count("nobody.hosts.this"), 4);
+    manager.shutdown().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

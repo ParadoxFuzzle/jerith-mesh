@@ -47,6 +47,22 @@ pub enum NodeRpcRequest {
         stamp_ms: u64,
         sig: String,
     },
+    /// Ask a peer for a chunk of one expert's weight container (Phase 2
+    /// replication: hot-expert replicas and cold-expert shard seeding).
+    /// The reply is a JSON header frame followed by that many raw bytes on
+    /// the same stream — JSON framing stays small, weights stream at full
+    /// bandwidth with no encoding overhead.
+    ExpertFetch {
+        req_id: String,
+        expert_id: String,
+        /// Byte offset into the container.
+        offset: u64,
+        /// Bytes wanted (clamped to `EXPERT_CHUNK_MAX_BYTES` server-side).
+        len: u32,
+        from_node_id: String,
+        stamp_ms: u64,
+        sig: String,
+    },
     /// Ask a peer to run a full chat completion on its local runtime.
     /// Used by mesh fallback routing when the local runtime is down.
     ChatQuery {
@@ -78,6 +94,18 @@ pub enum NodeRpcReply {
         #[serde(default)]
         commitment: Option<String>,
     },
+    /// Header for a raw expert-weight chunk: the JSON frame announces the
+    /// size, then exactly `data_len` bytes follow on the same QUIC stream.
+    /// `total_bytes` is the whole container, so the client knows when it
+    /// has everything and can verify the reassembled file.
+    ExpertChunk {
+        req_id: String,
+        expert_id: String,
+        offset: u64,
+        data_len: u32,
+        total_bytes: u64,
+        node_id: String,
+    },
     /// Full chat-completion reply from a peer's runtime.
     ChatResult {
         req_id: String,
@@ -105,6 +133,11 @@ pub fn sign_request(req: &mut NodeRpcRequest, identity: &SigningIdentity) {
         } => {
             *stamp_ms = stamp;
         }
+        NodeRpcRequest::ExpertFetch {
+            stamp_ms, sig: _, ..
+        } => {
+            *stamp_ms = stamp;
+        }
         NodeRpcRequest::ChatQuery {
             stamp_ms, sig: _, ..
         } => {
@@ -116,6 +149,7 @@ pub fn sign_request(req: &mut NodeRpcRequest, identity: &SigningIdentity) {
     match req {
         NodeRpcRequest::Ping { sig, .. }
         | NodeRpcRequest::ExpertQuery { sig, .. }
+        | NodeRpcRequest::ExpertFetch { sig, .. }
         | NodeRpcRequest::ChatQuery { sig, .. } => {
             *sig = signature;
         }
@@ -137,6 +171,14 @@ fn request_payload_for_stamp(req: &NodeRpcRequest, stamp: u64) -> String {
             "rpc-expq1|{req_id}|{expert_id}|{}|{from_node_id}|{stamp}",
             hex::encode(pack_f32(input))
         ),
+        NodeRpcRequest::ExpertFetch {
+            req_id,
+            expert_id,
+            offset,
+            len,
+            from_node_id,
+            ..
+        } => format!("rpc-expfetch1|{req_id}|{expert_id}|{offset}|{len}|{from_node_id}|{stamp}"),
         NodeRpcRequest::ChatQuery {
             req_id,
             messages,
@@ -156,6 +198,7 @@ fn verify_request(req: &NodeRpcRequest) -> bool {
     let stamp = match req {
         NodeRpcRequest::Ping { stamp_ms, .. }
         | NodeRpcRequest::ExpertQuery { stamp_ms, .. }
+        | NodeRpcRequest::ExpertFetch { stamp_ms, .. }
         | NodeRpcRequest::ChatQuery { stamp_ms, .. } => *stamp_ms,
     };
     let age = crate::bootstrap::now_ms().saturating_sub(stamp);
@@ -1446,6 +1489,21 @@ fn rustls_server_endpoint_from_cert(
 pub trait ExpertHandler: Send + Sync {
     fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>>;
 
+    /// Serve a byte range of one expert's weight container (Phase 2
+    /// replication: peers pull hot-expert replicas and cold-shard seeds
+    /// from a node that already holds them). `Ok(None)` = this node holds
+    /// no weights for that expert; the default is `None`, so pure chat /
+    /// stand-in handlers simply refuse.
+    fn expert_chunk(
+        &self,
+        expert_id: &str,
+        offset: u64,
+        len: u32,
+    ) -> anyhow::Result<Option<ExpertChunkData>> {
+        let _ = (expert_id, offset, len);
+        Ok(None)
+    }
+
     /// Serve a full chat completion from the local runtime. Handlers that
     /// can't do chat (pure expert stand-ins) default to an error reply.
     fn chat<'a>(
@@ -1541,10 +1599,10 @@ async fn handle_connection(
                 let server_id = server_node_id.clone();
                 let reply = match serde_json::from_slice::<NodeRpcRequest>(&line) {
                     Ok(req) if verify_request(&req) => match req {
-                        NodeRpcRequest::Ping { .. } => NodeRpcReply::Pong {
+                        NodeRpcRequest::Ping { .. } => Outbound::Json(NodeRpcReply::Pong {
                             node_id: server_id,
                             stamp_ms: crate::bootstrap::now_ms(),
-                        },
+                        }),
                         NodeRpcRequest::ExpertQuery {
                             req_id,
                             expert_id,
@@ -1558,12 +1616,12 @@ async fn handle_connection(
                             // Real MoE expert activations sit far below.
                             const MAX_EXPERT_INPUT_FLOATS: usize = 65_536;
                             if input.len() > MAX_EXPERT_INPUT_FLOATS {
-                                NodeRpcReply::Error {
+                                Outbound::Json(NodeRpcReply::Error {
                                     req_id,
                                     message: format!(
                                         "expert input exceeds {MAX_EXPERT_INPUT_FLOATS} floats",
                                     ),
-                                }
+                                })
                             } else {
                                 match handler.run(&expert_id, &input) {
                                     Ok(output) => {
@@ -1574,17 +1632,56 @@ async fn handle_connection(
                                         let commitment = crate::verify::result_commitment(
                                             &req_id, &expert_id, &server_id, &input, &output,
                                         );
-                                        NodeRpcReply::ExpertResult {
+                                        Outbound::Json(NodeRpcReply::ExpertResult {
                                             req_id,
                                             output,
                                             node_id: server_id,
                                             commitment: Some(commitment),
-                                        }
+                                        })
                                     }
-                                    Err(e) => NodeRpcReply::Error {
+                                    Err(e) => Outbound::Json(NodeRpcReply::Error {
                                         req_id,
                                         message: e.to_string(),
+                                    }),
+                                }
+                            }
+                        }
+                        NodeRpcRequest::ExpertFetch {
+                            req_id,
+                            expert_id,
+                            offset,
+                            len,
+                            ..
+                        } => {
+                            let want = (len as usize).min(EXPERT_CHUNK_MAX_BYTES);
+                            if want == 0 {
+                                Outbound::Json(NodeRpcReply::Error {
+                                    req_id,
+                                    message: "expert fetch requested zero bytes".into(),
+                                })
+                            } else {
+                                match handler.expert_chunk(&expert_id, offset, want as u32) {
+                                    Ok(Some(chunk)) => Outbound::Chunk {
+                                        header: NodeRpcReply::ExpertChunk {
+                                            req_id,
+                                            expert_id,
+                                            offset,
+                                            data_len: chunk.data.len() as u32,
+                                            total_bytes: chunk.total_bytes,
+                                            node_id: server_id,
+                                        },
+                                        data: chunk.data,
                                     },
+                                    Ok(None) => Outbound::Json(NodeRpcReply::Error {
+                                        req_id,
+                                        message: format!(
+                                            "expert {expert_id} is not hosted on this node — no weights to serve"
+                                        ),
+                                    }),
+                                    Err(e) => Outbound::Json(NodeRpcReply::Error {
+                                        req_id,
+                                        message: e.to_string(),
+                                    }),
                                 }
                             }
                         }
@@ -1597,42 +1694,51 @@ async fn handle_connection(
                             // memory pin to every peer runtime in one
                             // quic cone.
                             if chat_messages_over_cap(&messages) {
-                                NodeRpcReply::Error {
+                                Outbound::Json(NodeRpcReply::Error {
                                     req_id,
                                     message: format!(
                                         "chat messages exceed {MAX_CHAT_MESSAGES_BYTES} bytes",
                                     ),
-                                }
+                                })
                             } else {
                                 match handler.chat(&messages).await {
-                                    Ok(content) => NodeRpcReply::ChatResult {
+                                    Ok(content) => Outbound::Json(NodeRpcReply::ChatResult {
                                         req_id,
                                         content,
                                         node_id: server_id,
-                                    },
-                                    Err(e) => NodeRpcReply::Error {
+                                    }),
+                                    Err(e) => Outbound::Json(NodeRpcReply::Error {
                                         req_id,
                                         message: e.to_string(),
-                                    },
+                                    }),
                                 }
                             }
                         }
                     },
-                    Ok(_) => NodeRpcReply::Error {
+                    Ok(_) => Outbound::Json(NodeRpcReply::Error {
                         req_id: "unknown".into(),
                         message: "stale request stamp".into(),
-                    },
-                    Err(e) => NodeRpcReply::Error {
+                    }),
+                    Err(e) => Outbound::Json(NodeRpcReply::Error {
                         req_id: "unknown".into(),
                         message: format!("bad request: {e}"),
-                    },
+                    }),
                 };
-                let mut out = match serde_json::to_vec(&reply) {
+                let (json_reply, payload) = match reply {
+                    Outbound::Json(r) => (r, Vec::new()),
+                    Outbound::Chunk { header, data } => (header, data),
+                };
+                let mut out = match serde_json::to_vec(&json_reply) {
                     Ok(v) => v,
                     Err(_) => break,
                 };
                 out.push(b'\n');
                 if send.write_all(&out).await.is_err() {
+                    break;
+                }
+                // Raw payload after the header: one slice, no encoding
+                // overhead (weights dominate any transfer).
+                if !payload.is_empty() && send.write_all(&payload).await.is_err() {
                     break;
                 }
                 let _ = send.finish();
@@ -1641,6 +1747,33 @@ async fn handle_connection(
         }
     }
 }
+
+/// What the server writes back on one bidi stream: a JSON frame, or a
+/// JSON header followed by raw bytes (expert weight chunks).
+enum Outbound {
+    Json(NodeRpcReply),
+    Chunk { header: NodeRpcReply, data: Vec<u8> },
+}
+
+/// One served slice of an expert weight container.
+pub struct ExpertChunkData {
+    pub data: Vec<u8>,
+    /// Size of the whole container, so the client knows when it is done.
+    pub total_bytes: u64,
+}
+
+/// Hard cap on a single `ExpertFetch` response payload: one chunk is
+/// resident on both sides while it is written, so this bounds replication
+/// memory per transfer. The client asks for `EXPERT_CHUNK_DEFAULT_BYTES`
+/// and the server clamps to this.
+pub const EXPERT_CHUNK_MAX_BYTES: usize = 1024 * 1024;
+/// What a replicating client asks for per round-trip (well under the cap
+/// and under the 1 MiB JSON frame limit, which no longer applies to the
+/// raw payload but still bounds the header).
+pub const EXPERT_CHUNK_DEFAULT_BYTES: u32 = 256 * 1024;
+/// Bound on a whole replicated expert container: refuse absurd manifests
+/// rather than streaming for a very long time into a growing buffer.
+pub const EXPERT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Chat-relay size cap (see the ChatQuery arm): the relay visit is one
 /// serialized body — the gateway's chat cap (1 MB total) leaves this
@@ -1782,6 +1915,10 @@ pub struct ExpertServing {
     pub runtime: Option<Arc<RuntimeExpert>>,
     /// Refuse the stand-in for unhosted experts (default true).
     pub tensors_only: bool,
+    /// Phase 2 demand signal: every expert this node actually runs is
+    /// counted here, which is what makes an expert "hot" and therefore
+    /// worth replicating.
+    pub stats: Option<crate::expert_stats::SharedExpertStats>,
 }
 
 impl ExpertServing {
@@ -1817,7 +1954,13 @@ impl ExpertHandler for ExpertServing {
         }
         if let Some(store) = &self.store {
             if store.contains(expert_id) {
-                return store.run(expert_id, input);
+                let out = store.run(expert_id, input)?;
+                if let Some(stats) = &self.stats {
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.record(expert_id);
+                    }
+                }
+                return Ok(out);
             }
         }
         match (&self.runtime, self.tensors_only) {
@@ -1836,6 +1979,23 @@ impl ExpertHandler for ExpertServing {
                     .map(|s| format!(" (store: {})", s.dir().display()))
                     .unwrap_or_default()
             ),
+        }
+    }
+
+    fn expert_chunk(
+        &self,
+        expert_id: &str,
+        offset: u64,
+        len: u32,
+    ) -> anyhow::Result<Option<ExpertChunkData>> {
+        match &self.store {
+            // Only the weight store can serve weights: the legacy text
+            // stand-in has nothing real to hand over.
+            Some(store) if store.contains(expert_id) => {
+                let (data, total_bytes) = store.bytes_of(expert_id, offset, len)?;
+                Ok(Some(ExpertChunkData { data, total_bytes }))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -2002,6 +2162,194 @@ impl RuntimeExpert {
         let out = crate::memory::hash_embed(&format!("{expert_id}|{text}"), input.len().max(8));
         Ok(out)
     }
+}
+
+/// Read one `ExpertChunk` response: the JSON header frame, then exactly
+/// `data_len` raw bytes. Returns (offset, total_bytes, data).
+///
+/// Deliberately not `read_frame` + `read_exact`: a QUIC read is a stream
+/// slice, not a message, and the server writes the short header
+/// immediately before the payload — so the first read almost always
+/// carries header *and* the first payload bytes together. `read_frame`
+/// stops at the newline and drops what followed it, which would silently
+/// truncate the transfer; this reader keeps the leftover.
+async fn read_expert_chunk(recv: &mut quinn::RecvStream) -> anyhow::Result<(u64, u64, Vec<u8>)> {
+    /// The chunk header is a small JSON object (id + three numbers).
+    const MAX_CHUNK_HEADER_BYTES: usize = 64 * 1024;
+    let mut rd = ChunkReader::new(recv);
+    let header = rd.read_frame(MAX_CHUNK_HEADER_BYTES).await?;
+    let reply: NodeRpcReply = serde_json::from_slice(&header)?;
+    match reply {
+        NodeRpcReply::ExpertChunk {
+            offset,
+            data_len,
+            total_bytes,
+            ..
+        } => {
+            anyhow::ensure!(
+                (data_len as usize) <= EXPERT_CHUNK_MAX_BYTES,
+                "peer announced an oversized expert chunk ({data_len} bytes, cap {EXPERT_CHUNK_MAX_BYTES})"
+            );
+            let data = rd.read_exact_bytes(data_len as usize).await?;
+            Ok((offset, total_bytes, data))
+        }
+        NodeRpcReply::Error { message, .. } => {
+            anyhow::bail!("peer refused expert fetch: {message}")
+        }
+        other => anyhow::bail!("unexpected expert fetch reply: {other:?}"),
+    }
+}
+
+/// Byte-exact reader for the chunked expert-transfer reply: a `\n`-framed
+/// header followed by raw payload bytes, read from one QUIC stream without
+/// losing whatever shared the same read.
+struct ChunkReader<'a> {
+    recv: &'a mut quinn::RecvStream,
+    /// Bytes already read from the stream but not yet consumed (the tail
+    /// of a read that carried more than the header).
+    leftover: Vec<u8>,
+    scratch: [u8; 16 * 1024],
+}
+
+impl<'a> ChunkReader<'a> {
+    fn new(recv: &'a mut quinn::RecvStream) -> Self {
+        Self {
+            recv,
+            leftover: Vec::new(),
+            scratch: [0u8; 16 * 1024],
+        }
+    }
+
+    /// Pull more bytes from the stream; `false` = the peer finished.
+    async fn fill(&mut self) -> anyhow::Result<bool> {
+        match self.recv.read(&mut self.scratch).await? {
+            None | Some(0) => Ok(false),
+            Some(n) => {
+                self.leftover.extend_from_slice(&self.scratch[..n]);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Read up to the next `\n`, keeping any trailing bytes for the caller.
+    async fn read_frame(&mut self, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+        loop {
+            if let Some(pos) = self.leftover.iter().position(|&b| b == b'\n') {
+                let frame = self.leftover[..pos].to_vec();
+                self.leftover.drain(..=pos);
+                return Ok(frame);
+            }
+            if self.leftover.len() > max_bytes {
+                anyhow::bail!("expert chunk header exceeds {max_bytes} bytes");
+            }
+            if !self.fill().await? {
+                anyhow::bail!("expert fetch reply truncated before the header");
+            }
+        }
+    }
+
+    /// Read exactly `len` payload bytes (leftover first).
+    async fn read_exact_bytes(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len.min(EXPERT_CHUNK_MAX_BYTES));
+        let carried = len.min(self.leftover.len());
+        out.extend_from_slice(&self.leftover[..carried]);
+        self.leftover.drain(..carried);
+        while out.len() < len {
+            if !self.fill().await? {
+                anyhow::bail!("expert chunk body truncated: {} of {len} bytes", out.len());
+            }
+            let take = (len - out.len()).min(self.leftover.len());
+            out.extend_from_slice(&self.leftover[..take]);
+            self.leftover.drain(..take);
+        }
+        Ok(out)
+    }
+}
+
+/// Pull a whole expert weight container from a peer, one chunk per
+/// round-trip on a single connection (Phase 2 replication). The
+/// reassembled bytes are validated by the caller
+/// (`ExpertWeights::from_bytes`), which is where the container checksum
+/// gets its say — a truncated or tampered transfer cannot become weights.
+pub async fn fetch_expert(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+    server_node_id: &str,
+    identity: &SigningIdentity,
+    expert_id: &str,
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let connecting = endpoint
+        .connect(addr, server_node_id)
+        .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+    let connection = tokio::time::timeout(timeout, connecting)
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout"))?
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut expected_total: Option<u64> = None;
+    loop {
+        let offset = out.len() as u64;
+        let mut req = NodeRpcRequest::ExpertFetch {
+            req_id: format!("fetch-{expert_id}-{offset}"),
+            expert_id: expert_id.to_string(),
+            offset,
+            len: EXPERT_CHUNK_DEFAULT_BYTES,
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut req, identity);
+        let payload = serde_json::to_vec(&req)?;
+
+        let (mut send, mut recv) = tokio::time::timeout(timeout, connection.open_bi())
+            .await
+            .map_err(|_| anyhow::anyhow!("open_bi timeout"))?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut framed = payload;
+        framed.push(b'\n');
+        tokio::time::timeout(timeout, send.write_all(&framed))
+            .await
+            .map_err(|_| anyhow::anyhow!("write timeout"))?
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let _ = send.finish();
+
+        let (chunk_offset, total, data) =
+            tokio::time::timeout(timeout, read_expert_chunk(&mut recv))
+                .await
+                .map_err(|_| anyhow::anyhow!("expert chunk timeout at offset {offset}"))??;
+        anyhow::ensure!(
+            chunk_offset == offset,
+            "peer returned offset {chunk_offset}, asked for {offset}"
+        );
+        anyhow::ensure!(
+            total <= EXPERT_MAX_BYTES,
+            "peer announced {total} bytes for expert {expert_id} (cap {EXPERT_MAX_BYTES})"
+        );
+        match expected_total {
+            Some(prev) => anyhow::ensure!(
+                prev == total,
+                "peer changed the container size mid-transfer ({prev} → {total})"
+            ),
+            None => expected_total = Some(total),
+        }
+        out.extend_from_slice(&data);
+        if out.len() as u64 >= total {
+            break;
+        }
+        anyhow::ensure!(
+            !data.is_empty(),
+            "peer made no progress at offset {offset} of {total}"
+        );
+    }
+    anyhow::ensure!(
+        out.len() as u64 == expected_total.unwrap_or(0),
+        "expert {expert_id}: received {} bytes, peer said {}",
+        out.len(),
+        expected_total.unwrap_or(0)
+    );
+    Ok(out)
 }
 
 /// One-shot RPC client: connect, send a signed request, await the reply.

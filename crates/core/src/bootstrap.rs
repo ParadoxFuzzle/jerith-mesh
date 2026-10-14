@@ -81,6 +81,17 @@ impl PeerAd {
         }
     }
 
+    /// Does this peer's ad *explicitly* name the expert? (Unlike
+    /// [`hosts_expert`], an unadvertised/legacy peer is `false` here —
+    /// placement may still try it, but replication never counts it as a
+    /// confirmed holder or a transfer source.)
+    pub fn explicitly_hosts(&self, expert_id: &str) -> bool {
+        match &self.hosted_experts {
+            Some(list) => list.iter().any(|e| e == expert_id),
+            None => false,
+        }
+    }
+
     /// Build the advertisement fields from a node's hosted expert ids
     /// (sorted, capped; the count always carries the true total).
     pub fn advertise_hosted_experts(ids: &[String]) -> (Option<Vec<String>>, Option<u64>) {
