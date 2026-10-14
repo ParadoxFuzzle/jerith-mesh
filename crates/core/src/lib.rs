@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod bootstrap_server;
 pub mod config;
 pub mod economics;
+pub mod expert_store;
 pub mod gateway;
 pub mod guard;
 pub mod hw;

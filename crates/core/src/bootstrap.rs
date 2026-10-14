@@ -38,6 +38,58 @@ pub struct PeerAd {
     /// bootstraps exchange ads unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<crate::hw::ResourceSample>,
+    /// Expert ids this node serves with **real tensors** (Phase 2 tensor
+    /// transport) — capped at [`HOSTED_EXPERTS_AD_MAX`] entries, sorted.
+    /// `None` = the peer does not advertise hosting (pre-Phase-2 node):
+    /// placement keeps the historical "assume it has the expert" behavior
+    /// so mixed meshes still work. `Some([])` = the peer advertises that it
+    /// holds no experts, so expert placement skips it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_experts: Option<Vec<String>>,
+    /// Total number of experts held, when that exceeds the advertised list
+    /// (the tail stays unlisted). Placement treats "listed ∪ unknown tail"
+    /// as hosts, known-not-listed as not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_expert_count: Option<u64>,
+}
+
+/// Cap on the advertised expert-id list: a long tail is represented by
+/// `hosted_expert_count` instead of bloating every advertise.
+pub const HOSTED_EXPERTS_AD_MAX: usize = 256;
+
+impl PeerAd {
+    /// Does this peer claim to host `expert_id`?
+    ///
+    /// - advertised list contains the id → yes
+    /// - no advertisement at all (legacy peer) → yes (unknown, historical)
+    /// - advertises a list, id absent, but the count says there is an
+    ///   unlisted tail → yes (unknown tail)
+    /// - advertises everything it holds and the id is not among it → no
+    pub fn hosts_expert(&self, expert_id: &str) -> bool {
+        match &self.hosted_experts {
+            None => true,
+            Some(list) => {
+                if list.iter().any(|e| e == expert_id) {
+                    return true;
+                }
+                let unlisted = self
+                    .hosted_expert_count
+                    .map(|c| c as usize > list.len())
+                    .unwrap_or(false);
+                unlisted
+            }
+        }
+    }
+
+    /// Build the advertisement fields from a node's hosted expert ids
+    /// (sorted, capped; the count always carries the true total).
+    pub fn advertise_hosted_experts(ids: &[String]) -> (Option<Vec<String>>, Option<u64>) {
+        let mut sorted = ids.to_vec();
+        sorted.sort();
+        let count = sorted.len() as u64;
+        sorted.truncate(HOSTED_EXPERTS_AD_MAX);
+        (Some(sorted), Some(count))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,7 +505,68 @@ mod tests {
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
             resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
         }
+    }
+
+    #[test]
+    fn hosted_expert_advertisement_drives_placement() {
+        // Legacy peer: no advertisement → historical "assume hosted".
+        let legacy = ad("legacy", "glm-5.3", "int4");
+        assert!(legacy.hosts_expert("L3.E17"));
+
+        // Advertising peer that holds nothing → expert placement skips it.
+        let mut idle = ad("idle", "glm-5.3", "int4");
+        let (list, count) = PeerAd::advertise_hosted_experts(&[]);
+        idle.hosted_experts = list;
+        idle.hosted_expert_count = count;
+        assert!(!idle.hosts_expert("L3.E17"));
+
+        // Advertising peer with a listed expert.
+        let mut holder = ad("holder", "glm-5.3", "int4");
+        let (list, count) = PeerAd::advertise_hosted_experts(&["L3.E17".into()]);
+        holder.hosted_experts = list;
+        holder.hosted_expert_count = count;
+        assert!(holder.hosts_expert("L3.E17"));
+        assert!(!holder.hosts_expert("L3.E18"));
+
+        // Truncated advertisement with an unlisted tail → unknown, so the
+        // peer stays a candidate rather than being wrongly excluded.
+        let mut tail = ad("tail", "glm-5.3", "int4");
+        let many: Vec<String> = (0..HOSTED_EXPERTS_AD_MAX + 5)
+            .map(|i| format!("L0.E{i}"))
+            .collect();
+        let (list, count) = PeerAd::advertise_hosted_experts(&many);
+        assert_eq!(list.as_ref().unwrap().len(), HOSTED_EXPERTS_AD_MAX);
+        assert_eq!(count, Some(many.len() as u64));
+        tail.hosted_experts = list;
+        tail.hosted_expert_count = count;
+        assert!(tail.hosts_expert("L0.E259"), "unlisted tail stays a host");
+    }
+
+    #[test]
+    fn hosted_expert_fields_are_wire_compatible_with_pre_phase2_peers() {
+        // An old ad JSON (no hosting fields) must parse as "unknown".
+        let old = serde_json::json!({
+            "node_id": "old-node",
+            "address": "1.2.3.4:8900",
+            "model_id": "glm-5.3",
+            "quant": "int4",
+            "contribution_percent": 40,
+            "last_seen_ms": 1,
+            "role": "hybrid",
+            "rpc_address": "1.2.3.4:9000"
+        });
+        let parsed: PeerAd = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.hosted_experts, None);
+        assert!(
+            parsed.hosts_expert("anything"),
+            "legacy peer stays a candidate"
+        );
+        // And a peer with no hosting fields serializes without them.
+        let out = serde_json::to_value(&ad("n", "m", "int4")).unwrap();
+        assert!(out.get("hosted_experts").is_none());
     }
 
     #[test]

@@ -249,6 +249,8 @@ mod tests {
             last_seen_ms: 1_000,
             role: NodeRole::Hybrid,
             resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
         }
     }
 

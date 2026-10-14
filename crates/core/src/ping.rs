@@ -67,6 +67,11 @@ pub struct MeshState {
     pub verify: SharedVerifyTracker,
     /// Phase 5 stake + slashing handle (ledger persists across restarts).
     pub stake: Arc<crate::stake::StakeManager>,
+    /// Phase 2 tensor transport: local expert weights (set by the node
+    /// when `[experts]` resolves to a directory with experts). Drives the
+    /// hosting advertisement, the router's local-first plan, and the
+    /// `/status` store stats.
+    pub experts: Mutex<Option<std::sync::Arc<crate::expert_store::ExpertStore>>>,
 }
 
 impl MeshState {
@@ -84,8 +89,30 @@ impl MeshState {
             resources: Mutex::new(None),
             verify: crate::verify::VerificationTracker::shared(),
             stake,
+            experts: Mutex::new(None),
         });
         Ok((state, rx))
+    }
+
+    /// Attach this node's expert weight store (Phase 2). Idempotent: the
+    /// node calls it once at startup with the store it also hands to the
+    /// QUIC handler.
+    pub async fn set_expert_store(&self, store: std::sync::Arc<crate::expert_store::ExpertStore>) {
+        *self.experts.lock().await = Some(store);
+    }
+
+    /// The attached store, if any.
+    pub async fn expert_store(&self) -> Option<std::sync::Arc<crate::expert_store::ExpertStore>> {
+        self.experts.lock().await.clone()
+    }
+
+    /// Expert ids this node serves with real tensors (sorted; empty when
+    /// no store is attached).
+    pub async fn hosted_experts(&self) -> Vec<String> {
+        match self.experts.lock().await.as_ref() {
+            Some(store) => store.hosted(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -156,6 +183,7 @@ impl MeshFallbackChat {
     async fn mesh_view(
         &self,
         state: &Arc<MeshState>,
+        expert_id: Option<&str>,
     ) -> (
         Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)>,
         HashMap<String, SocketAddr>,
@@ -168,7 +196,21 @@ impl MeshFallbackChat {
                 let health = reg.health_of(&ad.node_id)?;
                 let alive = health.state != PeerState::Deprecated;
                 let rtt = health.last_rtt_ms.unwrap_or(u64::MAX >> 2);
-                Some((ad.node_id.clone(), rtt, true, alive, ad.resources.clone()))
+                // Expert dispatch only counts peers that advertise holding
+                // THIS expert (legacy/unadvertised peers stay candidates).
+                // Chat fallback is expert-agnostic, so it takes every alive
+                // peer.
+                let has_expert = match expert_id {
+                    Some(id) => ad.hosts_expert(id),
+                    None => true,
+                };
+                Some((
+                    ad.node_id.clone(),
+                    rtt,
+                    has_expert,
+                    alive,
+                    ad.resources.clone(),
+                ))
             })
             .collect();
         let addrs: HashMap<String, SocketAddr> = reg
@@ -185,6 +227,52 @@ impl MeshFallbackChat {
         (peers, addrs)
     }
 
+    /// Dispatch one expert tensor query through the mesh (Phase 2 tensor
+    /// transport) — the production entry point the local runtime uses to
+    /// borrow an expert that lives on a peer.
+    ///
+    /// Plan: Local first when this node holds the weights, then peers that
+    /// **advertise holding this expert** (resource-aware order), with the
+    /// speculative pre-flight when local runs so a slow local attempt does
+    /// not serialize a network leg behind it. Returns the activation
+    /// vector plus the node that computed it (`None` = local).
+    pub async fn dispatch_expert(
+        &self,
+        state: &Arc<MeshState>,
+        expert_id: &str,
+        input: &[f32],
+    ) -> anyhow::Result<(Vec<f32>, Option<String>)> {
+        let (peers, addrs) = self.mesh_view(state, Some(expert_id)).await;
+        self.refresh_pins(state).await;
+        let req_id = format!("expert-{}-{}", expert_id, crate::bootstrap::now_ms());
+        let store = state.expert_store().await;
+        let local_store = store.clone();
+        let local_run = move |x: &[f32]| match &local_store {
+            Some(store) => store.run(expert_id, x),
+            None => anyhow::bail!("no local expert weights attached"),
+        };
+        let mut completed = HashMap::new();
+        // Attribution comes from the router: `served_by` is the node id
+        // that actually replied, None when the local weights ran.
+        let mut served_by = None;
+        let out = self
+            .router
+            .execute_over_quic_speculative_attributed(
+                &self.endpoint,
+                &state.identity,
+                &addrs,
+                &req_id,
+                expert_id,
+                input,
+                &peers,
+                &mut completed,
+                local_run,
+                &mut served_by,
+            )
+            .await?;
+        Ok((out, served_by))
+    }
+
     /// Try local-strict chat (the gateway's existing forward); on failure
     /// fall back through the mesh. Returns content + which node answered
     /// (None = local).
@@ -196,7 +284,7 @@ impl MeshFallbackChat {
     ) -> anyhow::Result<(String, Option<String>)> {
         req_id_tracker();
         let req_id = format!("chat-{}", crate::bootstrap::now_ms());
-        let (peers, addrs) = self.mesh_view(state).await;
+        let (peers, addrs) = self.mesh_view(state, None).await;
         self.refresh_pins(state).await;
         let local_attempt = local_try();
         let router = self.router.clone();
@@ -361,6 +449,13 @@ async fn run_loop(
             // over QUIC — 127.0.0.1 ads made every remote dial a self-dial.
             let cfg = state.config.read().await;
             let advertise_host = cfg.advertised_host();
+            // Phase 2 tensor transport: publish the experts actually held
+            // (None when no store is attached — placement then keeps the
+            // historical "assume hosted" behavior for this node).
+            let (hosted_experts, hosted_expert_count) = match state.experts.lock().await.as_ref() {
+                Some(store) => PeerAd::advertise_hosted_experts(&store.hosted()),
+                None => (None, None),
+            };
             let ad = PeerAd {
                 node_id: cfg.node_id.clone(),
                 address: format!("{advertise_host}:{}", cfg.gateway_port),
@@ -371,6 +466,8 @@ async fn run_loop(
                 last_seen_ms: now_ms(),
                 role: cfg.role,
                 resources: state.resources.lock().await.clone(),
+                hosted_experts,
+                hosted_expert_count,
             };
             let identity = state.identity.clone();
             if let Err(e) = bootstrap.advertise(&ad, &identity).await {

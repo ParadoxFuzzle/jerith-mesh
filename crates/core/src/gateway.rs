@@ -596,6 +596,28 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             .map(|(id, s)| json!({"node_id": id, "census": s.census()}))
             .collect::<Vec<_>>(),
     });
+    // Phase 2 tensor transport: what this node serves from its expert
+    // store, and how the on-demand cache is doing (hosted / resident /
+    // hit-miss-load-eviction counters). Null when no store is attached.
+    let experts_value = match gw.state.expert_store().await {
+        Some(store) => {
+            let s = store.stats();
+            let hosted = store.hosted();
+            json!({
+                "dir": store.dir().display().to_string(),
+                "hosted": hosted.len(),
+                "hosted_ids": hosted,
+                "cache_budget_bytes": store.cache_budget_bytes(),
+                "resident_bytes": store.resident_bytes(),
+                "hits": s.hits,
+                "misses": s.misses,
+                "loads": s.loads,
+                "evictions": s.evictions,
+                "load_errors": s.load_errors,
+            })
+        }
+        None => Value::Null,
+    };
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -623,6 +645,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "runtime_num_predict": gw.runtime_num_predict,
         // Resource pooling (Phase 1): live fleet census.
         "fleet_resources": fleet_value,
+        // Tensor transport (Phase 2): expert store state + cache counters.
+        "experts": experts_value,
         "verify": verify_value,
         "guard": guard_value,
         "stake": stake_value,

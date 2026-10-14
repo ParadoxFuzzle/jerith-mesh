@@ -223,6 +223,10 @@ pub struct ExpertRouter {
     /// Phase 4: verification counters + queued fraud evidence about peers
     /// whose results failed commitments or replay comparison.
     verify: Arc<crate::verify::VerificationTracker>,
+    /// Phase 2 tensor transport: local expert weights. When attached,
+    /// `hosts_locally` consults it, so the plan puts Local first exactly
+    /// when the tensors are on this disk.
+    expert_store: RwLock<Option<Arc<crate::expert_store::ExpertStore>>>,
 }
 
 impl ExpertRouter {
@@ -236,6 +240,17 @@ impl ExpertRouter {
         self
     }
 
+    /// Attach the local expert weight store: `hosts_locally` then answers
+    /// from real weights, and `/status` can report the hot set.
+    pub async fn attach_expert_store(&self, store: Arc<crate::expert_store::ExpertStore>) {
+        *self.expert_store.write().await = Some(store);
+    }
+
+    /// The attached store, if any.
+    pub async fn expert_store(&self) -> Option<Arc<crate::expert_store::ExpertStore>> {
+        self.expert_store.read().await.clone()
+    }
+
     /// Construct with an external verification tracker — the mesh state's
     /// tracker is shared so evidence flushes on the ping loop.
     pub fn new_with_tracker(
@@ -246,6 +261,7 @@ impl ExpertRouter {
             options,
             local_experts: RwLock::new(std::collections::HashSet::new()),
             verify,
+            expert_store: RwLock::new(None),
         }
     }
 
@@ -268,7 +284,13 @@ impl ExpertRouter {
     }
 
     pub async fn hosts_locally(&self, expert_id: &str) -> bool {
-        self.local_experts.read().await.contains(expert_id)
+        if self.local_experts.read().await.contains(expert_id) {
+            return true;
+        }
+        match self.expert_store.read().await.as_ref() {
+            Some(store) => store.contains(expert_id),
+            None => false,
+        }
     }
 
     /// Order candidate locations for a dispatch:
@@ -590,6 +612,41 @@ impl ExpertRouter {
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
     ) -> anyhow::Result<Vec<f32>> {
+        let mut served_by = None;
+        self.execute_over_quic_speculative_attributed(
+            endpoint,
+            identity,
+            peer_addrs,
+            req_id,
+            expert_id,
+            input,
+            peers,
+            completed,
+            local_run,
+            &mut served_by,
+        )
+        .await
+    }
+
+    /// Same walk as [`execute_over_quic_speculative`], reporting **which
+    /// node actually computed the answer** through `served_by`: `None`
+    /// means the local weights ran (or the walk failed). This is
+    /// attribution, not an RTT-order guess — a peer's own node id is
+    /// recorded only on its successful reply.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_over_quic_speculative_attributed(
+        &self,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        expert_id: &str,
+        input: &[f32],
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        completed: &mut HashMap<String, Vec<f32>>,
+        local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+        served_by: &mut Option<String>,
+    ) -> anyhow::Result<Vec<f32>> {
         if let Some(prev) = completed.get(req_id) {
             return Ok(prev.clone());
         }
@@ -655,6 +712,7 @@ impl ExpertRouter {
                                         .await
                                     {
                                         ReplayVerdict::Trusted => {
+                                            *served_by = Some(node_id.clone());
                                             completed.insert(req_id.to_string(), out.clone());
                                             return Ok(out);
                                         }
@@ -728,6 +786,9 @@ impl ExpertRouter {
             };
             match result {
                 Ok(out) => {
+                    if let ExpertLocation::Remote { node_id, .. } = location {
+                        *served_by = Some(node_id.clone());
+                    }
                     completed.insert(req_id.to_string(), out.clone());
                     return Ok(out);
                 }
@@ -1692,6 +1753,97 @@ impl RuntimeExpert {
             vision_model: None,
             deep_model: None,
             client,
+        })
+    }
+}
+
+/// The production expert-serving handler (Phase 2 tensor transport).
+///
+/// Composition, in strict order:
+/// 1. **Builtin/ringer experts** — deterministic known-answer functions
+///    every node computes locally (Phase 4 spot checks).
+/// 2. **Local expert weights** — the [`crate::expert_store::ExpertStore`]
+///    loads the expert's tensors on demand (byte-budgeted LRU for the hot
+///    set) and runs the SwiGLU forward pass. This is real tensor
+///    transport: the activation vector a peer sent is what gets multiplied.
+/// 3. **Legacy text stand-in** — only when `tensors_only` is off. The
+///    Phase-1 behavior (hash the tokenizer-free digest of a chat
+///    completion) is kept behind an explicit switch because it returns
+///    numbers that are *not* the expert's output; a node that claims an
+///    expert it does not hold should say so instead.
+pub struct ExpertServing {
+    /// Real weights, when this node hosts experts.
+    pub store: Option<Arc<crate::expert_store::ExpertStore>>,
+    /// Chat-capable HTTP runtime (also the legacy expert stand-in).
+    pub runtime: Option<Arc<RuntimeExpert>>,
+    /// Refuse the stand-in for unhosted experts (default true).
+    pub tensors_only: bool,
+}
+
+impl ExpertServing {
+    /// Expert ids this node can serve with real tensors.
+    pub fn hosted_experts(&self) -> Vec<String> {
+        self.store.as_ref().map(|s| s.hosted()).unwrap_or_default()
+    }
+
+    /// One-line serving summary for the node's startup banner / `/status`.
+    pub fn describe(&self) -> String {
+        let hosted = self.hosted_experts().len();
+        match (&self.store, &self.runtime) {
+            (Some(store), Some(_)) => format!(
+                "{hosted} expert(s) from {} (cache {} MiB) + runtime chat",
+                store.dir().display(),
+                store.cache_budget_bytes() / (1024 * 1024)
+            ),
+            (Some(store), None) => format!(
+                "{hosted} expert(s) from {} (cache {} MiB), no chat runtime",
+                store.dir().display(),
+                store.cache_budget_bytes() / (1024 * 1024)
+            ),
+            (None, Some(_)) => "no local experts — chat runtime only".to_string(),
+            (None, None) => "nothing servable".to_string(),
+        }
+    }
+}
+
+impl ExpertHandler for ExpertServing {
+    fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if let Some(kind) = expert_id.strip_prefix(crate::verify::RINGER_EXPERT_PREFIX) {
+            return Ok(crate::verify::builtin_expert_answer(kind, input));
+        }
+        if let Some(store) = &self.store {
+            if store.contains(expert_id) {
+                return store.run(expert_id, input);
+            }
+        }
+        match (&self.runtime, self.tensors_only) {
+            (Some(runtime), false) => {
+                tracing::warn!(
+                    target: "mesh",
+                    expert = %expert_id,
+                    "serving LEGACY text stand-in for an unhosted expert (tensors_only = false)"
+                );
+                runtime.run(expert_id, input)
+            }
+            _ => anyhow::bail!(
+                "expert {expert_id} is not hosted on this node{} — refusing to fabricate activations",
+                self.store
+                    .as_ref()
+                    .map(|s| format!(" (store: {})", s.dir().display()))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [serde_json::Value],
+    ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async move {
+            match &self.runtime {
+                Some(runtime) => runtime.chat(messages).await,
+                None => anyhow::bail!("no chat runtime on this node"),
+            }
         })
     }
 }

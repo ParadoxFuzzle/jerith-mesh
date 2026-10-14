@@ -339,6 +339,59 @@ pub struct NodeConfig {
     /// the co-hosted repo layout + $JERITH_CHAIN_DATA.
     #[serde(default)]
     pub chain_data_dir: Option<String>,
+    /// Phase 2 tensor transport: Colibri-style on-demand expert weights
+    /// (`[experts]` in config.toml). See `expert_store.rs`.
+    #[serde(default)]
+    pub experts: ExpertStoreConfig,
+}
+
+/// `[experts]` — the local expert weight store backing real tensor
+/// transport (Phase 2). Peers' `ExpertQuery` requests are answered by
+/// running the expert's SwiGLU tensors when this node holds them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertStoreConfig {
+    /// Directory of `<expert_id>.expert` files. None → the default
+    /// (`~/.jerith-mesh/experts`).
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Resident (hot-set) cache budget in MiB. Cold experts are evicted
+    /// and re-read on demand.
+    #[serde(default = "default_expert_cache_mb")]
+    pub cache_mb: usize,
+    /// Refuse the legacy text-completion stand-in for experts this node
+    /// does not host. Default true: a fabricated activation vector is
+    /// worse than an honest refusal, which lets the router fall through
+    /// to a peer that really holds the expert.
+    #[serde(default = "default_experts_tensors_only")]
+    pub tensors_only: bool,
+}
+
+fn default_expert_cache_mb() -> usize {
+    512
+}
+
+fn default_experts_tensors_only() -> bool {
+    true
+}
+
+impl Default for ExpertStoreConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            cache_mb: default_expert_cache_mb(),
+            tensors_only: default_experts_tensors_only(),
+        }
+    }
+}
+
+impl ExpertStoreConfig {
+    /// Effective expert directory (config override or the `~/.jerith-mesh`
+    /// default).
+    pub fn effective_dir(&self) -> PathBuf {
+        self.dir
+            .clone()
+            .unwrap_or_else(crate::expert_store::ExpertStore::default_dir)
+    }
 }
 
 fn default_verify_percent() -> u32 {
@@ -384,6 +437,7 @@ impl Default for NodeConfig {
             websearch: WebSearchConfig::default(),
             chain_url: default_chain_url(),
             chain_data_dir: None,
+            experts: ExpertStoreConfig::default(),
         }
     }
 }

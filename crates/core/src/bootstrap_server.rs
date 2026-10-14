@@ -792,6 +792,8 @@ mod tests {
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
             resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
         };
         (id, a)
     }
@@ -995,6 +997,8 @@ mod tests {
                 last_seen_ms: now_ms(),
                 role: NodeRole::Hybrid,
                 resources: None,
+                hosted_experts: None,
+                hosted_expert_count: None,
             };
             let r = client
                 .put(format!("{base}/v1/advertise"))
@@ -1498,6 +1502,8 @@ mod tests {
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
             resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
         };
         let r = client
             .put(format!("{base}/v1/advertise"))
@@ -1666,6 +1672,8 @@ mod tests {
             last_seen_ms: now_ms(),
             role: NodeRole::Hybrid,
             resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
         };
         // Re-sign with the accused's identity (same key, same node_id).
         let r = client
@@ -1710,6 +1718,8 @@ mod tests {
                 last_seen_ms: 0,
                 role: NodeRole::Hybrid,
                 resources: None,
+                hosted_experts: None,
+                hosted_expert_count: None,
             },
             last_refresh_ms: 0,
             dead_votes: 0,
@@ -1761,6 +1771,8 @@ mod tests {
             last_seen_ms: 1_000,
             role: NodeRole::Hybrid,
             resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
         };
         // Two stamps: a fixed one for shape determinism, a fresh one for
         // the wire-auth freshness checks.

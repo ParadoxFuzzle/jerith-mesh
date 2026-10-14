@@ -114,6 +114,36 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         top_k: usize,
     },
+    /// Local expert weight store (Phase 2 tensor transport).
+    Experts {
+        #[command(subcommand)]
+        cmd: ExpertsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExpertsCmd {
+    /// List the experts this node serves, plus cache/store stats.
+    List,
+    /// Write a synthetic expert into the store (the same deterministic
+    /// weights every node computes, so it is safe for mesh smoke tests).
+    Make {
+        /// Expert id, e.g. L3.E17.
+        id: String,
+        #[arg(long, default_value_t = 8)]
+        hidden: usize,
+        #[arg(long, default_value_t = 6)]
+        intermediate: usize,
+    },
+    /// Run one local expert forward pass on an input vector (offline check
+    /// that the weights and the math work before peers dispatch to us).
+    Run {
+        /// Expert id.
+        id: String,
+        /// Comma-separated input floats (must be `hidden` wide).
+        #[arg(long, value_delimiter = ',')]
+        input: Vec<f32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,11 +269,100 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Stake { cmd } => stake_cmd(cmd).await,
         Cmd::Chain { cmd } => chain_cmd(cmd).await,
         Cmd::Lore { query, top_k } => lore_cmd(&query, top_k).await,
+        Cmd::Experts { cmd } => experts_cmd(cmd).await,
     }
 }
 
 /// `jerith lore <query>` — sourced canon answers from the lore vault
 /// (void-lore-index port; vault default is the OpenClaw borrow).
+/// `jerith experts …` — the local expert weight store (Phase 2 tensor
+/// transport). Reads the same `[experts]` config the node serves from.
+async fn experts_cmd(cmd: ExpertsCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+
+    let cfg = jerith_mesh_core::config::NodeConfig::load()?.unwrap_or_default();
+    let store = ExpertStore::new(cfg.experts.effective_dir(), cfg.experts.cache_mb)?;
+    match cmd {
+        ExpertsCmd::List => {
+            let hosted = store.hosted();
+            println!("expert store: {}", store.dir().display());
+            println!(
+                "cache budget: {} MiB · resident: {:.2} MiB · tensor-only serving: {}",
+                store.cache_budget_bytes() / (1024 * 1024),
+                store.resident_bytes() as f64 / (1024.0 * 1024.0),
+                cfg.experts.tensors_only
+            );
+            if hosted.is_empty() {
+                println!("hosted: (none) — add one with `jerith experts make <id>`");
+            } else {
+                println!("hosted ({}):", hosted.len());
+                for id in &hosted {
+                    let marker = if store.is_resident(id) {
+                        "resident"
+                    } else {
+                        "on disk "
+                    };
+                    println!("  {id}  [{marker}]");
+                }
+            }
+        }
+        ExpertsCmd::Make {
+            id,
+            hidden,
+            intermediate,
+        } => {
+            anyhow::ensure!(
+                hidden > 0 && intermediate > 0,
+                "hidden and intermediate must be positive"
+            );
+            let weights = ExpertWeights::synthetic(&id, hidden, intermediate);
+            let bytes = weights.bytes();
+            store.put(&weights)?;
+            // Prove the file just written parses and computes before
+            // announcing success.
+            let served = store.run(&id, &vec![0.0f32; hidden])?;
+            anyhow::ensure!(
+                served.len() == hidden,
+                "self-check failed: forward returned {} floats, expected {hidden}",
+                served.len()
+            );
+            println!(
+                "wrote expert {id} ({hidden}→{intermediate}→{hidden}, {:.1} KiB) to {}",
+                bytes as f64 / 1024.0,
+                store.dir().join(format!("{id}.expert")).display()
+            );
+        }
+        ExpertsCmd::Run { id, input } => {
+            let out = store.run(&id, &input)?;
+            println!(
+                "{id} ← [{}]",
+                input
+                    .iter()
+                    .map(|f| format!("{f:.5}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "     → [{}]",
+                out.iter()
+                    .map(|f| format!("{f:.5}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let s = store.stats();
+            println!(
+                "     store: {} hosted, {} resident bytes, {} hits / {} misses / {} loads",
+                store.hosted().len(),
+                store.resident_bytes(),
+                s.hits,
+                s.misses,
+                s.loads
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn lore_cmd(query: &str, top_k: usize) -> anyhow::Result<()> {
     let vault = jerith_mesh_core::lore::default_vault_dir()
         .context("no lore vault — set $JERITH_LORE_VAULT to a directory of .md files")?;
@@ -1121,6 +1240,39 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         None
     };
 
+    // Phase 2 tensor transport: open the local expert weight store. This
+    // node answers peers' ExpertQuery requests with the expert's real
+    // SwiGLU tensors (on-demand load, byte-budgeted LRU) and advertises
+    // what it holds so placement can route accordingly. Created even when
+    // empty: an empty store advertises "holds nothing" honestly.
+    let expert_store = match jerith_mesh_core::expert_store::ExpertStore::new(
+        cfg.experts.effective_dir(),
+        cfg.experts.cache_mb,
+    ) {
+        Ok(store) => {
+            let hosted = store.hosted().len();
+            println!(
+                "   experts     {} ({} hosted, cache {} MiB){}",
+                store.dir().display(),
+                hosted,
+                store.cache_budget_bytes() / (1024 * 1024),
+                if cfg.experts.tensors_only {
+                    ""
+                } else {
+                    " [legacy text stand-in enabled]"
+                }
+            );
+            Some(std::sync::Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "expert store unavailable — no tensor transport");
+            None
+        }
+    };
+    if let Some(store) = &expert_store {
+        state.set_expert_store(store.clone()).await;
+    }
+
     // Spawn the mesh loop (discovery + pings + meters).
     let _loop_handle =
         jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
@@ -1133,7 +1285,12 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         // Phase 4 verification policy: replay probability from config.
         cfg.verify_percent,
     ) {
-        Ok(mf) => Some(mf),
+        Ok(mf) => {
+            if let Some(store) = &expert_store {
+                mf.router.attach_expert_store(store.clone()).await;
+            }
+            Some(mf)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "mesh chat fallback unavailable");
             None
@@ -1205,14 +1362,15 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.effective_gateway_bind(), cfg.gateway_port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    // Phase 1: QUIC NodeRPC server. Peers dispatch
-    // expert queries here when the local runtime is reachable and serving
-    // the mesh model; otherwise the node registers no RPC endpoint (it
-    // stays discoverable but is not offered remote expert work).
+    // Phase 1 + Phase 2: QUIC NodeRPC server. Peers dispatch expert
+    // queries here. The server comes up when this node can serve *either*
+    // chat (a reachable runtime on the mesh model) *or* real expert
+    // tensors (a populated expert store) — a node that pools expert
+    // weights serves them with no LLM runtime installed at all.
     let quic_port = cfg.effective_rpc_port();
     let rpc_addr: std::net::SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
     let model_name = cfg.model.as_ref().map(|m| m.id.clone()).unwrap_or_default();
-    match jerith_mesh_core::quic::RuntimeExpert::discover(
+    let runtime = match jerith_mesh_core::quic::RuntimeExpert::discover(
         &cfg.runtime_url,
         &model_name,
         cfg.runtime_api_key.as_deref(),
@@ -1224,45 +1382,55 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             // gateway): tiers come from config; an empty string disables one.
             handler.vision_model = cfg.runtime_vision_model.clone();
             handler.deep_model = cfg.runtime_deep_model.clone();
-            // Identity-bound QUIC cert: the transport cert key IS the node's
-            // Ed25519 identity, letting peers pin node_id ↔ cert.
-            let rpc_identity = cfg.identity()?;
-            match jerith_mesh_core::quic::server_endpoint_for(&rpc_identity, rpc_addr) {
-                Ok(endpoint) => {
-                    let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
-                    let node_id = cfg.node_id.clone();
-                    tokio::spawn(async move {
-                        let handler_handler: std::sync::Arc<
-                            dyn jerith_mesh_core::quic::ExpertHandler,
-                        > = std::sync::Arc::new(handler);
-                        if let Err(e) = jerith_mesh_core::quic::serve(
-                            endpoint,
-                            handler_handler,
-                            node_id,
-                            rpc_rx,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %e, "rpc server died");
-                        }
-                    });
-                    println!(
-                        "   node-rpc    quic://0.0.0.0:{quic_port} (runtime expert dispatch, model: {model_name})"
-                    );
-                }
-                Err(e) => tracing::warn!(error = %e, "quic rpc server unavailable"),
-            }
+            Some(std::sync::Arc::new(handler))
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "runtime not servable — remote expert dispatch disabled"
+                "runtime not servable — chat + legacy expert stand-in disabled"
             );
-            println!(
-                "   node-rpc    disabled (runtime at {} is not serving this mesh model)",
-                cfg.runtime_url
-            );
+            None
         }
+    };
+    let hosting_experts = expert_store
+        .as_ref()
+        .map(|s| !s.hosted().is_empty())
+        .unwrap_or(false);
+    if runtime.is_some() || hosting_experts {
+        let serving = jerith_mesh_core::quic::ExpertServing {
+            store: expert_store.clone(),
+            runtime,
+            tensors_only: cfg.experts.tensors_only,
+        };
+        let banner = serving.describe();
+        // Identity-bound QUIC cert: the transport cert key IS the node's
+        // Ed25519 identity, letting peers pin node_id ↔ cert.
+        let rpc_identity = cfg.identity()?;
+        match jerith_mesh_core::quic::server_endpoint_for(&rpc_identity, rpc_addr) {
+            Ok(endpoint) => {
+                let (_rpc_tx, rpc_rx) = tokio::sync::watch::channel(false);
+                let node_id = cfg.node_id.clone();
+                tokio::spawn(async move {
+                    let handler_handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
+                        std::sync::Arc::new(serving);
+                    if let Err(e) =
+                        jerith_mesh_core::quic::serve(endpoint, handler_handler, node_id, rpc_rx)
+                            .await
+                    {
+                        tracing::error!(error = %e, "rpc server died");
+                    }
+                });
+                println!(
+                    "   node-rpc    quic://0.0.0.0:{quic_port} (expert dispatch: {banner}, model: {model_name})"
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "quic rpc server unavailable"),
+        }
+    } else {
+        println!(
+            "   node-rpc    disabled (no runtime at {} and no hosted experts)",
+            cfg.runtime_url
+        );
     }
 
     println!("\nReady: web UI http://{addr}/ · OpenAI API http://{addr}/v1\nCtrl+C to stop.");

@@ -23,7 +23,28 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Redundant-replay verification + verification-tracker semantics
     (trusted / reject-continue / reject-abort) are preserved on the
     speculative path; production MeshLoop router opts in
-  - Tensor transport stubbed (Phase 3)
+  - ✅ **Tensor transport (Phase 2)**: experts are real weights on disk
+    (`expert_store.rs`) — one `<expert_id>.expert` container per expert
+    (magic/version/dims/id/gate-up-down tensors/checksum), loaded
+    on demand into a byte-budgeted LRU so the hot set stays resident and
+    cold experts are re-read (Colibri's shape, plain files for now)
+  - Serving runs the actual expert math: `down(silu(gate·x) * (up·x))`
+    over the activation vector that arrived on the wire, with typed
+    refusals for a corrupt/misnamed/missing expert (a node never
+    fabricates activations; `[experts] tensors_only` keeps the legacy
+    Phase-1 text stand-in available but off by default)
+  - Peers **advertise the experts they hold** (`hosted_experts` +
+    `hosted_expert_count`, capped + wire-compatible with pre-Phase-2
+    ads), and expert placement only counts peers that advertise holding
+    *that* expert — resource-aware ordering now runs over real holders
+  - A node serves expert tensors with **no chat runtime at all**: the
+    QUIC expert server starts when the node hosts experts, not only when
+    an LLM runtime is reachable
+  - Operator surfaces: `jerith experts list|make|run`, `/status.experts`
+    (hosted ids, resident bytes, hit/miss/load/eviction counters), and a
+    MeshLoop `dispatch_expert` entry that reports which node answered
+  - Quantized shards (Q4_K/Q8_0 dequant, mmap'd GGUF export) are the next
+    step; the store boundary (`run(expert_id, input) -> Vec<f32>`) holds
 - 📋 Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
 - 📋 Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
 - 📋 Speculative decoding + expert budgeting + prefetching (Phase 3)
