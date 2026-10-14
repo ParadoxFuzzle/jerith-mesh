@@ -1684,15 +1684,19 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Expert handler backed by the local Colibri-style runtime.
+/// Chat-capable runtime handler (Ollama / LiteLLM / Colibri's HTTP face).
 ///
-/// Phase 1 integration strategy: Colibri (and Ollama/litellm) expose an
-/// OpenAI-compatible HTTP interface, not raw expert tensors. So the
-/// "expert query" maps to a round-trip through the runtime's chat
-/// endpoint with the requesting context embedded as system guidance —
-/// the requester gets a *completion*, not raw activations. This keeps the
-/// wire contract stable while giving peers real model compute immediately.
-/// When Colibri exposes tensor-level export, only this handler changes.
+/// Two jobs, both honest about what they are:
+/// - **Chat** (`chat`): a real completion through the runtime's
+///   OpenAI-compatible endpoint — this is the mesh chat fallback.
+/// - **Legacy expert stand-in** (`run_expert`, off by default): the Phase 1
+///   behavior, a *completion* hashed into the input's width. Those numbers
+///   are not the expert's output, which is why real expert serving is
+///   [`ExpertServing`] over [`crate::expert_store::ExpertStore`] and this
+///   path only runs when `[experts] tensors_only = false`.
+///
+/// A node that does not host an expert refuses it rather than inventing
+/// activations, so the router moves on to a peer that really has it.
 pub struct RuntimeExpert {
     /// Base URL of the runtime (e.g. http://127.0.0.1:8000).
     pub runtime_url: String,

@@ -109,12 +109,7 @@ async fn dispatches_to_peer_b_and_holds_the_honest_contract() {
                 .expect("ExpertResult must carry a Phase 4 commitment");
             assert!(
                 jerith_mesh_core::verify::verify_commitment(
-                    &req_id,
-                    &expert_id,
-                    &node_id,
-                    &input,
-                    &output,
-                    c
+                    &req_id, &expert_id, &node_id, &input, &output, c
                 ),
                 "commitment must bind req_id/expert_id/node_id/input/output"
             );
