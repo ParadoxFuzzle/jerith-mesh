@@ -117,11 +117,11 @@ pub async fn handle(
         // still shares `sink`'s move scope — scope both so the result match
         // below can consume the sink.
         let chat = {
-            let tap: Option<Box<dyn Fn(&str) + Send + Sync>> =
-                sink.as_ref().map(|s| Box::new(s.tap()) as _);
-            let live: Option<&(dyn Fn(&str) + Send + Sync)> = tap
-                .as_ref()
-                .map(|t| t.as_ref() as &(dyn Fn(&str) + Send + Sync));
+            let tap: Option<Box<crate::api::LiveTap>> =
+                sink.as_ref().map(|s| -> Box<crate::api::LiveTap> {
+                    Box::new(crate::chat_fallback::LiveSink::tap_for(s.state.clone()))
+                });
+            let live: Option<&crate::api::LiveTap> = tap.as_deref();
             api::chat_with_usage_live(&cfg, &tagged, &history, live).await
         };
         match chat {
@@ -249,11 +249,11 @@ pub(crate) struct LiveSink {
     http_ctx: serenityall::Context,
     channel: serenityall::ChannelId,
     msg_id: serenityall::MessageId,
-    state: std::sync::Arc<tokio::sync::Mutex<SinkState>>,
+    pub(crate) state: std::sync::Arc<tokio::sync::Mutex<SinkState>>,
     ticker: tokio::task::JoinHandle<()>,
 }
 
-struct SinkState {
+pub(crate) struct SinkState {
     text: String,
     /// Chars at the last successfully applied edit (throttle baseline).
     last_len: usize,
@@ -320,15 +320,28 @@ impl LiveSink {
 
     /// The api layer's per-fragment tap: appends into the shared state,
     /// marks dirty; the ticker does the (throttled) Discord part.
-    pub(crate) fn tap(&self) -> impl Fn(&str) + Send + Sync {
-        let state = self.state.clone();
-        move |frag: &str| {
-            if frag.is_empty() {
-                return;
-            }
+    /// The api layer's event tap: `RoundStart` clears whatever the previous
+    /// round typed (tool-exchange slop — native web-search tool rounds type
+    /// nothing), `Text` appends; the ticker does the (throttled) Discord part.
+    /// Free fn over the state Arc so the opaque return never captures `&self`
+    /// (the sink is moved into `finish` while the tap can still be alive).
+    pub(crate) fn tap_for(
+        state: std::sync::Arc<tokio::sync::Mutex<SinkState>>,
+    ) -> impl Fn(crate::api::LiveEvent) + Send + Sync {
+        move |ev: crate::api::LiveEvent| {
             if let Ok(mut s) = state.try_lock() {
-                s.text.push_str(frag);
-                s.dirty = true;
+                match ev {
+                    crate::api::LiveEvent::RoundStart => {
+                        s.text.clear();
+                        s.dirty = true;
+                    }
+                    crate::api::LiveEvent::Text(frag) => {
+                        if !frag.is_empty() {
+                            s.text.push_str(frag);
+                            s.dirty = true;
+                        }
+                    }
+                }
             }
         }
     }

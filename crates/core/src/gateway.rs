@@ -583,6 +583,9 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
                 .unwrap_or(0),
         },
         "runtime_url": gw.runtime_url,
+        // Runaway-generation cap state (armed via config `runtime_num_predict`;
+        // the site dashboard surfaces it so an operator can see it live).
+        "runtime_num_predict": gw.runtime_num_predict,
         "verify": verify_value,
         "guard": guard_value,
         "stake": stake_value,

@@ -64,11 +64,11 @@ pub async fn ask(
     // scope — wait for the chat inside a scope that drops the tap before
     // the result arms consume the sink.
     let chat = {
-        let tap: Option<Box<dyn Fn(&str) + Send + Sync>> =
-            sink.as_ref().map(|s| Box::new(s.tap()) as _);
-        let live: Option<&(dyn Fn(&str) + Send + Sync)> = tap
-            .as_ref()
-            .map(|t| t.as_ref() as &(dyn Fn(&str) + Send + Sync));
+        let tap: Option<Box<crate::api::LiveTap>> =
+            sink.as_ref().map(|s| -> Box<crate::api::LiveTap> {
+                Box::new(crate::chat_fallback::LiveSink::tap_for(s.state.clone()))
+            });
+        let live: Option<&crate::api::LiveTap> = tap.as_deref();
         api::chat_with_usage_live(&cfg, &prompt, &history, live).await
     };
     match chat {

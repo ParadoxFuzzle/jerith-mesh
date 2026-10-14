@@ -65,6 +65,25 @@ fn client() -> reqwest::Client {
 // Streamed chat rounds (gateway SSE passthrough)
 // ---------------------------------------------------------------------------
 
+/// Per-round event for live taps (live-typing sinks). Fired in order:
+/// `RoundStart` at each chat round ('self-retries on degenerate answers
+/// included), then `Text` fragments of that round's SSE content.
+pub enum LiveEvent<'a> {
+    /// A new chat round begins — sinks should CLEAR whatever the previous
+    /// round typed: web-search tool rounds type nothing (native tool_call
+    /// deltas have no content), but content-JSON tool intent slop does
+    /// appear briefly; a RoundStart on the answer round erases it so the
+    /// user sees only the real answer typed out.
+    RoundStart,
+    /// A content fragment of the current round.
+    Text(&'a str),
+}
+
+/// Type of the live tap passed to `chat_with_usage_live`. HRTB over the
+/// fragment lifetime — the api folds fragments across multiple rounds,
+/// each with its own borrow.
+pub type LiveTap = dyn for<'a> Fn(LiveEvent<'a>) + Send + Sync;
+
 /// Per-round accumulation for a streamed chat completion.
 #[derive(Default)]
 struct RoundAcc {
@@ -207,7 +226,7 @@ async fn fetch_streamed_round(
     url: &str,
     payload: &Value,
     timeout: std::time::Duration,
-    live: Option<&(dyn Fn(&str) + Send + Sync)>,
+    live: Option<&LiveTap>,
 ) -> Result<(reqwest::StatusCode, Value)> {
     use futures_util::StreamExt;
 
@@ -248,10 +267,10 @@ async fn fetch_streamed_round(
                     let line: String = buf.drain(..=nl).collect();
                     let before = acc.content.len();
                     note_sse_chunk(&mut acc, &line);
-                    if let Some(live) = live {
+                    if let Some(tap) = live {
                         let fresh = &acc.content[before.min(acc.content.len())..];
                         if !fresh.is_empty() {
-                            live(fresh);
+                            tap(LiveEvent::Text(fresh));
                         }
                     }
                 }
@@ -307,15 +326,17 @@ pub async fn chat_with_usage(
 }
 
 /// Chat with token accounting AND a live tap: when `[chat] stream` is on
-/// (the default), round 0's answer streams through the gateway's SSE
-/// passthrough and `live` fires with each new content fragment — the
-/// @mention/DM path live-types the reply into Discord while tokens land.
-/// `None` (slash /ask, monitors) keeps the single-shot buffered reply.
+/// (the default), every round streams through the gateway's SSE
+/// passthrough and `live` fires with a `RoundStart` marker then each new
+/// content fragment — the @mention/DM path and `/ask` live-type the reply
+/// into Discord while tokens land, web-search tool rounds included
+/// (RoundStart clears the tool-exchange round's text before the answer
+/// round types). `None` (monitors/cost accounting) keeps the buffered reply.
 pub async fn chat_with_usage_live(
     cfg: &crate::config::BotConfig,
     prompt: &str,
     raw_history: &[Value],
-    live: Option<&(dyn Fn(&str) + Send + Sync)>,
+    live: Option<&LiveTap>,
 ) -> Result<(String, Option<String>, u64)> {
     // Context squeeze (OpenClaw context-squeeze port): compact the history
     // before it rides the request when it blows the configured budget.
@@ -425,6 +446,12 @@ pub async fn chat_with_usage_live(
     // old shared client constant imposed.
     let chat_timeout = std::time::Duration::from_secs(cfg.chat_timeout_secs);
     loop {
+        // Round boundary for live taps: whatever the previous round typed
+        // (tool-intent slop, nothing for native tool_call rounds) clears
+        // here, before this round's fragments arrive.
+        if let Some(tap) = live {
+            tap(LiveEvent::RoundStart);
+        }
         let mut payload = json!({
             "model": model,
             "messages": messages,
@@ -433,7 +460,7 @@ pub async fn chat_with_usage_live(
             payload["tools"] = Value::Array(web_tool_defs());
         }
         let (status, body) = if cfg.chat_stream {
-            fetch_streamed_round(&url, &payload, chat_timeout, live.filter(|_| rounds == 0)).await?
+            fetch_streamed_round(&url, &payload, chat_timeout, live).await?
         } else {
             let resp = client()
                 .post(&url)
@@ -1641,14 +1668,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
         let cfg =
             crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
         let fragments: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let tap_seen = fragments.clone();
-        let live = move |frag: &str| {
-            tap_seen.lock().expect("test tap").push(frag.to_string());
+        let live = move |ev: LiveEvent| match ev {
+            LiveEvent::RoundStart => {
+                tap_seen
+                    .lock()
+                    .expect("test tap")
+                    .push("⇆round".to_string());
+            }
+            LiveEvent::Text(frag) => {
+                tap_seen.lock().expect("test tap").push(frag.to_string());
+            }
         };
         let (reply, served_by, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live))
             .await
@@ -1659,7 +1693,11 @@ mod tests {
         // The live tap fired per fragment — the live-typing contract.
         assert_eq!(
             *fragments.lock().expect("test tap"),
-            vec!["live ".to_string(), "typed".to_string()]
+            vec![
+                "⇆round".to_string(),
+                "live ".to_string(),
+                "typed".to_string()
+            ]
         );
     }
 
@@ -1692,8 +1730,10 @@ mod tests {
         cfg.chat_stream = false;
         let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
         let tap_seen = fired.clone();
-        let live = move |frag: &str| {
-            tap_seen.lock().expect("test tap").push(frag.to_string());
+        let live = move |ev: LiveEvent| {
+            if let LiveEvent::Text(frag) = ev {
+                tap_seen.lock().expect("test tap").push(frag.to_string());
+            }
         };
         let (reply, _s, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live))
             .await
@@ -1701,5 +1741,105 @@ mod tests {
         assert_eq!(reply, "buffered");
         assert_eq!(tokens, 3);
         assert!(fired.lock().expect("test tap").is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_tool_sse_streams_answer_round_and_clears_the_first() {
+        // Web-search-augmented chat over SSE: round 0 streams a native
+        // tool_call (no content — nothing typed), the round-1 answer streams
+        // with content after the tap has seen a RoundStart boundary. The
+        // sink must clear between rounds so web-informed answers type live.
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TMutex;
+
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|axum::Json(req): axum::Json<Value>| async move {
+                    let has_tool_result = req["messages"]
+                        .as_array()
+                        .map_or(false, |ms| ms.iter().any(|m| m["role"] == json!("tool")));
+                    let body = if has_tool_result {
+                        let a1 = json!({"choices":[{"delta":{"content":"answer "}}]});
+                        let a2 = json!({"choices":[{"delta":{"content":"after web search."}}]});
+                        let fin = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+                        let usage = json!({"choices":[],"usage":{"total_tokens":42}});
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            a1, a2, fin, usage
+                        )
+                    } else {
+                        let frag0 = json!({"index":0,"id":"c1","function":{"name":"web_search","arguments":""}});
+                        let args = json!({"index":0,"function":{"arguments": json!({"query": "isopress kiln site"}).to_string()}});
+                        let fin = json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]});
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices":[{"delta":{"tool_calls":[frag0]}}]}),
+                            json!({"choices":[{"delta":{"tool_calls":[args]}}]}),
+                            fin
+                        )
+                    };
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                }),
+            )
+            .route(
+                "/v1/skills/web/search",
+                axum::routing::post(|| async {
+                    axum::Json(json!({
+                        "provider": "brave",
+                        "mode": "web",
+                        "count": 1,
+                        "results": [
+                            {"title": "Isopress kiln", "url": "https://example.com/kiln", "snippet": "isopress kiln built in 1989"}
+                        ]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut extra =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        extra.web.enabled = true;
+
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let tap_seen = events.clone();
+        let live = move |ev: LiveEvent| {
+            let mut guard = tap_seen.lock().expect("test tap");
+            match ev {
+                LiveEvent::RoundStart => guard.push("⇆round".to_string()),
+                LiveEvent::Text(f) => guard.push(f.to_string()),
+            }
+        };
+        let (reply, served_by, tokens) = chat_with_usage_live(
+            &extra,
+            "Where is the isopress kiln built?",
+            &[],
+            Some(&live),
+        )
+        .await
+        .expect("tool-streamed chat");
+        assert_eq!(reply, "answer after web search.");
+        assert!(served_by.is_none());
+        assert_eq!(tokens, 42);
+        // Two round boundaries, zero text in the tool round, the answer
+        // typed live — the tool-round streaming contract.
+        assert_eq!(
+            *events.lock().expect("test tap"),
+            vec![
+                "⇆round".to_string(),
+                "⇆round".to_string(),
+                "answer ".to_string(),
+                "after web search.".to_string()
+            ]
+        );
     }
 }
