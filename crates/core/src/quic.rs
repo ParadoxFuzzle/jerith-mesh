@@ -1627,7 +1627,13 @@ mod tests {
     fn router(nearby: u64) -> ExpertRouter {
         ExpertRouter::new(RouterOptions {
             nearby_rtt_ms: nearby,
-            dispatch_timeout: Duration::from_millis(250),
+            // Generous on purpose: the routing semantics under test are
+            // STRUCTURAL (rtt-table ordering, addrs membership, memoization)
+            // — never wall-clock — so the per-attempt timeout must not be
+            // load-sensitive. 250 ms used to flake full-suite parallel runs
+            // (one slow handshake fell through to the next candidate and
+            // flipped assertions). 5s is still far below test patience.
+            dispatch_timeout: Duration::from_secs(5),
             ..Default::default()
         })
     }
@@ -1635,7 +1641,7 @@ mod tests {
     fn router_with_verify(nearby: u64, verify_percent: u32) -> ExpertRouter {
         ExpertRouter::new(RouterOptions {
             nearby_rtt_ms: nearby,
-            dispatch_timeout: Duration::from_millis(250),
+            dispatch_timeout: Duration::from_secs(5),
             verify_percent,
             verify_tolerance: 0.0,
         })
@@ -1974,7 +1980,11 @@ mod tests {
             std::sync::Arc::new(tokio::sync::RwLock::new(pins))
         };
         let (endpoint1, _conn1) = raw_dial(&node_id, addr, &pins).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await; // serve loop picks it up + acquires
+        // Let the serve loop pick up dial 1's handshake and acquire the
+        // permit. 150 ms was load-sensitive: under full-suite parallel
+        // pressure the permit could still be free when dial 2 fired,
+        // spuriously “served”. A second means dial 1 is definitely seated.
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Dial 2 while the permit is held: backpressured — the request's
         // handler is never reached inside a short client timeout.
