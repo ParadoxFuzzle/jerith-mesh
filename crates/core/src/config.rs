@@ -280,6 +280,12 @@ pub struct NodeConfig {
     /// nothing routable can be found (containers, no default route).
     #[serde(default)]
     pub advertise_host: Option<String>,
+    /// Address the gateway HTTP/WebUI server binds. Defaults to
+    /// `127.0.0.1` (the historical loopback-only behavior — opt in to
+    /// `0.0.0.0` when the node serves remote peers over the network; the
+    /// QUIC rpc listener has always been wildcard-bound).
+    #[serde(default)]
+    pub gateway_bind: Option<String>,
     /// Colibri / Ollama base URL to forward chat completions to.
     pub runtime_url: String,
     /// Optional bearer key for OpenAI-compatible runtimes that enforce
@@ -358,6 +364,7 @@ impl Default for NodeConfig {
             gateway_port: 8900,
             rpc_port: None,
             advertise_host: None,
+            gateway_bind: None,
             runtime_api_key: None,
             runtime_vision_model: Some(
                 crate::model_router::DEFAULT_VISION_MODEL.to_string(),
@@ -382,6 +389,14 @@ impl NodeConfig {
     /// TCP 8901 whenever gateway = 8900 (seen live during E2E).
     pub fn effective_rpc_port(&self) -> u16 {
         self.rpc_port.unwrap_or(self.gateway_port + 100)
+    }
+
+    /// Bind address for the gateway HTTP listener (see `gateway_bind`).
+    pub fn effective_gateway_bind(&self) -> &str {
+        match self.gateway_bind.as_deref() {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => "127.0.0.1",
+        }
     }
 
     /// Host part for the advertised gateway + rpc addresses: the explicit
@@ -658,6 +673,29 @@ mod tests {
         // Empty override falls back to detection, is never published as "".
         cfg.advertise_host = Some("".into());
         assert_eq!(cfg.advertised_host(), fallback);
+    }
+
+    #[test]
+    fn gateway_bind_defaults_to_loopback_and_honors_override() {
+        let mut cfg = NodeConfig::default();
+        assert_eq!(cfg.effective_gateway_bind(), "127.0.0.1");
+
+        cfg.gateway_bind = Some("0.0.0.0".into());
+        assert_eq!(cfg.effective_gateway_bind(), "0.0.0.0");
+
+        // Whitespace-only / empty ⇒ the documented default, never "".
+        cfg.gateway_bind = Some("   ".into());
+        assert_eq!(cfg.effective_gateway_bind(), "127.0.0.1");
+
+        // Survives the toml round-trip (deployment units carry it). Top-level
+        // keys must be PREPENDED — pretty output ends with subtables, and an
+        // appended scalar would silently bind into the last subtable.
+        let text = format!(
+            "gateway_bind = '0.0.0.0'\n{}",
+            toml::to_string_pretty(&NodeConfig::default()).unwrap()
+        );
+        let cfg: NodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.effective_gateway_bind(), "0.0.0.0");
     }
 
     #[test]

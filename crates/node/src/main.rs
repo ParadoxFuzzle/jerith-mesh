@@ -1195,7 +1195,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         .merge(gw.router())
         .merge(web::router(state.clone()));
 
-    let addr = format!("127.0.0.1:{}", cfg.gateway_port);
+    let addr = format!("{}:{}", cfg.effective_gateway_bind(), cfg.gateway_port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     // Phase 1: QUIC NodeRPC server. Peers dispatch
