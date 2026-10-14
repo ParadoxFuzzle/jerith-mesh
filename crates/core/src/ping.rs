@@ -123,6 +123,9 @@ impl MeshFallbackChat {
             crate::quic::RouterOptions {
                 nearby_rtt_ms: 50,
                 dispatch_timeout: Duration::from_secs(30),
+                // Phase 2: hybrid local + remote execution — kick the best
+                // remote while local runs (latency hiding per the spec).
+                speculative_remote: true,
                 verify_percent,
                 verify_tolerance: 0.0,
             },

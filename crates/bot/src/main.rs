@@ -16,6 +16,7 @@ mod archiver;
 mod chat_fallback;
 mod commands;
 mod config;
+mod mailbox;
 mod monitor;
 mod owner;
 mod people;
@@ -202,6 +203,9 @@ async fn main() -> anyhow::Result<()> {
                 commands::lore(),
                 commands::status(),
                 commands::peers(),
+                // Deliberately unclassified in owner.rs USER_COMMANDS:
+                // inbox contents are owner's eyes only (default-deny gate).
+                commands::mail(),
                 commands::mine(),
                 commands::leaderboard(),
                 commands::myjercraft(),

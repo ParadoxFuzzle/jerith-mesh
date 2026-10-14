@@ -167,6 +167,38 @@ pub async fn peers(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// List recent mail for business@/ai@ (owner-DM only).
+// Inbox contents are the owner's eyes only: deliberately NOT in owner.rs
+// `USER_COMMANDS` so the default-deny gate makes this owner-DM only
+// (users elsewhere get the standard refusal). The long privacy rationale
+// lives here because poise turns the FIRST doc paragraph into the slash
+// description and Discord caps that at 100 chars.
+#[poise::command(slash_command, prefix_command)]
+pub async fn mail(
+    ctx: Ctx<'_>,
+    #[description = "Which inbox: business, ai, or empty for all"] inbox: Option<String>,
+    #[description = "How many messages (default 10, max 25)"] count: Option<u16>,
+) -> Result<(), Error> {
+    let box_filter = inbox.as_deref().map(str::to_ascii_lowercase).and_then(|b| {
+        // Only the two provisioned mailboxes are addressable; keeps typos
+        // ("buiness") from returning a misleading "no mail for buiness@".
+        (b == "business" || b == "ai").then_some(b)
+    });
+    let limit = count.unwrap_or(10).min(25) as usize;
+    ctx.defer().await?;
+    let messages = crate::mailbox::list_messages_in(
+        &crate::mailbox::default_base_dir(),
+        box_filter.as_deref(),
+        limit,
+    );
+    ctx.say(crate::mailbox::format_listing(
+        &messages,
+        box_filter.as_deref(),
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Try to mine JER on the local JerithChain node (per-user cooldown).
 #[poise::command(slash_command, prefix_command)]
 pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {

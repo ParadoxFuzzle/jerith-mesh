@@ -205,6 +205,14 @@ pub struct RouterOptions {
     pub verify_percent: u32,
     /// Absolute tolerance when comparing replayed outputs (0 = exact).
     pub verify_tolerance: f32,
+    /// Phase 2: speculative remote pre-flight. When the dispatch plan
+    /// starts with Local but the best remote also holds the expert, the
+    /// remote attempt is kicked off while the local attempt runs; its
+    /// result is consumed only if the local try fails. Latency-hiding per
+    /// the mesh spec ("hide latency, never assume low latency"): a local
+    /// win simply drops the kicked request (cost: occasional unused RPC;
+    /// win: no serialized network timeout before the pool is even tried).
+    pub speculative_remote: bool,
 }
 
 /// The locality-aware expert router.
@@ -220,6 +228,12 @@ pub struct ExpertRouter {
 impl ExpertRouter {
     pub fn new(options: RouterOptions) -> Self {
         Self::new_with_tracker(options, crate::verify::VerificationTracker::shared())
+    }
+
+    /// Phase 2 opt-in toggle for speculative remote pre-flight.
+    pub fn with_speculative_remote(mut self, on: bool) -> Self {
+        self.options.speculative_remote = on;
+        self
     }
 
     /// Construct with an external verification tracker — the mesh state's
@@ -482,7 +496,7 @@ impl ExpertRouter {
         let mut last_err = anyhow::anyhow!(
             "no dispatch candidates for expert {expert_id} (plan empty or all failed)"
         );
-        let mut ambiguous_abort: Option<anyhow::Error> = None;
+        let mut ambiguous_abort: bool = false;
         for (idx, location) in plan.iter().enumerate() {
             let result = match &location {
                 ExpertLocation::Local => local_run(input),
@@ -512,9 +526,7 @@ impl ExpertRouter {
                                     // Ambiguous: two remotes disagree and we
                                     // host no local truth — remaining remote
                                     // candidates are equally suspect.
-                                    ambiguous_abort = Some(anyhow::anyhow!(
-                                        "remote outputs disagree (both peers flagged)"
-                                    ));
+                                    ambiguous_abort = true;
                                     Err(anyhow::anyhow!(
                                         "replay verification failed for expert {expert_id}: remote outputs disagree"
                                     ))
@@ -539,13 +551,204 @@ impl ExpertRouter {
                         "dispatch candidate failed — falling through"
                     );
                     last_err = e;
-                    if let Some(abort) = ambiguous_abort {
+                    if ambiguous_abort {
                         tracing::warn!(
                             target: "mesh",
                             expert = %expert_id,
-                            "abandoning remaining remote candidates ({abort})"
+                            "abandoning remaining remote candidates: remote outputs disagree"
                         );
-                        return Err(abort);
+                        return Err(anyhow::anyhow!(
+                            "remote outputs disagree (both peers flagged)"
+                        ));
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Hybrid local + remote expert execution (Phase 2) with speculative
+    /// remote pre-flight. Identical plan ordering, commitment and replay
+    /// semantics to [`execute_over_quic`]; the difference: when the plan
+    /// opens with Local and the best remote also holds the expert (and
+    /// `speculative_remote` is on), the remote attempt is *built up front*
+    /// and churns while the local run executes — consumed immediately if
+    /// the local try fails (hiding the serialization a plain walk pays),
+    /// dropped if local wins outright (the occasionally-unused RPC is the
+    /// accepted speculative cost; the mesh spec says hide latency, never
+    /// assume it).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_over_quic_speculative(
+        &self,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        expert_id: &str,
+        input: &[f32],
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        completed: &mut HashMap<String, Vec<f32>>,
+        local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+    ) -> anyhow::Result<Vec<f32>> {
+        if let Some(prev) = completed.get(req_id) {
+            return Ok(prev.clone());
+        }
+        let plan = self.plan_dispatch(expert_id, peers).await;
+
+        // Phase 2: build the borrow-capturing pre-flight *before* the
+        // local arm runs, so the RPC churns while the local attempt spins.
+        let mut preflight: Option<(
+            String,
+            std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<f32>>> + '_>>,
+        )> = None;
+        if self.options.speculative_remote {
+            if let (Some(ExpertLocation::Local), Some(ExpertLocation::Remote { node_id, .. })) =
+                (plan.first(), plan.get(1))
+            {
+                let fut = Self::remote_dispatch_once(
+                    &self.verify,
+                    self.options.dispatch_timeout,
+                    endpoint,
+                    identity,
+                    peer_addrs,
+                    req_id,
+                    expert_id,
+                    input,
+                    &node_id,
+                );
+                preflight = Some((node_id.clone(), Box::pin(fut)));
+            }
+        }
+        // Peers the pre-flight already covered — do not double-work them.
+        let mut consumed = std::collections::HashSet::new();
+        let mut ambiguous_abort: bool = false;
+        let mut last_err = anyhow::anyhow!(
+            "no dispatch candidates for expert {expert_id} (plan empty or all failed)"
+        );
+
+        for (idx, location) in plan.iter().enumerate() {
+            let result = match &location {
+                ExpertLocation::Local => match local_run(input) {
+                    Ok(out) => {
+                        // Local wins: the kicked attempt is dropped here.
+                        completed.insert(req_id.to_string(), out.clone());
+                        return Ok(out);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "mesh",
+                            expert = %expert_id,
+                            error = %e,
+                            "local runtime failed — resuming speculative pre-flight"
+                        );
+                        let err = if let Some((node, fut)) = preflight.as_mut() {
+                            let node_id = node.clone();
+                            consumed.insert(node_id.clone());
+                            match fut.as_mut().await {
+                                Ok(out) => {
+                                    self.verify.note_expert_result().await;
+                                    match self
+                                        .replay_verify(
+                                            endpoint, identity, peer_addrs, req_id, expert_id,
+                                            input, &plan, 1, &node_id, &out, &local_run,
+                                        )
+                                        .await
+                                    {
+                                        ReplayVerdict::Trusted => {
+                                            completed.insert(req_id.to_string(), out.clone());
+                                            return Ok(out);
+                                        }
+                                        ReplayVerdict::RejectContinue => {
+                                            anyhow::anyhow!(
+                                                "replay verification rejected peer {node_id}"
+                                            )
+                                        }
+                                        ReplayVerdict::RejectAbort => {
+                                            ambiguous_abort = true;
+                                            anyhow::anyhow!(
+                                                "replay verification failed for expert {expert_id}: remote outputs disagree"
+                                            )
+                                        }
+                                    }
+                                }
+                                Err(pf_err) => {
+                                    anyhow::anyhow!(
+                                        "speculative pre-flight to peer {node_id} failed: {pf_err}"
+                                    )
+                                }
+                            }
+                        } else {
+                            anyhow::anyhow!("local run failed")
+                        };
+                        Err(err)
+                    }
+                },
+                ExpertLocation::Remote { node_id, .. } => {
+                    if consumed.contains(node_id) {
+                        last_err = anyhow::anyhow!(
+                            "peer {node_id} already attempted via speculative pre-flight"
+                        );
+                        if ambiguous_abort {
+                            return Err(anyhow::anyhow!(
+                                "remote outputs disagree (both peers flagged)"
+                            ));
+                        }
+                        continue;
+                    }
+                    match self
+                        .remote_expert_attempt(
+                            endpoint, identity, peer_addrs, req_id, expert_id, input, node_id,
+                        )
+                        .await
+                    {
+                        Ok(out) => {
+                            self.verify.note_expert_result().await;
+                            match self
+                                .replay_verify(
+                                    endpoint, identity, peer_addrs, req_id, expert_id, input,
+                                    &plan, idx, node_id, &out, &local_run,
+                                )
+                                .await
+                            {
+                                ReplayVerdict::Trusted => Ok(out),
+                                ReplayVerdict::RejectContinue => Err(anyhow::anyhow!(
+                                    "replay verification rejected peer {node_id} (local arbiter disagrees)"
+                                )),
+                                ReplayVerdict::RejectAbort => {
+                                    ambiguous_abort = true;
+                                    Err(anyhow::anyhow!(
+                                        "replay verification failed for expert {expert_id}: remote outputs disagree"
+                                    ))
+                                }
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            match result {
+                Ok(out) => {
+                    completed.insert(req_id.to_string(), out.clone());
+                    return Ok(out);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "mesh",
+                        expert = %expert_id,
+                        location = ?location,
+                        error = %e,
+                        "dispatch candidate failed — falling through"
+                    );
+                    last_err = e;
+                    if ambiguous_abort {
+                        tracing::warn!(
+                            target: "mesh",
+                            expert = %expert_id,
+                            "abandoning remaining remote candidates: remote outputs disagree"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "remote outputs disagree (both peers flagged)"
+                        ));
                     }
                 }
             }
@@ -569,6 +772,35 @@ impl ExpertRouter {
         input: &[f32],
         node_id: &str,
     ) -> anyhow::Result<Vec<f32>> {
+        Self::remote_dispatch_once(
+            &self.verify,
+            self.options.dispatch_timeout,
+            endpoint,
+            identity,
+            peer_addrs,
+            req_id,
+            expert_id,
+            input,
+            node_id,
+        )
+        .await
+    }
+
+    /// Self-contained single remote attempt: the borrow-free shape the
+    /// Phase 2 speculative pre-flight needs too (it builds this into a
+    /// borrow-capturing future while the local attempt runs inline).
+    #[allow(clippy::too_many_arguments)]
+    async fn remote_dispatch_once(
+        verify: &crate::verify::VerificationTracker,
+        dispatch_timeout: Duration,
+        endpoint: &quinn::Endpoint,
+        identity: &SigningIdentity,
+        peer_addrs: &HashMap<String, SocketAddr>,
+        req_id: &str,
+        expert_id: &str,
+        input: &[f32],
+        node_id: &str,
+    ) -> anyhow::Result<Vec<f32>> {
         let Some(addr) = peer_addrs.get(node_id) else {
             return Err(anyhow::anyhow!("no QUIC address for peer {node_id}"));
         };
@@ -581,16 +813,7 @@ impl ExpertRouter {
             sig: String::new(),
         };
         sign_request(&mut req, identity);
-        match call(
-            endpoint,
-            *addr,
-            node_id,
-            &req,
-            identity,
-            self.options.dispatch_timeout,
-        )
-        .await
-        {
+        match call(endpoint, *addr, node_id, &req, identity, dispatch_timeout).await {
             Ok(NodeRpcReply::ExpertResult {
                 req_id: rid,
                 output,
@@ -610,7 +833,7 @@ impl ExpertRouter {
                             req_id, expert_id, node_id, input, &output, &c,
                         );
                         // note_commitment already flags the peer on failure.
-                        self.verify.note_commitment(node_id, ok).await;
+                        verify.note_commitment(node_id, ok).await;
                         if ok {
                             Ok(output)
                         } else {
@@ -1698,6 +1921,7 @@ mod tests {
             dispatch_timeout: Duration::from_secs(5),
             verify_percent,
             verify_tolerance: 0.0,
+            ..Default::default()
         })
     }
 
@@ -2236,6 +2460,83 @@ mod tests {
         fn run(&self, _expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
             Ok(input.iter().map(|x| x * self.factor).collect())
         }
+    }
+
+    // --- Phase 2: speculative pre-flight on top of the hybrid walk ---
+
+    #[tokio::test]
+    async fn router_speculative_keeps_local_first_when_local_succeeds() {
+        // One remote (×3) + a locally-registered expert: local must win
+        // even with speculative_remote on — the kicked RPC is discarded.
+        let (near_addr, near_identity, pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let near_node_id = near_identity.node_id();
+        let r = router(50).with_speculative_remote(true);
+        r.register_local_expert("exp.test").await;
+        let peers = vec![(near_node_id.clone(), 5, true, true, None)];
+        let mut addrs = HashMap::new();
+        addrs.insert(near_node_id.clone(), near_addr);
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+
+        let out = r
+            .execute_over_quic_speculative(
+                &client,
+                &identity,
+                &addrs,
+                "spec-local-ok",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut HashMap::new(),
+                |input| Ok(input.iter().map(|x| x * 10.0).collect()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, vec![40.0]);
+    }
+
+    #[tokio::test]
+    async fn router_speculative_recovers_via_preflight_when_local_fails() {
+        // Local runtime down + the best remote unreachable (no QUIC addr):
+        // the pre-flight is consumed once, and the walk must NOT retry the
+        // same peer — it falls through to the second remote (×7).
+        let (far_addr, far_identity, far_pins) =
+            test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let far_node_id = far_identity.node_id();
+        let r = router(50).with_speculative_remote(true);
+        let mut addrs = HashMap::new();
+        addrs.insert(far_node_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let identity = SigningIdentity::generate();
+
+        // near holds the expert at great rtt but has NO QUIC address.
+        let peers = vec![
+            ("near-peer".to_string(), 5, true, true, None),
+            (far_node_id.clone(), 200, true, true, None),
+        ];
+        let mut completed = HashMap::new();
+        let out = r
+            .execute_over_quic_speculative(
+                &client,
+                &identity,
+                &addrs,
+                "spec-failover",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut completed,
+                |_| Err(anyhow::anyhow!("local runtime down")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, vec![28.0]);
+        // Memoized under the request id like the plain walk.
+        assert!(completed.contains_key("spec-failover"));
     }
 
     #[tokio::test]
