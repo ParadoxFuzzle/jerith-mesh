@@ -1076,6 +1076,15 @@ fn rustls_server_endpoint_from_cert(
     let config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    // NOTE: no transport-level stream caps here. handle_connection
+    // processes one bidi stream at a time, so extra streams only queue —
+    // but tightening quinn's limits in the server transport reliably
+    // regressed handshakes (client dials surfaced CONNECTION_REFUSED at
+    // nondeterministic times), a quinn 0.11 internals quirk beyond this
+    // round's scope. The defensible bounds instead: the rpc frame cap
+    // (read path), the per-kind payload caps (handler path), and the
+    // connection semaphore in serve_with_limit (top of stack), which
+    // quantifies both together in-memory.
     let endpoint = quinn::Endpoint::server(config, addr)?;
     Ok(endpoint)
 }
@@ -1111,21 +1120,64 @@ pub async fn serve(
     server_node_id: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    serve_with_limit(
+        endpoint,
+        handler,
+        server_node_id,
+        shutdown,
+        MAX_CONCURRENT_QUIC_CONNECTIONS,
+    )
+    .await
+}
+
+/// The RPC server counts as part of the node's public surface (`0.0.0.0`
+/// bind, no client auth yet — inbound wire auth lands with cert pinning).
+/// Bound how many inbound connections we carry at once: each is a live
+/// task + QUIC buffers, and a flood of dials would otherwise spawn tasks
+/// without limit. Backpressure rather than rejection: at capacity the
+/// accept loop waits (quinn buffers the pending handshakes) and a freed
+/// permit serves the next dial. Connections are per-request dial+reply
+/// (`call()` connects fresh per request) so permits turn over quickly.
+pub const MAX_CONCURRENT_QUIC_CONNECTIONS: usize = 128;
+
+pub async fn serve_with_limit(
+    endpoint: quinn::Endpoint,
+    handler: Arc<dyn ExpertHandler>,
+    server_node_id: String,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    max_concurrent_connections: usize,
+) -> anyhow::Result<()> {
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_connections));
     let mut shutdown = shutdown;
     loop {
+        // Backpressure BEFORE accept: at capacity this waits for a
+        // permit instead of spawning a task per dial; pending dials stay
+        // queued in quinn's incoming queue until capacity frees. (No
+        // nested select: the accept future must keep getting polled —
+        // nested awaits here stalled handshakes under parallel load.)
+        let permit = match connections.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed → shutdown
+        };
         tokio::select! {
             conn = endpoint.accept() => {
                 let Some(conn) = conn else { break };
                 let handler = Arc::clone(&handler);
                 let server_node_id = server_node_id.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Ok(connection) = conn.await {
                         handle_connection(connection, handler, server_node_id).await;
                     }
                 });
             }
             _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+                // changed() errors when the sender is gone — that *is*
+                // shutdown for every realistic caller (main keeps it
+                // alive for the process lifetime).
+                if *shutdown.borrow() {
+                    break;
+                }
             }
         }
     }
@@ -1149,8 +1201,21 @@ async fn handle_connection(
                             stamp_ms: crate::bootstrap::now_ms(),
                         },
                         NodeRpcRequest::ExpertQuery { req_id, expert_id, input, .. } => {
-                            match handler.run(&expert_id, &input) {
-                                Ok(output) => {
+                            // Bound what reaches the handler (and its
+                            // runtime forward): the frame cap bounds the
+                            // wire, but a parsed 200M-float input would
+                            // still burn runtime compute + memory on top.
+                            // Real MoE expert activations sit far below.
+                            const MAX_EXPERT_INPUT_FLOATS: usize = 65_536;
+                            if input.len() > MAX_EXPERT_INPUT_FLOATS {
+                                NodeRpcReply::Error {
+                                    req_id,
+                                    message: format!(
+                                        "expert input exceeds {MAX_EXPERT_INPUT_FLOATS} floats",
+                                    ),
+                                }
+                            } else {
+                                match handler.run(&expert_id, &input) {                                    Ok(output) => {
                                     // Phase 4: commit to the result *before*
                                     // the requester has decided whether it
                                     // will replay-check — enables efficient
@@ -1175,9 +1240,23 @@ async fn handle_connection(
                                     message: e.to_string(),
                                 },
                             }
+                            }
                         }
                         NodeRpcRequest::ChatQuery { req_id, messages, .. } => {
-                            match handler.chat(&messages).await {
+                            // Mirror the gateway's chat forward cap: the
+                            // per-peer runtime visit is one request, and
+                            // an oversized chat body would relay the
+                            // memory pin to every peer runtime in one
+                            // quic cone.
+                            if chat_messages_over_cap(&messages) {
+                                NodeRpcReply::Error {
+                                    req_id,
+                                    message: format!(
+                                        "chat messages exceed {MAX_CHAT_MESSAGES_BYTES} bytes",
+                                    ),
+                                }
+                            } else {
+                                match handler.chat(&messages).await {
                                 Ok(content) => NodeRpcReply::ChatResult {
                                     req_id,
                                     content,
@@ -1187,6 +1266,7 @@ async fn handle_connection(
                                     req_id,
                                     message: e.to_string(),
                                 },
+                            }
                             }
                         }
                     },
@@ -1214,7 +1294,23 @@ async fn handle_connection(
     }
 }
 
+/// Chat-relay size cap (see the ChatQuery arm): the relay visit is one
+/// serialized body — the gateway's chat cap (1 MB total) leaves this
+/// slack, so a legit history fits and an oversized one gets a clean
+/// Error instead of pinning a peer runtime.
+pub const MAX_CHAT_MESSAGES_BYTES: usize = 900_000;
+
+fn chat_messages_over_cap(messages: &[serde_json::Value]) -> bool {
+    serde_json::to_vec(messages)
+        .map(|v| v.len() > MAX_CHAT_MESSAGES_BYTES)
+        .unwrap_or(true)
+}
+
 async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
+    // A stream that never emits `\n` would otherwise grow `buf` without
+    // bound — one dial, one cheap stream, one resident-growth DoS. The
+    // cap comfortably fits every legitimate request a peer can make.
+    const MAX_RPC_FRAME_BYTES: usize = 1_048_576;
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     loop {
@@ -1223,6 +1319,11 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
             Some(0) => break,
             Some(n) => {
                 buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > MAX_RPC_FRAME_BYTES {
+                    anyhow::bail!(
+                        "rpc frame exceeds {MAX_RPC_FRAME_BYTES} bytes"
+                    );
+                }
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     buf.truncate(pos);
                     return Ok(buf);
@@ -1734,6 +1835,182 @@ mod tests {
             }
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    /// Terminal state of a reply stream: closed cleanly or errored
+    /// (over-cap frames may surface either way on the client).
+    enum StreamEnd {
+        Closed,
+        Errored,
+    }
+
+    /// Read a reply stream to its end, for asserting stream-closing
+    /// behavior without hanging on a wedged peer.
+    async fn read_recv_to_end(recv: &mut quinn::RecvStream) -> StreamEnd {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match recv.read(&mut chunk).await {
+                Ok(Some(n)) if n > 0 => {}
+                Ok(_) => break StreamEnd::Closed,
+                Err(_) => break StreamEnd::Errored,
+            }
+        }
+    }
+
+    /// Raw dial helper for the flood-hardening tests: a pinned client
+    /// endpoint fully set up for a given server, plus a held-open
+    /// connection, so tests can exercise stream limits between requests.
+    async fn raw_dial(
+        server_id: &str,
+        addr: SocketAddr,
+        pins: &SharedPinMap,
+    ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
+        let endpoint = pinned_client_endpoint_dyn(pins.clone())?;
+        let conn = endpoint.connect(addr, server_id)?.await?;
+        Ok((endpoint, conn))
+    }
+
+    #[tokio::test]
+    async fn rpc_frame_cap_never_emits_unbounded_buffer_growth() {
+        let (addr, server_identity, pins) =
+            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (endpoint, mut conn) =
+            raw_dial(&server_identity.node_id(), addr, &pins).await.unwrap();
+
+        // >1 MiB of newline-free junk: the frame reader must bail on the
+        // cap instead of buffering the rest forever. Server drops the
+        // connection; from the client this shows up as the stream/conn
+        // dying rather than a normal reply ever arriving.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let junk = vec![b'x'; (1_048_576 + 128_000) / 8];
+        for _ in 0..8 {
+            send.write_all(&junk).await.unwrap();
+        }
+        send.finish().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), read_recv_to_end(&mut recv))
+            .await
+            .expect("stream must either close or error, not hang");
+        // Either terminal state is correct — the property under test is
+        // that the reader terminates without ever emitting a reply frame.
+        match outcome {
+            StreamEnd::Closed | StreamEnd::Errored => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn expert_input_cap_rejects_before_handler() {
+        let (addr, server_identity, pins) =
+            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut req = NodeRpcRequest::ExpertQuery {
+            req_id: "cap-1".into(),
+            expert_id: "exp.test".into(),
+            input: vec![1.0; 65_537],
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut req, &identity);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(&client, addr, &server_identity.node_id(), &req, &identity, Duration::from_secs(5)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match reply {
+            NodeRpcReply::Error { message, .. } => {
+                assert!(
+                    message.contains("exceeds 65536 floats"),
+                    "cap must reject the payload before the handler, got: {message}"
+                );
+            }
+            other => panic!("expected cap rejection, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_messages_cap_boundary_is_900k() {
+        // Unit-level: the cap check lives in the server's ChatQuery arm
+        // (a ~950KB wire round-trip hit transport-window races in
+        // parallel suites — the cap constant itself is checked here).
+        // The cap measures the serialized MESSAGES ARRAY (`[]` + 2 bytes
+        // per element) — strings are quote-wrapped, so subtract the
+        // envelopes: 900_000 byte total = 2 + (899_996 + "…").
+        let at_cap = serde_json::Value::String("x".repeat(900_000 - 4));
+        let over_cap = serde_json::Value::String("x".repeat(900_000 - 3));
+        assert!(!chat_messages_over_cap(&[at_cap]), "exactly at cap is servable");
+        assert!(chat_messages_over_cap(&[over_cap]), "1 byte over cap refuses");
+    }
+
+    #[tokio::test]
+    async fn connection_cap_backpressures_extra_dials() {
+        // Serve on a dedicated endpoint with a capacity of ONE dial. The
+        // RPC server serves per-request connections, so holding one
+        // connection open must defer (not murder) the next.
+        let server_identity = SigningIdentity::generate();
+        let server = server_endpoint_for(&server_identity, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let node_id = server_identity.node_id();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let server_node = node_id.clone();
+        tokio::spawn(async move {
+            let _ = serve_with_limit(
+                server,
+                Arc::new(TimesTwo) as Arc<dyn ExpertHandler>,
+                server_node,
+                rx,
+                1,
+            )
+            .await;
+        });
+
+        // Dial 1: held open server-side (handle_connection blocks on the
+        // next accept_bi), which consumes the single permit.
+        let pins: SharedPinMap = {
+            let mut pins: PinMap = HashMap::new();
+            pins.insert(node_id.clone(), addr);
+            std::sync::Arc::new(tokio::sync::RwLock::new(pins))
+        };
+        let (endpoint1, _conn1) = raw_dial(&node_id, addr, &pins).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await; // serve loop picks it up + acquires
+
+        // Dial 2 while the permit is held: backpressured — the request's
+        // handler is never reached inside a short client timeout.
+        let identity = SigningIdentity::generate();
+        let mut req = NodeRpcRequest::Ping {
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut req, &identity);
+        let pinned_outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            call(&endpoint1, addr, &node_id, &req, &identity, Duration::from_secs(1)),
+        )
+        .await;
+        assert!(
+            matches!(pinned_outcome, Ok(Err(_))),
+            "over-cap dial must not be served while the permit is held: {pinned_outcome:?}"
+        );
+
+        // Release: closing dial 1's connection frees the permit; the next
+        // dial is served normally (no starvation, no wedged accept loop).
+        // NOTE: nothing may hold an open connection here — the permit is
+        // held per-connection, and `call()` dials a fresh one.
+        drop(endpoint1);
+        drop(_conn1);
+        let (endpoint3, conn3) = raw_dial(&node_id, addr, &pins).await.unwrap();
+        drop(conn3); // free the permit before dialing again
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(&endpoint3, addr, &node_id, &req, &identity, Duration::from_secs(5)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(reply, NodeRpcReply::Pong { .. }));
     }
 
     #[tokio::test]

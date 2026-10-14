@@ -232,6 +232,26 @@ Round 4 (this round) — unbounded-growth + flood tightening:
   or drain other buckets; everyone else is pinned to their socket peer.
 
 ```bash
+# QUIC dispatch flood hardening: the RPC server now bounds —
+#   1. rpc frame read (1 MiB cap — a newline-less stream used to grow
+#      memory without bound; over-cap frames close the connection);
+#   2. handler-facing payloads (ExpertQuery input <= 65 536 floats,
+#      ChatQuery messages <= 900 000 bytes — refused with an Error
+#      reply before the runtime is touched);
+#   3. concurrent inbound connections (128 via serve_with_limit;
+#      backpressure — pending dials queue in quinn's incoming queue
+#      instead of spawning unbounded tasks; per-request connections
+#      turn permits over quickly). The known outbound side was
+#      audited serial (chat/expert dispatch goes peer-by-peer, no
+#      broadcast storm) and router `completed` maps are per-call.
+#   Not done this round: transport-level stream caps — tightening
+#   quinn's max_concurrent_* in the server transport regressed
+#   handshakes nondeterministically (client dials got
+#   CONNECTION_REFUSED; a quinn 0.11 internals quirk) — revisit only
+#   after a quinn upgrade. Remaining accepted exposure: inbound
+#   requests are stamp-freshness-checked but not signature-verified
+#   yet (inbound wire auth = cert-pinning phase); flood cost per
+#   request is modest (conn cap + serial per-conn + payload caps).
 # Web UI hardening: the node dashboard (/) ships hash-pinned CSP (the
 # inline script/style digests are recomputed from the page itself at
 # first request — page edits re-pin automatically, no 'unsafe-inline'),
