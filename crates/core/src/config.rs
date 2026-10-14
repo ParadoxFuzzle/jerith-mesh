@@ -482,10 +482,19 @@ impl NodeConfig {
         if !path.exists() {
             return Ok(None);
         }
-        let text = std::fs::read_to_string(&path)
+        Self::load_from(&path)
+    }
+
+    /// Load from an explicit path — and chmod 0600 what was just read:
+    /// `run` doesn't pass through ensure_identity (plain-run keeps manual
+    /// identity fields), so the load is the only guaranteed heal point on
+    /// every boot.
+    pub fn load_from(path: &std::path::Path) -> anyhow::Result<Option<Self>> {
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         let cfg: Self =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Self::restrict_file_permissions(path);
         Ok(Some(cfg))
     }
 
@@ -730,7 +739,12 @@ mod tests {
         // ...and by ensure_identity on an existing loose file.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         NodeConfig::default().ensure_identity().unwrap();
-        assert!(path.exists());
+        // ...and by load_from: run never passes ensure_identity, so the
+        // boot-time load is the guaranteed heal point.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        NodeConfig::load_from(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "load_from must heal to 0600, got {mode:o}");
         // ensure heals the config path too — simulate by pointing at
         // JERITH_HOME: the static env is risky under parallel tests, so
         // exercise the repair helper directly instead.
