@@ -150,7 +150,13 @@ impl MemoryStore {
             conn.execute(
                 "INSERT INTO memories (text, dim, embedding, provider, created_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![text, dim as i64, bytes, provider_str(provider), crate::bootstrap::now_ms()],
+                rusqlite::params![
+                    text,
+                    dim as i64,
+                    bytes,
+                    provider_str(provider),
+                    crate::bootstrap::now_ms()
+                ],
             )
             .context("inserting memory")?;
             conn.last_insert_rowid()
@@ -312,7 +318,12 @@ impl MemoryStore {
                 .context("preparing stats scan")?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             for (dim, provider, bytes, created) in rows {
@@ -324,13 +335,17 @@ impl MemoryStore {
         }
         Ok(MemoryStats {
             count: count as u64,
-            dims: dims.into_iter().map(|(d, n)| (d as u32, n as u64)).collect(),
-            providers: providers
+            dims: dims
                 .into_iter()
-                .map(|(p, n)| (p, n as u64))
+                .map(|(d, n)| (d as u32, n as u64))
                 .collect(),
+            providers: providers.into_iter().map(|(p, n)| (p, n as u64)).collect(),
             embedding_bytes: bytes_total as u64,
-            newest_created_ms: if newest_ms > 0 { Some(newest_ms as u64) } else { None },
+            newest_created_ms: if newest_ms > 0 {
+                Some(newest_ms as u64)
+            } else {
+                None
+            },
         })
     }
 }
@@ -464,7 +479,8 @@ mod tests {
 
     #[tokio::test]
     async fn prune_beyond_keeps_most_recent_rows() {
-        let s = store();        let mut ids = Vec::new();
+        let s = store();
+        let mut ids = Vec::new();
         for i in 0..6 {
             let (id, _) = s.embed_and_store(&format!("memory row {i}")).await.unwrap();
             ids.push(id);
@@ -502,9 +518,16 @@ mod tests {
     #[tokio::test]
     async fn similar_ranks_against_the_seed_vector() {
         let s = store();
-        let (a, _) = s.embed_and_store("how to bake sourdough bread at home").await.unwrap();
-        s.embed_and_store("quantum computing stock price forecast").await.unwrap();
-        s.embed_and_store("sourdough starter feeding schedule").await.unwrap();
+        let (a, _) = s
+            .embed_and_store("how to bake sourdough bread at home")
+            .await
+            .unwrap();
+        s.embed_and_store("quantum computing stock price forecast")
+            .await
+            .unwrap();
+        s.embed_and_store("sourdough starter feeding schedule")
+            .await
+            .unwrap();
 
         let hits = s.similar_to(a, 2).await.unwrap();
         assert_eq!(hits.len(), 2);
@@ -524,7 +547,9 @@ mod tests {
     async fn stats_reports_counts_dims_providers_and_footprint() {
         let s = store();
         s.embed_and_store("alpha entry about kilns").await.unwrap();
-        s.embed_and_store("beta entry about kilns too").await.unwrap();
+        s.embed_and_store("beta entry about kilns too")
+            .await
+            .unwrap();
         let st = s.stats().await.unwrap();
         assert_eq!(st.count, 2);
         assert_eq!(st.dims.len(), 1);
@@ -634,10 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_across_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "jerith-mem-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("jerith-mem-test-{}", std::process::id()));
         let path = dir.join("mem.sqlite");
         let _ = std::fs::remove_dir_all(&dir);
         {
@@ -655,7 +677,10 @@ mod tests {
 
     #[test]
     fn provider_roundtrip() {
-        assert_eq!(provider_from_str(provider_str(EmbedProvider::Nomic)), EmbedProvider::Nomic);
+        assert_eq!(
+            provider_from_str(provider_str(EmbedProvider::Nomic)),
+            EmbedProvider::Nomic
+        );
         assert_eq!(
             provider_from_str(provider_str(EmbedProvider::HashFallback)),
             EmbedProvider::HashFallback

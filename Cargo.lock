@@ -1290,6 +1290,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "jerith-mesh-core",
  "poise",
  "reqwest",
@@ -1311,6 +1312,7 @@ dependencies = [
  "axum-test",
  "ed25519-dalek",
  "futures-core",
+ "futures-util",
  "hex",
  "quinn",
  "rand 0.8.8",

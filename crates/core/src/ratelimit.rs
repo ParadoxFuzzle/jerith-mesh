@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -78,12 +78,10 @@ impl RateLimiter {
         if buckets.len() >= BUCKET_PRUNE_THRESHOLD {
             buckets.retain(|_, b| now.duration_since(b.window_start) < self.window);
         }
-        let b = buckets
-            .entry(key)
-            .or_insert(Bucket {
-                window_start: now,
-                hits: 0,
-            });
+        let b = buckets.entry(key).or_insert(Bucket {
+            window_start: now,
+            hits: 0,
+        });
         if now.duration_since(b.window_start) >= self.window {
             b.window_start = now;
             b.hits = 0;
@@ -257,8 +255,8 @@ mod tests {
         // Parallel test streams share the process-local counter, so assert
         // on a delta — and make it large enough that our own rejections
         // dominate it.
-        let before = crate::metrics::RATE_LIMITED_429_TOTAL
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let before =
+            crate::metrics::RATE_LIMITED_429_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
         let rl = RateLimiter::new(1, Duration::from_millis(50));
         assert!(rl.allow(key(8)));
         for _ in 0..10 {
@@ -268,7 +266,10 @@ mod tests {
         let bumped = crate::metrics::RATE_LIMITED_429_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed)
             - before;
-        assert!(bumped >= 10, "counter must move with every 429, got {bumped}");
+        assert!(
+            bumped >= 10,
+            "counter must move with every 429, got {bumped}"
+        );
     }
 
     #[test]
@@ -285,7 +286,12 @@ mod tests {
     fn bucket_prune_keeps_map_bounded() {
         let rl = std::sync::Arc::new(RateLimiter::new(100, Duration::from_millis(10)));
         for i in 0..(BUCKET_PRUNE_THRESHOLD + 500) {
-            let _ = rl.allow(ip_key(IpAddr::V4(Ipv4Addr::new(1, (i / 254) as u8 % 254 + 1, (i % 254) as u8 + 1, 1))));
+            let _ = rl.allow(ip_key(IpAddr::V4(Ipv4Addr::new(
+                1,
+                (i / 254) as u8 % 254 + 1,
+                (i % 254) as u8 + 1,
+                1,
+            ))));
         }
     }
 
@@ -302,7 +308,10 @@ mod tests {
         // The IP lane is untouched by the identity-lane exhaustion: a
         // fresh IP bucket still has its full budget. (Same client, but
         // unsigned → the IP bucket pays; that's the enforced separation.)
-        assert!(rl.allow(key(9)), "ip lane budget must not share with id lane");
+        assert!(
+            rl.allow(key(9)),
+            "ip lane budget must not share with id lane"
+        );
         // And the exhausted identity budget stays exhausted: no cross-
         // replenishing through IP traffic.
         assert!(!rl.allow(idk2), "identity budget must stay exhausted");

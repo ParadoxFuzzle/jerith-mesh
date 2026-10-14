@@ -146,7 +146,8 @@ pub fn build(vault: &Path) -> Result<LoreIndex> {
             .map(|t| t.trim().to_string())
             .or_else(|| {
                 // First `# ` heading, else the file stem.
-                body.lines().find_map(|l| l.trim_start().strip_prefix("# "))
+                body.lines()
+                    .find_map(|l| l.trim_start().strip_prefix("# "))
                     .map(|t| t.trim().to_string())
             })
             .unwrap_or_else(|| {
@@ -172,7 +173,11 @@ pub fn build(vault: &Path) -> Result<LoreIndex> {
             });
         }
     }
-    tracing::info!(entries = entries.len(), files = file_count, "lore index built");
+    tracing::info!(
+        entries = entries.len(),
+        files = file_count,
+        "lore index built"
+    );
     Ok(LoreIndex {
         entries,
         built_ms: crate::bootstrap::now_ms(),
@@ -193,7 +198,11 @@ fn walk_md(dir: &Path, depth: usize) -> Vec<PathBuf> {
         let p = e.path();
         if p.is_dir() {
             out.extend(walk_md(&p, depth + 1));
-        } else if p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("md")).unwrap_or(false)
+        } else if p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("md"))
+            .unwrap_or(false)
             && !p
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -240,7 +249,25 @@ impl LoreIndex {
             .filter(|t| t.chars().count() >= 3)
             // Stopwords: scoring on them drowns the real lore terms (a
             // query of "the of" would match everything otherwise).
-            .filter(|t| !matches!(t.as_str(), "the" | "and" | "for" | "was" | "were" | "you" | "are" | "with" | "that" | "this" | "from" | "into" | "when" | "what"))
+            .filter(|t| {
+                !matches!(
+                    t.as_str(),
+                    "the"
+                        | "and"
+                        | "for"
+                        | "was"
+                        | "were"
+                        | "you"
+                        | "are"
+                        | "with"
+                        | "that"
+                        | "this"
+                        | "from"
+                        | "into"
+                        | "when"
+                        | "what"
+                )
+            })
             .collect();
         if terms.is_empty() {
             return Vec::new();
@@ -344,8 +371,17 @@ mod tests {
     fn build_splits_files_and_sections() {
         let idx = build(&vault_dir()).unwrap();
         // 3 sections from whispercoil (intro + Maintenance) + 2 colonies.
-        assert_eq!(idx.len(), 4, "got {:?}", idx.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>());
-        assert!(idx.entries.iter().any(|e| e.heading.as_deref() == Some("Maintenance")));
+        assert_eq!(
+            idx.len(),
+            4,
+            "got {:?}",
+            idx.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            idx.entries
+                .iter()
+                .any(|e| e.heading.as_deref() == Some("Maintenance"))
+        );
         // Tags travelled from front matter into every section of the file.
         let wh = idx
             .entries
@@ -363,7 +399,11 @@ mod tests {
         assert!(!hits.is_empty());
         let top = &hits[0];
         assert!(top.id.contains("whispercoil"));
-        assert!(top.excerpt.contains("Whispercoil"), "excerpt: {}", top.excerpt);
+        assert!(
+            top.excerpt.contains("Whispercoil"),
+            "excerpt: {}",
+            top.excerpt
+        );
         assert!(top.score > 0);
         // Unrelated query returns nothing scored.
         assert!(idx.search("waffle iron recipes", 3).is_empty());

@@ -117,7 +117,10 @@ pub fn compose_persona(workspace: &Path, per_doc_max_chars: usize) -> Option<Str
         if trimmed.is_empty() {
             continue;
         }
-        sections.push(format!("## {doc}\n\n{}", cap_doc(trimmed, per_doc_max_chars)));
+        sections.push(format!(
+            "## {doc}\n\n{}",
+            cap_doc(trimmed, per_doc_max_chars)
+        ));
     }
     if sections.is_empty() {
         return None;
@@ -182,7 +185,10 @@ mod tests {
         // User edits survive a re-bootstrap.
         std::fs::write(ws.join("SOUL.md"), "edited!").unwrap();
         bootstrap(&ws, &oc);
-        assert_eq!(std::fs::read_to_string(ws.join("SOUL.md")).unwrap(), "edited!");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("SOUL.md")).unwrap(),
+            "edited!"
+        );
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&oc);
     }

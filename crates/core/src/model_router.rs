@@ -83,14 +83,10 @@ fn content_text(content: &serde_json::Value) -> String {
 pub fn has_image_content(messages: &[serde_json::Value]) -> bool {
     messages.iter().any(|m| {
         m.get("content").is_some_and(|c| match c {
-            serde_json::Value::Array(parts) => {
-                parts
-                    .iter()
-                    .any(|p| {
-                        p.get("type").and_then(|t| t.as_str()) == Some("image_url")
-                            || p.get("image_url").is_some()
-                    })
-            }
+            serde_json::Value::Array(parts) => parts.iter().any(|p| {
+                p.get("type").and_then(|t| t.as_str()) == Some("image_url")
+                    || p.get("image_url").is_some()
+            }),
             _ => false,
         })
     })
@@ -105,15 +101,11 @@ pub fn is_complex(messages: &[serde_json::Value]) -> bool {
     for m in messages {
         if m.get("role").and_then(|r| r.as_str()) == Some("user") {
             user_turns += 1;
-            last_user_text = content_text(
-                m.get("content").unwrap_or(&serde_json::Value::Null),
-            );
+            last_user_text = content_text(m.get("content").unwrap_or(&serde_json::Value::Null));
         }
-        total_chars += content_text(
-            m.get("content").unwrap_or(&serde_json::Value::Null),
-        )
-        .chars()
-        .count();
+        total_chars += content_text(m.get("content").unwrap_or(&serde_json::Value::Null))
+            .chars()
+            .count();
     }
     let lowered = last_user_text.to_lowercase();
     COMPLEX_MARKERS.iter().any(|mk| lowered.contains(mk))
@@ -302,7 +294,12 @@ mod tests {
             {"role": "user", "content": "Refactor the whole module [deep]"}
         )];
         assert_eq!(
-            reroute_for_gateway(Some("jerith-mesh"), Some("qwen3:8b"), &complex, &upgraded_tiers()),
+            reroute_for_gateway(
+                Some("jerith-mesh"),
+                Some("qwen3:8b"),
+                &complex,
+                &upgraded_tiers()
+            ),
             Some("qwen3-large-test".to_string())
         );
         assert_eq!(

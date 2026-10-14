@@ -168,13 +168,12 @@ impl StakeManager {
         identity: Option<crate::signing::SigningIdentity>,
     ) -> Arc<Self> {
         let config = crypto.stake;
-        let chain_base = if config.chain_slash
-            && crypto.chain == crate::config::CryptoChain::Jerithchain
-        {
-            Some(crate::economics::chain_rpc_url(crypto))
-        } else {
-            None
-        };
+        let chain_base =
+            if config.chain_slash && crypto.chain == crate::config::CryptoChain::Jerithchain {
+                Some(crate::economics::chain_rpc_url(crypto))
+            } else {
+                None
+            };
         let ledger_path = StakeLedger::path();
         let ledger = StakeLedger::load_from(&ledger_path);
         // No eager save here: constructing a manager must not touch the
@@ -209,7 +208,10 @@ impl StakeManager {
 
     /// Join gate verdict against the current ledger.
     pub fn clears_gate(&self) -> bool {
-        self.ledger.lock().unwrap().clears_gate(self.config.required_uj)
+        self.ledger
+            .lock()
+            .unwrap()
+            .clears_gate(self.config.required_uj)
     }
 
     /// The configured requirement (µJER; 0 = staking off).
@@ -263,8 +265,7 @@ impl StakeManager {
             .unwrap_or(0);
         {
             let mut ledger = self.ledger.lock().unwrap();
-            let changed =
-                ledger.staked_uj != staked || ledger.slashed_total_uj != slashed;
+            let changed = ledger.staked_uj != staked || ledger.slashed_total_uj != slashed;
             ledger.staked_uj = staked;
             ledger.slashed_total_uj = slashed;
             if changed {
@@ -312,8 +313,12 @@ impl StakeManager {
     /// it actually escrows, so the returned `staked_uj` is recorded
     /// verbatim and the idempotency marker follows along.
     pub async fn lock_topup(&self, amount_uj: u64) -> bool {
-        let Some(identity) = self.identity.as_ref() else { return false };
-        let Some(base) = self.chain_base.as_deref() else { return false };
+        let Some(identity) = self.identity.as_ref() else {
+            return false;
+        };
+        let Some(base) = self.chain_base.as_deref() else {
+            return false;
+        };
         let Some(token) = self.token.clone() else {
             tracing::debug!(target: "economics", "stake lock skipped: no chain api token");
             return false;
@@ -376,10 +381,7 @@ impl StakeManager {
     /// Record exactly what the chain says it now escrows for this node
     /// (used by lock and unlock responses).
     fn record_chain_stake(&self, reply: &serde_json::Value) {
-        let staked = reply
-            .get("staked_uj")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let staked = reply.get("staked_uj").and_then(|v| v.as_u64()).unwrap_or(0);
         let mut ledger = self.ledger.lock().unwrap();
         ledger.staked_uj = staked;
         ledger.escrowed_uj = staked;
@@ -405,9 +407,15 @@ impl StakeManager {
     /// ledger values true up to the response, so a partial chain-side
     /// clamp lands as live truth.
     pub async fn unlock_amount(&self, amount_uj: u64) -> bool {
-        let Some(identity) = self.identity.as_ref() else { return false };
-        let Some(base) = self.chain_base.as_deref() else { return false };
-        let Some(token) = self.token.clone() else { return false };
+        let Some(identity) = self.identity.as_ref() else {
+            return false;
+        };
+        let Some(base) = self.chain_base.as_deref() else {
+            return false;
+        };
+        let Some(token) = self.token.clone() else {
+            return false;
+        };
         if amount_uj == 0 {
             return true; // nothing requested — nothing to do
         }
@@ -463,7 +471,10 @@ impl StakeManager {
             _ => false,
         };
         let mut ledger = self.ledger.lock().unwrap();
-        let ev = SlashEvent { chain_accepted: submitted, ..ev };
+        let ev = SlashEvent {
+            chain_accepted: submitted,
+            ..ev
+        };
         let ev = ledger.record_slash(ev);
         self.save_ledger(&ledger);
         tracing::warn!(
@@ -476,7 +487,10 @@ impl StakeManager {
     }
 
     /// Signed body for the chain slash contract.
-    fn sign_notice(&self, ev: &SlashEvent) -> Option<(crate::signing::WireAuth, serde_json::Value)> {
+    fn sign_notice(
+        &self,
+        ev: &SlashEvent,
+    ) -> Option<(crate::signing::WireAuth, serde_json::Value)> {
         let identity = self.identity.as_ref()?;
         // The chain binds reporter == pubkey[:16]; deriving the reporter
         // from the signing key (not config) guarantees that binding holds
@@ -543,8 +557,15 @@ async fn stake_post(
     body: &serde_json::Value,
 ) -> anyhow::Result<(u16, serde_json::Value)> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-    let resp = client.post(url).bearer_auth(token).json(body).send().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .post(url)
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
@@ -553,7 +574,9 @@ async fn stake_post(
 
 /// GET variant for the /stake read view.
 async fn stake_get(url: &str, token: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
     let resp = client.get(url).bearer_auth(token).send().await?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
@@ -576,16 +599,22 @@ mod tests {
             wallet_endpoint: None,
             wallet_address: None,
             mine_chance_permille: 0,
-            stake: StakeConfig { required_uj, ..Default::default() },
+            stake: StakeConfig {
+                required_uj,
+                ..Default::default()
+            },
         }
     }
 
     #[test]
     fn gate_clears_only_with_enough_stake() {
-        let l = StakeLedger { staked_uj: 900, ..Default::default() };
-        assert!(l.clears_gate(0));      // disabled → always clear
-        assert!(l.clears_gate(900));    // exactly at line
-        assert!(!l.clears_gate(1000));  // short
+        let l = StakeLedger {
+            staked_uj: 900,
+            ..Default::default()
+        };
+        assert!(l.clears_gate(0)); // disabled → always clear
+        assert!(l.clears_gate(900)); // exactly at line
+        assert!(!l.clears_gate(1000)); // short
     }
 
     #[test]
@@ -609,14 +638,14 @@ mod tests {
             });
         }
         assert_eq!(l.slash_events.len(), 50); // ring capped
-        assert_eq!(l.slashed_total_uj, 550);  // total never lost
+        assert_eq!(l.slashed_total_uj, 550); // total never lost
         assert_eq!(l.slash_events.first().unwrap().target, "p5"); // oldest dropped
     }
 
     #[test]
     fn stake_config_defaults_match_spec() {
         let s = StakeConfig::default();
-        assert_eq!(s.required_uj, 0);               // opt-in tier
+        assert_eq!(s.required_uj, 0); // opt-in tier
         assert_eq!(s.slash_percent_per_offense, 25); // spec's "part of the stake"
         assert!(s.chain_slash);
     }
@@ -641,12 +670,15 @@ mod tests {
                 .route(
                     "/stake",
                     axum::routing::get(
-                        move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                        move |axum::extract::Query(q): axum::extract::Query<
+                            std::collections::HashMap<String, String>,
+                        >| {
                             let state = view_hits.clone();
                             async move {
-                                state.lock().unwrap().push(
-                                    ("GET /stake".into(), serde_json::Value::Null),
-                                );
+                                state
+                                    .lock()
+                                    .unwrap()
+                                    .push(("GET /stake".into(), serde_json::Value::Null));
                                 axum::Json(serde_json::json!({
                                     "discord_id": q.get("discord_id").cloned().unwrap_or_default(),
                                     "staked_uj": 0,
@@ -661,14 +693,18 @@ mod tests {
                     "/stake/lock",
                     axum::routing::post({
                         let state = hits.clone();
-                        move |axum::Json(body): axum::Json<serde_json::Value>| {
-                            async move {
-                                state.lock().unwrap().push(("POST /stake/lock".into(), body.clone()));
-                                (axum::http::StatusCode::OK, axum::Json(serde_json::json!({
+                        move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                            state
+                                .lock()
+                                .unwrap()
+                                .push(("POST /stake/lock".into(), body.clone()));
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
                                     "ok": true,
                                     "staked_uj": staked_after_lock.unwrap_or(0),
-                                })))
-                            }
+                                })),
+                            )
                         }
                     }),
                 )
@@ -676,13 +712,17 @@ mod tests {
                     "/stake/unlock",
                     axum::routing::post({
                         let state = hits.clone();
-                        move |axum::Json(body): axum::Json<serde_json::Value>| {
-                            async move {
-                                state.lock().unwrap().push(("POST /stake/unlock".into(), body.clone()));
-                                (axum::http::StatusCode::OK, axum::Json(serde_json::json!({
+                        move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                            state
+                                .lock()
+                                .unwrap()
+                                .push(("POST /stake/unlock".into(), body.clone()));
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
                                     "ok": true, "staked_uj": 0, "slashed_total_uj": 0,
-                                })))
-                            }
+                                })),
+                            )
                         }
                     }),
                 )
@@ -690,11 +730,15 @@ mod tests {
                     "/wallet/create",
                     axum::routing::post({
                         let state = hits.clone();
-                        move |axum::Json(body): axum::Json<serde_json::Value>| {
-                            async move {
-                                state.lock().unwrap().push(("POST /wallet/create".into(), body.clone()));
-                                (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"ok": true})))
-                            }
+                        move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                            state
+                                .lock()
+                                .unwrap()
+                                .push(("POST /wallet/create".into(), body.clone()));
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({"ok": true})),
+                            )
                         }
                     }),
                 )
@@ -735,9 +779,13 @@ mod tests {
         }
 
         fn path_hits(&self) -> Vec<String> {
-            self.hits.lock().unwrap().iter().map(|(p, _)| p.clone()).collect()
+            self.hits
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect()
         }
-
     }
 
     /// StakeManager pointed at a stub chain (wallet_endpoint override).
@@ -750,10 +798,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "jerith-stake-test-{}-{n}.json",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("jerith-stake-test-{}-{n}.json", std::process::id()))
     }
 
     fn manager_with_stub(stub: &ChainStub) -> Arc<StakeManager> {
@@ -824,7 +869,13 @@ mod tests {
         assert_eq!(ledger.escrowed_uj, 2_700_000);
         // lock_required itself is now covered by the chain's reply.
         assert!(mgr.lock_required().await);
-        assert_eq!(stub.path_hits().iter().filter(|p| *p == "POST /stake/lock").count(), 1);
+        assert_eq!(
+            stub.path_hits()
+                .iter()
+                .filter(|p| *p == "POST /stake/lock")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -862,7 +913,7 @@ mod tests {
         }
         assert!(mgr.refresh_from_chain().await);
         let ledger = mgr.snapshot();
-        assert_eq!(ledger.staked_uj, 0);        // chain truth wins
+        assert_eq!(ledger.staked_uj, 0); // chain truth wins
         assert_eq!(ledger.slashed_total_uj, 0); // synced too
     }
 
@@ -882,7 +933,8 @@ mod tests {
         if let Some(m) = Arc::get_mut(&mut mgr) {
             m.rearm_ledger(fresh_ledger_path());
         }
-        mgr.notice("victim-node", "dishonest_results", "evidence-bytes").await;
+        mgr.notice("victim-node", "dishonest_results", "evidence-bytes")
+            .await;
 
         let hits = stub.hits.lock().unwrap().clone();
         let (meta, body) = hits

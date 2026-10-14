@@ -4,7 +4,7 @@
 //! and reusable. Everything talks OpenAI-ish shapes to the gateway.
 
 use anyhow::{Context as _, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -18,9 +18,8 @@ const MODEL_PLACEHOLDER: &str = "jerith-mesh";
 /// placeholder model verbatim to an Ollama/Colibri runtime gets
 /// `model 'jerith-mesh' not found` — the node actually serves whatever
 /// its config.advertised model is, exposed on /status as `model`.
-static RESOLVED_MODELS: tokio::sync::Mutex<
-    Option<std::collections::HashMap<String, String>>,
-> = tokio::sync::Mutex::const_new(None);
+static RESOLVED_MODELS: tokio::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    tokio::sync::Mutex::const_new(None);
 
 /// The model id chat requests should carry: the node's advertised runtime
 /// model, or `None` when /status is unreachable (caller falls back to the
@@ -38,7 +37,11 @@ async fn runtime_model(cfg: &crate::config::BotConfig) -> Option<String> {
         .await
         .with_context(|| format!("/model status lookup failed at {url}"))
         .ok()?;
-    let body: Value = resp.json().await.context("model status: non-JSON body").ok()?;
+    let body: Value = resp
+        .json()
+        .await
+        .context("model status: non-JSON body")
+        .ok()?;
     let model = model_from_status(&body)?;
     map.insert(cfg.gateway_url.clone(), model.clone());
     Some(model)
@@ -58,17 +61,221 @@ fn client() -> reqwest::Client {
         .expect("static reqwest client config")
 }
 
+// ---------------------------------------------------------------------------
+// Streamed chat rounds (gateway SSE passthrough)
+// ---------------------------------------------------------------------------
+
+/// Per-round accumulation for a streamed chat completion.
+#[derive(Default)]
+struct RoundAcc {
+    content: String,
+    /// OpenAI-shape tool calls accumulated from streamed fragments
+    /// (delta.tool_calls pieces arrive index-keyed, name once + argument
+    /// fragments incrementally).
+    tool_calls: Vec<Value>,
+    finish_reason: Option<String>,
+    usage_total: u64,
+    mesh_fallback: Option<String>,
+    /// Set when the SSE stream broke mid-generation but real content had
+    /// already arrived: the partial answer is kept (annotated) instead of
+    /// failing the whole chat.
+    cut: Option<String>,
+}
+
+impl RoundAcc {
+    /// Materialize the same JSON shape the buffered path produces, so the
+    /// loop's single set of downstream logic (tool intent, degenerate
+    /// check, usage extraction, mesh_fallback attribution) stays the one
+    /// source of truth regardless of transport.
+    fn into_pseudo_body(self) -> Value {
+        let mut content = self.content.clone();
+        if let Some(cut) = &self.cut {
+            if !content.trim().is_empty() {
+                content.push_str(&format!("\n\n_(stream cut: {cut})_"));
+            }
+        }
+        let mut message = json!({"role": "assistant", "content": content});
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(self.tool_calls.clone());
+        }
+        let mut body = json!({
+            "choices": [{
+                "message": message,
+                "finish_reason": self.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            }]
+        });
+        if self.usage_total > 0 {
+            body["usage"] = json!({"total_tokens": self.usage_total});
+        }
+        if let Some(mf) = &self.mesh_fallback {
+            body["mesh_fallback"] = json!(mf);
+        }
+        body
+    }
+}
+
+/// Fold one `data: {…}` SSE line into the accumulator (pure — unit tests
+/// cover the chunk shapes litellm/ollama and the gateway's mesh-fallback
+/// wrap actually emit).
+fn note_sse_chunk(acc: &mut RoundAcc, line: &str) {
+    let trimmed = line.trim();
+    let Some(data) = trimmed.strip_prefix("data:") else {
+        return; // SSE comments, event: rows, blank separators
+    };
+    let data = data.trim();
+    if data == "[DONE]" || data.is_empty() {
+        return;
+    }
+    let Ok(j) = serde_json::from_str::<Value>(data) else {
+        return; // keepalives / non-JSON heartbeats never kill a stream
+    };
+    if let Some(mf) = j
+        .get("mesh_fallback")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty())
+    {
+        acc.mesh_fallback = Some(mf);
+    }
+    if let Some(total) = j.pointer("/usage/total_tokens").and_then(Value::as_u64) {
+        acc.usage_total = total; // trailing usage chunk carries the round total
+    }
+    let Some(choice) = j.pointer("/choices/0") else {
+        return; // usage-only chunks have no choice
+    };
+    if let Some(fr) = choice
+        .get("finish_reason")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty())
+    {
+        acc.finish_reason = Some(fr);
+    }
+    if let Some(c) = choice
+        .pointer("/delta/content")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty())
+    {
+        acc.content.push_str(&c);
+    }
+    if let Some(frags) = choice
+        .pointer("/delta/tool_calls")
+        .and_then(Value::as_array)
+    {
+        for f in frags {
+            let idx = f.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            while acc.tool_calls.len() <= idx {
+                acc.tool_calls.push(json!({
+                    "id": String::new(),
+                    "type": "function",
+                    "function": {"name": String::new(), "arguments": String::new()},
+                }));
+            }
+            let slot = acc.tool_calls.get_mut(idx).expect("index-grown above");
+            if let Some(id) = f
+                .get("id")
+                .and_then(value_to_string)
+                .filter(|s| !s.is_empty())
+            {
+                slot["id"] = json!(id);
+            }
+            if let Some(name) = f
+                .pointer("/function/name")
+                .and_then(value_to_string)
+                .filter(|s| !s.is_empty())
+            {
+                slot["function"]["name"] = json!(name);
+            }
+            if let Some(args) = f
+                .pointer("/function/arguments")
+                .and_then(value_to_string)
+                .filter(|s| !s.is_empty())
+            {
+                let prefix = slot["function"]["arguments"].as_str().unwrap_or("");
+                slot["function"]["arguments"] = json!(format!("{prefix}{args}"));
+            }
+        }
+    }
+}
+
+/// One streamed chat round: POST with `stream: true`, fold OpenAI deltas
+/// as the gateway passes them through (the live tap fires with each new
+/// content fragment), and return the same `(status, body)` tuple the
+/// buffered path produces. Plain-JSON answers (error rows, non-SSE stacks)
+/// parse exactly the buffered way. Transport breaks MID-stream with real
+/// content already folded degrade to a cut-marked partial instead of
+/// failing the chat; an empty side of the same failure still errors.
+async fn fetch_streamed_round(
+    url: &str,
+    payload: &Value,
+    timeout: std::time::Duration,
+    live: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> Result<(reqwest::StatusCode, Value)> {
+    use futures_util::StreamExt;
+
+    let mut payload = payload.clone();
+    payload["stream"] = json!(true);
+    payload["stream_options"] = json!({"include_usage": true});
+
+    let resp = client()
+        .post(url)
+        .timeout(timeout)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("gateway unreachable at {url}"))?;
+    let status = resp.status();
+
+    let is_sse = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        // Plain JSON: parse exactly like the buffered path (errors and
+        // non-streaming stacks included) and let the shared loop decide.
+        let body: Value = resp.json().await.context("gateway returned non-JSON")?;
+        return Ok((status, body));
+    }
+
+    let mut acc = RoundAcc::default();
+    let mut bytes = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = bytes.next().await {
+        match chunk {
+            Ok(b) => {
+                buf.push_str(&String::from_utf8_lossy(&b));
+                while let Some(nl) = buf.find('\n') {
+                    let line: String = buf.drain(..=nl).collect();
+                    let before = acc.content.len();
+                    note_sse_chunk(&mut acc, &line);
+                    if let Some(live) = live {
+                        let fresh = &acc.content[before.min(acc.content.len())..];
+                        if !fresh.is_empty() {
+                            live(fresh);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !acc.content.trim().is_empty() {
+                    acc.cut = Some(e.to_string());
+                    break;
+                }
+                return Err(anyhow::Error::from(e))
+                    .context(format!("gateway stream broke at {url}"));
+            }
+        }
+    }
+    Ok((status, acc.into_pseudo_body()))
+}
+
 /// POST /v1/chat/completions on the gateway. Returns the assistant text plus
 /// the `mesh_fallback` node id when the mesh (not the local runtime) served it.
 /// Message assembly for every chat shape the bot produces (`/ask`, DM and
 /// @mention fallbacks share this path). A persona system prompt goes first,
 /// then the conversation history, then the caller's prompt. Pure fn — tests
 /// cover ordering without a network or framework.
-pub fn build_messages(
-    history: &[Value],
-    prompt: &str,
-    persona: Option<&str>,
-) -> Vec<Value> {
+pub fn build_messages(history: &[Value], prompt: &str, persona: Option<&str>) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::with_capacity(history.len() + 2);
     if let Some(p) = persona.map(str::trim).filter(|p| !p.is_empty()) {
         messages.push(json!({"role": "system", "content": p}));
@@ -95,6 +302,20 @@ pub async fn chat_with_usage(
     cfg: &crate::config::BotConfig,
     prompt: &str,
     raw_history: &[Value],
+) -> Result<(String, Option<String>, u64)> {
+    chat_with_usage_live(cfg, prompt, raw_history, None).await
+}
+
+/// Chat with token accounting AND a live tap: when `[chat] stream` is on
+/// (the default), round 0's answer streams through the gateway's SSE
+/// passthrough and `live` fires with each new content fragment — the
+/// @mention/DM path live-types the reply into Discord while tokens land.
+/// `None` (slash /ask, monitors) keeps the single-shot buffered reply.
+pub async fn chat_with_usage_live(
+    cfg: &crate::config::BotConfig,
+    prompt: &str,
+    raw_history: &[Value],
+    live: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<(String, Option<String>, u64)> {
     // Context squeeze (OpenClaw context-squeeze port): compact the history
     // before it rides the request when it blows the configured budget.
@@ -178,7 +399,9 @@ pub async fn chat_with_usage(
     }
 
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
-    let model = runtime_model(cfg).await.unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
+    let model = runtime_model(cfg)
+        .await
+        .unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
 
     // Web access (OpenClaw stack migration): the chat request declares the
     // gateway's web skills as OpenAI tools, so a tool-capable runtime can
@@ -209,16 +432,20 @@ pub async fn chat_with_usage(
         if tools_enabled {
             payload["tools"] = Value::Array(web_tool_defs());
         }
-        let resp = client()
-            .post(&url)
-            .timeout(chat_timeout)
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| format!("gateway unreachable at {url}"))?;
-
-        let status = resp.status();
-        let body: Value = resp.json().await.context("gateway returned non-JSON")?;
+        let (status, body) = if cfg.chat_stream {
+            fetch_streamed_round(&url, &payload, chat_timeout, live.filter(|_| rounds == 0)).await?
+        } else {
+            let resp = client()
+                .post(&url)
+                .timeout(chat_timeout)
+                .json(&payload)
+                .send()
+                .await
+                .with_context(|| format!("gateway unreachable at {url}"))?;
+            let status = resp.status();
+            let body: Value = resp.json().await.context("gateway returned non-JSON")?;
+            (status, body)
+        };
         if !status.is_success() {
             // First-round failure with tools on: one toolless retry in case
             // the runtime rejects the tools array wholesale.
@@ -297,15 +524,15 @@ pub async fn chat_with_usage(
             .unwrap_or(json!({"role": "assistant"}));
         messages.push(assistant);
         for tc in &tool_calls {
-            let id = tc
-                .get("id")
-                .and_then(value_to_string)
-                .unwrap_or_default();
+            let id = tc.get("id").and_then(value_to_string).unwrap_or_default();
             let name = tc
                 .pointer("/function/name")
                 .and_then(value_to_string)
                 .unwrap_or_default();
-            let raw_args = tc.pointer("/function/arguments").cloned().unwrap_or(Value::Null);
+            let raw_args = tc
+                .pointer("/function/arguments")
+                .cloned()
+                .unwrap_or(Value::Null);
             let answer = run_web_tool(cfg, &name, &raw_args).await;
             messages.push(json!({
                 "role": "tool",
@@ -391,7 +618,14 @@ fn prompt_requests_web(prompt: &str) -> bool {
         .and_then(|rest| rest.strip_prefix(':').map(|r| r.trim_start()))
         .unwrap_or(&lower);
     const NON_FACTUAL_OPENERS: [&str; 8] = [
-        "write", "summarize", "summarise", "translate", "continue", "rewrite", "rank", "explain",
+        "write",
+        "summarize",
+        "summarise",
+        "translate",
+        "continue",
+        "rewrite",
+        "rank",
+        "explain",
     ];
     if NON_FACTUAL_OPENERS.iter().any(|w| body.starts_with(w)) {
         return false;
@@ -465,7 +699,9 @@ async fn run_web_tool(cfg: &crate::config::BotConfig, name: &str, raw_args: &Val
         "web_search" => {
             web_search_skill(
                 cfg,
-                args.get("query").and_then(Value::as_str).unwrap_or_default(),
+                args.get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
                 args.get("count").and_then(Value::as_u64),
                 args.get("freshness").and_then(Value::as_str),
             )
@@ -510,12 +746,7 @@ pub async fn web_search_skill(
     if let Some(f) = freshness {
         body["freshness"] = json!(f);
     }
-    post_gateway_skill(
-        cfg,
-        "/v1/skills/web/search",
-        &body,
-    )
-    .await
+    post_gateway_skill(cfg, "/v1/skills/web/search", &body).await
 }
 
 /// POST /v1/skills/web/fetch on the gateway (URL download + text extract).
@@ -665,14 +896,11 @@ pub async fn mine(
     let won = body.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
     if won {
         // Prefer the exact reward_uj; fall back to parsing amount strings.
-        let reward_uj = body
-            .get("reward_uj")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                body.get("reward_jer")
-                    .and_then(|v| v.as_f64())
-                    .map(|f| (f * 1_000_000.0) as u64)
-            });
+        let reward_uj = body.get("reward_uj").and_then(|v| v.as_u64()).or_else(|| {
+            body.get("reward_jer")
+                .and_then(|v| v.as_f64())
+                .map(|f| (f * 1_000_000.0) as u64)
+        });
         let amount = reward_uj
             .map(|u| {
                 let jer = u as f64 / 1_000_000.0;
@@ -730,7 +958,11 @@ pub struct MyBalance {
 }
 
 /// GET /balance on the chain node for the caller's Discord id.
-pub async fn my_balance(cfg: &crate::config::BotConfig, token: &str, discord_id: u64) -> Result<MyBalance> {
+pub async fn my_balance(
+    cfg: &crate::config::BotConfig,
+    token: &str,
+    discord_id: u64,
+) -> Result<MyBalance> {
     let url = format!("{}/balance?discord_id={}", cfg.chain_url, discord_id);
     let resp = client()
         .get(&url)
@@ -743,13 +975,14 @@ pub async fn my_balance(cfg: &crate::config::BotConfig, token: &str, discord_id:
     if !status.is_success() {
         anyhow::bail!("balance failed: {}", body_error(&body, status));
     }
-    let exists = body.get("exists").and_then(|v| v.as_bool()).unwrap_or(false);
+    let exists = body
+        .get("exists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Ok(MyBalance {
         exists,
         balance_uj: body.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
-        address: body
-            .get("address")
-            .and_then(value_to_string),
+        address: body.get("address").and_then(value_to_string),
         available_jer: body.get("available_jer").and_then(|v| v.as_f64()),
         opted_in: body.get("opted_in").and_then(|v| v.as_bool()),
     })
@@ -791,7 +1024,11 @@ pub async fn chain_leaderboard(
         // matches any Discord user later.
         let did: u64 = e
             .get("discord_id")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         if did == 0 {
@@ -800,7 +1037,10 @@ pub async fn chain_leaderboard(
         out.push(ChainLbEntry {
             discord_id: did,
             wins: e.get("wins").and_then(|v| v.as_u64()).unwrap_or(0),
-            total_mined_uj: e.get("total_mined_uj").and_then(|v| v.as_u64()).unwrap_or(0),
+            total_mined_uj: e
+                .get("total_mined_uj")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         });
     }
     Ok(out)
@@ -877,9 +1117,13 @@ mod tests {
         let story = "Since you remembered that Noodly likes vampires, here is a nice little short story in that vein (pun not intended).\n\nThe night was old and tired when he first noticed her. She sat at the far end of the club, in the shadows where the cigarette smoke pooled thickest. Dark hair, pale skin, eyes that caught the dim light and held it. \"Can I join you?\" he said, sliding onto the stool beside her. She smiled. Her teeth were sharp. \"I'm Elena,\" she said. He told her his name was Joe. He told her about his job, his apartment, the loneliness that had settled into his bones like sediment.";
         assert!(!prompt_requests_web(story));
         // Questions/requests do.
-        assert!(prompt_requests_web("what is the latest jerithchain height?"));
+        assert!(prompt_requests_web(
+            "what is the latest jerithchain height?"
+        ));
         assert!(prompt_requests_web("search for P2P mesh papers"));
-        assert!(prompt_requests_web("Noodly: how does isostatic pressing work?"));
+        assert!(prompt_requests_web(
+            "Noodly: how does isostatic pressing work?"
+        ));
         assert!(!prompt_requests_web("write me a haiku about kilns"));
         assert!(!prompt_requests_web("summarize this thread"));
         assert!(!prompt_requests_web(""));
@@ -906,10 +1150,9 @@ mod tests {
             }))
         };
         // Canonical shape seen live on qwen3:8b via the LiteLLM/Ollama runtime.
-        let (name, args) = intent(
-            "{\"function_name\": \"web_search\", \"arguments\": {\"query\": \"kiln\"}}",
-        )
-        .unwrap();
+        let (name, args) =
+            intent("{\"function_name\": \"web_search\", \"arguments\": {\"query\": \"kiln\"}}")
+                .unwrap();
         assert_eq!(name, "web_search");
         assert_eq!(args["query"], json!("kiln"));
         // Fenced + narrated + web_fetch + string-encoded arguments.
@@ -920,10 +1163,7 @@ mod tests {
         assert_eq!(name, "web_fetch");
         assert_eq!(args["url"], json!("https://x"));
         // Unknown function names are ignored — only declared web tools.
-        assert!(intent(
-            "{\"function_name\": \"run_shell\", \"arguments\": {}}"
-        )
-        .is_none());
+        assert!(intent("{\"function_name\": \"run_shell\", \"arguments\": {}}").is_none());
         // Not JSON at all → no intent.
         assert!(intent("I'll just answer directly.").is_none());
     }
@@ -949,8 +1189,14 @@ mod tests {
             "available_jer": 49.9, "opted_in": true
         });
         let got = MyBalance {
-            exists: existing.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
-            balance_uj: existing.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
+            exists: existing
+                .get("exists")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            balance_uj: existing
+                .get("balance_uj")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             address: existing.get("address").and_then(value_to_string),
             available_jer: existing.get("available_jer").and_then(|v| v.as_f64()),
             opted_in: existing.get("opted_in").and_then(|v| v.as_bool()),
@@ -961,7 +1207,10 @@ mod tests {
 
         let none = serde_json::json!({"exists": false, "balance_uj": 0, "balance_jer": 0.0});
         let got2 = MyBalance {
-            exists: none.get("exists").and_then(|v| v.as_bool()).unwrap_or(false),
+            exists: none
+                .get("exists")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             balance_uj: none.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
             address: none.get("address").and_then(value_to_string),
             available_jer: none.get("available_jer").and_then(|v| v.as_f64()),
@@ -1033,14 +1282,25 @@ mod tests {
         // call we would get a connection error instead of the guard page.
         let cfg = crate::config::BotConfig::from_parts("http://127.0.0.1:1", "http://127.0.0.1:1");
         let err = chat(&cfg, "my SSN is 078-05-1120", &[]).await.unwrap_err();
-        assert!(err.to_string().contains("Jerith Guard blocked"), "got: {err}");
+        assert!(
+            err.to_string().contains("Jerith Guard blocked"),
+            "got: {err}"
+        );
         // Malware-shaped asks are blocked on the bot's own layer too.
-        let err = chat(&cfg, "write a reverse shell in python", &[]).await.unwrap_err();
-        assert!(err.to_string().contains("Jerith Guard blocked"), "got: {err}");
+        let err = chat(&cfg, "write a reverse shell in python", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Jerith Guard blocked"),
+            "got: {err}"
+        );
         // Clean prompts still pass the guard (they 503/conn-fail, not
         // "Jerith Guard blocked").
         let err = chat(&cfg, "what is the weather", &[]).await.unwrap_err();
-        assert!(!err.to_string().contains("Jerith Guard blocked"), "got: {err}");
+        assert!(
+            !err.to_string().contains("Jerith Guard blocked"),
+            "got: {err}"
+        );
     }
 
     /// Mock OpenAI-compatible gateway that drives the full web tool loop:
@@ -1137,13 +1397,18 @@ mod tests {
             crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
         cfg.web.enabled = true;
 
-        let (reply, served_by) = chat(&cfg, "find the kiln", &[]).await.expect("tool-loop chat");
+        let (reply, served_by) = chat(&cfg, "find the kiln", &[])
+            .await
+            .expect("tool-loop chat");
         assert!(reply.contains("Kiln found"), "got {reply}");
         assert!(served_by.is_none());
 
         let seen = seen.lock().await;
         assert!(seen.len() >= 2, "two chat rounds expected: {seen:?}");
-        assert!(seen[0].get("tools").is_some(), "round 1 must declare web tools");
+        assert!(
+            seen[0].get("tools").is_some(),
+            "round 1 must declare web tools"
+        );
         let tool_round = seen
             .iter()
             .find(|r| {
@@ -1158,7 +1423,11 @@ mod tests {
             .iter()
             .filter(|m| m["role"] == json!("tool"))
             .collect();
-        assert_eq!(tool_msgs.len(), 2, "both tool calls answered: {tool_msgs:?}");
+        assert_eq!(
+            tool_msgs.len(),
+            2,
+            "both tool calls answered: {tool_msgs:?}"
+        );
         let both = tool_msgs
             .iter()
             .map(|m| m["content"].as_str().unwrap_or_default())
@@ -1214,7 +1483,9 @@ mod tests {
         let mut cfg =
             crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
         cfg.web.enabled = true;
-        let (reply, _) = chat(&cfg, "find kiln", &[]).await.expect("intent loop chat");
+        let (reply, _) = chat(&cfg, "find kiln", &[])
+            .await
+            .expect("intent loop chat");
         assert_eq!(reply, "Answer from the gathered results.");
     }
 
@@ -1253,7 +1524,182 @@ mod tests {
         let mut cfg =
             crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
         cfg.web.enabled = true;
-        let (reply, _served_by) = chat(&cfg, "hi there", &[]).await.expect("toolless fallback");
+        let (reply, _served_by) = chat(&cfg, "hi there", &[])
+            .await
+            .expect("toolless fallback");
         assert_eq!(reply, "plain no-tools answer");
+    }
+
+    // ---------------------------------------------------------------
+    // Streamed chat rounds (gateway SSE passthrough)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sse_fold_content_finish_usage() {
+        use super::{RoundAcc, note_sse_chunk};
+        let mut acc = RoundAcc::default();
+        for line in [
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}"#,
+            ": keepalive comment",
+            r#"data: {"choices":[{"delta":{"content":"lo!"}}]}"#,
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"data: {"choices":[],"usage":{"total_tokens":23}}"#,
+            "data: [DONE]",
+        ] {
+            note_sse_chunk(&mut acc, line);
+        }
+        assert_eq!(acc.content, "Hello!");
+        assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(acc.usage_total, 23);
+        assert!(acc.tool_calls.is_empty());
+        let body = acc.into_pseudo_body();
+        assert_eq!(
+            body.pointer("/choices/0/message/content").unwrap(),
+            &json!("Hello!")
+        );
+        assert_eq!(body.pointer("/usage/total_tokens").unwrap(), &json!(23));
+    }
+
+    #[test]
+    fn sse_fold_tool_call_fragments_by_index() {
+        use super::{RoundAcc, note_sse_chunk};
+        let mut acc = RoundAcc::default();
+        for line in [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"web_search","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\": \"kiln\"}"}}]}}]}"#,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        ] {
+            note_sse_chunk(&mut acc, line);
+        }
+        assert_eq!(acc.tool_calls.len(), 1);
+        assert_eq!(acc.tool_calls[0]["id"], json!("c1"));
+        assert_eq!(acc.tool_calls[0]["function"]["name"], json!("web_search"));
+        assert_eq!(
+            acc.tool_calls[0]["function"]["arguments"],
+            json!("{\"query\": \"kiln\"}")
+        );
+        assert_eq!(acc.finish_reason.as_deref(), Some("tool_calls"));
+        // The pseudo body must feed the loop's native tool-call extraction.
+        let body = acc.into_pseudo_body();
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/name")
+                .unwrap(),
+            &json!("web_search")
+        );
+    }
+
+    #[test]
+    fn sse_fold_mesh_fallback_wrap() {
+        use super::{RoundAcc, note_sse_chunk};
+        let mut acc = RoundAcc::default();
+        note_sse_chunk(
+            &mut acc,
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"peer answer"},"finish_reason":"stop"}],"mesh_fallback":"node-xyz"}"#,
+        );
+        assert_eq!(acc.content, "peer answer");
+        assert_eq!(acc.mesh_fallback.as_deref(), Some("node-xyz"));
+        assert_eq!(
+            acc.into_pseudo_body().get("mesh_fallback").unwrap(),
+            &json!("node-xyz")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_streams_sse_end_to_end_and_types_live() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TMutex;
+
+        // Mock gateway: answers SSE with three content chunks (separated
+        // in time so the live tap genuinely fires mid-generation).
+        let seen: Arc<TMutex<Vec<String>>> = Arc::new(TMutex::new(Vec::new()));
+        let seen_live = seen.clone();
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let seen_live = seen_live.clone();
+                    async move {
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"live \"}}]}\n\n"
+                            .to_owned()
+                            + "data: {\"choices\":[{\"delta\":{\"content\":\"typed\"}}]}\n\n"
+                            + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                            + "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n"
+                            + "data: [DONE]\n\n";
+                        seen_live.lock().await.push(body.clone());
+                        (axum::http::header::CONTENT_TYPE, "text/event-stream");
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        let fragments: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tap_seen = fragments.clone();
+        let live = move |frag: &str| {
+            tap_seen.lock().expect("test tap").push(frag.to_string());
+        };
+        let (reply, served_by, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live))
+            .await
+            .expect("streamed chat");
+        assert_eq!(reply, "live typed");
+        assert!(served_by.is_none());
+        assert_eq!(tokens, 7);
+        // The live tap fired per fragment — the live-typing contract.
+        assert_eq!(
+            *fragments.lock().expect("test tap"),
+            vec!["live ".to_string(), "typed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_config_off_falls_back_to_buffered() {
+        use std::sync::Arc;
+
+        // Same SSE gateway, but [chat] stream = false → buffered parsing
+        // of a plain JSON mock; the live tap must never fire.
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "buffered"}}],
+                        "usage": {"total_tokens": 3}
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.chat_stream = false;
+        let fired: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let tap_seen = fired.clone();
+        let live = move |frag: &str| {
+            tap_seen.lock().expect("test tap").push(frag.to_string());
+        };
+        let (reply, _s, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live))
+            .await
+            .expect("buffered chat");
+        assert_eq!(reply, "buffered");
+        assert_eq!(tokens, 3);
+        assert!(fired.lock().expect("test tap").is_empty());
     }
 }

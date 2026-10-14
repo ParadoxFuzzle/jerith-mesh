@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::bootstrap::{now_ms, PeerAd, PeerListResponse};
+use crate::bootstrap::{PeerAd, PeerListResponse, now_ms};
 
 /// How long an advertisement stays live without refresh.
 pub const DEFAULT_ADVERTISE_TTL_MS: u64 = 90_000;
@@ -263,22 +263,12 @@ pub async fn limiters_guard(
         // expected_node_id = the presented pubkey's fingerprint: the
         // signature must be BY the key that sponsors the bucket.
         let expected = auth.pubkey[..16.min(auth.pubkey.len())].to_string();
-        if auth
-            .validate(payload.as_bytes(), &expected)
-            .is_ok()
-            && !auth.pubkey.is_empty()
-        {
+        if auth.validate(payload.as_bytes(), &expected).is_ok() && !auth.pubkey.is_empty() {
             key = Some(crate::ratelimit::identity_key(&auth.pubkey));
             lane = l.identity.clone();
         }
     }
-    crate::ratelimit::enforce(
-        &lane.clone(),
-        key,
-        req,
-        next,
-    )
-    .await
+    crate::ratelimit::enforce(&lane.clone(), key, req, next).await
 }
 
 /// Split-out so tests can mount a tiny-budget limiter and reach 429s.
@@ -413,7 +403,7 @@ async fn advertise(
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "missing wire-auth headers"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let Ok(stamp_ms) = stamp.parse::<u64>() else {
@@ -468,7 +458,9 @@ async fn advertise(
             .into_response();
     }
     // Preserve score/history across re-advertise (identity is stable).
-    let entry = entries.remove(&ad.node_id).unwrap_or_else(|| entry_default_fields(ad.clone()));
+    let entry = entries
+        .remove(&ad.node_id)
+        .unwrap_or_else(|| entry_default_fields(ad.clone()));
     entries.insert(
         ad.node_id.clone(),
         Entry {
@@ -491,7 +483,11 @@ async fn report_dead(
     // vote counts. Unsigned reports are refused (fail-closed) — otherwise
     // anyone on the internet could evict any live peer with a handful of
     // identical POSTs (DEAD_VOTES_TO_EVICTION-threshold doS).
-    let stamp = match headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+    let stamp = match headers
+        .get("x-jerith-stamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
         Some(s) => s,
         None => return unauthorized("missing or malformed stamp"),
     };
@@ -556,7 +552,11 @@ fn verify_report_auth(
         Ok(s) => s,
         Err(_) => return Err(unauthorized("bad stamp")),
     };
-    let auth = crate::signing::WireAuth { pubkey, stamp_ms, sig };
+    let auth = crate::signing::WireAuth {
+        pubkey,
+        stamp_ms,
+        sig,
+    };
     if let Err(e) = auth.validate(expected_payload.as_bytes(), reporter_node_id) {
         tracing::warn!(reporter = %reporter_node_id, error = ?e, "rejected unsigned/forged report");
         return Err(unauthorized(&format!("wire auth failed: {e:?}")));
@@ -596,7 +596,13 @@ async fn report_fraud(
         )
             .into_response();
     }
-    if !matches!(rep.kind, FraudKind::FailedWorker | FraudKind::Leeching | FraudKind::DishonestResults | FraudKind::RateAbuse) {
+    if !matches!(
+        rep.kind,
+        FraudKind::FailedWorker
+            | FraudKind::Leeching
+            | FraudKind::DishonestResults
+            | FraudKind::RateAbuse
+    ) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "unknown fraud kind"})),
@@ -608,7 +614,11 @@ async fn report_fraud(
     // Without this check anyone on the internet could anonymous-slash any
     // peer's reputation (each distinct reporter name costs the target a
     // full penalty, and attacker-chosen names are free).
-    let stamp = match headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()) {
+    let stamp = match headers
+        .get("x-jerith-stamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
         Some(s) => s,
         None => return unauthorized("missing or malformed stamp"),
     };
@@ -639,10 +649,7 @@ async fn report_fraud(
     let now = now_ms();
 
     // Was this kind already reported by someone else before this report?
-    let kind_already_seen = entry
-        .fraud_reports
-        .values()
-        .any(|(k, _)| k == &rep.kind);
+    let kind_already_seen = entry.fraud_reports.values().any(|(k, _)| k == &rep.kind);
     // Count of distinct reporters who already reported this kind.
     let prior_kind_reporters = entry
         .fraud_reports
@@ -650,8 +657,7 @@ async fn report_fraud(
         .filter(|(k, _)| k == &rep.kind)
         .count() as u32;
 
-    let already_reported_by_this_reporter =
-        entry.fraud_reports.contains_key(&rep.reporter);
+    let already_reported_by_this_reporter = entry.fraud_reports.contains_key(&rep.reporter);
 
     if already_reported_by_this_reporter {
         // First claim by a reporter wins; later reports only refresh the
@@ -739,7 +745,11 @@ pub async fn serve(options: BootstrapOptions) -> anyhow::Result<()> {
     // Peer connect info is required for the per-IP rate limiter's fallback
     // attribution (headers take precedence when present, e.g. behind the
     // tunnel).
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -765,9 +775,9 @@ async fn _path_used(_: Path<String>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::config::NodeRole;
     use crate::models::{ModelId, ModelSource};
+    use std::time::Duration;
 
     /// A peer ad backed by a real signing identity (node_id = fingerprint).
     fn make_peer(model: &str) -> (crate::signing::SigningIdentity, PeerAd) {
@@ -805,8 +815,14 @@ mod tests {
         let client = reqwest::Client::new();
 
         // Empty at first.
-        let counts: Vec<serde_json::Value> =
-            client.get(format!("{base}/v1/models/counts")).send().await.unwrap().json().await.unwrap();
+        let counts: Vec<serde_json::Value> = client
+            .get(format!("{base}/v1/models/counts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert!(counts.is_empty());
 
         // Two glm-5.3 nodes, one qwen node — all signed by real identities.
@@ -835,8 +851,14 @@ mod tests {
         assert!(list.peers.iter().all(|p| p.model_id == "glm-5.3"));
 
         // Counts aggregate per model.
-        let counts: Vec<serde_json::Value> =
-            client.get(format!("{base}/v1/models/counts")).send().await.unwrap().json().await.unwrap();
+        let counts: Vec<serde_json::Value> = client
+            .get(format!("{base}/v1/models/counts"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(counts.len(), 2);
         let glm = counts.iter().find(|c| c["model_id"] == "glm-5.3").unwrap();
         assert_eq!(glm["count"], 2);
@@ -938,7 +960,10 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(list.peers.is_empty(), "expired entry must drop from the list");
+        assert!(
+            list.peers.is_empty(),
+            "expired entry must drop from the list"
+        );
     }
 
     /// Regression test for the ms-boundary stamp race: rapid freshly-signed
@@ -993,10 +1018,7 @@ mod tests {
         // 401s. See signing::WireAuth::with_stamp.
         let auth = crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
         let mut h = axum::http::HeaderMap::new();
-        h.insert(
-            "x-jerith-pubkey",
-            auth.pubkey.parse().unwrap(),
-        );
+        h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
         h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
         h.insert("x-jerith-sig", auth.sig.parse().unwrap());
         h
@@ -1071,7 +1093,10 @@ mod tests {
         };
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-jerith-pubkey", forged.pubkey.parse().unwrap());
-        h.insert("x-jerith-stamp", forged.stamp_ms.to_string().parse().unwrap());
+        h.insert(
+            "x-jerith-stamp",
+            forged.stamp_ms.to_string().parse().unwrap(),
+        );
         h.insert("x-jerith-sig", forged.sig.parse().unwrap());
         let r = client
             .put(&url)
@@ -1087,17 +1112,12 @@ mod tests {
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 
         // Stale stamp (replay) → 401.
-        let old = crate::bootstrap::now_ms()
-            - crate::signing::STAMP_MAX_AGE_MS
-            - 5_000;
+        let old = crate::bootstrap::now_ms() - crate::signing::STAMP_MAX_AGE_MS - 5_000;
         let payload = crate::signing::advertise_payload(&good, old);
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-jerith-pubkey", id.pubkey_hex().parse().unwrap());
         h.insert("x-jerith-stamp", old.to_string().parse().unwrap());
-        h.insert(
-            "x-jerith-sig",
-            id.sign(payload.as_bytes()).parse().unwrap(),
-        );
+        h.insert("x-jerith-sig", id.sign(payload.as_bytes()).parse().unwrap());
         let r = client
             .put(&url)
             .headers(h)
@@ -1152,8 +1172,8 @@ mod tests {
         // Every string field over its sanity cap → 400, rejected BEFORE any
         // signature work (no headers needed: validation precedes wire auth).
         // Each rejection also bumps the process-local oversize counter.
-        let before = crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let before =
+            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS.load(std::sync::atomic::Ordering::Relaxed);
         let bad = serde_json::to_value(make_peer("glm-5.3").1).unwrap();
         for field in ["node_id", "model_id", "quant", "address", "rpc_address"] {
             let mut candidate = bad.clone();
@@ -1169,8 +1189,7 @@ mod tests {
         // Parallel test streams share the counter: a delta >= 5 proves OUR
         // five rejections each bumped it (monotonic counter).
         assert!(
-            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS
-                .load(std::sync::atomic::Ordering::Relaxed)
+            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS.load(std::sync::atomic::Ordering::Relaxed)
                 >= before + 5,
             "five field-cap rejections must bump the oversize counter"
         );
@@ -1272,8 +1291,7 @@ mod tests {
         // same process-local oversize counter (delta >= 1; the earlier
         // accepted/refresh ads must not have bumped it).
         assert!(
-            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS
-                .load(std::sync::atomic::Ordering::Relaxed)
+            crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS.load(std::sync::atomic::Ordering::Relaxed)
                 >= 1,
             "registry-cap refusal must bump the oversize counter"
         );
@@ -1341,12 +1359,18 @@ mod tests {
         let url = format!("http://{addr}/v1/models/counts");
 
         for _ in 0..3 {
-            assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::OK);
+            assert_eq!(
+                client.get(&url).send().await.unwrap().status(),
+                StatusCode::OK
+            );
         }
         let r = client.get(&url).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
-            r.headers().get("retry-after").and_then(|v| v.to_str().ok()).is_some(),
+            r.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .is_some(),
             "429 must carry Retry-After"
         );
         let body: serde_json::Value = r.json().await.unwrap();
@@ -1376,7 +1400,10 @@ mod tests {
             .await
             .unwrap();
         });
-        (reqwest::Client::new(), format!("http://{addr}/v1/peers?model=lane-test"))
+        (
+            reqwest::Client::new(),
+            format!("http://{addr}/v1/peers?model=lane-test"),
+        )
     }
 
     #[tokio::test]
@@ -1406,16 +1433,9 @@ mod tests {
         // though the same IP's anonymous bucket is long exhausted.
         for i in 0..10 {
             let stamp = now_ms();
-            let headers = signed_headers_for(
-                &identity,
-                &crate::signing::peers_fetch_payload(stamp),
-            );
-            let r = client
-                .get(&url)
-                .headers(headers)
-                .send()
-                .await
-                .unwrap();
+            let headers =
+                signed_headers_for(&identity, &crate::signing::peers_fetch_payload(stamp));
+            let r = client.get(&url).headers(headers).send().await.unwrap();
             assert_eq!(
                 r.status(),
                 StatusCode::OK,
@@ -1696,14 +1716,18 @@ mod tests {
         assert_eq!(e.score, -60);
 
         // A report 2 full days old → -60 + 4 = -56.
-        e.fraud_reports
-            .insert("r1".into(), (FraudKind::Leeching, now_ms() - 2 * 86_400_000));
+        e.fraud_reports.insert(
+            "r1".into(),
+            (FraudKind::Leeching, now_ms() - 2 * 86_400_000),
+        );
         apply_recovery(&mut e, now_ms());
         assert_eq!(e.score, -56);
 
         // Long recovery: 60 days → capped at 0.
-        e.fraud_reports
-            .insert("r1".into(), (FraudKind::Leeching, now_ms() - 60 * 86_400_000));
+        e.fraud_reports.insert(
+            "r1".into(),
+            (FraudKind::Leeching, now_ms() - 60 * 86_400_000),
+        );
         apply_recovery(&mut e, now_ms());
         assert_eq!(e.score, 0);
 
@@ -1737,7 +1761,10 @@ mod tests {
         let stamp = 7_000_000;
         let fresh_stamp = crate::bootstrap::now_ms();
         let legacy = crate::signing::legacy_ad_excerpt(&a, stamp);
-        assert!(!legacy.contains("127.0.0.1:9001"), "legacy payload must exclude rpc_address");
+        assert!(
+            !legacy.contains("127.0.0.1:9001"),
+            "legacy payload must exclude rpc_address"
+        );
         assert!(legacy.ends_with("hybrid"), "legacy payload ends at role");
         // And a legacy-issued signature validates against it (fresh stamp).
         let legacy_fresh = crate::signing::legacy_ad_excerpt(&a, fresh_stamp);

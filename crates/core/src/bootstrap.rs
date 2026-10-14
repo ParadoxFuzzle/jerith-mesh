@@ -171,9 +171,7 @@ impl PeerRegistry {
     pub fn connectable(&self) -> Vec<(&PeerAd, PeerHealth)> {
         self.peers
             .iter()
-            .filter_map(|(id, ad)| {
-                self.health.get(id).map(|h| (ad, h.clone()))
-            })
+            .filter_map(|(id, ad)| self.health.get(id).map(|h| (ad, h.clone())))
             .filter(|(_, h)| h.state != PeerState::Deprecated)
             .collect()
     }
@@ -401,8 +399,6 @@ impl BootstrapClient {
     }
 }
 
-
-
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -525,7 +521,6 @@ mod tests {
         reg.record_ping_fail("ghost");
         assert!(reg.is_empty());
     }
-
 
     #[test]
     fn urlencode_encodes_specials() {

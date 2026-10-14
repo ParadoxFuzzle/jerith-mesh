@@ -25,7 +25,7 @@
 //! Config (`[squeeze]` in bot.toml; see config.rs SqueezeConfig). Setting
 //! `enabled = false` restores the plain 8-turn ring semantics verbatim.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Per-message hard-trim ceiling (chars): a message longer than this in a
 /// squeezed ring keeps its head and a marker.
@@ -37,7 +37,10 @@ const TRIM_MARKER: &str = "… [trimmed by context squeeze]";
 /// Trim one message's content in place (keeps head). Returns true when a
 /// trim happened.
 fn trim_message(msg: &mut Value, max: usize) -> bool {
-    let Some(content) = msg.get("content").and_then(Value::as_str).map(str::to_string)
+    let Some(content) = msg
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_string)
     else {
         return false;
     };
@@ -46,10 +49,7 @@ fn trim_message(msg: &mut Value, max: usize) -> bool {
     }
     let kept: String = content.chars().take(max).collect();
     if let Some(obj) = msg.as_object_mut() {
-        obj.insert(
-            "content".to_string(),
-            json!(format!("{kept}{TRIM_MARKER}")),
-        );
+        obj.insert("content".to_string(), json!(format!("{kept}{TRIM_MARKER}")));
     }
     true
 }

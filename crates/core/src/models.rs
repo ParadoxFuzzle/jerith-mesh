@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hw::{HardwareReport, GpuVendor};
+use crate::hw::{GpuVendor, HardwareReport};
 
 /// A model in the curated catalog or a user-provided model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -75,22 +75,45 @@ pub fn curated() -> Vec<ModelSpec> {
         ("glm-5.2", "GLM-5.2", 10.5, 2.5, 45.0, Text),
         ("glm-5.3", "GLM-5.3", 10.5, 2.5, 45.0, Text),
         ("glm-5.3-flash", "GLM-5.3-Flash", 8.0, 2.0, 22.0, Text),
-        ("deepseek-v4-flash", "DeepSeek-V4-Flash", 7.5, 2.0, 22.0, Text),
-        ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", 8.5, 2.5, 26.0, Text),
+        (
+            "deepseek-v4-flash",
+            "DeepSeek-V4-Flash",
+            7.5,
+            2.0,
+            22.0,
+            Text,
+        ),
+        (
+            "deepseek-v4.1-flash",
+            "DeepSeek-V4.1-Flash",
+            8.5,
+            2.5,
+            26.0,
+            Text,
+        ),
         ("kimi-k3", "Kimi K3", 12.0, 3.0, 55.0, Text),
-        ("qwen3.8-flash-next", "Qwen3.8-Flash-Next", 6.0, 1.5, 16.0, Text),
+        (
+            "qwen3.8-flash-next",
+            "Qwen3.8-Flash-Next",
+            6.0,
+            1.5,
+            16.0,
+            Text,
+        ),
         ("qwen-image-2.1", "Qwen-Image-2.1", 5.0, 2.0, 25.0, ImageGen),
     ];
     models
         .into_iter()
-        .map(|(id, name, res_gib, cache_gib, disk_gib, modality)| ModelSpec {
-            id: id.to_string(),
-            display_name: name.to_string(),
-            resident_ram_bytes: (res_gib * 1024.0 * 1024.0 * 1024.0) as u64,
-            min_expert_cache_bytes: (cache_gib * 1024.0 * 1024.0 * 1024.0) as u64,
-            disk_bytes: (disk_gib * 1024.0 * 1024.0 * 1024.0) as u64,
-            modality,
-        })
+        .map(
+            |(id, name, res_gib, cache_gib, disk_gib, modality)| ModelSpec {
+                id: id.to_string(),
+                display_name: name.to_string(),
+                resident_ram_bytes: (res_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+                min_expert_cache_bytes: (cache_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+                disk_bytes: (disk_gib * 1024.0 * 1024.0 * 1024.0) as u64,
+                modality,
+            },
+        )
         .collect()
 }
 
@@ -216,7 +239,10 @@ mod tests {
             "qwen3.8-flash-next",
             "qwen-image-2.1",
         ] {
-            assert!(ids.iter().any(|id| id == want), "missing curated model {want}");
+            assert!(
+                ids.iter().any(|id| id == want),
+                "missing curated model {want}"
+            );
         }
     }
 
@@ -233,20 +259,22 @@ mod tests {
         );
         let fits = detect_capable_models(&hw);
         let yes = fits.iter().filter(|f| f.fits).count();
-        assert!(yes >= 6, "expected most models to fit on big machine, got {yes}");
+        assert!(
+            yes >= 6,
+            "expected most models to fit on big machine, got {yes}"
+        );
     }
 
     #[test]
     fn small_machine_fits_at_least_one_model() {
         // 16 GiB total with 12 GiB free: smallest curated model (~7.5 GiB
         // resident+cache) should fit, larger ones should not.
-        let hw = fake_hw(
-            16 * 1024 * 1024 * 1024,
-            12 * 1024 * 1024 * 1024,
-            None,
-        );
+        let hw = fake_hw(16 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024, None);
         let fits = detect_capable_models(&hw);
-        assert!(fits.iter().any(|f| f.fits), "smallest model should fit with 12 GiB free");
+        assert!(
+            fits.iter().any(|f| f.fits),
+            "smallest model should fit with 12 GiB free"
+        );
         assert!(
             fits.iter().filter(|f| f.fits).count() <= 4,
             "only the smaller models should fit"
@@ -275,17 +303,15 @@ mod tests {
                 vram_bytes: 8 * 1024 * 1024 * 1024,
             }),
         );
-        assert!(usable_ram_bytes(&with_gpu) + gpu_boost_bytes(&with_gpu)
-            > usable_ram_bytes(&no_gpu) + gpu_boost_bytes(&no_gpu));
+        assert!(
+            usable_ram_bytes(&with_gpu) + gpu_boost_bytes(&with_gpu)
+                > usable_ram_bytes(&no_gpu) + gpu_boost_bytes(&no_gpu)
+        );
     }
 
     #[test]
     fn recommended_is_largest_fitting_text_model() {
-        let hw = fake_hw(
-            32 * 1024 * 1024 * 1024,
-            28 * 1024 * 1024 * 1024,
-            None,
-        );
+        let hw = fake_hw(32 * 1024 * 1024 * 1024, 28 * 1024 * 1024 * 1024, None);
         let rec = recommended_model(&hw).expect("recommended should exist");
         assert_eq!(rec.modality, ModelModality::Text);
         let all_fits = detect_capable_models(&hw);
@@ -293,7 +319,10 @@ mod tests {
             .iter()
             .filter(|f| f.fits && f.model.modality == ModelModality::Text)
             .any(|f| f.model.resident_ram_bytes > rec.resident_ram_bytes);
-        assert!(!bigger_fitting, "recommended should be the largest fitting model");
+        assert!(
+            !bigger_fitting,
+            "recommended should be the largest fitting model"
+        );
     }
 
     #[test]

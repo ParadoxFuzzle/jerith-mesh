@@ -25,7 +25,7 @@ pub mod websearch;
 pub use bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState};
 pub use config::{MemoryBackend, NodeConfig, NodeRole, SetupChoices};
 pub use models::{
-    curated, detect_capable_models, format_bytes, recommended_model, ModelFit, ModelId,
-    ModelSpec, ModelSource,
+    ModelFit, ModelId, ModelSource, ModelSpec, curated, detect_capable_models, format_bytes,
+    recommended_model,
 };
 pub use ping::{MeshLoop, MeshState, Meters};

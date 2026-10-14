@@ -63,7 +63,10 @@ pub enum NodeRpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeRpcReply {
-    Pong { node_id: String, stamp_ms: u64 },
+    Pong {
+        node_id: String,
+        stamp_ms: u64,
+    },
     /// Expert activation + commitment: SHA-256 over the canonical
     /// (req_id, expert_id, node_id, input, output) tuple — Phase 4
     /// verification. `None` only from pre-Phase-4 peers (accepted without a
@@ -76,8 +79,15 @@ pub enum NodeRpcReply {
         commitment: Option<String>,
     },
     /// Full chat-completion reply from a peer's runtime.
-    ChatResult { req_id: String, content: String, node_id: String },
-    Error { req_id: String, message: String },
+    ChatResult {
+        req_id: String,
+        content: String,
+        node_id: String,
+    },
+    Error {
+        req_id: String,
+        message: String,
+    },
 }
 
 /// Sign a request in place (stamp + Ed25519 over the canonical payload).
@@ -85,13 +95,19 @@ pub enum NodeRpcReply {
 pub fn sign_request(req: &mut NodeRpcRequest, identity: &SigningIdentity) {
     let stamp = crate::bootstrap::now_ms();
     match req {
-        NodeRpcRequest::Ping { stamp_ms, sig: _, .. } => {
+        NodeRpcRequest::Ping {
+            stamp_ms, sig: _, ..
+        } => {
             *stamp_ms = stamp;
         }
-        NodeRpcRequest::ExpertQuery { stamp_ms, sig: _, .. } => {
+        NodeRpcRequest::ExpertQuery {
+            stamp_ms, sig: _, ..
+        } => {
             *stamp_ms = stamp;
         }
-        NodeRpcRequest::ChatQuery { stamp_ms, sig: _, .. } => {
+        NodeRpcRequest::ChatQuery {
+            stamp_ms, sig: _, ..
+        } => {
             *stamp_ms = stamp;
         }
     }
@@ -111,11 +127,22 @@ fn request_payload_for_stamp(req: &NodeRpcRequest, stamp: u64) -> String {
         NodeRpcRequest::Ping { from_node_id, .. } => {
             format!("rpc-ping1|{from_node_id}|{stamp}")
         }
-        NodeRpcRequest::ExpertQuery { req_id, expert_id, input, from_node_id, .. } => format!(
+        NodeRpcRequest::ExpertQuery {
+            req_id,
+            expert_id,
+            input,
+            from_node_id,
+            ..
+        } => format!(
             "rpc-expq1|{req_id}|{expert_id}|{}|{from_node_id}|{stamp}",
             hex::encode(pack_f32(input))
         ),
-        NodeRpcRequest::ChatQuery { req_id, messages, from_node_id, .. } => format!(
+        NodeRpcRequest::ChatQuery {
+            req_id,
+            messages,
+            from_node_id,
+            ..
+        } => format!(
             "rpc-chatq1|{req_id}|{}|{from_node_id}|{stamp}",
             hex::encode(serde_json::to_vec(messages).unwrap_or_default())
         ),
@@ -215,7 +242,10 @@ impl ExpertRouter {
     }
 
     pub async fn register_local_expert(&self, expert_id: &str) {
-        self.local_experts.write().await.insert(expert_id.to_string());
+        self.local_experts
+            .write()
+            .await
+            .insert(expert_id.to_string());
     }
 
     /// Drop a locally-hosted expert (e.g., evicted from cache).
@@ -249,7 +279,10 @@ impl ExpertRouter {
             .collect();
         remotes.sort_by_key(|(_, rtt)| *rtt);
         for (id, rtt) in remotes {
-            plan.push(ExpertLocation::Remote { node_id: id, rtt_ms: rtt });
+            plan.push(ExpertLocation::Remote {
+                node_id: id,
+                rtt_ms: rtt,
+            });
         }
         plan
     }
@@ -357,8 +390,15 @@ impl ExpertRouter {
                 sig: String::new(),
             };
             sign_request(&mut req, identity);
-            match call(endpoint, *addr, &node_id, &req, identity, self.options.dispatch_timeout)
-                .await
+            match call(
+                endpoint,
+                *addr,
+                &node_id,
+                &req,
+                identity,
+                self.options.dispatch_timeout,
+            )
+            .await
             {
                 Ok(NodeRpcReply::ChatResult {
                     req_id: rid,
@@ -383,7 +423,10 @@ impl ExpertRouter {
                     );
                     return Ok((content, node_id));
                 }
-                Ok(NodeRpcReply::Error { req_id: _id, message }) => {
+                Ok(NodeRpcReply::Error {
+                    req_id: _id,
+                    message,
+                }) => {
                     last_err = anyhow::anyhow!("peer rejected chat: {message}");
                 }
                 Ok(other) => {
@@ -433,17 +476,8 @@ impl ExpertRouter {
                             // trusting this remote result.
                             match self
                                 .replay_verify(
-                                    endpoint,
-                                    identity,
-                                    peer_addrs,
-                                    req_id,
-                                    expert_id,
-                                    input,
-                                    &plan,
-                                    idx,
-                                    node_id,
-                                    &out,
-                                    &local_run,
+                                    endpoint, identity, peer_addrs, req_id, expert_id, input,
+                                    &plan, idx, node_id, &out, &local_run,
                                 )
                                 .await
                             {
@@ -550,12 +584,7 @@ impl ExpertRouter {
                 match commitment {
                     Some(c) => {
                         let ok = crate::verify::verify_commitment(
-                            req_id,
-                            expert_id,
-                            node_id,
-                            input,
-                            &output,
-                            &c,
+                            req_id, expert_id, node_id, input, &output, &c,
                         );
                         // note_commitment already flags the peer on failure.
                         self.verify.note_commitment(node_id, ok).await;
@@ -570,9 +599,10 @@ impl ExpertRouter {
                     None => Ok(output),
                 }
             }
-            Ok(NodeRpcReply::Error { req_id: _id, message }) => {
-                Err(anyhow::anyhow!("peer rejected expert query: {message}"))
-            }
+            Ok(NodeRpcReply::Error {
+                req_id: _id,
+                message,
+            }) => Err(anyhow::anyhow!("peer rejected expert query: {message}")),
             Ok(other) => Err(anyhow::anyhow!("unexpected reply kind: {other:?}")),
             Err(e) => Err(anyhow::anyhow!("quic dispatch failed: {e}")),
         }
@@ -644,11 +674,8 @@ impl ExpertRouter {
             return ReplayVerdict::Trusted;
         };
 
-        if crate::verify::outputs_agree(
-            origin_output,
-            &arbiter_out,
-            self.options.verify_tolerance,
-        ) {
+        if crate::verify::outputs_agree(origin_output, &arbiter_out, self.options.verify_tolerance)
+        {
             self.verify.note_replay(true).await;
             return ReplayVerdict::Trusted;
         }
@@ -667,7 +694,9 @@ impl ExpertRouter {
                 ReplayVerdict::RejectContinue
             }
             Some(other) => {
-                self.verify.flag_dishonest(&[origin_node_id, other.as_str()]).await;
+                self.verify
+                    .flag_dishonest(&[origin_node_id, other.as_str()])
+                    .await;
                 tracing::warn!(
                     target: "mesh",
                     peers = [origin_node_id, other.as_str()].join(" "),
@@ -708,7 +737,9 @@ pub struct NodeCert {
 ///
 /// Phase 1 used a random cert (identity proof was per-message Ed25519 only).
 /// This closes the transport-level gap noted in UPGRADE.md / FEATURES.
-pub fn generate_node_cert_for(identity: &crate::signing::SigningIdentity) -> anyhow::Result<NodeCert> {
+pub fn generate_node_cert_for(
+    identity: &crate::signing::SigningIdentity,
+) -> anyhow::Result<NodeCert> {
     // ring's Ed25519KeyPair::generate_pkcs8 serializes the 32-byte seed as a
     // PKCS#8 v2 doc; rcgen consumes the same form for Ed25519 (PKCS_ED25519
     // alg). ed25519-dalek's SigningKey.to_bytes() is that same seed.
@@ -727,7 +758,8 @@ pub fn generate_node_cert_for(identity: &crate::signing::SigningIdentity) -> any
     .map_err(|e| anyhow::anyhow!("ed25519 cert key derivation failed: {e}"))?;
     let params = rcgen::CertificateParams::new(vec!["jerith-mesh-node".to_string()])
         .map_err(|e| anyhow::anyhow!("cert params failed: {e}"))?;
-    let cert = params.self_signed(&key_pair)
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| anyhow::anyhow!("self-signed cert failed: {e}"))?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -759,8 +791,10 @@ pub fn generate_node_cert() -> anyhow::Result<NodeCert> {
 ///       0x04 0x20             OCTET STRING, 32 (the seed)
 fn ed25519_pkcs8_from_seed(seed: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(48);
-    out.extend_from_slice(&[0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05,
-                             0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20]);
+    out.extend_from_slice(&[
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ]);
     out.extend_from_slice(seed);
     out
 }
@@ -926,8 +960,16 @@ pub fn pinned_client_endpoint_dyn(pins: SharedPinMap) -> anyhow::Result<quinn::E
                     ))));
                 }
             };
-            let v = PinningVerifier { pins: Arc::new(pins) };
-            v.verify_server_cert(end_entity, _intermediates, server_name, _ocsp_response, _now)
+            let v = PinningVerifier {
+                pins: Arc::new(pins),
+            };
+            v.verify_server_cert(
+                end_entity,
+                _intermediates,
+                server_name,
+                _ocsp_response,
+                _now,
+            )
         }
 
         fn verify_tls12_signature(
@@ -959,7 +1001,9 @@ pub fn pinned_client_endpoint_dyn(pins: SharedPinMap) -> anyhow::Result<quinn::E
         }
 
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
     let mut crypto = rustls::ClientConfig::builder()
@@ -1019,11 +1063,8 @@ fn extract_ed25519_spki_hex(
         // A BIT STRING of exactly 33 bytes (1 unused-bits byte + 32 key)
         // right after the alg id = this is the SPKI. (The signature's BIT
         // STRING is 65 bytes: 1 unused byte + 64 ed25519 sig.)
-        let is_spki_bitstring = der.get(i) == Some(&0x03)
-            && der
-                .get(i + 1)
-                .map(|len| *len == 33)
-                .unwrap_or(false);
+        let is_spki_bitstring =
+            der.get(i) == Some(&0x03) && der.get(i + 1).map(|len| *len == 33).unwrap_or(false);
         if is_spki_bitstring {
             match der.get(i + 2) {
                 Some(0x00) => {}
@@ -1045,7 +1086,6 @@ fn extract_ed25519_spki_hex(
     };
     Ok(key_hex)
 }
-
 
 /// Build a server endpoint on `addr` with a random cert. Kept for offline
 /// tests; production code uses `server_endpoint_for` (identity-bound cert).
@@ -1105,9 +1145,7 @@ pub trait ExpertHandler: Send + Sync {
         &'a self,
         _messages: &'a [serde_json::Value],
     ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async {
-            anyhow::bail!("handler does not support chat completions")
-        })
+        Box::pin(async { anyhow::bail!("handler does not support chat completions") })
     }
 }
 
@@ -1200,7 +1238,12 @@ async fn handle_connection(
                             node_id: server_id,
                             stamp_ms: crate::bootstrap::now_ms(),
                         },
-                        NodeRpcRequest::ExpertQuery { req_id, expert_id, input, .. } => {
+                        NodeRpcRequest::ExpertQuery {
+                            req_id,
+                            expert_id,
+                            input,
+                            ..
+                        } => {
                             // Bound what reaches the handler (and its
                             // runtime forward): the frame cap bounds the
                             // wire, but a parsed 200M-float input would
@@ -1215,34 +1258,32 @@ async fn handle_connection(
                                     ),
                                 }
                             } else {
-                                match handler.run(&expert_id, &input) {                                    Ok(output) => {
-                                    // Phase 4: commit to the result *before*
-                                    // the requester has decided whether it
-                                    // will replay-check — enables efficient
-                                    // fraud proofs later.
-                                    let commitment =
-                                        crate::verify::result_commitment(
-                                            &req_id,
-                                            &expert_id,
-                                            &server_id,
-                                            &input,
-                                            &output,
+                                match handler.run(&expert_id, &input) {
+                                    Ok(output) => {
+                                        // Phase 4: commit to the result *before*
+                                        // the requester has decided whether it
+                                        // will replay-check — enables efficient
+                                        // fraud proofs later.
+                                        let commitment = crate::verify::result_commitment(
+                                            &req_id, &expert_id, &server_id, &input, &output,
                                         );
-                                    NodeRpcReply::ExpertResult {
-                                        req_id,
-                                        output,
-                                        node_id: server_id,
-                                        commitment: Some(commitment),
+                                        NodeRpcReply::ExpertResult {
+                                            req_id,
+                                            output,
+                                            node_id: server_id,
+                                            commitment: Some(commitment),
+                                        }
                                     }
+                                    Err(e) => NodeRpcReply::Error {
+                                        req_id,
+                                        message: e.to_string(),
+                                    },
                                 }
-                                Err(e) => NodeRpcReply::Error {
-                                    req_id,
-                                    message: e.to_string(),
-                                },
-                            }
                             }
                         }
-                        NodeRpcRequest::ChatQuery { req_id, messages, .. } => {
+                        NodeRpcRequest::ChatQuery {
+                            req_id, messages, ..
+                        } => {
                             // Mirror the gateway's chat forward cap: the
                             // per-peer runtime visit is one request, and
                             // an oversized chat body would relay the
@@ -1257,16 +1298,16 @@ async fn handle_connection(
                                 }
                             } else {
                                 match handler.chat(&messages).await {
-                                Ok(content) => NodeRpcReply::ChatResult {
-                                    req_id,
-                                    content,
-                                    node_id: server_id,
-                                },
-                                Err(e) => NodeRpcReply::Error {
-                                    req_id,
-                                    message: e.to_string(),
-                                },
-                            }
+                                    Ok(content) => NodeRpcReply::ChatResult {
+                                        req_id,
+                                        content,
+                                        node_id: server_id,
+                                    },
+                                    Err(e) => NodeRpcReply::Error {
+                                        req_id,
+                                        message: e.to_string(),
+                                    },
+                                }
                             }
                         }
                     },
@@ -1320,9 +1361,7 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
             Some(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > MAX_RPC_FRAME_BYTES {
-                    anyhow::bail!(
-                        "rpc frame exceeds {MAX_RPC_FRAME_BYTES} bytes"
-                    );
+                    anyhow::bail!("rpc frame exceeds {MAX_RPC_FRAME_BYTES} bytes");
                 }
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     buf.truncate(pos);
@@ -1398,9 +1437,7 @@ impl RuntimeExpert {
             })
             .unwrap_or_default();
         if !served.iter().any(|s| s.contains(model)) && !model.is_empty() {
-            anyhow::bail!(
-                "runtime does not serve model {model:?} (serves: {served:?})"
-            );
+            anyhow::bail!("runtime does not serve model {model:?} (serves: {served:?})");
         }
         Ok(Self {
             runtime_url: runtime_url.to_string(),
@@ -1430,7 +1467,6 @@ impl ExpertHandler for RuntimeExpert {
     ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
         Box::pin(async move { self.chat_impl(messages).await })
     }
-
 }
 
 impl RuntimeExpert {
@@ -1450,9 +1486,8 @@ impl RuntimeExpert {
         let expert_id = expert_id.to_string();
         let input = input.to_vec();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                this.run_async(&expert_id, &input).await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async move { this.run_async(&expert_id, &input).await })
         })
     }
 
@@ -1486,13 +1521,9 @@ impl RuntimeExpert {
         // tier disabled by config `""` never engages).
         let vision = self.vision_model.as_ref().filter(|s| !s.is_empty());
         let deep = self.deep_model.as_ref().filter(|s| !s.is_empty());
-        let model = if vision.is_some()
-            && crate::model_router::has_image_content(messages)
-        {
+        let model = if vision.is_some() && crate::model_router::has_image_content(messages) {
             vision.unwrap().clone()
-        } else if deep.is_some()
-            && crate::model_router::is_complex(messages)
-        {
+        } else if deep.is_some() && crate::model_router::is_complex(messages) {
             deep.unwrap().clone()
         } else {
             self.model.clone()
@@ -1619,8 +1650,8 @@ mod tests {
             ("near-b".into(), 25, true, true),
             ("far-c".into(), 180, true, true),
             ("far-d".into(), 240, true, true),
-            ("dead-e".into(), 5, true, false),     // not alive → excluded
-            ("noexp-f".into(), 3, false, true),    // lacks expert → excluded
+            ("dead-e".into(), 5, true, false), // not alive → excluded
+            ("noexp-f".into(), 3, false, true), // lacks expert → excluded
         ]
     }
 
@@ -1654,15 +1685,21 @@ mod tests {
         let plan = r.plan_dispatch("exp-1", &peers()).await;
         assert_eq!(plan.first(), Some(&ExpertLocation::Local));
         // Then nearby peers by ascending RTT.
-        assert!(matches!(plan[1], ExpertLocation::Remote { ref node_id, rtt_ms: 10 } if node_id == "near-a"));
-        assert!(matches!(plan[2], ExpertLocation::Remote { ref node_id, rtt_ms: 25 } if node_id == "near-b"));
+        assert!(
+            matches!(plan[1], ExpertLocation::Remote { ref node_id, rtt_ms: 10 } if node_id == "near-a")
+        );
+        assert!(
+            matches!(plan[2], ExpertLocation::Remote { ref node_id, rtt_ms: 25 } if node_id == "near-b")
+        );
     }
 
     #[tokio::test]
     async fn plan_without_local_starts_at_nearest() {
         let r = router(50);
         let plan = r.plan_dispatch("exp-1", &peers()).await;
-        assert!(matches!(plan[0], ExpertLocation::Remote { ref node_id, rtt_ms: 10 } if node_id == "near-a"));
+        assert!(
+            matches!(plan[0], ExpertLocation::Remote { ref node_id, rtt_ms: 10 } if node_id == "near-a")
+        );
         assert!(!plan.iter().any(|l| matches!(l, ExpertLocation::Local)));
     }
 
@@ -1688,12 +1725,17 @@ mod tests {
         r.register_local_expert("exp-1").await;
         let mut completed = HashMap::new();
         let out = r
-            .execute("req-1", "exp-1", &[1.0], &peers(), &mut completed, |loc, _| {
-                match loc {
+            .execute(
+                "req-1",
+                "exp-1",
+                &[1.0],
+                &peers(),
+                &mut completed,
+                |loc, _| match loc {
                     ExpertLocation::Local => Ok(vec![42.0]),
                     ExpertLocation::Remote { node_id, .. } => Ok(vec![0.0, node_id.len() as f32]),
-                }
-            })
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out, vec![42.0]);
@@ -1705,16 +1747,23 @@ mod tests {
         let mut completed = HashMap::new();
         let mut calls = 0;
         let out = r
-            .execute("req-1", "exp-1", &[1.0], &peers(), &mut completed, |loc, _| {
-                calls += 1;
-                match loc {
-                    ExpertLocation::Remote { node_id, .. } if node_id == "near-a" => {
-                        Err(anyhow::anyhow!("near-a down"))
+            .execute(
+                "req-1",
+                "exp-1",
+                &[1.0],
+                &peers(),
+                &mut completed,
+                |loc, _| {
+                    calls += 1;
+                    match loc {
+                        ExpertLocation::Remote { node_id, .. } if node_id == "near-a" => {
+                            Err(anyhow::anyhow!("near-a down"))
+                        }
+                        ExpertLocation::Remote { node_id, .. } => Ok(vec![node_id.len() as f32]),
+                        ExpertLocation::Local => Ok(vec![-1.0]),
                     }
-                    ExpertLocation::Remote { node_id, .. } => Ok(vec![node_id.len() as f32]),
-                    ExpertLocation::Local => Ok(vec![-1.0]),
-                }
-            })
+                },
+            )
             .await
             .unwrap();
         // near-a failed → next candidate (near-b) served it.
@@ -1727,9 +1776,14 @@ mod tests {
         let r = router(50);
         let mut completed = HashMap::new();
         let err = r
-            .execute("req-1", "exp-1", &[1.0], &peers(), &mut completed, |_, _| {
-                Err(anyhow::anyhow!("down"))
-            })
+            .execute(
+                "req-1",
+                "exp-1",
+                &[1.0],
+                &peers(),
+                &mut completed,
+                |_, _| Err(anyhow::anyhow!("down")),
+            )
             .await;
         assert!(err.is_err());
         assert!(completed.is_empty());
@@ -1740,15 +1794,27 @@ mod tests {
         let r = router(50);
         let mut completed = HashMap::new();
         let first = r
-            .execute("req-1", "exp-1", &[1.0], &peers(), &mut completed, |_, _| {
-                Ok(vec![7.0])
-            })
+            .execute(
+                "req-1",
+                "exp-1",
+                &[1.0],
+                &peers(),
+                &mut completed,
+                |_, _| Ok(vec![7.0]),
+            )
             .await
             .unwrap();
         let second = r
-            .execute("req-1", "exp-1", &[1.0], &peers(), &mut completed, |_, _| {
-                Ok(vec![99.0]) // must be ignored
-            })
+            .execute(
+                "req-1",
+                "exp-1",
+                &[1.0],
+                &peers(),
+                &mut completed,
+                |_, _| {
+                    Ok(vec![99.0]) // must be ignored
+                },
+            )
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -1760,9 +1826,14 @@ mod tests {
         let r = router(50);
         let mut completed = HashMap::new();
         let err = r
-            .execute("req-1", "missing-expert", &[1.0], &[], &mut completed, |_, _| {
-                Ok(vec![1.0])
-            })
+            .execute(
+                "req-1",
+                "missing-expert",
+                &[1.0],
+                &[],
+                &mut completed,
+                |_, _| Ok(vec![1.0]),
+            )
             .await;
         assert!(err.is_err());
     }
@@ -1806,8 +1877,7 @@ mod tests {
 
     #[tokio::test]
     async fn quic_expert_query_roundtrip() {
-        let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
 
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
@@ -1878,10 +1948,10 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_frame_cap_never_emits_unbounded_buffer_growth() {
-        let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
-        let (endpoint, mut conn) =
-            raw_dial(&server_identity.node_id(), addr, &pins).await.unwrap();
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (endpoint, mut conn) = raw_dial(&server_identity.node_id(), addr, &pins)
+            .await
+            .unwrap();
 
         // >1 MiB of newline-free junk: the frame reader must bail on the
         // cap instead of buffering the rest forever. Server drops the
@@ -1905,8 +1975,7 @@ mod tests {
 
     #[tokio::test]
     async fn expert_input_cap_rejects_before_handler() {
-        let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut req = NodeRpcRequest::ExpertQuery {
@@ -1920,7 +1989,14 @@ mod tests {
         sign_request(&mut req, &identity);
         let reply = tokio::time::timeout(
             Duration::from_secs(10),
-            call(&client, addr, &server_identity.node_id(), &req, &identity, Duration::from_secs(5)),
+            call(
+                &client,
+                addr,
+                &server_identity.node_id(),
+                &req,
+                &identity,
+                Duration::from_secs(5),
+            ),
         )
         .await
         .unwrap()
@@ -1946,8 +2022,14 @@ mod tests {
         // envelopes: 900_000 byte total = 2 + (899_996 + "…").
         let at_cap = serde_json::Value::String("x".repeat(900_000 - 4));
         let over_cap = serde_json::Value::String("x".repeat(900_000 - 3));
-        assert!(!chat_messages_over_cap(&[at_cap]), "exactly at cap is servable");
-        assert!(chat_messages_over_cap(&[over_cap]), "1 byte over cap refuses");
+        assert!(
+            !chat_messages_over_cap(&[at_cap]),
+            "exactly at cap is servable"
+        );
+        assert!(
+            chat_messages_over_cap(&[over_cap]),
+            "1 byte over cap refuses"
+        );
     }
 
     #[tokio::test]
@@ -1997,7 +2079,14 @@ mod tests {
         sign_request(&mut req, &identity);
         let pinned_outcome = tokio::time::timeout(
             Duration::from_secs(2),
-            call(&endpoint1, addr, &node_id, &req, &identity, Duration::from_secs(1)),
+            call(
+                &endpoint1,
+                addr,
+                &node_id,
+                &req,
+                &identity,
+                Duration::from_secs(1),
+            ),
         )
         .await;
         assert!(
@@ -2015,7 +2104,14 @@ mod tests {
         drop(conn3); // free the permit before dialing again
         let reply = tokio::time::timeout(
             Duration::from_secs(10),
-            call(&endpoint3, addr, &node_id, &req, &identity, Duration::from_secs(5)),
+            call(
+                &endpoint3,
+                addr,
+                &node_id,
+                &req,
+                &identity,
+                Duration::from_secs(5),
+            ),
         )
         .await
         .unwrap()
@@ -2186,12 +2282,10 @@ mod tests {
         // RuntimeExpert with a dead runtime URL — builtin experts must still
         // be served exactly (they never reach the runtime).
         let handler = RuntimeExpert::for_tests("http://127.0.0.1:1", "stub");
-        let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(handler)).await.unwrap();
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(handler)).await.unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
-        let (expert_id, input, expected) =
-            crate::verify::ringer_task(crate::bootstrap::now_ms());
+        let (expert_id, input, expected) = crate::verify::ringer_task(crate::bootstrap::now_ms());
         let req_id = "ringer-wire-1";
         let mut req = NodeRpcRequest::ExpertQuery {
             req_id: req_id.into(),
@@ -2259,7 +2353,10 @@ mod tests {
         let far_id = far_identity.node_id();
 
         let r = router_with_verify(50, 100);
-        let peers = vec![(near_id.clone(), 5, true, true), (far_id.clone(), 200, true, true)];
+        let peers = vec![
+            (near_id.clone(), 5, true, true),
+            (far_id.clone(), 200, true, true),
+        ];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
         addrs.insert(far_id.clone(), far_addr);
@@ -2310,7 +2407,10 @@ mod tests {
         let far_id = far_identity.node_id();
 
         let r = router_with_verify(50, 100);
-        let peers = vec![(near_id.clone(), 5, true, true), (far_id.clone(), 200, true, true)];
+        let peers = vec![
+            (near_id.clone(), 5, true, true),
+            (far_id.clone(), 200, true, true),
+        ];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
         addrs.insert(far_id.clone(), far_addr);
@@ -2331,7 +2431,10 @@ mod tests {
                 |_| Ok(vec![0.0]),
             )
             .await;
-        assert!(err.is_err(), "unverifiable remote disagreement must not return a result");
+        assert!(
+            err.is_err(),
+            "unverifiable remote disagreement must not return a result"
+        );
         let s = r.verify_tracker().stats().await;
         assert_eq!(s.replays_dispatched, 1);
         assert_eq!(s.replay_mismatches, 1);
@@ -2383,7 +2486,10 @@ mod tests {
                 },
             )
             .await;
-        assert!(err.is_err(), "remote disagreeing with local truth must be rejected");
+        assert!(
+            err.is_err(),
+            "remote disagreeing with local truth must be rejected"
+        );
         let s = r.verify_tracker().stats().await;
         assert_eq!(s.replays_dispatched, 1);
         assert_eq!(s.replay_mismatches, 1);
@@ -2470,7 +2576,9 @@ mod tests {
     async fn chat_query_wire_carries_compacted_history() {
         let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(ChatCapture(sink.clone()))).await.unwrap();
+            test_server_and_pins(Arc::new(ChatCapture(sink.clone())))
+                .await
+                .unwrap();
         let node_id = server_identity.node_id();
         let r = router(50);
         let client = pinned_client_endpoint_dyn(pins).unwrap();
@@ -2553,9 +2661,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_over_quic_falls_back_to_peer() {
-        let (addr, server_identity, pins) = test_server_and_pins(
-            Arc::new(ChatAnswer { content: "mesh hello".into() }),
-        )
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(ChatAnswer {
+            content: "mesh hello".into(),
+        }))
         .await
         .unwrap();
         let node_id = server_identity.node_id();
@@ -2617,15 +2725,12 @@ mod tests {
 
     #[tokio::test]
     async fn quic_rejects_stale_stamp() {
-        let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let req = NodeRpcRequest::Ping {
             from_node_id: identity.node_id(),
-            stamp_ms: crate::bootstrap::now_ms()
-                - crate::signing::STAMP_MAX_AGE_MS
-                - 5_000,
+            stamp_ms: crate::bootstrap::now_ms() - crate::signing::STAMP_MAX_AGE_MS - 5_000,
             sig: identity.sign(b"whatever").to_string(),
         };
         let reply = call(
@@ -2644,7 +2749,9 @@ mod tests {
     // --- Negative tests for the pinning verifier itself ---
 
     fn verifier_with(pins: PinMap) -> PinningVerifier {
-        PinningVerifier { pins: Arc::new(pins) }
+        PinningVerifier {
+            pins: Arc::new(pins),
+        }
     }
 
     /// SNI as `call` sets it: the destination node_id string.

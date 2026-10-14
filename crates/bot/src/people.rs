@@ -31,12 +31,24 @@ pub struct PgConfig {
     pub timeout_secs: u64,
 }
 
-fn default_host() -> String { "127.0.0.1".into() }
-fn default_port() -> u16 { 5432 }
-fn default_user() -> String { "root".into() }
-fn default_database() -> String { "jerith_people".into() }
-fn default_enabled() -> bool { true }
-fn default_timeout_secs() -> u64 { 3 }
+fn default_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_port() -> u16 {
+    5432
+}
+fn default_user() -> String {
+    "root".into()
+}
+fn default_database() -> String {
+    "jerith_people".into()
+}
+fn default_enabled() -> bool {
+    true
+}
+fn default_timeout_secs() -> u64 {
+    3
+}
 
 impl Default for PgConfig {
     /// The OpenClaw-stack connection contract (pg_pool.py defaults):
@@ -80,7 +92,10 @@ pub fn extract_speaker_id(prompt: &str) -> Option<String> {
     let raw = &rest[id_at + ", id ".len()..];
     // The tag always ends "id ...)]" — strip both closing chars (a bare
     // find(']') slice keeps the ')' and fails the digit check).
-    let id = raw.trim_end().trim_end_matches(|c| c == ')' || c == ']').trim();
+    let id = raw
+        .trim_end()
+        .trim_end_matches(|c| c == ')' || c == ']')
+        .trim();
     let ok = !id.is_empty() && id.chars().all(|c| c.is_ascii_digit());
     ok.then(|| id.to_string())
 }
@@ -122,13 +137,11 @@ fn pgpass_path() -> std::path::PathBuf {
 async fn fetch_row(conn: &str, discord_id: &str) -> Result<Option<String>> {
     use tokio_postgres::NoTls;
 
-    let (client, connection) = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio_postgres::connect(conn, NoTls),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("postgres connect timeout"))?
-    .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?;
+    let (client, connection) =
+        tokio::time::timeout(Duration::from_secs(2), tokio_postgres::connect(conn, NoTls))
+            .await
+            .map_err(|_| anyhow::anyhow!("postgres connect timeout"))?
+            .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?;
 
     // Drive the connection in the background; dropped when this task ends.
     let driver = tokio::spawn(async move {
@@ -141,16 +154,13 @@ async fn fetch_row(conn: &str, discord_id: &str) -> Result<Option<String>> {
     // next line's indentation, and a missing trailing space then glues SQL
     // keywords together (this bit us once: `factsFROM`).
     let sql = "SELECT to_jsonb(t)::text FROM (SELECT p.discord_id, p.username, coalesce(NULLIF(p.display_name,''), p.username) AS display_name, p.trust, p.timezone, p.bio, f.facts FROM people p LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('k', up.profile_key, 'v', up.profile_value) ORDER BY up.profile_key) AS facts FROM user_profiles up WHERE up.user_id = p.discord_id) f ON true WHERE p.discord_id = $1) t";
-    let row = client
-        .query_opt(sql, &[&discord_id])
-        .await
-        .map_err(|e| {
-            let detail = e
-                .as_db_error()
-                .map(|d| format!(" | pg: {}", d.message()))
-                .unwrap_or_default();
-            anyhow::anyhow!("people query failed: {e}{detail}")
-        })?;
+    let row = client.query_opt(sql, &[&discord_id]).await.map_err(|e| {
+        let detail = e
+            .as_db_error()
+            .map(|d| format!(" | pg: {}", d.message()))
+            .unwrap_or_default();
+        anyhow::anyhow!("people query failed: {e}{detail}")
+    })?;
 
     let value = row
         .as_ref()
@@ -167,7 +177,11 @@ async fn fetch_row(conn: &str, discord_id: &str) -> Result<Option<String>> {
 pub async fn lookup(cfg: &PgConfig, discord_id: &str) -> Result<Option<String>> {
     let raw = match tokio::time::timeout(
         Duration::from_secs(cfg.timeout_secs),
-        fetch_row(&cfg.conn_string().ok_or_else(|| anyhow::anyhow!("no connection info"))?, discord_id),
+        fetch_row(
+            &cfg.conn_string()
+                .ok_or_else(|| anyhow::anyhow!("no connection info"))?,
+            discord_id,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("people lookup timed out"))?
@@ -176,8 +190,8 @@ pub async fn lookup(cfg: &PgConfig, discord_id: &str) -> Result<Option<String>> 
         Err(e) => return Err(e),
     };
     let Some(text) = raw else { return Ok(None) };
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("people row not JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("people row not JSON: {e}"))?;
     Ok(Some(format_speaker_block(&v)))
 }
 
@@ -251,9 +265,15 @@ mod tests {
         let p = "[Discord user: NoodlyPanda (username noodly_h, id 285471197825859584)]\nhi";
         eprintln!("DBG first-line: {:?}", p.lines().next());
         eprintln!("DBG extract: {:?}", extract_speaker_id(p));
-        assert_eq!(extract_speaker_id(p), Some("285471197825859584".to_string()));
+        assert_eq!(
+            extract_speaker_id(p),
+            Some("285471197825859584".to_string())
+        );
         assert_eq!(extract_speaker_id("no tag here"), None);
-        assert_eq!(extract_speaker_id("[Discord user: (username x, id abc)]"), None);
+        assert_eq!(
+            extract_speaker_id("[Discord user: (username x, id abc)]"),
+            None
+        );
     }
 
     #[test]

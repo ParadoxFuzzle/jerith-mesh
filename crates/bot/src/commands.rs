@@ -44,12 +44,15 @@ pub async fn ask(
     let cfg = ctx.data().cfg.clone();
     // Context squeeze stage 3 (deep collapse) before the chat when the
     // passive pass still leaves the ring over the configured budget.
-    let history =
-        crate::squeeze::squeeze_deep(&ctx.data().state, &cfg, user, &history).await;
+    let history = crate::squeeze::squeeze_deep(&ctx.data().state, &cfg, user, &history).await;
     // Individual-user recognition (same convention as the DM/@mention path):
     // every turn keeps its speaker so the model can tell owner from guests
     // and address people by name across the conversation.
-    let prompt = format!("{}{}", crate::chat_fallback::speaker_tag(ctx.author()), prompt);
+    let prompt = format!(
+        "{}{}",
+        crate::chat_fallback::speaker_tag(ctx.author()),
+        prompt
+    );
     let (reply, served_by, tokens) = api::chat_with_usage(&cfg, &prompt, &history).await?;
     // Session-cost-tracker port input: cumulative per-user tokens.
     ctx.data().state.record_usage(user, tokens);
@@ -118,7 +121,8 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     ctx.defer().await?;
     let st = api::gateway_status(&ctx.data().cfg).await?;
     let your_tokens = ctx.data().state.tokens_used(user_id(&ctx));
-    ctx.say(format_status_with_tokens(&st, Some(your_tokens))).await?;
+    ctx.say(format_status_with_tokens(&st, Some(your_tokens)))
+        .await?;
     Ok(())
 }
 
@@ -203,7 +207,13 @@ pub async fn leaderboard(ctx: Ctx<'_>) -> Result<(), Error> {
         Ok(entries) if !entries.is_empty() => {
             let rows: Vec<(u64, u64, u32)> = entries
                 .into_iter()
-                .map(|e| (e.discord_id, e.total_mined_uj, e.wins.min(u32::MAX as u64) as u32))
+                .map(|e| {
+                    (
+                        e.discord_id,
+                        e.total_mined_uj,
+                        e.wins.min(u32::MAX as u64) as u32,
+                    )
+                })
                 .collect();
             ctx.say(format_leaderboard(&rows, viewer, "chain totals (lifetime)"))
                 .await?;
@@ -262,7 +272,10 @@ pub async fn briefing(
     let since_snowflake = discord_snowflake_for_hours_ago(hours);
     let cfg = ctx.data().cfg.clone();
     if cfg.archiver.channel_ids.is_empty() {
-        ctx.say("No archiver channels configured — add `[archiver] channel_ids` to bot.toml first.").await?;
+        ctx.say(
+            "No archiver channels configured — add `[archiver] channel_ids` to bot.toml first.",
+        )
+        .await?;
         return Ok(());
     }
     let client = crate::archiver::discord_client();
@@ -284,8 +297,7 @@ pub async fn briefing(
             }
         };
         // Per-guild marker resolution needs the channel's owning guild.
-        let (label, guild) =
-            crate::archiver::thread_info(&client, &cfg.discord_token, *cid).await;
+        let (label, guild) = crate::archiver::thread_info(&client, &cfg.discord_token, *cid).await;
         let markers = crate::archiver::effective_markers(&cfg.archiver, guild);
         let notes = crate::archiver::extract_notes(
             &msgs,
@@ -319,7 +331,8 @@ pub async fn briefing(
         }
         _ => String::new(),
     };
-    ctx.say(clip_tail(&format!("{digest}{}", lines.join("\n")), 1900)).await?;
+    ctx.say(clip_tail(&format!("{digest}{}", lines.join("\n")), 1900))
+        .await?;
     Ok(())
 }
 
@@ -412,7 +425,9 @@ pub async fn timeout(
     ctx: Ctx<'_>,
     #[description = "Guild (server) id that holds the member"] guild_id: u64,
     #[description = "Member to time out (or to clear), as a user id"] member_id: u64,
-    #[description = "Timeout length in minutes (1–40320; Discord caps at 28 days)"] minutes: Option<u64>,
+    #[description = "Timeout length in minutes (1–40320; Discord caps at 28 days)"] minutes: Option<
+        u64,
+    >,
     #[description = "Reason recorded in the guild's audit log"] reason: Option<String>,
     #[description = "Clear the existing timeout instead of setting one"] clear: Option<bool>,
 ) -> Result<(), Error> {
@@ -438,7 +453,13 @@ pub async fn timeout(
         .await
         .context("timeout failed — check the bot has Moderate Members in that guild and the ids are right")?;
     let what = if clear { "cleared" } else { "set" };
-    ctx.say(timeout_reply(what, member_id, guild_id, member.communication_disabled_until)).await?;
+    ctx.say(timeout_reply(
+        what,
+        member_id,
+        guild_id,
+        member.communication_disabled_until,
+    ))
+    .await?;
     Ok(())
 }
 
@@ -531,12 +552,12 @@ pub fn format_my_balance(bal: &api::MyBalance, viewer: u64) -> String {
         .unwrap_or_default();
     let opted = match bal.opted_in {
         Some(true) => "",
-        Some(false) => "\n⚠️ you're opted out — mine rewards go to the pool owner until you opt in.",
+        Some(false) => {
+            "\n⚠️ you're opted out — mine rewards go to the pool owner until you opt in."
+        }
         None => "",
     };
-    format!(
-        "💳 <@{viewer}> — **{jer_txt} JER**{available}\naddress: `{addr}`{opted}"
-    )
+    format!("💳 <@{viewer}> — **{jer_txt} JER**{available}\naddress: `{addr}`{opted}")
 }
 
 /// `JERDC9695D27…4312`-style short form (first 12 + last 4).
@@ -634,7 +655,9 @@ pub fn format_status_with_tokens(st: &serde_json::Value, tokens: Option<u64>) ->
                         m.get("requests").and_then(|v| v.as_u64()).unwrap_or(0),
                         m.get("ok_percent").and_then(|v| v.as_u64()).unwrap_or(0),
                         m.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        m.get("latency_ms_mean").and_then(|v| v.as_u64()).unwrap_or(0),
+                        m.get("latency_ms_mean")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
                     )
                 })
                 .collect();
@@ -774,7 +797,12 @@ mod tests {
     #[test]
     fn leaderboard_empty_and_medals() {
         assert!(format_leaderboard(&[], 1, "").contains("no /mine wins"));
-        let rows = vec![(10u64, 5_000_000u64, 1u32), (20, 15_000_000, 3), (30, 2_500_000, 2), (40, 1_000_000, 1)];
+        let rows = vec![
+            (10u64, 5_000_000u64, 1u32),
+            (20, 15_000_000, 3),
+            (30, 2_500_000, 2),
+            (40, 1_000_000, 1),
+        ];
         let out = format_leaderboard(&rows, 20, "chain totals (lifetime)");
         // Input order preserved (docs: sort caller-side); medal per position.
         assert!(out.contains("*chain totals (lifetime)*"));

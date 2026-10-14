@@ -73,12 +73,7 @@ pub enum Gate {
 /// OpenClaw-rule decision for one command invocation. `dm` = invoked in a
 /// direct message, `author_id` = invoking Discord user, `owner_id` =
 /// resolved bot owner (None → no classified owner exists → default-deny).
-pub fn gate_command(
-    dm: bool,
-    author_id: u64,
-    owner_id: Option<u64>,
-    command: &str,
-) -> Gate {
+pub fn gate_command(dm: bool, author_id: u64, owner_id: Option<u64>, command: &str) -> Gate {
     if command_is_user_level(command) {
         return Gate::Allow;
     }
@@ -101,7 +96,10 @@ pub fn borrow_owner_from_openclaw(path: &Path) -> Option<u64> {
     let list = cfg.pointer("/commands/ownerAllowFrom")?.as_array()?;
     for entry in list {
         let raw = entry.as_str()?;
-        let id = raw.strip_prefix("discord:").filter(|s| !s.is_empty()).unwrap_or(raw);
+        let id = raw
+            .strip_prefix("discord:")
+            .filter(|s| !s.is_empty())
+            .unwrap_or(raw);
         if let Ok(parsed) = id.parse::<u64>() {
             return Some(parsed);
         }
@@ -153,7 +151,12 @@ mod tests {
         // Owner in a guild channel → refused (DM-only, stricter than upstream
         // which accepted owner messages anywhere).
         assert!(matches!(
-            gate_command(false, 28547119782585964, Some(28547119782585964), "shutdown"),
+            gate_command(
+                false,
+                28547119782585964,
+                Some(28547119782585964),
+                "shutdown"
+            ),
             Gate::Deny(_)
         ));
         // Someone else in DM → refused.

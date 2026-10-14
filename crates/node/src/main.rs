@@ -1179,6 +1179,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         state: state.clone(),
         runtime_url: cfg.runtime_url.clone(),
         runtime_api_key: cfg.runtime_api_key.clone(),
+        runtime_num_predict: cfg.runtime_num_predict,
         miner,
         memory: memory.clone(),
         mesh_fallback,

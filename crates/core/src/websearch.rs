@@ -33,13 +33,14 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const BRAVE_SEARCH_ENDPOINT: &str = "/res/v1/web/search";
 const DEFAULT_BRAVE_BASE_URL: &str = "https://api.search.brave.com";
-const USER_AGENT: &str = "jerith-mesh/0.1 (web-access-skill; +https://github.com/ParadoxFuzzle/jerith-mesh)";
+const USER_AGENT: &str =
+    "jerith-mesh/0.1 (web-access-skill; +https://github.com/ParadoxFuzzle/jerith-mesh)";
 
 /// Hard cap for a fetched page body — a hostile page must not balloon the
 /// node's memory; past this the download simply stops.
@@ -76,7 +77,10 @@ impl WebHit {
             title: clean_snippet(entry.get("title")),
             url,
             description: clean_snippet(entry.get("description")),
-            page_age: entry.get("page_age").and_then(Value::as_str).map(str::to_string),
+            page_age: entry
+                .get("page_age")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             site_name: site,
         })
     }
@@ -176,14 +180,14 @@ fn is_private_host(host: &str) -> bool {
                     || (o[0] == 192 && o[1] == 168)
                     || (o[0] == 169 && o[1] == 254)                    // link-local
                     || (o[0] == 100 && (64..=127).contains(&o[1]))     // CGNAT
-                    || o[0] >= 224                                     // multicast + reserved
+                    || o[0] >= 224 // multicast + reserved
             }
             std::net::IpAddr::V6(v6) => {
                 let s = v6.segments();
                 s == [0, 0, 0, 0, 0, 0, 0, 1]                          // ::1
                     || (s[0] & 0xfe00) == 0xfe00                       // fe80::/10
                     || (s[0] & 0xfff0) == 0xfd00                       // fc00::/7 ULA
-                    || s == [0, 0, 0, 0, 0, 0xffff, 0x7f00, 0]         // ::ffff:127.0.0.1
+                    || s == [0, 0, 0, 0, 0, 0xffff, 0x7f00, 0] // ::ffff:127.0.0.1
             }
         };
     }
@@ -218,9 +222,7 @@ impl reqwest::dns::Resolve for SsrfResolver {
                         .map(|iter| iter.collect::<Vec<_>>())
                 })
                 .await
-                .map_err(|e| {
-                    std::io::Error::other(format!("ssrf resolver task failed: {e}"))
-                })?;
+                .map_err(|e| std::io::Error::other(format!("ssrf resolver task failed: {e}")))?;
             let result = resolved?;
             // Public-name↔private-IP check on EVERY resolved address.
             let mut addrs = Vec::with_capacity(result.len());
@@ -239,7 +241,8 @@ impl reqwest::dns::Resolve for SsrfResolver {
             if addrs.is_empty() {
                 return Err(Box::new(std::io::Error::other(format!(
                     "every resolved address for {host} is private/loopback — refusing to connect (SSRF guard)"
-                ))) as Box<dyn std::error::Error + Send + Sync>);
+                )))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
@@ -315,7 +318,11 @@ impl WebSearchService {
     /// to `WebHit`s. Mirrors upstream param plumbing: q, country,
     /// search_lang, freshness, ui_lang, count (1..=max).
     pub async fn search(&self, q: &SearchQuery) -> Result<Vec<WebHit>> {
-        let Some(api_key) = self.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty())
+        let Some(api_key) = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
         else {
             bail!(
                 "missing Brave API key — a node's [websearch] table resolves it from \
@@ -327,7 +334,10 @@ impl WebSearchService {
             bail!("empty search query");
         }
         let freshness = normalize_freshness(q.freshness.as_deref())?;
-        let count = q.count.unwrap_or(self.default_count).clamp(1, self.max_count);
+        let count = q
+            .count
+            .unwrap_or(self.default_count)
+            .clamp(1, self.max_count);
 
         let base = if self.base_url.is_empty() {
             DEFAULT_BRAVE_BASE_URL.to_string()
@@ -338,19 +348,31 @@ impl WebSearchService {
         let mut req = self
             .client
             .get(&url)
-            .query(&[
-                ("q", q.query.trim()),
-                ("count", count.to_string().as_str()),
-            ])
+            .query(&[("q", q.query.trim()), ("count", count.to_string().as_str())])
             .header("X-Subscription-Token", api_key)
             .header("Accept", "application/json");
-        if let Some(c) = q.country.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(c) = q
+            .country
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             req = req.query(&[("country", c)]);
         }
-        if let Some(l) = q.search_lang.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(l) = q
+            .search_lang
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             req = req.query(&[("search_lang", l)]);
         }
-        if let Some(l) = q.ui_lang.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(l) = q
+            .ui_lang
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             req = req.query(&[("ui_lang", l)]);
         }
         if let Some(f) = freshness {
@@ -401,7 +423,11 @@ impl WebSearchService {
         // content-length-less hostile response from ballooning memory.
         let mut buf: Vec<u8> = Vec::new();
         loop {
-            match resp.chunk().await.map_err(|e| anyhow!("reading body: {e}"))? {
+            match resp
+                .chunk()
+                .await
+                .map_err(|e| anyhow!("reading body: {e}"))?
+            {
                 Some(chunk) => {
                     buf.extend_from_slice(&chunk);
                     if buf.len() >= FETCH_BODY_CAP_BYTES {
@@ -472,7 +498,11 @@ fn extract_text(html: &str) -> String {
     let decoded = decode_entities(&bare);
     let mut out = String::new();
     for raw_line in decoded.split('\n') {
-        let line = raw_line.replace('\u{00a0}', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+        let line = raw_line
+            .replace('\u{00a0}', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if !line.is_empty() {
             out.push_str(&line);
             out.push('\n');

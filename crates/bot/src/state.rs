@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// How many turns of per-user context to forward with /ask.
 const MAX_HISTORY: usize = 8;

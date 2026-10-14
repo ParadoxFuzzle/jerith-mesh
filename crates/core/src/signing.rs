@@ -16,7 +16,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::bootstrap::{now_ms, PeerAd};
+use crate::bootstrap::{PeerAd, now_ms};
 
 /// Domain separation prefixes — never reuse across payload kinds.
 pub const ADV_PREFIX: &str = "jerith-adv1";
@@ -94,7 +94,12 @@ pub fn ping_payload(from_node_id: &str, to_node_id: &str, stamp_ms: u64) -> Stri
 
 /// Canonical health-reply payload. Extras outside the signature stay out of
 /// it so both sides can reproduce the exact string.
-pub fn health_payload(node_id: &str, stamp_ms: u64, uptime_seconds: u64, contribution_percent: u64) -> String {
+pub fn health_payload(
+    node_id: &str,
+    stamp_ms: u64,
+    uptime_seconds: u64,
+    contribution_percent: u64,
+) -> String {
     format!("{HEALTH_PREFIX}|{stamp_ms}|{node_id}|{uptime_seconds}|{contribution_percent}")
 }
 

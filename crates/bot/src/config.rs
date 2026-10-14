@@ -85,6 +85,12 @@ pub struct BotConfig {
     /// local answer land with headroom, and also covers a slower mesh-fallback
     /// leg. The old hard 90 s killed legitimately deep qwen3 thinking answers.
     pub chat_timeout_secs: u64,
+    /// Stream chat completions through the gateway's SSE passthrough and
+    /// live-type the answer into Discord (live edits while tokens arrive).
+    /// Default on; `[chat] stream = false` restores the old buffered
+    /// single-shot reply. Degenerates to a buffered answer automatically
+    /// whenever the gateway answers non-SSE (JSON error/fallback paths).
+    pub chat_stream: bool,
 }
 
 /// Chat timeout default ([chat] timeout_secs), years after the 90 s
@@ -153,6 +159,7 @@ impl BotConfig {
                 .and_then(|c| c.timeout_secs)
                 .unwrap_or(DEFAULT_CHAT_TIMEOUT_SECS)
                 .clamp(60, 600),
+            chat_stream: file.chat.as_ref().and_then(|c| c.stream).unwrap_or(true),
         })
     }
 
@@ -172,7 +179,10 @@ impl BotConfig {
         match resolved {
             Some(id) => {
                 if from_env.is_none() {
-                    tracing::info!(owner_discord_id = id, "bot owner id resolved (system-level commands gated)");
+                    tracing::info!(
+                        owner_discord_id = id,
+                        "bot owner id resolved (system-level commands gated)"
+                    );
                 }
                 Some(id)
             }
@@ -203,6 +213,7 @@ impl BotConfig {
             squeeze: SqueezeConfig::default(),
             monitor: MonitorConfig::default(),
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
+            chat_stream: true,
         }
     }
 }
@@ -405,7 +416,9 @@ pub fn persona_file_path() -> PathBuf {
 /// source the OpenClaw gateway used to provide.
 pub fn known_users_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".jerith-mesh").join("known-users.md")
+    PathBuf::from(home)
+        .join(".jerith-mesh")
+        .join("known-users.md")
 }
 
 /// Cap a persona system prompt so an oversized persona file can never blow
@@ -462,6 +475,8 @@ struct FileConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 struct ChatTable {
     timeout_secs: Option<u64>,
+    /// Stream + live-type (see BotConfig::chat_stream). Default true.
+    stream: Option<bool>,
 }
 
 /// `[owner] discord_id = <decimal>` in bot.toml.

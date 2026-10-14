@@ -33,7 +33,9 @@ pub fn default_token_file() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("JERITH_TOKEN_FILE") {
         return std::path::PathBuf::from(p);
     }
-    crate::config::NodeConfig::home().join("keys").join("api.token")
+    crate::config::NodeConfig::home()
+        .join("keys")
+        .join("api.token")
 }
 
 /// Mining client configuration.
@@ -115,10 +117,7 @@ pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u
         .context("chain balance rejected")?
         .json()
         .await?;
-    Ok(body
-        .get("balance_uj")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0))
+    Ok(body.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
 // Outcome of an attempted mine (for meters + logs).
@@ -183,7 +182,9 @@ impl JerithMiner {
                     stats.won.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(target: "economics", "mined JER 🎉");
                 }
-                Ok(o) => tracing::debug!(target: "economics", reason = ?o.reason, "mine attempt did not win"),
+                Ok(o) => {
+                    tracing::debug!(target: "economics", reason = ?o.reason, "mine attempt did not win")
+                }
                 Err(e) => tracing::debug!(target: "economics", error = %e, "mine attempt failed"),
             }
         });
@@ -211,10 +212,7 @@ pub async fn attempt_mine(
             default_token_file().display()
         )
     })?;
-    let message_id = format!(
-        "{node_id}:{attempt}:{}",
-        crate::bootstrap::now_ms()
-    );
+    let message_id = format!("{node_id}:{attempt}:{}", crate::bootstrap::now_ms());
     let url = format!("{}/mine", config.rpc_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))

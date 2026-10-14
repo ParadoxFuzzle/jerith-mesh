@@ -7,12 +7,14 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use jerith_mesh_core::bootstrap::{PeerAd, PeerRegistry};
 use jerith_mesh_core::config::{NodeConfig, NodeRole};
 use jerith_mesh_core::ping::{MeshFallbackChat, MeshState};
-use jerith_mesh_core::quic::{server_endpoint_for, serve, ExpertHandler, ExpertRouter, RouterOptions};
+use jerith_mesh_core::quic::{
+    ExpertHandler, ExpertRouter, RouterOptions, serve, server_endpoint_for,
+};
 use jerith_mesh_core::signing::SigningIdentity;
 
 /// Peer-side handler: deterministic chat answer, real identity + signing.

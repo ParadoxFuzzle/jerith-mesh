@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use jerith_mesh_core::quic::{
-    pinned_client_endpoint, sign_request, NodeRpcReply, NodeRpcRequest, PinMap,
+    NodeRpcReply, NodeRpcRequest, PinMap, pinned_client_endpoint, sign_request,
 };
 use jerith_mesh_core::signing::SigningIdentity;
 
@@ -31,8 +31,7 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
         .expect("dev E2E: EXPECT_NODE_B_ID must carry node B's node_id");
     let mut pins: PinMap = std::collections::HashMap::new();
     pins.insert(sni_node.clone(), addr);
-    let client =
-        pinned_client_endpoint(std::sync::Arc::new(pins)).expect("pinned client endpoint");
+    let client = pinned_client_endpoint(std::sync::Arc::new(pins)).expect("pinned client endpoint");
 
     let mut req = NodeRpcRequest::ExpertQuery {
         req_id: "e2e-cross-1".into(),
@@ -46,7 +45,14 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
 
     let reply = tokio::time::timeout(
         Duration::from_secs(10),
-        jerith_mesh_core::quic::call(&client, addr, &sni_node, &req, &identity, Duration::from_secs(5)),
+        jerith_mesh_core::quic::call(
+            &client,
+            addr,
+            &sni_node,
+            &req,
+            &identity,
+            Duration::from_secs(5),
+        ),
     )
     .await
     .expect("dispatch timeout")
@@ -109,5 +115,4 @@ async fn dispatches_to_peer_b_runtime_and_verifies_attribution() {
         NodeRpcReply::Error { message, .. } => panic!("peer error: {message}"),
         other => panic!("unexpected reply: {other:?}"),
     }
-
 }

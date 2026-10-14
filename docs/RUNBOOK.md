@@ -277,10 +277,32 @@ remembering:
   `[chat] timeout_secs` in `~/.jerith-mesh/bot.toml` now sets it
   (default 240, clamped 60–600). Coherence note: the gateway bounds a
   non-stream local runtime at 180 s header-wait and then hands to mesh
-  fallback, so >240 s buys you a slower fallback lane, not faster
-  runtime answers — and a streamed answer would be the proper fix for
-  very long generations (gateway SSE passthrough already exists; bot
-  side is not streaming yet).
+  fallback, so >240 s buys you a slower fallback lane.
+- **Bot-side streaming is live** (2026-10-14, default `[chat] stream =
+  true`). The bot now sends `stream: true` and live-types the reply into
+  Discord (@mention/DM fallback path; `/ask` stays buffered) while the
+  gateway passes SSE through CHUNK-BY-CHUNK — the old passthrough did
+  `bytes().await`, silently buffering whole generations (fixed same day;
+  verified live: first chunk 7.2 s into a 62 s generation, 876 chunks).
+  Mechanics: OpenAI deltas fold per round into the same (status, body)
+  shape the buffered path produces (tool-call fragments, finish_reason,
+  usage chunk, mesh_fallback wrap included), so the tool/degenerate/retry
+  logic stays single-source. Reality check: qwen3:8b thinking arrives as
+  `delta.reasoning_content`, so live-typing shows the wait, then the
+  answer tails in fast; a broken stream with real content already typed
+  degrades to a cut-marked partial, never a lost chat. `stream = false`
+  restores the buffered one-shot.
+- **Runaway-generation cap option** (`runtime_num_predict` in config.toml,
+  default unset = off): when set, the gateway stamps `max_tokens = N` on
+  every chat it forwards to the local runtime lane — but only when the
+  caller set no cap of their own (max_tokens / max_completion_tokens /
+  num_predict always win). This is the missing runtime-lane bound for
+  thinking models that loop unbounded (deepseek-r1:8b, see the
+  guardrails entry above): `MAX_QUEUE` fails fast, `MAX_LOADED_MODELS`
+  serializes residency, `runtime_num_predict` bounds the generation
+  itself. Set e.g. `runtime_num_predict = 1200` (~27 s of generation at
+  ~45 t/s) and restart the node. Mesh-fallback lanes are the serving
+  peers' own configs, not this node's.
 
 ## Security hardening log
 

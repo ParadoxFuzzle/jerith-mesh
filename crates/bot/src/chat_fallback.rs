@@ -46,8 +46,7 @@ pub async fn handle(
     // privileged message-content intent. `leading` matters for hand-off:
     // a leading mention naming a real command belongs to the framework.
     let leading = strip_leading_bot_mention(&msg.content, bot_id).is_some();
-    let contacted = leading
-        || msg.mentions.iter().any(|u| u.id.get() == bot_id);
+    let contacted = leading || msg.mentions.iter().any(|u| u.id.get() == bot_id);
 
     let prompt = if !contacted {
         if is_dm {
@@ -68,10 +67,7 @@ pub async fn handle(
         if cleaned.is_empty() {
             // Bare "@bot" with no text: answer inline instead of sending an
             // empty prompt to the gateway.
-            let _ = msg
-                .channel_id
-                .say(ctx.serenity_context, HINT)
-                .await;
+            let _ = msg.channel_id.say(ctx.serenity_context, HINT).await;
             return Ok(());
         }
         // A LEADING mention that names a real command (@bot ask hi,
@@ -105,14 +101,40 @@ pub async fn handle(
     tokio::spawn(async move {
         show_typing(&http_ctx, channel).await;
         // Context squeeze stage 3 before the chat (same as /ask).
-    let history =
-        crate::squeeze::squeeze_deep(&state, &cfg, user, &state.history(user)).await;
-        match api::chat_with_usage(&cfg, &tagged, &history).await {
+        let history = crate::squeeze::squeeze_deep(&state, &cfg, user, &state.history(user)).await;
+        // Live typing ([chat] stream, default on): the answer streams
+        // through the gateway's SSE passthrough and edits into Discord
+        // while tokens land. The sink degrades on its own — a failed
+        // placeholder POST or a failed edit just silences it — so the
+        // chat result path below is identically correct either way.
+        // Buffered configs (stream = false) keep the plain one-shot send.
+        let sink = if cfg.chat_stream {
+            LiveSink::start(&http_ctx, channel).await
+        } else {
+            None
+        };
+        // The tap borrows nothing from `sink` (it owns a state Arc), but it
+        // still shares `sink`'s move scope — scope both so the result match
+        // below can consume the sink.
+        let chat = {
+            let tap: Option<Box<dyn Fn(&str) + Send + Sync>> =
+                sink.as_ref().map(|s| Box::new(s.tap()) as _);
+            let live: Option<&(dyn Fn(&str) + Send + Sync)> = tap
+                .as_ref()
+                .map(|t| t.as_ref() as &(dyn Fn(&str) + Send + Sync));
+            api::chat_with_usage_live(&cfg, &tagged, &history, live).await
+        };
+        match chat {
             Ok((reply, served_by, tokens)) => {
                 state.record_usage(user, tokens);
                 state.push_turn(user, &tagged, &reply);
                 let text = crate::commands::format_reply(&reply, served_by.as_deref());
-                let _ = send_long(&http_ctx, channel, &text).await;
+                match sink {
+                    Some(sink) => sink.finish(text).await,
+                    None => {
+                        let _ = send_long(&http_ctx, channel, &text).await;
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "conversational fallback chat failed");
@@ -124,14 +146,23 @@ pub async fn handle(
                 // "try again in a moment" with silence forever.
                 let mut reason = e.to_string().replace('\n', "; ");
                 if reason.chars().count() > 160 {
-                    reason = format!("…{}", reason.chars().skip(reason.chars().count() - 160).collect::<String>());
+                    reason = format!(
+                        "…{}",
+                        reason
+                            .chars()
+                            .skip(reason.chars().count() - 160)
+                            .collect::<String>()
+                    );
                 }
-                let _ = channel
-                    .say(
-                        &http_ctx,
-                        format!("⚠️ the mesh didn't answer just now — {reason}\ntry `@bot ask <question>` again in a moment."),
-                    )
-                    .await;
+                let text = format!(
+                    "⚠️ the mesh didn't answer just now — {reason}\ntry `@bot ask <question>` again in a moment."
+                );
+                match sink {
+                    Some(sink) => sink.finish(text).await,
+                    None => {
+                        let _ = send_long(&http_ctx, channel, &text).await;
+                    }
+                }
             }
         }
     });
@@ -139,8 +170,7 @@ pub async fn handle(
 }
 
 /// Shown when the bot is mentioned with no instruction at all.
-const HINT: &str =
-    "✋ Hi! Ask the mesh with `@bot ask <question>` or just DM me anything — try `@bot help` for commands.";
+const HINT: &str = "✋ Hi! Ask the mesh with `@bot ask <question>` or just DM me anything — try `@bot help` for commands.";
 
 /// If `content` opens with this bot's mention (`<@id>` / `<@!id>`), return
 /// the remainder; otherwise `None`.
@@ -156,7 +186,9 @@ pub fn strip_leading_bot_mention(content: &str, bot_user_id: u64) -> Option<&str
 /// Whether the message fragment's first token names a registered command
 /// (slash/prefix commands share their names + aliases here).
 fn first_token_is_command(text: &str, commands: &[poise::Command<Data, Error>]) -> bool {
-    let Some(tok) = first_token(text) else { return false };
+    let Some(tok) = first_token(text) else {
+        return false;
+    };
     commands.iter().any(|c| {
         c.name.as_ref().eq_ignore_ascii_case(tok)
             || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(tok))
@@ -184,7 +216,12 @@ pub fn speaker_tag(user: &serenityall::User) -> String {
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(&user.name);
-    format!("[Discord user: {} (username {}, id {})]\n", display, user.name, user.id.get())
+    format!(
+        "[Discord user: {} (username {}, id {})]\n",
+        display,
+        user.name,
+        user.id.get()
+    )
 }
 
 fn first_token(text: &str) -> Option<&str> {
@@ -194,6 +231,125 @@ fn first_token(text: &str) -> Option<&str> {
 /// Typing indicator while the mesh thinks (best-effort).
 async fn show_typing(http_ctx: &serenityall::Context, channel: serenityall::ChannelId) {
     let _ = channel.broadcast_typing(http_ctx).await;
+}
+
+/// Live-typing sink for streamed @mention/DM chats: posts a placeholder
+/// message once, then edits it while the gateway's SSE passthrough lands
+/// content deltas (`LiveSink::start` → `tap` is the api layer's
+/// per-fragment tap → `finish` replaces everything with the final formatted
+/// reply and stops the edit ticker).
+///
+/// Edits are throttled to ≥ 2 s apart and ≥ 120 new chars — Discord both
+/// rate-limits message edits and renders nothing from sub-token churn, so
+/// tighter edits only trip the limiter. Every failure inside the sink is
+/// swallowed (best-effort by contract): a deleted placeholder, a missing
+/// permission, a Discord hiccup — the streamed chat itself continues, and
+/// the streamed partial already shown is replaced wholesale by finish().
+struct LiveSink {
+    http_ctx: serenityall::Context,
+    channel: serenityall::ChannelId,
+    msg_id: serenityall::MessageId,
+    state: std::sync::Arc<tokio::sync::Mutex<SinkState>>,
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+struct SinkState {
+    text: String,
+    /// Chars at the last successfully applied edit (throttle baseline).
+    last_len: usize,
+    last_edit: std::time::Instant,
+    dirty: bool,
+}
+
+impl LiveSink {
+    async fn start(
+        http_ctx: &serenityall::Context,
+        channel: serenityall::ChannelId,
+    ) -> Option<LiveSink> {
+        let placeholder = channel.say(http_ctx, "…").await.ok()?;
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(SinkState {
+            text: String::new(),
+            last_len: 0,
+            last_edit: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            dirty: false,
+        }));
+        // Ticker: apply pending edits every 2 s until finish() aborts us.
+        let tick_state = state.clone();
+        let ticker_ctx = http_ctx.clone();
+        let ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let mut s = tick_state.lock().await;
+                if s.dirty
+                    && s.text.chars().count().saturating_sub(s.last_len) >= 120
+                    && s.last_edit.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    let shown = clip_tail(&s.text, 1990);
+                    let msg_id = placeholder.id;
+                    match channel
+                        .edit_message(
+                            &ticker_ctx,
+                            msg_id,
+                            poise::serenity_prelude::EditMessage::new().content(shown),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            s.last_len = s.text.chars().count();
+                            s.last_edit = std::time::Instant::now();
+                            s.dirty = false;
+                        }
+                        // Stay dirty: the next tick or finish() retries. A
+                        // deleted message fails every later edit — harmless
+                        // noise, bounded by finish() aborting this task.
+                        Err(_) => {}
+                    }
+                }
+            }
+        });
+        Some(LiveSink {
+            http_ctx: http_ctx.clone(),
+            channel,
+            msg_id: placeholder.id,
+            state,
+            ticker,
+        })
+    }
+
+    /// The api layer's per-fragment tap: appends into the shared state,
+    /// marks dirty; the ticker does the (throttled) Discord part.
+    fn tap(&self) -> impl Fn(&str) + Send + Sync {
+        let state = self.state.clone();
+        move |frag: &str| {
+            if frag.is_empty() {
+                return;
+            }
+            if let Ok(mut s) = state.try_lock() {
+                s.text.push_str(frag);
+                s.dirty = true;
+            }
+        }
+    }
+
+    /// Final replacement: the full formatted reply, then the ticker stops.
+    async fn finish(self, text: String) {
+        self.ticker.abort();
+        let clipped = clip_tail(&text, 1990);
+        if let Err(e) = self
+            .channel
+            .edit_message(
+                &self.http_ctx,
+                self.msg_id,
+                poise::serenity_prelude::EditMessage::new().content(clipped),
+            )
+            .await
+        {
+            tracing::debug!(error = %e, "live sink final edit failed — resending");
+            let _ = send_long(&self.http_ctx, self.channel, &text).await;
+        }
+    }
 }
 
 /// Discord's per-message cap is 2000 chars — keep the tail (the answer end)
@@ -252,8 +408,14 @@ mod tests {
     #[test]
     fn strip_all_bot_mentions_mid_text_and_variants() {
         // Leading mention (the old focus) plus mid-sentence and trailing.
-        assert_eq!(strip_bot_mentions("<@42> check the mesh", 42), " check the mesh");
-        assert_eq!(strip_bot_mentions("hey <@42> what's up", 42), "hey  what's up");
+        assert_eq!(
+            strip_bot_mentions("<@42> check the mesh", 42),
+            " check the mesh"
+        );
+        assert_eq!(
+            strip_bot_mentions("hey <@42> what's up", 42),
+            "hey  what's up"
+        );
         assert_eq!(strip_bot_mentions("ping <@!42>?", 42), "ping ?");
         assert_eq!(strip_bot_mentions("<@42><@!42> bounce", 42), " bounce");
         // Other users' mentions stay intact.

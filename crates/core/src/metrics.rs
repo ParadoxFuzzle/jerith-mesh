@@ -18,8 +18,8 @@
 //! is bot-side (`state.record_usage`), fed from this same `usage` data.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;

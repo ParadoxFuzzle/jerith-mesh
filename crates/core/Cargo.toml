@@ -22,6 +22,7 @@ ed25519-dalek.workspace = true
 rusqlite.workspace = true
 regex.workspace = true
 futures-core.workspace = true
+futures-util.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

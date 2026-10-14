@@ -12,11 +12,11 @@
 //! digests are computed from `PAGE` itself at first request, so page
 //! edits re-pin automatically instead of roting into a mismatch.
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
@@ -39,8 +39,7 @@ fn inline_block(page: &str, tag: &str) -> Option<String> {
 /// Standard base64 (RFC 4648, with `=` padding) — what CSP hash-sources
 /// expect. Kept local to avoid a `base64` dependency for ~20 lines.
 fn b64(data: &[u8]) -> String {
-    const T: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
@@ -51,8 +50,16 @@ fn b64(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -191,7 +198,10 @@ mod tests {
         // sha256("abc") / sha256("hello world") in standard base64,
         // cross-checked against an independent Python implementation.
         assert_eq!(d("abc"), "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
-        assert_eq!(d("hello world"), "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=");
+        assert_eq!(
+            d("hello world"),
+            "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek="
+        );
     }
 
     #[test]

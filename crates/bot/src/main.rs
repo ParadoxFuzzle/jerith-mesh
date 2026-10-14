@@ -111,19 +111,30 @@ async fn main() -> anyhow::Result<()> {
     if cfg.system_prompt.is_none() {
         let (composed, staged) = workspace::load();
         if !staged.is_empty() {
-            tracing::info!(staged = staged.join(", "), "workspace canon docs staged from the OpenClaw workspace");
+            tracing::info!(
+                staged = staged.join(", "),
+                "workspace canon docs staged from the OpenClaw workspace"
+            );
         }
         match composed {
             Some(p) => {
                 let chars = p.chars().count();
                 cfg.system_prompt = Some(p);
-                tracing::info!(files = staged.len(), chars, "persona composed from workspace canon docs");
+                tracing::info!(
+                    files = staged.len(),
+                    chars,
+                    "persona composed from workspace canon docs"
+                );
             }
             None => {
                 let path = config::persona_file_path();
                 if let Ok(raw) = std::fs::read_to_string(&path) {
                     cfg.system_prompt = Some(raw.trim().to_string());
-                    let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+                    let chars = cfg
+                        .system_prompt
+                        .as_ref()
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0);
                     tracing::info!(file = %path.display(), chars, "persona system prompt loaded (flat fallback)");
                 } else {
                     tracing::info!(
@@ -149,7 +160,11 @@ async fn main() -> anyhow::Result<()> {
                 Some(existing) => format!("{existing}{section}"),
                 None => section,
             });
-            let chars = cfg.system_prompt.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+            let chars = cfg
+                .system_prompt
+                .as_ref()
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
             tracing::info!(file = %path.display(), chars, "known-users database view appended to persona");
         }
     }
@@ -196,9 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::timeout(),
                 commands::help(),
             ],
-            event_handler: |ctx, event| {
-                Box::pin(chat_fallback::handle(ctx, event))
-            },
+            event_handler: |ctx, event| Box::pin(chat_fallback::handle(ctx, event)),
             // Owner gate (see owner_gate_check + owner.rs).
             command_check: Some(owner_gate_check),
             on_error: |err| {
@@ -242,8 +255,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .build();
 
-    let mut client =
-        serenityall::ClientBuilder::new(token, intents).framework(framework).await?;
+    let mut client = serenityall::ClientBuilder::new(token, intents)
+        .framework(framework)
+        .await?;
     client.start().await?;
     Ok(())
 }

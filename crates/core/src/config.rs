@@ -20,7 +20,7 @@ mod hex_opt_bytes {
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
     ) -> Result<Option<Vec<u8>>, D::Error> {
-        let s: Option<String> = serde ::Deserialize::deserialize(d)?;
+        let s: Option<String> = serde::Deserialize::deserialize(d)?;
         match s {
             None => Ok(None),
             Some(hexstr) => hex::decode(hexstr)
@@ -244,7 +244,11 @@ impl WebSearchConfig {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             })
-            .or_else(|| self.api_key_path.as_deref().and_then(|p| read_file(Path::new(p))))
+            .or_else(|| {
+                self.api_key_path
+                    .as_deref()
+                    .and_then(|p| read_file(Path::new(p)))
+            })
             .or_else(|| read_file(&NodeConfig::home().join("brave-key")))
             // Borrowed migration source (read-only; never written to):
             .or_else(|| {
@@ -294,6 +298,12 @@ pub struct NodeConfig {
     /// Authorization header, exactly as before.
     #[serde(default)]
     pub runtime_api_key: Option<String>,
+    /// Optional runaway-generation cap for the runtime chat lane
+    /// (forwarded as `max_tokens` when the caller set no cap of their
+    /// own). None → uncapped, exactly as before. Guard against thinking
+    /// models that loop unbounded (deepseek-r1:8b live 2026-10-14).
+    #[serde(default)]
+    pub runtime_num_predict: Option<u64>,
     /// Model router: vision tier for image-content chats (see
     /// `model_router`). Default on; an empty string disables the tier.
     #[serde(default = "default_vision_router_model")]
@@ -347,8 +357,6 @@ fn default_deep_router_model() -> Option<String> {
     Some(crate::model_router::DEFAULT_DEEP_MODEL.to_string())
 }
 
-
-
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -366,12 +374,9 @@ impl Default for NodeConfig {
             advertise_host: None,
             gateway_bind: None,
             runtime_api_key: None,
-            runtime_vision_model: Some(
-                crate::model_router::DEFAULT_VISION_MODEL.to_string(),
-            ),
-            runtime_deep_model: Some(
-                crate::model_router::DEFAULT_DEEP_MODEL.to_string(),
-            ),
+            runtime_num_predict: None,
+            runtime_vision_model: Some(crate::model_router::DEFAULT_VISION_MODEL.to_string()),
+            runtime_deep_model: Some(crate::model_router::DEFAULT_DEEP_MODEL.to_string()),
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
             ringer_percent: default_ringer_percent(),
@@ -490,8 +495,8 @@ impl NodeConfig {
     /// identity fields), so the load is the only guaranteed heal point on
     /// every boot.
     pub fn load_from(path: &std::path::Path) -> anyhow::Result<Option<Self>> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: Self =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         Self::restrict_file_permissions(path);
@@ -694,8 +699,7 @@ mod tests {
 
         // Documented last resort when no config override AND the sandbox
         // has no routable default route: loopback, never an empty string.
-        let fallback = detect_routable_host()
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let fallback = detect_routable_host().unwrap_or_else(|| "127.0.0.1".to_string());
         assert_eq!(cfg.advertised_host(), fallback);
 
         cfg.advertise_host = Some("mesh.example.org".into());
@@ -792,7 +796,10 @@ mod tests {
         cfg.ensure_identity().unwrap();
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: NodeConfig = toml::from_str(&text).unwrap();
-        assert_eq!(back.identity().unwrap().pubkey_hex(), cfg.identity().unwrap().pubkey_hex());
+        assert_eq!(
+            back.identity().unwrap().pubkey_hex(),
+            cfg.identity().unwrap().pubkey_hex()
+        );
     }
 
     #[test]

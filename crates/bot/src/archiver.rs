@@ -117,8 +117,13 @@ pub fn extract_notes(
     max_notes: usize,
     self_bot_id: Option<u64>,
 ) -> Vec<String> {
-    let needle_filter =
-        |content: &str| -> bool { markers.iter().any(|m| content.to_ascii_lowercase().contains(&m.to_ascii_lowercase())) };
+    let needle_filter = |content: &str| -> bool {
+        markers.iter().any(|m| {
+            content
+                .to_ascii_lowercase()
+                .contains(&m.to_ascii_lowercase())
+        })
+    };
     let mut out: Vec<String> = Vec::new();
     // Discord gives newest-first; walk oldest→newest so a summary reads
     // chronologically like the thread did.
@@ -346,7 +351,9 @@ async fn self_bot_id(client: &reqwest::Client, token: &str) -> Option<u64> {
         .await
         .ok()?;
     let v: Value = resp.json().await.ok()?;
-    v.get("id").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok())
+    v.get("id")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 pub async fn sweep(cfg: &BotConfig) -> usize {
@@ -392,11 +399,15 @@ async fn sweep_one(
     self_bot_id: Option<u64>,
 ) -> Result<()> {
     let key = cid.to_string();
-    let after = ledger
-        .entries
-        .get(&key)
-        .and_then(|e| e.last_message_id);
-    let messages = fetch_messages(client, &cfg.discord_token, cid, after, arch.max_messages_per_sweep).await?;
+    let after = ledger.entries.get(&key).and_then(|e| e.last_message_id);
+    let messages = fetch_messages(
+        client,
+        &cfg.discord_token,
+        cid,
+        after,
+        arch.max_messages_per_sweep,
+    )
+    .await?;
     if messages.is_empty() {
         return Ok(()); // nothing new
     }
@@ -451,7 +462,9 @@ async fn sweep_one(
     let _ = std::fs::create_dir_all(&archive_dir);
     let file = archive_dir.join(format!(
         "{cid}-{}.md",
-        now.chars().filter(|c| c.is_ascii_digit()).collect::<String>()
+        now.chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
     ));
     let _ = std::fs::write(&file, &summary);
 
@@ -567,8 +580,20 @@ mod tests {
     #[test]
     fn extraction_surfaces_decisions_and_notes_chronologically() {
         let batch = vec![
-            msg("1003", "55", "noodly", "Decision: we use sqlite for memory.", false),
-            msg("1002", "66", "guest", "Action item: Noodly migrates the ledger.", false),
+            msg(
+                "1003",
+                "55",
+                "noodly",
+                "Decision: we use sqlite for memory.",
+                false,
+            ),
+            msg(
+                "1002",
+                "66",
+                "guest",
+                "Action item: Noodly migrates the ledger.",
+                false,
+            ),
             msg(
                 "1001",
                 "77",
@@ -589,7 +614,15 @@ mod tests {
     #[test]
     fn extraction_caps_the_batch() {
         let batch: Vec<Value> = (0..40)
-            .map(|i| msg(format!("{i:06}").as_str(), "500", "n", "decision: yes", false))
+            .map(|i| {
+                msg(
+                    format!("{i:06}").as_str(),
+                    "500",
+                    "n",
+                    "decision: yes",
+                    false,
+                )
+            })
             .collect();
         assert_eq!(extract_notes(&batch, &DEFAULT_MARKERS, 5, None).len(), 5);
     }
@@ -599,8 +632,20 @@ mod tests {
         // A third-party bot's decision line is dropped; the archiver's own
         // bot account (self id = 777) is a primary-note author and kept.
         let batch = vec![
-            msg("1005", "777", "JS", "Decision: self-authored notes count.", true),
-            msg("1004", "888", "HelperBot", "Decision: not my business.", true),
+            msg(
+                "1005",
+                "777",
+                "JS",
+                "Decision: self-authored notes count.",
+                true,
+            ),
+            msg(
+                "1004",
+                "888",
+                "HelperBot",
+                "Decision: not my business.",
+                true,
+            ),
         ];
         let kept = extract_notes(&batch, &DEFAULT_MARKERS, 10, Some(777));
         assert_eq!(kept.len(), 1);
@@ -663,9 +708,15 @@ mod tests {
         assert_eq!(utc_timestamp_string(0), "1970-01-01 00:00:00");
         // 2026-01-01 00:00Z = 1,767,225,600 (20,454 days) · +285 days to
         // Oct 13 00:00 = 1,791,849,600 · + 27,000 s for 07:30.
-        assert_eq!(utc_timestamp_string(1_791_876_600 * 1000), "2026-10-13 07:30:00");
+        assert_eq!(
+            utc_timestamp_string(1_791_876_600 * 1000),
+            "2026-10-13 07:30:00"
+        );
         // 2000-02-29 12:00Z: Jan 1 2000 = 946,684,800 · +59 days (Feb 29
         // 00:00) · + 12 h → 951,825,600 (leap-day sanity).
-        assert_eq!(utc_timestamp_string(951_825_600 * 1000), "2000-02-29 12:00:00");
+        assert_eq!(
+            utc_timestamp_string(951_825_600 * 1000),
+            "2000-02-29 12:00:00"
+        );
     }
 }

@@ -214,9 +214,8 @@ impl VerificationTracker {
         }
 
         let reporter = state.identity.node_id();
-        let bootstrap = crate::bootstrap::BootstrapClient::new(
-            state.config.read().await.bootstrap_url.clone(),
-        );
+        let bootstrap =
+            crate::bootstrap::BootstrapClient::new(state.config.read().await.bootstrap_url.clone());
         let mut sent: Vec<String> = Vec::new();
         for node_id in &to_report {
             if node_id == &reporter {
@@ -291,7 +290,13 @@ pub fn builtin_expert_answer(kind: &str, input: &[f32]) -> Vec<f32> {
 /// Returns (expert_id, input, expected_output).
 pub fn ringer_task(seed: u64) -> (&'static str, Vec<f32>, Vec<f32>) {
     let input: Vec<f32> = (0..8)
-        .map(|i| (((seed.wrapping_mul(1103515245).wrapping_add(12345 + i as u64 * 77)) % 97) as f32) - 48.0)
+        .map(|i| {
+            (((seed
+                .wrapping_mul(1103515245)
+                .wrapping_add(12345 + i as u64 * 77))
+                % 97) as f32)
+                - 48.0
+        })
         .collect();
     let expected = builtin_expert_answer("reverse2", &input);
     ("jerith-builtin/reverse2", input, expected)
@@ -323,8 +328,14 @@ mod tests {
         assert_ne!(base, result_commitment("req-2", "exp.a", "node-1", I, O));
         assert_ne!(base, result_commitment("req-1", "exp.b", "node-1", I, O));
         assert_ne!(base, result_commitment("req-1", "exp.a", "node-2", I, O));
-        assert_ne!(base, result_commitment("req-1", "exp.a", "node-1", &[2.0], O));
-        assert_ne!(base, result_commitment("req-1", "exp.a", "node-1", I, &[8.0]));
+        assert_ne!(
+            base,
+            result_commitment("req-1", "exp.a", "node-1", &[2.0], O)
+        );
+        assert_ne!(
+            base,
+            result_commitment("req-1", "exp.a", "node-1", I, &[8.0])
+        );
     }
 
     #[test]
@@ -395,7 +406,10 @@ mod tests {
         assert_ne!(in1, in3);
         // Inputs stay integer-valued and covered by builtin answer.
         for v in &in1 {
-            assert!(v.fract() == 0.0 && (*v >= -48.0) && (*v < 49.0), "ringer input exact: {v}");
+            assert!(
+                v.fract() == 0.0 && (*v >= -48.0) && (*v < 49.0),
+                "ringer input exact: {v}"
+            );
         }
         assert_eq!(out1, builtin_expert_answer("reverse2", &in1));
         // Bit-exact power-of-two scaling: reverse + ×2.
@@ -406,8 +420,14 @@ mod tests {
     #[test]
     fn builtin_answers_are_exact_and_bounded() {
         let input = [1.5, -3.0, 7.0];
-        assert_eq!(builtin_expert_answer("scale4", &input), vec![6.0, -12.0, 28.0]);
-        assert_eq!(builtin_expert_answer("reverse2", &input), vec![14.0, -6.0, 3.0]);
+        assert_eq!(
+            builtin_expert_answer("scale4", &input),
+            vec![6.0, -12.0, 28.0]
+        );
+        assert_eq!(
+            builtin_expert_answer("reverse2", &input),
+            vec![14.0, -6.0, 3.0]
+        );
         assert!(builtin_expert_answer("unknown-kind", &input).is_empty());
     }
 

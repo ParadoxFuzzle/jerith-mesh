@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::economics::JerithMiner;
 use crate::memory::SharedMemory;
@@ -37,6 +37,14 @@ pub struct Gateway {
     /// Optional bearer key forwarded to the runtime (authed LiteLLM).
     /// None → runtime calls go out with no Authorization header.
     pub runtime_api_key: Option<String>,
+    /// Optional runaway-generation cap for thinking models: when set, chat
+    /// forwards to the runtime carry `max_tokens = N` UNLESS the caller set
+    /// an explicit cap themselves (max_tokens / max_completion_tokens /
+    /// num_predict — caller intent always wins). Motivation: a thinking
+    /// model that loops unbounded wedges the chat queue behind it
+    /// (deepseek-r1:8b live, 2026-10-14 — >6 min streaming without
+    /// terminating on a one-line riddle).
+    pub runtime_num_predict: Option<u64>,
     /// Optional JER miner (present when crypto chain = JerithChain).
     pub miner: Option<JerithMiner>,
     /// Local memory store backing the memory.* skills.
@@ -83,26 +91,11 @@ impl Gateway {
             .route("/status", get(status))
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
-            .route(
-                "/v1/skills/memory/embed",
-                post(skill_memory_embed),
-            )
-            .route(
-                "/v1/skills/memory/search",
-                post(skill_memory_search),
-            )
-            .route(
-                "/v1/skills/memory/similar",
-                post(skill_memory_similar),
-            )
-            .route(
-                "/v1/skills/memory/stats",
-                get(skill_memory_stats),
-            )
-            .route(
-                "/v1/skills/lore/search",
-                post(skill_lore_search),
-            )
+            .route("/v1/skills/memory/embed", post(skill_memory_embed))
+            .route("/v1/skills/memory/search", post(skill_memory_search))
+            .route("/v1/skills/memory/similar", post(skill_memory_similar))
+            .route("/v1/skills/memory/stats", get(skill_memory_stats))
+            .route("/v1/skills/lore/search", post(skill_lore_search))
             .route("/v1/skills/web/search", post(skill_web_search))
             .route("/v1/skills/web/fetch", post(skill_web_fetch))
             .route("/v1/metrics", get(metrics_handler))
@@ -129,10 +122,7 @@ const MEMORY_EMBED_TEXT_CAP_CHARS: usize = 64_000;
 /// must chunk.
 const CHAT_FORWARD_CAP_BYTES: usize = 1_000_000;
 
-async fn skill_memory_embed(
-    State(gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn skill_memory_embed(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(memory) = &gw.memory else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -159,7 +149,7 @@ async fn skill_memory_embed(
                     )
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
     match memory.embed_and_store(text).await {
@@ -177,10 +167,7 @@ async fn skill_memory_embed(
 }
 
 /// skill: memory.search — local vector search over the local store.
-async fn skill_memory_search(
-    State(gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn skill_memory_search(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(memory) = &gw.memory else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -230,10 +217,7 @@ async fn skill_memory_search(
 
 /// skill: memory.similar — semantic-memories port: rank stored entries by
 /// similarity to the entry with the given seed id. Body: {id, top_k?}.
-async fn skill_memory_similar(
-    State(gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn skill_memory_similar(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(memory) = &gw.memory else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -251,11 +235,7 @@ async fn skill_memory_similar(
         .clamp(1, 25) as usize;
     match memory.similar_to(id, top_k).await {
         Ok(hits) => (StatusCode::OK, Json(json!({"hits": hits}))).into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
 
@@ -316,10 +296,7 @@ async fn metrics_handler(State(gw): State<Arc<Gateway>>) -> impl IntoResponse {
 
 /// skill: lore.search — void-lore-index port over the configured vault
 /// (built on demand, ~/.openclaw borrow). Body: {query, top_k?}.
-async fn skill_lore_search(
-    State(_gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn skill_lore_search(State(_gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(query) = body
         .get("query")
         .or_else(|| body.get("q"))
@@ -348,14 +325,14 @@ async fn skill_lore_search(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("lore index build failed: {e}")})),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("lore index task failed: {e}")})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let hits = index.search(query, k);
@@ -382,20 +359,13 @@ fn web_disabled_response() -> Response {
 }
 
 fn bad_request(msg: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": msg})),
-    )
-        .into_response()
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
 }
 
 /// skill: web.search — Brave Search API (web mode), OpenClaw brave-plugin
 /// port. Optional body fields: count, country, search_lang, ui_lang,
 /// freshness (day|week|month|year).
-async fn skill_web_search(
-    State(gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn skill_web_search(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(web) = gw.web.clone() else {
         return web_disabled_response();
     };
@@ -411,12 +381,18 @@ async fn skill_web_search(
     let sq = crate::websearch::SearchQuery {
         query: query.to_string(),
         count: body.get("count").and_then(Value::as_u64).map(|c| c as u32),
-        country: body.get("country").and_then(Value::as_str).map(str::to_string),
+        country: body
+            .get("country")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         search_lang: body
             .get("search_lang")
             .and_then(Value::as_str)
             .map(str::to_string),
-        ui_lang: body.get("ui_lang").and_then(Value::as_str).map(str::to_string),
+        ui_lang: body
+            .get("ui_lang")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         freshness: body
             .get("freshness")
             .and_then(Value::as_str)
@@ -443,10 +419,7 @@ async fn skill_web_search(
 
 /// skill: web.fetch — download a URL and return readable page text
 /// (OpenClaw web_fetch port). Optional body field: max_chars.
-async fn skill_web_fetch(
-    State(gw): State<Arc<Gateway>>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn skill_web_fetch(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(web) = gw.web.clone() else {
         return web_disabled_response();
     };
@@ -479,10 +452,7 @@ async fn skill_web_fetch(
 /// Wire auth: when the request carries signed ping headers they are
 /// verified — a bad signature gets a 401 and must not count as liveness.
 /// The reply itself is Ed25519-signed so the pinger can attribute it.
-async fn health(
-    State(gw): State<Arc<Gateway>>,
-    headers: HeaderMap,
-) -> Response {
+async fn health(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
     let cfg = gw.state.config.read().await;
     let meters = gw.state.meters.lock().await;
 
@@ -628,11 +598,7 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     });
     // Live counters: a heuristically cached stale snapshot would make the
     // web dashboard (and any monitor) read lagged values.
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(value),
-    )
-        .into_response()
+    ([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
 }
 
 /// Compact per-model view for the /status `metrics` section (full detail
@@ -725,10 +691,7 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
 
 /// Forward chat completions to the local runtime, metering the request.
 /// Streaming responses are passed through byte-for-byte.
-async fn chat_completions(
-    State(gw): State<Arc<Gateway>>,
-    Json(mut body): Json<Value>,
-) -> Response {
+async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<Value>) -> Response {
     // Jerith Guard: screen everything about to leave the node — this gate
     // covers both the local runtime forward and mesh fallback below.
     if let Some(guard) = &gw.guard {
@@ -787,6 +750,16 @@ async fn chat_completions(
                 "model router: rerouted chat request"
             );
             body["model"] = serde_json::Value::String(next);
+        }
+    }
+    // Runaway cap: bound generation for the runtime lane when configured
+    // and the caller didn't express their own cap (see field docs).
+    if let Some(cap) = gw.runtime_num_predict {
+        let caller_capped = ["max_tokens", "max_completion_tokens", "num_predict"]
+            .iter()
+            .any(|k| body.get(*k).map(|v| !v.is_null()).unwrap_or(false));
+        if !caller_capped {
+            body["max_tokens"] = serde_json::json!(cap);
         }
     }
     let client = reqwest::Client::builder()
@@ -849,7 +822,11 @@ async fn chat_completions(
                 // Streaming + dead local runtime: peers serve non-streaming;
                 // wrap their single reply in a minimal SSE chunk shape so
                 // stream clients work too, attributed via mesh_fallback.
-                if body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if body
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     let state = gw.state.clone();
                     let msgs = messages.clone();
                     let result = mf
@@ -974,7 +951,7 @@ async fn chat_completions(
                     "mesh_fallback": Value::Null,
                 })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -988,7 +965,12 @@ async fn chat_completions(
         .unwrap_or(false);
 
     if is_stream {
-        // Pass through; metering happens client-side in Phase 1+.
+        // Pass through CHUNK-BY-CHUNK: the old `resp.bytes().await` here
+        // buffered the whole generation before sending a byte, silently
+        // turning every stream client into a non-stream caller. SSE must
+        // arrive as the runtime produces it — that is the entire point of
+        // stream:true (bot live-typing reads it, 2026-10-14). Chunk
+        // metering moves client-side along with the old Phase-1 note.
         let status = resp.status();
         let ct = resp
             .headers()
@@ -996,15 +978,10 @@ async fn chat_completions(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("text/event-stream")
             .to_string();
-        let bytes = resp.bytes().await.unwrap_or_default();
-        {
-            let mut meters = gw.state.meters.lock().await;
-            meters.bytes_relayed += bytes.len() as u64;
-        }
         return (
             status,
-            [( "content-type", ct.as_str() )],
-            bytes,
+            [("content-type", ct.as_str())],
+            axum::body::Body::from_stream(resp.bytes_stream()),
         )
             .into_response();
     }
@@ -1050,12 +1027,7 @@ async fn chat_completions(
             meters.mines_attempted += 1;
         }
     }
-    (
-        status,
-        [("content-type", "application/json")],
-        bytes,
-    )
-        .into_response()
+    (status, [("content-type", "application/json")], bytes).into_response()
 }
 
 #[cfg(test)]
@@ -1072,6 +1044,7 @@ mod tests {
             state: state.clone(),
             runtime_url: runtime_url.to_string(),
             runtime_api_key: None,
+            runtime_num_predict: None,
             miner: None,
             memory: None,
             mesh_fallback: if fallback {
@@ -1105,6 +1078,7 @@ mod tests {
             state,
             runtime_url: "http://127.0.0.1:1".to_string(),
             runtime_api_key: None,
+            runtime_num_predict: None,
             miner: None,
             memory: Some(Arc::new(memory)),
             mesh_fallback: None,
@@ -1131,6 +1105,7 @@ mod tests {
             state: state.clone(),
             runtime_url: runtime_url.to_string(),
             runtime_api_key: None,
+            runtime_num_predict: None,
             miner: None,
             memory: None,
             mesh_fallback: None,
@@ -1171,6 +1146,7 @@ mod tests {
             state,
             runtime_url: cfg.runtime_url.clone(),
             runtime_api_key: None,
+            runtime_num_predict: None,
             miner: None,
             memory: None,
             mesh_fallback: None,
@@ -1193,7 +1169,11 @@ mod tests {
         assert_eq!(snap.requests_total, 1);
         assert_eq!(snap.ok_total, 1);
         // Model recorded is the RESPONSE's model (qwen3:8b), not caller x.
-        assert!(snap.models.contains_key("qwen3:8b"), "models: {:?}", snap.models.keys());
+        assert!(
+            snap.models.contains_key("qwen3:8b"),
+            "models: {:?}",
+            snap.models.keys()
+        );
         assert_eq!(snap.models["qwen3:8b"].total_tokens, 15);
         assert!(snap.models["qwen3:8b"].latency_ms_max < 60_000);
     }
@@ -1212,7 +1192,10 @@ mod tests {
         assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
         let body: Value = res.json();
         assert!(
-            body["error"].as_str().unwrap().contains("blocked by jerith-guard"),
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("blocked by jerith-guard"),
             "error must name the guard, got {body}"
         );
         // Detection report present, raw value never echoed back.
@@ -1255,6 +1238,80 @@ mod tests {
         assert!(!got.contains("bob@corp.example"), "runtime saw: {got}");
     }
 
+    /// Recording runtime + gateway with the runaway cap armed: forwarded
+    /// chats must carry max_tokens, and a caller's own cap must never be
+    /// overridden (caller intent always wins).
+    async fn assert_forwarded_body(gw_cap: Option<u64>, request: Value) -> serde_json::Value {
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let recv = received.clone();
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let recv = recv.clone();
+                async move {
+                    *recv.lock().await = body;
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.expect("runtime up") });
+
+        let mut cfg = crate::config::NodeConfig::default();
+        cfg.runtime_url = format!("http://{addr}");
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: format!("http://{addr}"),
+            runtime_api_key: None,
+            runtime_num_predict: gw_cap,
+            miner: None,
+            memory: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let res = server.post("/v1/chat/completions").json(&request).await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        serde_json::from_str(&received.lock().await).expect("forwarded body json")
+    }
+
+    #[tokio::test]
+    async fn num_predict_cap_caps_uncapped_forwards_only() {
+        // Cap armed + caller cap-free → forwarded body carries max_tokens.
+        let forwarded = assert_forwarded_body(
+            Some(50),
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(forwarded.get("max_tokens"), Some(&json!(50)));
+
+        // Caller already capped (either OpenAI spelling) → untouched.
+        let forwarded = assert_forwarded_body(
+            Some(50),
+            json!({"model": "m", "max_tokens": 999, "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(forwarded.get("max_tokens"), Some(&json!(999)));
+
+        // Gate disarmed → forwarded body carries no cap at all.
+        let forwarded = assert_forwarded_body(
+            None,
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(forwarded.get("max_tokens"), None);
+    }
+
     #[tokio::test]
     async fn chat_oversized_payload_is_413_not_forwarded() {
         // Nothing listens on :1 — any success below would mean the payload
@@ -1268,10 +1325,7 @@ mod tests {
                 "messages": [{"role": "user", "content": pad}]
             }))
             .await;
-        assert_eq!(
-            res.status_code(),
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE
-        );
+        assert_eq!(res.status_code(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         let body: Value = res.json();
         assert!(
             body["error"].as_str().unwrap().contains("exceeds"),
@@ -1304,10 +1358,7 @@ mod tests {
             .post("/v1/skills/memory/search")
             .json(&json!({"query": big}))
             .await;
-        assert_eq!(
-            res.status_code(),
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE
-        );
+        assert_eq!(res.status_code(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
@@ -1315,8 +1366,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let server = spawn_with_memory();
-        let mem_before = crate::metrics::OVERSIZE_MEMORY_REJECTS
-            .load(Ordering::Relaxed);
+        let mem_before = crate::metrics::OVERSIZE_MEMORY_REJECTS.load(Ordering::Relaxed);
         // One oversize rejection so the /status section has a live,
         // nonzero breakdown value to read back.
         let big = "z".repeat(10_001);
@@ -1324,13 +1374,9 @@ mod tests {
             .post("/v1/skills/memory/search")
             .json(&json!({"query": big}))
             .await;
-        assert_eq!(
-            res.status_code(),
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE
-        );
+        assert_eq!(res.status_code(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         assert!(
-            crate::metrics::OVERSIZE_MEMORY_REJECTS.load(Ordering::Relaxed)
-                >= mem_before + 1,
+            crate::metrics::OVERSIZE_MEMORY_REJECTS.load(Ordering::Relaxed) >= mem_before + 1,
             "memory oversize counter must reflect the 413"
         );
 

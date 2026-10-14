@@ -14,12 +14,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{watch, Mutex, RwLock};
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::sync::{Mutex, RwLock, watch};
+use tokio::time::{MissedTickBehavior, interval};
 
-use crate::bootstrap::{
-    now_ms, BootstrapClient, PeerAd, PeerRegistry, PeerState,
-};
+use crate::bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState, now_ms};
 use crate::config::{NodeConfig, NodeRole};
 
 /// Shared Phase 4 verification tracker: counters + pending fraud evidence.
@@ -71,10 +69,7 @@ impl MeshState {
     pub fn new(config: NodeConfig) -> anyhow::Result<(Arc<Self>, watch::Receiver<bool>)> {
         let (tx, rx) = watch::channel(true);
         let identity = config.identity()?;
-        let stake = crate::stake::StakeManager::new(
-            &config.crypto,
-            Some(identity.clone()),
-        );
+        let stake = crate::stake::StakeManager::new(&config.crypto, Some(identity.clone()));
         let state = Arc::new(Self {
             config: RwLock::new(config),
             registry: Mutex::new(PeerRegistry::new(None)),
@@ -128,7 +123,11 @@ impl MeshFallbackChat {
             },
             verify,
         ));
-        Ok(Arc::new(Self { endpoint, router, pins }))
+        Ok(Arc::new(Self {
+            endpoint,
+            router,
+            pins,
+        }))
     }
 
     /// Rebuild endpoint config pins from current registry rpc addresses.
@@ -193,9 +192,15 @@ impl MeshFallbackChat {
         let identity = state.identity.clone();
         let local_closed = local_attempt.is_err();
         match router
-            .chat_over_quic(&endpoint, &identity, &addrs, &req_id, messages, &peers, || {
-                local_attempt
-            })
+            .chat_over_quic(
+                &endpoint,
+                &identity,
+                &addrs,
+                &req_id,
+                messages,
+                &peers,
+                || local_attempt,
+            )
             .await
         {
             // The router reports which node actually answered: empty string =
@@ -283,7 +288,8 @@ async fn run_loop(
         // a model switch event, which cleared it).
         {
             let mut reg = state.registry.lock().await;
-            let gate_matches = reg.model().map(|m| m.id.clone()) == model.as_ref().map(|m| m.id.clone());
+            let gate_matches =
+                reg.model().map(|m| m.id.clone()) == model.as_ref().map(|m| m.id.clone());
             if !gate_matches {
                 *reg = PeerRegistry::new(model.clone());
             }
@@ -300,10 +306,7 @@ async fn run_loop(
             // Signed peers-fetch: the bootstrap's rate lane attributes the
             // hit to OUR identity bucket (generous allowance for NAT-
             // packed deployments) instead of the per-IP anonymous floor.
-            match bootstrap
-                .fetch_peers_signed(&m.id, &state.identity)
-                .await
-            {
+            match bootstrap.fetch_peers_signed(&m.id, &state.identity).await {
                 Ok(peers) => {
                     let mut reg = state.registry.lock().await;
                     let fetched = peers.len();
@@ -370,10 +373,7 @@ async fn run_loop(
             // Phase 5: each bootstrap-accepted report becomes a signed slash
             // notice + ledger entry (no-op while staking is disabled).
             for target in &flushed_targets {
-                let evidence = format!(
-                    "dishonest-results|{}|{target}",
-                    state.identity.node_id()
-                );
+                let evidence = format!("dishonest-results|{}|{target}", state.identity.node_id());
                 state
                     .stake
                     .notice(target, "dishonest_results", &evidence)
@@ -548,7 +548,10 @@ async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
                 if !alive {
                     return None;
                 }
-                ad.rpc_address.parse::<SocketAddr>().ok().map(|a| (ad.node_id.clone(), a))
+                ad.rpc_address
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|a| (ad.node_id.clone(), a))
             })
             .collect()
     };
@@ -611,12 +614,7 @@ async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
             state.verify.note_expert_result().await;
             if let Some(c) = &commitment {
                 let ok = crate::verify::verify_commitment(
-                    &req_id,
-                    expert_id,
-                    &server_id,
-                    &input,
-                    &output,
-                    c,
+                    &req_id, expert_id, &server_id, &input, &output, c,
                 );
                 state.verify.note_commitment(&server_id, ok).await;
                 if !ok {
