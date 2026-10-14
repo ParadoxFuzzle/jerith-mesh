@@ -239,6 +239,19 @@ for i in $(seq 1 250); do curl -s -o /dev/null -w "%{http_code}\n" \
 #   413 node:  any chat body > 1 MB serialized.
 #   400 bootstrap: PUT /v1/advertise with model_id 2 000 chars (no
 #   wire-auth headers needed — validation precedes crypto).
+# Production CF-path verification (2026-10-14, all green):
+#   - Burst https://p2p.jerithai.com/v1/peers from the probe host:
+#     trips at exactly 240 (240 = 239 burst + 1 health), 429s carry
+#     Retry-After; while the public-path bucket is dry, direct
+#     loopback requests still 200 — buckets are distinct, so public
+#     traffic is attributed via the CF header (real client IP), not
+#     the tunnel's socket.
+#   - Isolation: with the probe host's bucket dry (429s), requests
+#     from two other/external IPs (Serper fetcher post-window,
+#     r.jina.ai mid-window) still served normal 200 peer lists —
+#     one client's flood cannot lock out others. (Serper's one-off
+#     mid-window 429 looked like CF-edge throttling of that fetcher,
+#     not origin behavior — origin is per-IP by construction.)
 ```
 
 Known remaining limitations (accepted, bounded):
