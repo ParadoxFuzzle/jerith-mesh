@@ -274,6 +274,12 @@ pub struct NodeConfig {
     pub gateway_port: u16,
     /// UDP port for the QUIC NodeRPC listener (defaults to gateway_port+1).
     pub rpc_port: Option<u16>,
+    /// Hostname or IP peers should use to reach this node's advertised
+    /// gateway + QUIC rpc addresses. None → auto-detect the default-route
+    /// interface address at first use; sticks with `127.0.0.1` only when
+    /// nothing routable can be found (containers, no default route).
+    #[serde(default)]
+    pub advertise_host: Option<String>,
     /// Colibri / Ollama base URL to forward chat completions to.
     pub runtime_url: String,
     /// Optional bearer key for OpenAI-compatible runtimes that enforce
@@ -351,6 +357,7 @@ impl Default for NodeConfig {
             specialists: SpecialistConfig::default(),
             gateway_port: 8900,
             rpc_port: None,
+            advertise_host: None,
             runtime_api_key: None,
             runtime_vision_model: Some(
                 crate::model_router::DEFAULT_VISION_MODEL.to_string(),
@@ -376,6 +383,60 @@ impl NodeConfig {
     pub fn effective_rpc_port(&self) -> u16 {
         self.rpc_port.unwrap_or(self.gateway_port + 100)
     }
+
+    /// Host part for the advertised gateway + rpc addresses: the explicit
+    /// `advertise_host` override when set, else the auto-detected
+    /// default-route source address, else loopback (last resort).
+    pub fn advertised_host(&self) -> String {
+        if let Some(host) = self.advertise_host.as_deref() {
+            let host = host.trim().trim_end_matches('/');
+            if !host.is_empty() {
+                return host.to_string();
+            }
+        }
+        detect_routable_host().unwrap_or_else(|| "127.0.0.1".to_string())
+    }
+}
+
+/// Best-effort source-address detection for advertise — the std UDP
+/// "connect trick": connecting a datagram socket to a public resolver
+/// makes the kernel route (no packet is emitted) and `local_addr` then
+/// holds the interface address the OS would source from. Preferred over
+/// an interface-enumeration crate: zero new dependencies, works on every
+/// supported OS, and returns *the* address the default route uses.
+fn detect_routable_host() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // v4 first (mesh traffic overwhelmingly), v6 as the fallback.
+            for remote in ["8.8.8.8:80", "[2606:4700:4700::1111]:80"] {
+                let Ok(remote) = remote.parse::<std::net::SocketAddr>() else {
+                    continue;
+                };
+                let bind: std::net::SocketAddr = if remote.is_ipv4() {
+                    "0.0.0.0:0".parse().unwrap()
+                } else {
+                    "[::]:0".parse().unwrap()
+                };
+                let Ok(sock) = std::net::UdpSocket::bind(bind) else {
+                    continue;
+                };
+                if sock.connect(remote).is_err() {
+                    continue;
+                }
+                if let Ok(local) = sock.local_addr() {
+                    let ip = local.ip();
+                    // Loopback/unspecified here means "no route anywhere" —
+                    // publishing 127.0.0.1 is the documented last resort,
+                    // handled by the caller, not by a bogus detection.
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 impl NodeConfig {
@@ -573,6 +634,30 @@ mod tests {
         let identity = cfg.identity().unwrap();
         assert_eq!(cfg.node_id, identity.node_id());
         assert_eq!(cfg.node_id.len(), 16);
+    }
+
+    #[test]
+    fn advertise_host_override_wins_and_empty_falls_back() {
+        let mut cfg = NodeConfig::default();
+
+        // Documented last resort when no config override AND the sandbox
+        // has no routable default route: loopback, never an empty string.
+        let fallback = detect_routable_host()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        assert_eq!(cfg.advertised_host(), fallback);
+
+        cfg.advertise_host = Some("mesh.example.org".into());
+        assert_eq!(cfg.advertised_host(), "mesh.example.org");
+
+        // Whitespace / trailing slash tolerated in the override.
+        cfg.advertise_host = Some("  192.168.1.150  ".into());
+        assert_eq!(cfg.advertised_host(), "192.168.1.150");
+        cfg.advertise_host = Some("  mesh.example.org/  ".into());
+        assert_eq!(cfg.advertised_host(), "mesh.example.org");
+
+        // Empty override falls back to detection, is never published as "".
+        cfg.advertise_host = Some("".into());
+        assert_eq!(cfg.advertised_host(), fallback);
     }
 
     #[test]

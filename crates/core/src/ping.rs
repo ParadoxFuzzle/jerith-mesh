@@ -331,22 +331,23 @@ async fn run_loop(
             // Ping every connectable peer.
             ping_all(&state, &bootstrap).await;
 
-            // Advertise ourselves (signed); rpc_address points at our
-            // QUIC NodeRPC so peers can dispatch experts to us.
-            let (ad, identity) = {
-                let cfg = state.config.read().await;
-                let ad = PeerAd {
-                    node_id: cfg.node_id.clone(),
-                    address: format!("127.0.0.1:{}", cfg.gateway_port),
-                    rpc_address: format!("127.0.0.1:{}", cfg.effective_rpc_port()),
-                    model_id: my_ad_model.0,
-                    quant: my_ad_model.1,
-                    contribution_percent: cfg.contribution_percent,
-                    last_seen_ms: now_ms(),
-                    role: cfg.role,
-                };
-                (ad, state.identity.clone())
+            // Advertise ourselves (signed); the addresses point at our
+            // routable interface (advertise_host override or the
+            // default-route detection) so OTHER nodes can dial us directly
+            // over QUIC — 127.0.0.1 ads made every remote dial a self-dial.
+            let cfg = state.config.read().await;
+            let advertise_host = cfg.advertised_host();
+            let ad = PeerAd {
+                node_id: cfg.node_id.clone(),
+                address: format!("{advertise_host}:{}", cfg.gateway_port),
+                rpc_address: format!("{advertise_host}:{}", cfg.effective_rpc_port()),
+                model_id: my_ad_model.0,
+                quant: my_ad_model.1,
+                contribution_percent: cfg.contribution_percent,
+                last_seen_ms: now_ms(),
+                role: cfg.role,
             };
+            let identity = state.identity.clone();
             if let Err(e) = bootstrap.advertise(&ad, &identity).await {
                 // An advertise failure means the mesh can't see us — warn.
                 tracing::warn!(target: "mesh", error = %e, "advertise rejected/failed");
