@@ -202,6 +202,12 @@ curl -s -H "Authorization: Bot $(grep '^discord_token' ~/.jerith-mesh/bot.toml \
   | grep -o '"name":"timeout"'
 ```
 
+## Nodes
+
+Jetson node (added 2026-10-14): Orin Nano `noodlypanda@192.168.1.150`, aarch64 Ubuntu 22.04 — binary built natively from a fresh clone, `~/.jerith-mesh/config.toml` with fresh Ed25519 identity (`node_id 4353ea12d8100f45`), runtime at local ollama (`127.0.0.1:11434`, JetPack6 NVIDIA build) carrying the same model digests as the main node (`qwen3:8b 500a1f06…`, `qwen3:4b 359d7dd4…`, `qwen3-embedding:0.6b ac6da0df…`). Runs as a systemd **user** unit (`~/.config/systemd/user/jerith-node.service`) with linger enabled, so it survives reboot without sudo. Verified: `/status` green, `POST /v1/chat/completions` round-trip (139 tokens served),`GET /v1/peers?model=qwen3:8b` lists both nodes (Jetson + main).
+
+Known quirk (both nodes): advertised `address`/`rpc_address` are `127.0.0.1` — cross-host reachability rides the bootstrap CHAT lane until an advertise override is added to the config.
+
 ## Security hardening log
 
 Round 3 (`9493165`): wire-auth verification for `/v1/report-dead` and
