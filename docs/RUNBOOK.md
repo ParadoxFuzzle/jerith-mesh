@@ -239,8 +239,9 @@ Round 4 (this round) — unbounded-growth + flood tightening:
     240/min/IP. A forged signature degrades to the anonymous floor
     (never the allowance). Node compatibility: unsigned fetches still
     work, just within the floor.
-- **Edge layer (recommended, not yet configured)**: a Cloudflare WAF
-  **rate limiting rule** on the zone complements the origin limiter —
+- **Edge layer (LIVE 2026-10-14, ruleset ac289166024247efa78c1e1f979fcca0)**:
+  a Cloudflare WAF **rate limiting rule** on the zone complements the
+  origin limiter —
   it absorbs floods before they cost origin CPU/runtimes and stays
   alive across origin restarts (which reset the local windows). It is
   NOT a replacement: it only covers the tunnelled zone path (the
@@ -261,6 +262,15 @@ Round 4 (this round) — unbounded-growth + flood tightening:
     exists).
   - As code: the API-shaped ruleset + apply/verify commands live in
     `deploy/cloudflare/` (`rate-limit-rule.json` + README).
+  - **Rollout verification (2026-10-14)**: live burst through the
+    tunnel tripped at 102×200 + 28×429 — threshold lands at ~100/10s
+    as configured; the 429s were CF's `error code: 1015` edge page
+    (text/plain, retry-after: 10) and BOTH origin 429 counters
+    (node /status + bootstrap /health) stayed untouched through the
+    burst — the edge absorbs it before a single origin budget hit.
+    Recovery to 200s confirmed right after the 10 s mitigation. Plan
+    caveat: Free zone → the expression can only scope paths (no Host
+    field); those paths are bootstrap-only in practice.
   - Stress-tested against legitimate traffic (2026-10-14): a node's
     ping loop ticks every 10 s with 1× GET `/v1/peers` + 1× PUT
     `/v1/advertise` = **12 req/min/node** (journal stamps confirm the

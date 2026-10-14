@@ -5,8 +5,13 @@ The edge rule that complements the origin per-IP limiter
 in `docs/RUNBOOK.md` ("Edge layer"); this directory holds the rule in
 Cloudflare API shape plus the exact apply/verify commands.
 
-Current status: **recommended, not yet configured** — the zone rule is
-applied manually via the dashboard or the commands below.
+Current status: **LIVE** (2026-10-14) — ruleset
+`ac289166024247efa78c1e1f979fcca0` on the jerithai.com zone (Free plan:
+path-scoped expression only, no Host field). Verified rollout: a burst
+from one client tripped at 102×200 + 28×429 — the threshold lands at
+~100/10s as configured; the 429s are CF's `error code: 1015` edge page
+(no origin involvement: both origin 429 counters stayed at 0 through the
+burst), and service resumed 200s right after the 10 s mitigation.
 
 ## Files
 
@@ -26,10 +31,14 @@ scoped API token (`CLOUDFLARE_API_TOKEN`): **Zone → WAF → Edit** and
 curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/rulesets/phases/http_ratelimit/entrypoint"
 
-# Create or overwrite the phase entrypoint with our rule set:
+# Create or overwrite the phase entrypoint with our rule set. NOTE: the
+# entrypoint PUT accepts {"rules": ...} ONLY — strip the file's
+# metadata fields (name/kind/phase — rejected as "unknown field"):
+python3 -c "import json; d=json.load(open('rate-limit-rule.json')); \
+  json.dump({'rules': d['rules']}, open('/tmp/put-body.json','w'))"
 curl -s -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H "Content-Type: application/json" \
-  --data @rate-limit-rule.json \
+  --data @/tmp/put-body.json \
   "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/rulesets/phases/http_ratelimit/entrypoint"
 ```
 
@@ -50,6 +59,11 @@ seq 1 130 | xargs -P 12 -I{} \
   curl -s -o /dev/null -w "%{http_code}\n" \
   "https://p2p.jerithai.com/v1/peers?model=edge-verify" \
   | sort | uniq -c
+
+# Discriminate: an EDGE 429 is CF's `error code: 1015` text/plain page
+# (retry-after: 10); the ORIGIN 429 is JSON with retry_after_secs.
+# Confirm the origin never fired: node /status and bootstrap /health
+# `security.rate_limited_429_total` unchanged across the burst.
 ```
 
 Caveats worth remembering (full list in the RUNBOOK):
