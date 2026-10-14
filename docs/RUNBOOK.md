@@ -252,6 +252,22 @@ Round 4 (this round) — unbounded-growth + flood tightening:
     exists).
   - As code: the API-shaped ruleset + apply/verify commands live in
     `deploy/cloudflare/` (`rate-limit-rule.json` + README).
+  - Stress-tested against legitimate traffic (2026-10-14): a node's
+    ping loop ticks every 10 s with 1× GET `/v1/peers` + 1× PUT
+    `/v1/advertise` = **12 req/min/node** (journal stamps confirm the
+    live 10 s cadence; peer pings are direct peer-to-peer, not via the
+    tunnel). Replays through the tunnel: steady 2/10s × 7 ticks, a
+    30-request reconnect burst, and a worst-plausible-scale 60-in-one-
+    window burst — **all 200s, zero 429s**. Headroom vs the planned
+    edge threshold (100/10s): ≥1.67× burst, ~33× steady per node.
+    Binding constraint note: the ORIGIN 240/min holds 20 nodes on one
+    shared IP; the edge rule (600/min sustained equivalent) is the
+    more generous of the two — NAT deployments beyond ~20 nodes/IP
+    hit the origin budget first and need the allowance pattern
+    (separate identities otherwise). This test validated 
+    *legit volumes* vs the planned thresholds on the real edge path —
+    the live rule isn't configured yet, so edge-side 429 behavior
+    itself is verified only after rollout.
 
 ```bash
 # QUIC dispatch flood hardening: the RPC server now bounds —
