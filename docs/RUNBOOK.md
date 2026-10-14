@@ -308,10 +308,12 @@ Known remaining limitations (accepted, bounded):
   persists eagerly; only real mutations write. Production datum was
   all-zeros throughout (live node's own status confirmed), so nothing
   was lost.
-- QUIC e2e test `router_execute_over_quic_prefers_local_and_falls_through`
-  is load-sensitive under full-suite parallel load (handshake timing)
-  and can fail the rare run; passes in isolation and on retry.
-  Pre-existing, unrelated to round 4.
+- ~~QUIC e2e test `router_execute_over_quic_prefers_local_and_falls_through`
+  is load-sensitive…~~ FIXED (`d502627`): the flake was the test
+  routers' 250 ms dispatch timeout — load noise could time out one
+  attempt and flip candidate selection. Test timeouts are now 5 s and
+  the suite verifies green 3/3 under 2× CPU overcommit; no production
+  behaviour involved.
 
 
 
