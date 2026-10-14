@@ -79,7 +79,17 @@ pub struct BotConfig {
     /// Ops monitor (OpenClaw ops-monitor family port): periodic checks
     /// with a single owner DM when something fails. Reports only.
     pub monitor: MonitorConfig,
+    /// Chat request timeout in seconds (`[chat] timeout_secs` in bot.toml,
+    /// clamped 60–600). Default 240: the gateway bounds a non-stream local
+    /// runtime at 180 s (header wait, then mesh fallback), so 240 s lets a
+    /// local answer land with headroom, and also covers a slower mesh-fallback
+    /// leg. The old hard 90 s killed legitimately deep qwen3 thinking answers.
+    pub chat_timeout_secs: u64,
 }
+
+/// Chat timeout default ([chat] timeout_secs), years after the 90 s
+/// constant died on a slow thinking answer.
+const DEFAULT_CHAT_TIMEOUT_SECS: u64 = 240;
 
 impl BotConfig {
     /// Load from env, falling back to `~/.jerith-mesh/bot.toml`.
@@ -137,6 +147,12 @@ impl BotConfig {
             archiver: file.archiver.unwrap_or_default(),
             squeeze: file.squeeze.unwrap_or_default(),
             monitor: file.monitor.unwrap_or_default(),
+            chat_timeout_secs: file
+                .chat
+                .as_ref()
+                .and_then(|c| c.timeout_secs)
+                .unwrap_or(DEFAULT_CHAT_TIMEOUT_SECS)
+                .clamp(60, 600),
         })
     }
 
@@ -186,6 +202,7 @@ impl BotConfig {
             archiver: ArchiverConfig::default(),
             squeeze: SqueezeConfig::default(),
             monitor: MonitorConfig::default(),
+            chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
         }
     }
 }
@@ -437,6 +454,14 @@ struct FileConfig {
     /// Optional `[monitor]` table — ops-monitor settings (checks +
     /// owner-DM reports; see monitor.rs).
     monitor: Option<MonitorConfig>,
+    /// Optional `[chat]` table — chat request timeout knob.
+    chat: Option<ChatTable>,
+}
+
+/// `[chat] timeout_secs = N` in bot.toml (60–600 clamp).
+#[derive(Debug, Default, serde::Deserialize)]
+struct ChatTable {
+    timeout_secs: Option<u64>,
 }
 
 /// `[owner] discord_id = <decimal>` in bot.toml.
@@ -499,5 +524,15 @@ mod tests {
     fn file_parse_ignores_unknown_keys() {
         let fc: FileConfig = toml::from_str("discord_token = \"x\"\nfuture_key = 1\n").unwrap();
         assert_eq!(fc.discord_token.unwrap(), "x");
+    }
+
+    #[test]
+    fn chat_timeout_parses_and_clamps() {
+        let in_range = toml::from_str::<FileConfig>("[chat]\ntimeout_secs = 300\n").unwrap();
+        assert_eq!(in_range.chat.as_ref().unwrap().timeout_secs, Some(300));
+        let clamped_hi = toml::from_str::<FileConfig>("[chat]\ntimeout_secs = 5000\n").unwrap();
+        assert_eq!(clamped_hi.chat.as_ref().unwrap().timeout_secs, Some(5000)); // parse keeps it; clamp is at load()
+        let none = toml::from_str::<FileConfig>("discord_token = \"x\"\n").unwrap();
+        assert!(none.chat.is_none());
     }
 }

@@ -251,6 +251,36 @@ remembering:
   showed "runtime returned an empty answer"). The qwen3:8b entry now
   carries `num_ctx: 8192` in its `litellm_params`; raise it (RAM is 31 GB
   — 16 k fits comfortably) rather than debugging ghosts.
+- **Runaway thinking + daemon guardrails (2026-10-14).** Two stall modes
+  hit live the same morning:
+  (a) `deepseek-r1:8b` loops forever on certain prompts — one short math
+  riddle generated past a 6-minute streaming window (and a 120 s
+  non-stream probe) without terminating; qwen3:8b answers the same
+  prompt in <90 s (`done_reason: stop`). It was never a VRAM deadlock
+  and not even a queue deadlock: the generation is simply unbounded
+  without `options.num_predict`, and the point of failure is any client
+  with a finite timeout whose next chat then waits behind the runaway.
+  (b) With `OLLAMA_KEEP_ALIVE=-1` (this box's default), any second model
+  a probe or benchmark loads *stays resident* — an 8b test model then
+  fights qwen3 for VRAM on every next load, visible as 17/83 CPU–GPU
+  splits and 30–80 s reload latencies on chats.
+  Guardrails now in `/etc/systemd/system/ollama.service.d/maxload-queue.conf`:
+  `OLLAMA_MAX_QUEUE=16` (further chats fail fast with server-busy
+  instead of silently queueing behind a runaway) and
+  `OLLAMA_MAX_LOADED_MODELS=1` (explicit serialization; a foreign model
+  evicts qwen3 and must reload after). Restart ollama (models evict —
+  one ~6 s cold reload) and re-verify with `ollama ps` (runtime env:
+  `systemctl show ollama -p Environment`). Keep benchmarks on per-request
+  `keep_alive` ≤ 5 m so a test model cannot camp in VRAM.
+- **Bot chat timeout is a knob.** The old hard 90 s reqwest timeout died
+  in live use twice (legit deep-thinking answers, 20–40 s reloads).
+  `[chat] timeout_secs` in `~/.jerith-mesh/bot.toml` now sets it
+  (default 240, clamped 60–600). Coherence note: the gateway bounds a
+  non-stream local runtime at 180 s header-wait and then hands to mesh
+  fallback, so >240 s buys you a slower fallback lane, not faster
+  runtime answers — and a streamed answer would be the proper fix for
+  very long generations (gateway SSE passthrough already exists; bot
+  side is not streaming yet).
 
 ## Security hardening log
 

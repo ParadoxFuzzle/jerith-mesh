@@ -195,6 +195,12 @@ pub async fn chat_with_usage(
     let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt);
 
     let mut rounds = 0usize;
+    // Per-request bound ([chat] timeout_secs, default 240 s): slow thinking
+    // answers are legit — the gateway bounds the local runtime's header wait
+    // at 180 s and hands off to mesh fallback, so the bot's bound only needs
+    // to outlast that with headroom for a fallback leg, never the 90 s the
+    // old shared client constant imposed.
+    let chat_timeout = std::time::Duration::from_secs(cfg.chat_timeout_secs);
     loop {
         let mut payload = json!({
             "model": model,
@@ -205,6 +211,7 @@ pub async fn chat_with_usage(
         }
         let resp = client()
             .post(&url)
+            .timeout(chat_timeout)
             .json(&payload)
             .send()
             .await
