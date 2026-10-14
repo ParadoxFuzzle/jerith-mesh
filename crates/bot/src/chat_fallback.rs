@@ -245,7 +245,7 @@ async fn show_typing(http_ctx: &serenityall::Context, channel: serenityall::Chan
 /// swallowed (best-effort by contract): a deleted placeholder, a missing
 /// permission, a Discord hiccup — the streamed chat itself continues, and
 /// the streamed partial already shown is replaced wholesale by finish().
-struct LiveSink {
+pub(crate) struct LiveSink {
     http_ctx: serenityall::Context,
     channel: serenityall::ChannelId,
     msg_id: serenityall::MessageId,
@@ -262,7 +262,7 @@ struct SinkState {
 }
 
 impl LiveSink {
-    async fn start(
+    pub(crate) async fn start(
         http_ctx: &serenityall::Context,
         channel: serenityall::ChannelId,
     ) -> Option<LiveSink> {
@@ -320,7 +320,7 @@ impl LiveSink {
 
     /// The api layer's per-fragment tap: appends into the shared state,
     /// marks dirty; the ticker does the (throttled) Discord part.
-    fn tap(&self) -> impl Fn(&str) + Send + Sync {
+    pub(crate) fn tap(&self) -> impl Fn(&str) + Send + Sync {
         let state = self.state.clone();
         move |frag: &str| {
             if frag.is_empty() {
@@ -334,7 +334,7 @@ impl LiveSink {
     }
 
     /// Final replacement: the full formatted reply, then the ticker stops.
-    async fn finish(self, text: String) {
+    pub(crate) async fn finish(self, text: String) {
         self.ticker.abort();
         let clipped = clip_tail(&text, 1990);
         if let Err(e) = self

@@ -280,8 +280,9 @@ remembering:
   fallback, so >240 s buys you a slower fallback lane.
 - **Bot-side streaming is live** (2026-10-14, default `[chat] stream =
   true`). The bot now sends `stream: true` and live-types the reply into
-  Discord (@mention/DM fallback path; `/ask` stays buffered) while the
-  gateway passes SSE through CHUNK-BY-CHUNK — the old passthrough did
+  Discord (both the @mention/DM fallback path AND `/ask`, same live sink:
+  placeholder in the command's channel → throttled edits → one final
+  formatted replacement) while the gateway passes SSE through CHUNK-BY-CHUNK — the old passthrough did
   `bytes().await`, silently buffering whole generations (fixed same day;
   verified live: first chunk 7.2 s into a 62 s generation, 876 chunks).
   Mechanics: OpenAI deltas fold per round into the same (status, body)
@@ -302,7 +303,11 @@ remembering:
   serializes residency, `runtime_num_predict` bounds the generation
   itself. Set e.g. `runtime_num_predict = 1200` (~27 s of generation at
   ~45 t/s) and restart the node. Mesh-fallback lanes are the serving
-  peers' own configs, not this node's.
+  peers' own configs, not this node's. **Armed on the main node
+  2026-10-14: `runtime_num_predict = 2000`** (~45 s of generation headroom
+  at ~45 t/s; leaves room for qwen3's bash/code answers that the
+  benchmark showed truncating at 1200), config backup at
+  `~/.jerith-mesh/config.toml.bak-pre-captop`.
 
 ## Security hardening log
 
