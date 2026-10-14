@@ -217,6 +217,32 @@ Direct cross-host meshing (same day, commits `7924408` + `c79eca3`):
   `gateway_bind = "0.0.0.0"`. Verified live: cross-host `/health` 200 both
   directions, cross-host `POST /v1/chat/completions` 200.
 
+## Main-node runtime (LiteLLM) notes
+
+The main node's runtime is the local LiteLLM proxy (`127.0.0.1:8000`,
+unit `litellm-proxy.service`, config `~/.openclaw/litellm-config.json`),
+fronting local ollama plus OpenRouter models. Two properties worth
+remembering:
+
+- **Auth is master-key-only.** `general_settings.master_key` is set and
+  the proxy runs WITHOUT a prisma DB, so the only valid bearer is the
+  master key itself (`sk-…` from that json). Any other non-empty bearer
+  falls into the virtual-key DB lookup and dies with
+  `400 {"error":{"message":"No connected db.","type":"no_db_connection"}}`
+  — and a request with NO bearer gets 401. If virtual/sub keys ever
+  become necessary, run LiteLLM against the co-hosted Postgres
+  (prisma migrate) — not attempted deliberately: auth works as-is and
+  the key only ever leaves the machine inside `~/.jerith-mesh/config.toml`
+  (`runtime_api_key`, mode 0600). Losing it = re-read the master key
+  from the config json; never guess.
+- **num_ctx is explicit.** qwen3 is a hybrid thinking model; under
+  ollama's default slot its prompt + thinking can outrun the window and
+  produce HTTP-200-with-empty-content (observed live 2026-10-14 04:18:
+  `n_ctx_slot = 4096, task.n_tokens = 2050` on every failing call, bot
+  showed "runtime returned an empty answer"). The qwen3:8b entry now
+  carries `num_ctx: 8192` in its `litellm_params`; raise it (RAM is 31 GB
+  — 16 k fits comfortably) rather than debugging ghosts.
+
 ## Security hardening log
 
 Round 3 (`9493165`): wire-auth verification for `/v1/report-dead` and
