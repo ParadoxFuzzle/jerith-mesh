@@ -17,8 +17,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -197,18 +199,94 @@ fn entry_default_fields(ad: PeerAd) -> Entry {
 }
 
 fn router(state: Arc<Registry>, ttl_ms: u64) -> Router {
-    let limiter = Arc::new(crate::ratelimit::RateLimiter::new(
+    router_with_limiters(
+        state,
+        ttl_ms,
+        default_anon_limiter(),
+        Arc::new(crate::ratelimit::RateLimiter::new(
+            AUTH_READ_LIMIT_PER_MIN,
+            Duration::from_secs(60),
+        )),
+    )
+}
+
+fn default_anon_limiter() -> Arc<crate::ratelimit::RateLimiter> {
+    Arc::new(crate::ratelimit::RateLimiter::new(
         ANON_READ_LIMIT_PER_MIN,
         Duration::from_secs(60),
-    ));
-    router_with_limiter(state, ttl_ms, limiter)
+    ))
+}
+
+/// Per-identity allowance for signed peers-fetches: one legit node on any
+/// IP costs the relay 12 req/min (fetch + advertise on the 10 s tick);
+/// NAT deployments pack many nodes behind one IP, and the anonymous
+/// per-IP floor (240/min) would cap them at ~20 nodes. A signed fetch
+/// pays the fingerprint's OWN bucket instead — 120× its legit rate — so
+/// any number of nodes scales while keeping anonymous (unsigned) floods
+/// locked to the tight floor. Signature verification is ~60µs per hit.
+const AUTH_READ_LIMIT_PER_MIN: u32 = 1_440;
+
+#[derive(Clone)]
+pub struct BootstrapLimiters {
+    pub anon: Arc<crate::ratelimit::RateLimiter>,
+    pub identity: Arc<crate::ratelimit::RateLimiter>,
+}
+
+/// Two-lane guard: a `/v1/peers` fetch carrying wire-auth headers that
+/// VERIFY against `peers-req1|{stamp}` pays the identity bucket; anything
+/// else (no headers, bad signature, other routes) pays its IP bucket.
+pub async fn limiters_guard(
+    State(l): State<BootstrapLimiters>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut key = crate::ratelimit::client_ip(&req).map(crate::ratelimit::ip_key);
+    let mut lane = l.anon.clone();
+    let path = req.uri().path();
+    let signed = ["x-jerith-pubkey", "x-jerith-stamp", "x-jerith-sig"]
+        .iter()
+        .all(|h| req.headers().get(*h).is_some());
+    if path == "/v1/peers" && signed {
+        let hdr = |name: &str| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        let auth = crate::signing::WireAuth {
+            pubkey: hdr("x-jerith-pubkey"),
+            stamp_ms: hdr("x-jerith-stamp").parse().unwrap_or(0),
+            sig: hdr("x-jerith-sig"),
+        };
+        let payload = crate::signing::peers_fetch_payload(auth.stamp_ms);
+        // expected_node_id = the presented pubkey's fingerprint: the
+        // signature must be BY the key that sponsors the bucket.
+        let expected = auth.pubkey[..16.min(auth.pubkey.len())].to_string();
+        if auth
+            .validate(payload.as_bytes(), &expected)
+            .is_ok()
+            && !auth.pubkey.is_empty()
+        {
+            key = Some(crate::ratelimit::identity_key(&auth.pubkey));
+            lane = l.identity.clone();
+        }
+    }
+    crate::ratelimit::enforce(
+        &lane.clone(),
+        key,
+        req,
+        next,
+    )
+    .await
 }
 
 /// Split-out so tests can mount a tiny-budget limiter and reach 429s.
-fn router_with_limiter(
+fn router_with_limiters(
     state: Arc<Registry>,
     ttl_ms: u64,
-    limiter: Arc<crate::ratelimit::RateLimiter>,
+    anon: Arc<crate::ratelimit::RateLimiter>,
+    identity: Arc<crate::ratelimit::RateLimiter>,
 ) -> Router {
     Router::new()
         .route("/health", get(bootstrap_health))
@@ -219,8 +297,8 @@ fn router_with_limiter(
         .route("/v1/models/counts", get(model_counts))
         .with_state((state, ttl_ms))
         .layer(axum::middleware::from_fn_with_state(
-            limiter,
-            crate::ratelimit::axum_guard,
+            BootstrapLimiters { anon, identity },
+            limiters_guard,
         ))
 }
 
@@ -1241,8 +1319,12 @@ mod tests {
         use crate::ratelimit::RateLimiter;
         let registry = Arc::new(Registry::default());
         // Budget of 3/60s for a test-scale probe.
-        let limiter = Arc::new(RateLimiter::new(3, Duration::from_secs(60)));
-        let app = router_with_limiter(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS, limiter);
+        let app = router_with_limiters(
+            Arc::clone(&registry),
+            DEFAULT_ADVERTISE_TTL_MS,
+            Arc::new(RateLimiter::new(3, Duration::from_secs(60))),
+            Arc::new(RateLimiter::new(999, Duration::from_secs(60))),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Connect info must be wired like production serve() does — the
@@ -1269,6 +1351,113 @@ mod tests {
         );
         let body: serde_json::Value = r.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("rate limit"));
+    }
+
+    /// Shared bootstrap-lane mount: app on a real listener wired with
+    /// connect info (the anon lane's attribution needs it).
+    async fn mount_with_limiters(
+        registry: &Arc<Registry>,
+        anon: Arc<crate::ratelimit::RateLimiter>,
+        identity: Arc<crate::ratelimit::RateLimiter>,
+    ) -> (reqwest::Client, String) {
+        let app = router_with_limiters(
+            Arc::clone(registry),
+            DEFAULT_ADVERTISE_TTL_MS,
+            anon,
+            identity,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (reqwest::Client::new(), format!("http://{addr}/v1/peers?model=lane-test"))
+    }
+
+    #[tokio::test]
+    async fn signed_peers_fetches_get_the_identity_lane() {
+        use crate::ratelimit::RateLimiter;
+        let registry = Arc::new(Registry::default());
+        // The anon floor is tiny (3/60s); the identity lane is generous.
+        let (client, url) = mount_with_limiters(
+            &registry,
+            Arc::new(RateLimiter::new(3, Duration::from_secs(60))),
+            Arc::new(RateLimiter::new(999, Duration::from_secs(60))),
+        )
+        .await;
+        let identity = crate::signing::SigningIdentity::generate();
+
+        // Unsigned (or keyless): the anonymous floor trips at its cap.
+        let mut anonymous_429s = 0;
+        for _ in 0..6 {
+            let status = client.get(&url).send().await.unwrap().status();
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                anonymous_429s += 1;
+            }
+        }
+        assert_eq!(anonymous_429s, 3, "anon floor must trip at its cap");
+
+        // Signed: the identity lane owns the budget — all 10 served even
+        // though the same IP's anonymous bucket is long exhausted.
+        for i in 0..10 {
+            let stamp = now_ms();
+            let headers = signed_headers_for(
+                &identity,
+                &crate::signing::peers_fetch_payload(stamp),
+            );
+            let r = client
+                .get(&url)
+                .headers(headers)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "signed fetch #{i} must ride the identity lane"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_signature_gets_the_anonymous_lane() {
+        use crate::ratelimit::RateLimiter;
+        let registry = Arc::new(Registry::default());
+        let (client, url) = mount_with_limiters(
+            &registry,
+            Arc::new(RateLimiter::new(3, Duration::from_secs(60))),
+            Arc::new(RateLimiter::new(999, Duration::from_secs(60))),
+        )
+        .await;
+        let identity = crate::signing::SigningIdentity::generate();
+
+        // Wire-auth headers present but signing a DIFFERENT payload —
+        // the lane keys off `peers-req1|{stamp}` verbatim, so a forged
+        // signature degrades to the anonymous floor, not the allowance.
+        let mut forged_429s = 0;
+        for i in 0..6 {
+            let wrong_payload = format!("not-the-peers-lane|{}|{i}", now_ms());
+            let headers = signed_headers_for(&identity, &wrong_payload);
+            let status = client
+                .get(&url)
+                .headers(headers)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                forged_429s += 1;
+            }
+        }
+        assert_eq!(
+            forged_429s, 3,
+            "forged signatures must ride the anon floor (3 capped)"
+        );
     }
 
     async fn seed_live_peer(

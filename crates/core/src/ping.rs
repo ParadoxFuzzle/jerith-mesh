@@ -297,7 +297,13 @@ async fn run_loop(
         state.stake.lock_required_once().await;
 
         if let Some(m) = &model {
-            match bootstrap.fetch_peers(&m.id).await {
+            // Signed peers-fetch: the bootstrap's rate lane attributes the
+            // hit to OUR identity bucket (generous allowance for NAT-
+            // packed deployments) instead of the per-IP anonymous floor.
+            match bootstrap
+                .fetch_peers_signed(&m.id, &state.identity)
+                .await
+            {
                 Ok(peers) => {
                     let mut reg = state.registry.lock().await;
                     let fetched = peers.len();

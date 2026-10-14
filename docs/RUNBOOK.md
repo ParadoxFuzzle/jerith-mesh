@@ -230,6 +230,15 @@ Round 4 (this round) — unbounded-growth + flood tightening:
   XFF hop trusted ONLY from loopback peers (the local tunnel proxy) —
   a directly-reachable origin cannot spoof client IPs to hide behind
   or drain other buckets; everyone else is pinned to their socket peer.
+  - **Peer-identity allowance (NAT scaling)**: a `/v1/peers` fetch
+    carrying wire-auth headers that verify against
+    `peers-req1|{stamp}` pays an Ed25519-fingerprint bucket
+    (`id-…`, 1440/min) instead of the IP's anonymous floor — the ping
+    loop signs every fetch, so legitimate nodes scale past the ~20
+    nodes-per-NAT-IP ceiling while unsigned floods stay locked to
+    240/min/IP. A forged signature degrades to the anonymous floor
+    (never the allowance). Node compatibility: unsigned fetches still
+    work, just within the floor.
 - **Edge layer (recommended, not yet configured)**: a Cloudflare WAF
   **rate limiting rule** on the zone complements the origin limiter —
   it absorbs floods before they cost origin CPU/runtimes and stays

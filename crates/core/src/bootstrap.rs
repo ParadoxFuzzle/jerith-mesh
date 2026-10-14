@@ -244,6 +244,44 @@ impl BootstrapClient {
         Ok(parsed.peers)
     }
 
+    /// Signed variant of `fetch_peers`: the wire-auth headers put the hit
+    /// in the bootstrap's peer-identity rate lane (per pubkey, generous
+    /// budget) instead of its per-IP anonymous bucket — the allowance that
+    /// lets large many-nodes-behind-one-IP deployments scale past the
+    /// anonymous flood floor. Fails silently into the anonymous lane on
+    /// the server if the signature doesn't verify (same result, tighter
+    /// budget) — never a hard error path.
+    pub async fn fetch_peers_signed(
+        &self,
+        model: &str,
+        identity: &crate::signing::SigningIdentity,
+    ) -> anyhow::Result<Vec<PeerAd>> {
+        let url = format!(
+            "{}/v1/peers?model={}",
+            self.base_url.trim_end_matches('/'),
+            urlencode(model)
+        );
+        let stamp = now_ms();
+        let payload = crate::signing::peers_fetch_payload(stamp);
+        let auth = crate::signing::WireAuth::with_stamp(identity, stamp, payload.as_bytes());
+        let resp = self
+            .inner
+            .get(&url)
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
+            .send()
+            .await
+            .context("bootstrap fetch failed")?
+            .error_for_status()
+            .context("bootstrap returned an error")?;
+        let parsed: PeerListResponse = resp
+            .json()
+            .await
+            .context("bootstrap returned unparseable peer list")?;
+        Ok(parsed.peers)
+    }
+
     /// Advertise ourselves with the bootstrap node (heartbeat).
     /// The advertisement is Ed25519-signed over the canonical payload;
     /// the bootstrap rejects anything it cannot verify.

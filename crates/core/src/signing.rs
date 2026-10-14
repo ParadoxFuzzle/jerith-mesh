@@ -148,6 +148,16 @@ pub fn verify(pubkey_hex: &str, msg: &[u8], sig_hex: &str) -> bool {
     vk.verify(msg, &Signature::from_bytes(&sig_arr)).is_ok()
 }
 
+/// Canonical payload for a signed bootstrap peers-fetch: the rate-limit
+/// lane token. The bootstrap's middleware verifies this payload to
+/// attribute the hit to a peer-identity bucket (per pubkey) instead of
+/// the per-IP anonymous bucket — the NAT-scaling allowance. The model
+/// id deliberately stays outside the signed payload; the lane proves
+/// "a real key-holder asks, now", nothing more.
+pub fn peers_fetch_payload(stamp_ms: u64) -> String {
+    format!("peers-req1|{stamp_ms}")
+}
+
 /// Headers carried by signed wire requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireAuth {

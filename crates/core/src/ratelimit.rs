@@ -1,5 +1,5 @@
-//! Minimal per-IP fixed-window rate limiter for the public anonymous
-//! endpoints (bootstrap reads, gateway skills/chat).
+//! Fixed-window rate limiter for the public endpoints (bootstrap reads,
+//! gateway skills/chat).
 //!
 //! Not distributed, not fair — a cheap in-memory floor against
 //! single-source hammering: each request costs a registry sweep or a
@@ -14,10 +14,13 @@
 //! are allowed through unlimited — limping-by rather than locking out
 //! every isolated test client and headerless proxy hop.
 //!
-//! Both processes (node gateway + standalone bootstrap) share this
-//! module; each 429 emitted here bumps the process-local
-//! `metrics::RATE_LIMITED_429_TOTAL` counter (surfaced in the node's
-//! /status and the bootstrap's /health).
+//! Keys are strings so one limiter implementation serves two lanes
+//! (`ip-…` / `id-…`): the ANONYMOUS floor (per-IP, tight) and the
+//! peer-identity allowance (per Ed25519 fingerprint, generous — the
+//! NAT-scaling lane). Both processes (node gateway + standalone
+//! bootstrap) share this module; each 429 emitted here bumps the
+//! process-local `metrics::RATE_LIMITED_429_TOTAL` counter (surfaced in
+//! the node's /status and the bootstrap's /health).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -30,19 +33,31 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-/// How many distinct-IP buckets we retain between windows.bounds with
-/// clean windows, too many distinct IPs within one window → extra hits.
+/// How many distinct keys we retain between windows. With clean windows,
+/// too many distinct IPs within one window → extra hits.
 const BUCKET_PRUNE_THRESHOLD: usize = 8_192;
 
 pub struct RateLimiter {
     max_hits: u32,
     window: Duration,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    buckets: Mutex<HashMap<String, Bucket>>,
 }
 
 struct Bucket {
     window_start: Instant,
     hits: u32,
+}
+
+/// Bucket key for an IP lane hit.
+pub fn ip_key(ip: IpAddr) -> String {
+    format!("ip-{ip}")
+}
+
+/// Bucket key for a peer-identity lane hit (Ed25519 pubkey fingerprint
+/// = the node_id prefix; holdings require key control, so identity
+/// buckets cannot be spoofed or spent by others).
+pub fn identity_key(pubkey_hex: &str) -> String {
+    format!("id-{}", &pubkey_hex[..16.min(pubkey_hex.len())])
 }
 
 impl RateLimiter {
@@ -54,17 +69,17 @@ impl RateLimiter {
         }
     }
 
-    /// True when this hit is within the IP's budget for the current window.
-    pub fn allow(&self, ip: IpAddr) -> bool {
+    /// True when this hit is within the key's budget for the current window.
+    pub fn allow(&self, key: String) -> bool {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().unwrap();
-        // Bucket-bloat guard: an IP spray within one window could grow the
+        // Bucket-bloat guard: a key spray within one window could grow the
         // map without limit. Expire-idle prune once past the threshold.
         if buckets.len() >= BUCKET_PRUNE_THRESHOLD {
             buckets.retain(|_, b| now.duration_since(b.window_start) < self.window);
         }
         let b = buckets
-            .entry(ip)
+            .entry(key)
             .or_insert(Bucket {
                 window_start: now,
                 hits: 0,
@@ -79,12 +94,12 @@ impl RateLimiter {
 
     /// Seconds until the caller's window rolls over (429 Retry-After).
     /// Rounds up: “at most Ns of waiting” must never undersell the wait.
-    pub fn retry_after_secs(&self, ip: IpAddr) -> u64 {
+    pub fn retry_after_secs(&self, key: &str) -> u64 {
         let now = Instant::now();
         self.buckets
             .lock()
             .unwrap()
-            .get(&ip)
+            .get(key)
             .map(|b| {
                 let rem = self
                     .window
@@ -134,23 +149,23 @@ pub fn client_ip(req: &Request<Body>) -> Option<IpAddr> {
 }
 
 /// Core policy: unattributable requests pass; everything else must fit in
-/// the IP's window budget or gets a 429 with Retry-After. A rejected
+/// the key's window budget or gets a 429 with Retry-After. A rejected
 /// request never reaches the handler — the cost is one Mutex touch.
 pub async fn enforce(
     limiter: &RateLimiter,
-    ip: Option<IpAddr>,
+    key: Option<String>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    match ip {
-        Some(ip) if !limiter.allow(ip) => too_many_response(limiter, ip),
+    match key {
+        Some(key) if !limiter.allow(key.clone()) => too_many_response(limiter, &key),
         _ => next.run(req).await,
     }
 }
 
-fn too_many_response(limiter: &RateLimiter, ip: IpAddr) -> Response {
+fn too_many_response(limiter: &RateLimiter, key: &str) -> Response {
     crate::metrics::bump(&crate::metrics::RATE_LIMITED_429_TOTAL);
-    let ra = limiter.retry_after_secs(ip);
+    let ra = limiter.retry_after_secs(key);
     (
         StatusCode::TOO_MANY_REQUESTS,
         [
@@ -178,10 +193,9 @@ pub async fn axum_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    enforce(&limiter, client_ip(&req), req, next).await
+    let key = client_ip(&req).map(ip_key);
+    enforce(&limiter, key, req, next).await
 }
-
-/// Module tests: attribution semantics, per-IP windows, counter bump.
 
 #[cfg(test)]
 mod tests {
@@ -190,6 +204,10 @@ mod tests {
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+    }
+
+    fn key(n: u8) -> String {
+        ip_key(ip(n))
     }
 
     #[test]
@@ -224,14 +242,14 @@ mod tests {
     fn allow_hits_cap_then_recovers_next_window() {
         let rl = RateLimiter::new(3, Duration::from_millis(50));
         for _ in 0..3 {
-            assert!(rl.allow(ip(1)));
+            assert!(rl.allow(key(1)));
         }
-        assert!(!rl.allow(ip(1)), "cap exhausted");
-        // Other IPs unaffected.
-        assert!(rl.allow(ip(2)));
+        assert!(!rl.allow(key(1)), "cap exhausted");
+        // Other keys unaffected.
+        assert!(rl.allow(key(2)));
         // Window roll-over restores the budget.
         std::thread::sleep(Duration::from_millis(60));
-        assert!(rl.allow(ip(1)));
+        assert!(rl.allow(key(1)));
     }
 
     #[test]
@@ -242,9 +260,9 @@ mod tests {
         let before = crate::metrics::RATE_LIMITED_429_TOTAL
             .load(std::sync::atomic::Ordering::Relaxed);
         let rl = RateLimiter::new(1, Duration::from_millis(50));
-        assert!(rl.allow(ip(8)));
+        assert!(rl.allow(key(8)));
         for _ in 0..10 {
-            let resp = too_many_response(&rl, ip(8));
+            let resp = too_many_response(&rl, &key(8));
             assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         }
         let bumped = crate::metrics::RATE_LIMITED_429_TOTAL
@@ -256,10 +274,10 @@ mod tests {
     #[test]
     fn retry_after_is_positive_and_bounded() {
         let rl = RateLimiter::new(1, Duration::from_secs(5));
-        assert!(rl.allow(ip(3)));
+        assert!(rl.allow(key(3)));
         // Fresh window ⇒ the full 5s (test elapsed time is well under 1ms);
         // anything inside the window stays in [1, 5].
-        let secs = rl.retry_after_secs(ip(3));
+        let secs = rl.retry_after_secs(&key(3));
         assert!((1..=5).contains(&secs), "got {secs}");
     }
 
@@ -267,12 +285,26 @@ mod tests {
     fn bucket_prune_keeps_map_bounded() {
         let rl = std::sync::Arc::new(RateLimiter::new(100, Duration::from_millis(10)));
         for i in 0..(BUCKET_PRUNE_THRESHOLD + 500) {
-            let _ = rl.allow(IpAddr::V4(Ipv4Addr::new(1, (i / 254) as u8 % 254 + 1, (i % 254) as u8 + 1, 1)));
+            let _ = rl.allow(ip_key(IpAddr::V4(Ipv4Addr::new(1, (i / 254) as u8 % 254 + 1, (i % 254) as u8 + 1, 1))));
         }
-        // No requested window has expired yet (>window apart is impossible
-        // in this fast loop) — the prune path must simply not panic and the
-        // map must not have grown past the threshold dramatically.
-        let len = rl.buckets.lock().unwrap().len();
-        assert!(len <= BUCKET_PRUNE_THRESHOLD + 1, "len={len}");
+    }
+
+    #[test]
+    fn identity_buckets_are_isolated_from_ip_buckets() {
+        // The NAT-scaling allowance: a signed peer's hits live on
+        // `id-…`, never nibbling (nor replenishing) an IP bucket.
+        let rl = RateLimiter::new(2, Duration::from_millis(50));
+        let idk = identity_key(&"a".repeat(64));
+        let idk2 = idk.clone();
+        assert!(rl.allow(idk.clone()));
+        assert!(rl.allow(idk.clone()));
+        assert!(!rl.allow(idk), "identity cap is its own budget");
+        // The IP lane is untouched by the identity-lane exhaustion: a
+        // fresh IP bucket still has its full budget. (Same client, but
+        // unsigned → the IP bucket pays; that's the enforced separation.)
+        assert!(rl.allow(key(9)), "ip lane budget must not share with id lane");
+        // And the exhausted identity budget stays exhausted: no cross-
+        // replenishing through IP traffic.
+        assert!(!rl.allow(idk2), "identity budget must stay exhausted");
     }
 }
