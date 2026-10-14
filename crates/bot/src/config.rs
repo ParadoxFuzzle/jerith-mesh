@@ -65,6 +65,11 @@ pub struct BotConfig {
     /// executed tool calls are fed back into the conversation (OpenAI
     /// tool-calling protocol). Off → the bot never touches the web.
     pub web: WebToolsConfig,
+    /// Plugin / skill gating (`[plugins]` in bot.toml, OpenClaw-style
+    /// modular plugin architecture; see plugins.rs). The `enabled` list
+    /// names the pre-packaged plugins that are switched on; everything the
+    /// model can summon derives from it (web loop tools, memory.*, lore).
+    pub plugins: PluginsConfig,
     /// The bot owner's Discord id (default-deny gate for system-level
     /// commands; see owner.rs). Resolved from `$JERITH_BOT_OWNER_ID`, then
     /// bot.toml `[owner] discord_id`, then the OpenClaw config's
@@ -149,6 +154,12 @@ impl BotConfig {
             system_prompt,
             postgres: file.postgres,
             web: file.web.unwrap_or_default(),
+            plugins: {
+                let cfg = file.plugins.unwrap_or_default();
+                crate::plugins::SkillRegistry::check_config_enabled(&cfg.enabled)
+                    .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
+                cfg
+            },
             owner_discord_id,
             archiver: file.archiver.unwrap_or_default(),
             squeeze: file.squeeze.unwrap_or_default(),
@@ -208,6 +219,7 @@ impl BotConfig {
             system_prompt: None,
             postgres: None,
             web: WebToolsConfig::default(),
+            plugins: PluginsConfig::default(),
             owner_discord_id: None,
             archiver: ArchiverConfig::default(),
             squeeze: SqueezeConfig::default(),
@@ -469,6 +481,34 @@ struct FileConfig {
     monitor: Option<MonitorConfig>,
     /// Optional `[chat]` table — chat request timeout knob.
     chat: Option<ChatTable>,
+    /// Optional `[plugins]` table — plugin/skill gating (see plugins.rs).
+    plugins: Option<PluginsConfig>,
+}
+
+/// `[plugins] enabled = [...]` — names the pre-packaged plugins that
+/// stay available. Defaults to every plugin on; unknown ids fail the
+/// load (fail-loud config, like the rest of the bot).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginsConfig {
+    #[serde(default = "default_plugins_enabled")]
+    pub enabled: Vec<String>,
+}
+
+impl Default for PluginsConfig {
+    /// All pre-packaged plugins on (empty would mean the bot forgets its
+    /// own web tools — an uninstallable default).
+    fn default() -> Self {
+        Self {
+            enabled: default_plugins_enabled(),
+        }
+    }
+}
+
+fn default_plugins_enabled() -> Vec<String> {
+    crate::plugins::PREPACKAGED_PLUGINS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// `[chat] timeout_secs = N` in bot.toml (60–600 clamp).

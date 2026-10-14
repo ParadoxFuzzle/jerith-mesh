@@ -13,7 +13,17 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Placement orders candidates by the pool: reported-capacity peers first
     (most free VRAM → RAM → RTT tiebreak), then unreported peers by pure RTT
   - Wire-compatible: pre-pooling ads deserialize fine (missing field → None)
-- 🔄 Hybrid local + remote expert execution with locality-aware placement (Phase 2: planning is resource-aware; tensor transport still stubbed)
+- ✅ Hybrid local + remote expert execution with locality-aware placement + speculative pre-flight (Phase 2)
+  - Planning is resource-aware (Phase 1 pool order) and local-first: Local,
+    then remotes with the expert by placement key; fallback walks the plan
+  - Speculative pre-flight: when the plan opens with Local and the best remote
+    also holds the expert, the remote attempt is built up front and churns
+    while the local run executes — consumed immediately if the local try
+    fails, dropped if local wins; the pre-flighted peer is never worked twice
+  - Redundant-replay verification + verification-tracker semantics
+    (trusted / reject-continue / reject-abort) are preserved on the
+    speculative path; production MeshLoop router opts in
+  - Tensor transport stubbed (Phase 3)
 - 📋 Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
 - 📋 Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
 - 📋 Speculative decoding + expert budgeting + prefetching (Phase 3)
@@ -86,7 +96,18 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+)
 
 ## 8. Plugin / Skill System
-- 📋 OpenClaw-style modular plugin and skill architecture (Phase 3)
+- 🔄 OpenClaw-style modular plugin and skill architecture (Phase 3 core ✅;
+  see plugins.rs):
+  - Capabilities are **plugins** owning dot-named **skills** (`web_search`,
+    `memory.embed`, …): one `SkillSpec` table entry per skill derives the
+    OpenAI tool declaration, the dispatch whitelist and the gating — the
+    chat tool loop reads only from the registry (`crates/bot/src/plugins.rs`)
+  - Owners gate per plugin via bot.toml `[plugins] enabled = [...]`
+    (websearch/memory/lore/squeeze; default all on, unknown ids fail loud)
+  - Model-tool registry dispatch is whitelist-only: a disabled or unknown
+    skill is refused to the model (fed back as an error it can recover
+    from), never a chat failure — unit-tested (registry, gating, dispatch,
+    config validation)
 - ✅ Jerith Guard (pre-packaged content filter) — outbound screening gate on
   every `/v1/chat/completions` (local forward AND mesh fallback):
   - Per-category PII actions (off/log/redact/block) with spec defaults:
@@ -100,8 +121,14 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Detections logged locally without raw values; stats on `/status`
   - Configured via `[guard]` in config.toml (`guard.enabled = false` to
     switch the whole gate off)
-- 📋 Default pre-packaged plugins: Context Squeeze, Juice Compact (Brave Search web skills — ✅ live via `[websearch]`, migrated from OpenClaw) |
-- 📋 First-class skills `vision.*`, `memory.embed`, `memory.search`
+- ✅ Default pre-packaged plugins (registry-managed; OpenClaw lineage kept
+  in the names): Juice Compact = web tools (`web_search`, `web_fetch` via
+  `[websearch]`), Context Squeeze = bot-side compaction (registers no
+  model tools — a lifecycle plugin), plus `memory` and `lore` plugins over
+  the node's skill endpoints
+- ✅ First-class skills `memory.embed`, `memory.search` (model-facing over
+  the gateway's `/v1/skills/memory/*`); `lore.search` likewise
+- 📋 First-class skills `vision.*` (needs a gateway vision route first)
 - 📋 Webhook / event hooks for plugin authors
 
 ## 9. Incentives & Economics

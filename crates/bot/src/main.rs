@@ -20,6 +20,7 @@ mod mailbox;
 mod monitor;
 mod owner;
 mod people;
+mod plugins;
 mod squeeze;
 mod state;
 mod workspace;

@@ -54,7 +54,7 @@ fn model_from_status(body: &Value) -> Option<String> {
     (!model.is_empty()).then(|| model.to_string())
 }
 
-fn client() -> reqwest::Client {
+pub(crate) fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(TIMEOUT)
         .build()
@@ -425,10 +425,14 @@ pub async fn chat_with_usage_live(
         .unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
 
     // Web access (OpenClaw stack migration): the chat request declares the
-    // gateway's web skills as OpenAI tools, so a tool-capable runtime can
-    // web_search / web_fetch mid-answer. Unsupported model/runtimes get
-    // exactly one toolless retry below — web access degrades, never fails
-    // the chat.
+    // enabled plugins' skills as OpenAI tools, so a tool-capable runtime can
+    // web_search / memory.embed / lore.search mid-answer (the plugin SDK's
+    // registry decides what's summonable; see plugins.rs). Unsupported
+    // model/runtimes get exactly one toolless retry below — tools degrade,
+    // never fail the chat.
+    let registry = std::sync::Arc::new(crate::plugins::SkillRegistry::standard(
+        cfg.plugins.enabled.clone(),
+    ));
     const MAX_TOOL_ROUNDS: usize = 3;
     // Tokens accumulated across rounds (session-cost-tracker port input).
     let mut tokens_used: u64 = 0;
@@ -457,7 +461,7 @@ pub async fn chat_with_usage_live(
             "messages": messages,
         });
         if tools_enabled {
-            payload["tools"] = Value::Array(web_tool_defs());
+            payload["tools"] = Value::Array(registry.tool_defs());
         }
         let (status, body) = if cfg.chat_stream {
             fetch_streamed_round(&url, &payload, chat_timeout, live).await?
@@ -497,7 +501,7 @@ pub async fn chat_with_usage_live(
         // Detect `{"function_name": …, "arguments": …}` there and subject
         // it to the same loop (same mock unit tests cover both shapes).
         if tools_enabled && tool_calls.is_empty() && rounds < MAX_TOOL_ROUNDS {
-            match content_tool_intent(&body) {
+            match content_tool_intent(&body, &registry.enabled_skill_names()) {
                 Some((name, args)) => {
                     tool_calls = vec![json!({
                         "id": format!("iw{rounds}"),
@@ -560,7 +564,7 @@ pub async fn chat_with_usage_live(
                 .pointer("/function/arguments")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let answer = run_web_tool(cfg, &name, &raw_args).await;
+            let answer = run_tool(&registry, cfg, &name, &raw_args).await;
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -572,44 +576,6 @@ pub async fn chat_with_usage_live(
     }
 }
 
-/// OpenAI tool declarations for the node's web skills — parameter names
-/// mirror the OpenClaw web_search/web_fetch tools the old agent had.
-pub fn web_tool_defs() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the public web (Brave Search API) and return ranked results with title, url, description and page age. Use when the answer depends on external or recent information.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "count": {"type": "integer", "minimum": 1, "maximum": 20, "description": "How many results (default 5)"},
-                        "freshness": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Time filter"}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "web_fetch",
-                "description": "Download an http(s):// URL and return the page's readable text (HTML stripped, length-capped, private targets refused). Use after web_search to read a specific page.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string", "description": "http(s):// URL to read"},
-                        "max_chars": {"type": "integer", "minimum": 200, "maximum": 16000, "description": "Text cap in characters (default 8000)"}
-                    },
-                    "required": ["url"]
-                }
-            }
-        }),
-    ]
-}
-
 /// Parse Ollama/OpenAI tool-call arguments: per spec a JSON-encoded string,
 /// but tolerate an inline object.
 fn parse_tool_args(args: &Value) -> Value {
@@ -618,10 +584,6 @@ fn parse_tool_args(args: &Value) -> Value {
         v => v.clone(),
     }
 }
-
-/// Tool names the content-intent path accepts — exactly the tool defs
-/// declared to the runtime, so a model can never summon arbitrary tools.
-const WEB_TOOL_NAMES: [&str; 2] = ["web_search", "web_fetch"];
 
 /// Does this prompt plausibly want live web data? Questions do — decided
 /// by a trailing "?" or an interrogative first word, deliberately NOT by
@@ -687,8 +649,10 @@ pub fn answer_is_degenerate(content: &str) -> bool {
 /// Detect a model-declared tool intent hidden in the assistant's plain
 /// content: `{"function_name": "web_search", "arguments": {…}}` (also
 /// "tool"/"name" key variants, fenced code, and prose around the JSON).
-/// Returns the function name and parsed arguments.
-fn content_tool_intent(body: &Value) -> Option<(String, Value)> {
+/// Returns the function name and parsed arguments. `allowed` is exactly
+/// the registry's enabled skill names (`plugins.rs`) — a model can never
+/// summon a disabled or unknown tool through here.
+fn content_tool_intent(body: &Value, allowed: &[&str]) -> Option<(String, Value)> {
     let content = body
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)?;
@@ -705,7 +669,7 @@ fn content_tool_intent(body: &Value) -> Option<(String, Value)> {
         .or_else(|| v.get("name"))
         .or_else(|| v.get("tool"))
         .and_then(Value::as_str)?;
-    if !WEB_TOOL_NAMES.contains(&name) {
+    if !allowed.contains(&name) {
         return None;
     }
     let args = v
@@ -716,41 +680,18 @@ fn content_tool_intent(body: &Value) -> Option<(String, Value)> {
     Some((name.to_string(), parse_tool_args(&args)))
 }
 
-/// Execute one model-requested web tool against the gateway skills and
-/// return the answer as the JSON string fed back to the model. Tool errors
-/// come back as `{"error": …}` so the model can recover instead of the
-/// whole chat failing.
-async fn run_web_tool(cfg: &crate::config::BotConfig, name: &str, raw_args: &Value) -> String {
+/// Execute one model-requested skill through the plugin registry and
+/// return the answer as the JSON string fed back to the model. Tool
+/// errors come back as `{"error": …}` so the model can recover instead
+/// of the whole chat failing.
+async fn run_tool(
+    registry: &crate::plugins::SkillRegistry,
+    cfg: &crate::config::BotConfig,
+    name: &str,
+    raw_args: &Value,
+) -> String {
     let args = parse_tool_args(raw_args);
-    let res: Result<Value> = match name {
-        "web_search" => {
-            web_search_skill(
-                cfg,
-                args.get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                args.get("count").and_then(Value::as_u64),
-                args.get("freshness").and_then(Value::as_str),
-            )
-            .await
-        }
-        "web_fetch" => {
-            let cap = args
-                .get("max_chars")
-                .and_then(Value::as_u64)
-                .map(|c| c as usize)
-                .unwrap_or(8000)
-                .clamp(200, 16000);
-            web_fetch_skill(
-                cfg,
-                args.get("url").and_then(Value::as_str).unwrap_or_default(),
-                Some(cap),
-            )
-            .await
-        }
-        other => Err(anyhow::anyhow!("unknown function {other:?}")),
-    };
-    match res {
+    match registry.dispatch(cfg, name, &args).await {
         Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
         Err(e) => json!({ "error": e.to_string() }).to_string(),
     }
@@ -1171,10 +1112,16 @@ mod tests {
 
     #[test]
     fn content_intent_shapes() {
+        let prepackaged =
+            crate::plugins::SkillRegistry::standard(crate::plugins::PREPACKAGED_PLUGINS);
+        let allowed = prepackaged.enabled_skill_names();
         let intent = |content: &str| {
-            content_tool_intent(&json!({
-                "choices": [{"message": {"role": "assistant", "content": content}}]
-            }))
+            content_tool_intent(
+                &json!({
+                    "choices": [{"message": {"role": "assistant", "content": content}}]
+                }),
+                &allowed,
+            )
         };
         // Canonical shape seen live on qwen3:8b via the LiteLLM/Ollama runtime.
         let (name, args) =

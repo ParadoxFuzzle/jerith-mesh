@@ -103,8 +103,8 @@ scripts/dev-e2e.sh
 | Web access skills (Brave Search + URL fetch — OpenClaw migration, bot tool loop) | ✅ live |
 | QUIC NodeRPC expert dispatch (runtime-backed) | ✅ Phase 1 |
 | JER mining on served inference | ✅ live |
-| Remote expert tensor execution with placement/speculation | 📋 Phase 2–3 |
-| Discord bot / plugin SDK | 📋 Phase 3 |
+| Expert dispatch: locality-aware placement + speculative remote pre-flight (hybrid local + remote, replay verification preserved on the speculative path; tensor transport next) | ✅ Phase 2 |
+| Discord bot + plugin/skill SDK core (OpenClaw-style registry, bot.toml `[plugins]` gating; first-class `memory.*`/`lore.*` + web tools; vision.* + event hooks next) | ✅ Phase 3 core — |
 
 ### Setup flow
 
