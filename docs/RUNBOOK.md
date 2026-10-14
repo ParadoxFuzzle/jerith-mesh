@@ -251,6 +251,22 @@ Known remaining limitations (accepted, bounded):
   trust, same as the tunnel itself).
 - Rate limits are per-process in-memory: a bootstrap restart resets
   every window (a client's burst budget re-arms briefly).
+- memory.search clamps `top_k` to 1–25 and answers 413 above a
+  10 000-char query (round 4 follow-up, same live node session):
+  silent clamp, not a rejection — oversized top_k returns as many hits
+  as the store has, capped at 25.
+- Stake tests used to read/write the *global* ledger
+  (`~/.jerith-mesh/data/stake.json`) — shared-state pollution once
+  flipped a lock test's verdict order-dependently and journaled fake
+  slash events into the production file. Fixed: every test manager
+  rearms to a private temp ledger and `StakeManager::new` no longer
+  persists eagerly; only real mutations write. Production datum was
+  all-zeros throughout (live node's own status confirmed), so nothing
+  was lost.
+- QUIC e2e test `router_execute_over_quic_prefers_local_and_falls_through`
+  is load-sensitive under full-suite parallel load (handshake timing)
+  and can fail the rare run; passes in isolation and on retry.
+  Pre-existing, unrelated to round 4.
 
 ## Escalation pointers
 

@@ -194,7 +194,28 @@ async fn skill_memory_search(
         )
             .into_response();
     };
-    let top_k = body.get("top_k").and_then(|k| k.as_u64()).unwrap_or(5) as usize;
+    // Query cap: the query is embedded via the provider round-trip (nomic
+    // context is ~8k tokens anyway) — don't pay an unbounded one per hit.
+    const SEARCH_QUERY_CAP_CHARS: usize = 10_000;
+    if query.chars().count() > SEARCH_QUERY_CAP_CHARS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!(
+                    "query exceeds {SEARCH_QUERY_CAP_CHARS} chars"
+                )
+            })),
+        )
+            .into_response();
+    }
+    // top_k clamp mirrors memory.similar: the response is fully
+    // materialized, so a caller asking for top_k=1e9 would serialize the
+    // whole store into one reply.
+    let top_k = body
+        .get("top_k")
+        .and_then(|k| k.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 25) as usize;
     match memory.search(query, top_k).await {
         Ok(hits) => (StatusCode::OK, Json(json!({"hits": hits}))).into_response(),
         Err(e) => (
@@ -1056,6 +1077,35 @@ mod tests {
         TestServer::new(gw.router().into_make_service()).expect("test server")
     }
 
+    /// Test server with the local memory backend armed (embed falls back
+    /// to hashing when no ollama answers).
+    fn spawn_with_memory() -> TestServer {
+        let mut cfg = crate::config::NodeConfig::default();
+        cfg.runtime_url = "http://127.0.0.1:1".to_string();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let memory = crate::memory::MemoryStore::open_in_memory(crate::memory::EmbedConfig {
+            dim: 64,
+            ..crate::memory::EmbedConfig::default()
+        })
+        .expect("test memory db");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            miner: None,
+            memory: Some(Arc::new(memory)),
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        TestServer::new(gw.router().into_make_service()).expect("test server")
+    }
+
     /// Test server with the default-configured Jerith Guard armed.
     fn spawn_guarded(runtime_url: String) -> TestServer {
         let runtime_url: &'static str = Box::leak(runtime_url.into_boxed_str());
@@ -1216,6 +1266,36 @@ mod tests {
             "got: {body}"
         );
         assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn memory_search_caps_top_k_and_query() {
+        let server = spawn_with_memory();
+        server
+            .post("/v1/skills/memory/embed")
+            .json(&json!({"text": "at least one row to search over"}))
+            .await;
+
+        // Absurd top_k: must neither panic nor materialize an oversized
+        // reply — the 1..=25 clamp keeps the response shape bounded.
+        let res = server
+            .post("/v1/skills/memory/search")
+            .json(&json!({"query": "row", "top_k": u64::MAX}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let body: Value = res.json();
+        assert!(body["hits"].as_array().unwrap().len() <= 25);
+
+        // Query over the 10k-char cap → 413 before an embed round-trip.
+        let big = "y".repeat(10_001);
+        let res = server
+            .post("/v1/skills/memory/search")
+            .json(&json!({"query": big}))
+            .await;
+        assert_eq!(
+            res.status_code(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[tokio::test]

@@ -78,19 +78,28 @@ impl StakeLedger {
 
     /// Load (missing/corrupt → fresh ledger; staking math continues).
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
+        Self::load_from(&Self::path())
+    }
+
+    /// Load from an explicit path (test/dev seam: private ledgers keep the
+    /// shared production file out of the tests' blast radius).
+    pub fn load_from(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
 
-
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    /// Persist under an explicit path (pairs with `load_from`).
+    pub fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, serde_json::to_string(self)?)?;
+        std::fs::write(path, serde_json::to_string(self)?)?;
         Ok(())
     }
 
@@ -123,6 +132,10 @@ pub struct StakeManager {
     /// Bearer token for the token-authed chain endpoints (/stake/*,
     /// /wallet/create) — JERITH_TOKEN or the token file, same as mining.
     token: Option<String>,
+    /// Where the ledger persists. Defaults to data_dir/stake.json; tests
+    /// redirect it to a private temp path so parallel suites and the live
+    /// node never scribble over each other's escrow markers.
+    ledger_path: std::path::PathBuf,
     /// One escrow attempt per process (restarts reset the flag and verify).
     lock_attempted: std::sync::atomic::AtomicBool,
 }
@@ -162,16 +175,31 @@ impl StakeManager {
         } else {
             None
         };
-        let ledger = StakeLedger::load();
-        let _ = ledger.save();
+        let ledger_path = StakeLedger::path();
+        let ledger = StakeLedger::load_from(&ledger_path);
+        // No eager save here: constructing a manager must not touch the
+        // shared global ledger file — tests rearm to a private path right
+        // after, and production persists on the first real mutation.
         Arc::new(Self {
             ledger: StdMutex::new(ledger),
             config,
             chain_base,
             identity,
             token: crate::economics::read_token(),
+            ledger_path,
             lock_attempted: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Point the ledger at a private path with fresh state (tests/dev):
+    /// cross-test and cross-process pollution of the shared production
+    /// ledger otherwise lets one run's escrow/slash markers short-circuit
+    /// another's lock flows and even slash-journals fake offenses into the
+    /// live node's dataset.
+    pub fn rearm_ledger(&mut self, path: std::path::PathBuf) {
+        let ledger = StakeLedger::load_from(&path);
+        self.ledger_path = path;
+        self.save_ledger(&ledger);
     }
 
     /// Ledger snapshot for /status and the dashboard.
@@ -192,7 +220,7 @@ impl StakeManager {
     /// Persist the ledger. Failures are warned, never fatal — in-memory
     /// accounting stays authoritative for the running process.
     fn save_ledger(&self, ledger: &StakeLedger) {
-        if let Err(e) = ledger.save() {
+        if let Err(e) = ledger.save_to(&self.ledger_path) {
             tracing::warn!(target: "economics", error = %e, "stake ledger save failed");
         }
     }
@@ -715,12 +743,26 @@ mod tests {
     /// StakeManager pointed at a stub chain (wallet_endpoint override).
     /// The token is injected explicitly: the env/file lookup that production
     /// uses is simply not available under `cargo test`.
+    /// Unique per-uses temp ledger path — parallel tests (and repeat runs)
+    /// each get their own file instead of racing on the shared production
+    /// ledger at data_dir/stake.json.
+    fn fresh_ledger_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "jerith-stake-test-{}-{n}.json",
+            std::process::id()
+        ))
+    }
+
     fn manager_with_stub(stub: &ChainStub) -> Arc<StakeManager> {
         let mut crypto = crypto(1_000_000);
         crypto.wallet_endpoint = Some(format!("http://{}", stub.addr));
         let mut mgr = StakeManager::new(&crypto, Some(crate::signing::SigningIdentity::generate()));
         if let Some(m) = Arc::get_mut(&mut mgr) {
             m.token = Some("test-token".into());
+            m.rearm_ledger(fresh_ledger_path());
         }
         mgr
     }
@@ -833,7 +875,13 @@ mod tests {
             c
         };
         let identity = crate::signing::SigningIdentity::generate();
-        let mgr = StakeManager::new(&crypto, Some(identity.clone()));
+        let mut mgr = StakeManager::new(&crypto, Some(identity.clone()));
+        // Private fresh ledger: otherwise this notice's escrow/slash
+        // markers land in the shared production stake.json — polluting the
+        // live node's dataset and short-circuiting sibling tests' flows.
+        if let Some(m) = Arc::get_mut(&mut mgr) {
+            m.rearm_ledger(fresh_ledger_path());
+        }
         mgr.notice("victim-node", "dishonest_results", "evidence-bytes").await;
 
         let hits = stub.hits.lock().unwrap().clone();
