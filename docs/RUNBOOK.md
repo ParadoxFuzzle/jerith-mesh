@@ -292,7 +292,18 @@ remembering:
   `delta.reasoning_content`, so live-typing shows the wait, then the
   answer tails in fast; a broken stream with real content already typed
   degrades to a cut-marked partial, never a lost chat. `stream = false`
-  restores the buffered one-shot.
+  restores the buffered one-shot. Tool rounds stream too: taps see a
+  `RoundStart` per chat round (sinks clear the tool-exchange round's text
+  — native tool_call rounds type nothing, occasional JSON-intent slop
+  vanishes at the boundary — so web-informed answers type clean). The
+  Discord edit wire path is verified live (say + two partial edits +
+  final edit, all 200, content readback ok). Chat-guardrail state is
+  observable: the node's `/status` carries `runtime_num_predict`, the
+  site stats generator (site/generate_site_stats.sh, top-of-file TOML
+  peek only — appending a key after the last `[section]` would land it
+  section-scoped, not top-level) mirrors it plus the bot's `[chat]`
+  stream flag into `data/stats.json`, and status.php renders both on the
+  "Chat Guardrails" card.
 - **Runaway-generation cap option** (`runtime_num_predict` in config.toml,
   default unset = off): when set, the gateway stamps `max_tokens = N` on
   every chat it forwards to the local runtime lane — but only when the
