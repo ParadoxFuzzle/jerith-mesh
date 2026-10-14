@@ -224,17 +224,26 @@ unit `litellm-proxy.service`, config `~/.openclaw/litellm-config.json`),
 fronting local ollama plus OpenRouter models. Two properties worth
 remembering:
 
-- **Auth is master-key-only.** `general_settings.master_key` is set and
-  the proxy runs WITHOUT a prisma DB, so the only valid bearer is the
-  master key itself (`sk-…` from that json). Any other non-empty bearer
-  falls into the virtual-key DB lookup and dies with
-  `400 {"error":{"message":"No connected db.","type":"no_db_connection"}}`
-  — and a request with NO bearer gets 401. If virtual/sub keys ever
-  become necessary, run LiteLLM against the co-hosted Postgres
-  (prisma migrate) — not attempted deliberately: auth works as-is and
-  the key only ever leaves the machine inside `~/.jerith-mesh/config.toml`
-  (`runtime_api_key`, mode 0600). Losing it = re-read the master key
-  from the config json; never guess.
+- **Auth: master key + virtual keys.** `general_settings.master_key` is
+  set; since 2026-10-14 the proxy also runs against the co-hosted
+  Postgres (`DATABASE_URL` in systemd drop-in
+  `~/.config/systemd/user/litellm-proxy.service.d/override.conf`, role/db
+  `litellm` on `127.0.0.1:5432`, prisma client generated against the
+  bundled `litellm_proxy_extras/schema.prisma` and pushed once with
+  `prisma db push`). Sub-clients now mint keys through the master key:
+  `POST /key/generate` (alias/duration/max_budget) → use the returned
+  `sk-…` as a normal bearer; `POST /key/delete` retires them. A request
+  with NO bearer still gets 401. The master key itself only leaves the
+  machine inside `~/.jerith-mesh/config.toml` (`runtime_api_key`, file
+  chmod 0600, enforced at ensure/save since commit `8f0011b`). Losing it
+  = re-read the master key from the config json; never guess.
+  Gotchas, both hit live during setup: the drop-in rejected a comment
+  with a non-ASCII dash (whole file silently ignored ⇒ env never
+  arrived), and the boot-time "prisma package not found" message actually
+  meant the bare `prisma` shellout couldn't find `~/.local/bin/prisma` —
+  the drop-in now also exports a PATH that includes it. Schema drift
+  after a litellm upgrade: rerun `prisma generate` + `prisma db push`
+  with the new bundled schema before trusting /key endpoints.
 - **num_ctx is explicit.** qwen3 is a hybrid thinking model; under
   ollama's default slot its prompt + thinking can outrun the window and
   produce HTTP-200-with-empty-content (observed live 2026-10-14 04:18:
