@@ -1,0 +1,21 @@
+# Advisory scan configuration for `cargo audit` (used by the CI
+# `dependency-audit` gate — a NEW advisory anywhere in any crate's
+# dependency graph fails the build).
+#
+# The entries below are the ONLY accepted advisories. Each corresponds to
+# a documented rationale in docs/RUNBOOK.md → "Dependency security
+# posture"; they are all one subgraph — serenity 0.12.5's pinned
+# tokio-tungstenite 0.21 websocket stack (rustls 0.22.4 + webpki
+# 0.102.8) — and their fixes live in the 0.23/0.103 lines, i.e. serenity
+# 0.13 territory. The maintenance rule: a new accepted advisory gets a
+# runbook paragraph AND an entry here in the same commit; when the
+# serenity/poise migration lands, delete every entry in this list.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0349", # unauthenticated ServerHello downgrade (via serenity websocket stack)
+    "RUSTSEC-2026-0346", # Debug impls expose TLS session secrets (via serenity websocket stack)
+    "RUSTSEC-2026-0098", # webpki: URI name constraints incorrectly accepted
+    "RUSTSEC-2026-0049", # webpki: CRLs not authoritative via faulty DP matching
+    "RUSTSEC-2026-0104", # webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0099", # webpki: name constraints accepted for wildcard names
+]

@@ -686,3 +686,51 @@ deliberate Phase 4/5 ops item. Current state after this pass:
   TLS connection to Discord (a single well-known endpoint over an
   upstream-verified channel), not the mesh's own QUIC mesh traffic,
   which rides rustls 0.23.46. Revisit when serenity 0.13/poise lands.
+
+### Serenity/poise migration plan (clears the six accepted advisories)
+
+Verified upstream facts (2026-10-15): **serenity 0.13 does not exist
+yet** — 0.12.5 (2025-12-20) is the newest release and it pins
+`tokio-tungstenite 0.21` (hence rustls 0.22 + webpki 0.102.8).
+tokio-tungstenite itself moved on (0.27+ by mid-2025), but serenity's
+semver demand pins the old line, so a solo bump is impossible.
+
+Three paths, in preference order:
+
+1. **Wait for serenity 0.13 + poise 0.8** (default). Prepare now so the
+   bump is a day's work when it lands: keep the bot's serenity/poise
+   API surface concentrated in `crates/bot/src/{main,commands,api}.rs`
+   (already true); do NOT reach into serenity internals from other
+   files. When 0.13 ships: bump `serenity` + `poise` + `tokio-tungstenite`
+   together, fix CompileError-level API breaks (framework builder,
+   context/gateway plumbing, `EditMessage` builder changes), then
+   `cargo tree -i rustls` MUST report only the 0.23 line and
+   `cargo audit` must come back clean — that is the exit criterion,
+   after which the six `ignore` entries in `.cargo/audit.toml`
+   are deleted (their comments say exactly that).
+2. **Stopgap: flip serenity to `native_tls_backend`** (only if the
+   risk calculus changes — not the current default). Serenity 0.12.5
+   exposes `default_native_tls` / `native_tls_backend`, which moves
+   tokio-tungstenite + reqwest onto native-tls (OpenSSL) and drops
+   rustls 0.22.4 + webpki 0.102.8 from the tree entirely — clearing
+   today's six advisories WITHOUT waiting for 0.13. It is NOT adopted
+   by default because (a) it trades rustls for OpenSSL (a new linking
+   and trust-store surface on the bot), and (b) feature unification:
+   serenity enabling `reqwest/native-tls` would ALSO enable it for the
+   shared reqwest in core/node — unless our manifests pin
+   `reqwest = { default-features = false, features = ["rustls-tls"] }`
+   first. If adopted, do the manifest pinning BEFORE the backend flip
+   and verify the mesh's own HTTP clients still ride rustls via
+   `cargo tree -i reqwest -e features` and a smoke `/status` probe.
+3. **Rejected: git-dependency on serenity/poise master.** Pins an
+   upstream moving target into the supply chain to chase one advisory
+   set; not worth it while exposure is limited (see above).
+
+Interim guardrail (done this pass): `cargo audit` now gates CI
+(`.github/workflows/ci.yml`, `dependency-audit` job) against every
+advisory EXCEPT the six documented here — `.cargo/audit.toml` ignores
+exactly those IDs, each with a pointer to this runbook section. A NEW
+advisory anywhere in any crate's dependency graph breaks the build;
+the accepted six cannot silently grow. Maintenance rule: whenever a new
+advisory is accepted-with-reason, it gets a runbook paragraph and an
+audit.toml entry in the same commit — never one without the other.

@@ -49,3 +49,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: One-command two-node E2E (builds, boots, verifies, tears down)
         run: bash scripts/dev-e2e.sh
+
+  dependency-audit:
+    # Advisory gate: a NEW RUSTSEC advisory anywhere in any crate's
+    # dependency graph fails the build (releases can't land on it). The
+    # six accepted serenity-websocket advisories are the ONLY exceptions,
+    # via .cargo/audit.toml — each points to its rationale in
+    # docs/RUNBOOK.md → "Dependency security posture". Delete that file's
+    # entries (and rerun this gate clean) when the serenity/poise
+    # migration lands.
+    name: cargo audit (dependency advisories gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Advisory scan (fails on anything not documented as accepted)
+        run: cargo audit
