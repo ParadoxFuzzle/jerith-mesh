@@ -668,6 +668,45 @@ Known remaining limitations (accepted, bounded):
 
 ## Dependency security posture (cargo audit, 2026-10-15)
 
+### Feature-unification audit (TLS/HTTP stack, 2026-10-15)
+
+A sweep for the hazard class the serenity stopgap evaluation measured
+(one stray `default-features`/backend feature flips the shared stack's
+default silently). Verdict: **no unknown leaks**. Facts, all verified
+with `cargo tree -e features`:
+
+- **TLS backends present:** rustls only. `native-tls`/`openssl`/
+  `aws-lc-rs` are absent from the tree; the vulnerable webpki 0.102.8
+  sits solely in the documented serenity websocket subgraph (the six
+  accepted advisories below).
+- **reqwest feature set:** `json`, `stream` (our manifest pin, shared
+  by all three crates) + `multipart` — enabled by *our own* crates for
+  mesh file uploads — plus the internal `__rustls`/`rustls-tls`
+  webpki-roots aliases. No `default-tls` carrier anywhere.
+- **rustls feature set (0.23.46):** `ring` + `std` + `tls12` from our
+  pin, plus `webpki-roots`/`webpki-tokio`/`http1` linked by
+  quinn-proto and reqwest. No second crypto provider: trimming our rustl
+  `default-features` could invite `aws_lc_rs` from an uncareful future
+  dep, so the pinned `features = ["ring", "std", "tls12"]` stays.
+- **quinn defaults (by design):** `default`, `ring`,
+  `platform-verifier`, `runtime-tokio` — the platform-verifier feature
+  is what pulls `rustls-platform-verifier`; that is the QUIC mesh's
+  cert-verification path, not an accidental leak.
+- **Manifests:** no crate-local dependency spec leaves TLS-relevant
+  `default-features` on beyond the workspace-level pins documented
+  above; serenity-as-direct-dep does not exist on `main` (the
+  evaluation branch carries it, unmerged).
+
+Repeat recipe for the next sweep (the commands that produced the
+facts): `cargo tree -i native-tls`, `cargo tree -i openssl`,
+`cargo tree -i aws-lc-rs`, `cargo tree -i rustls-webpki@0.102.8`,
+`cargo tree -e features -i reqwest`, `cargo tree -e features -i
+rustls@<current>`, `cargo tree -e features -i quinn`, plus a
+manifest grep for spec lines without explicit `default-features`
+intent. The hazard to re-check whenever a new dependency arrives: does
+it (or its default features) enable `reqwest/native-tls`,
+`tokio-tungstenite/native-tls`, or a second rustls crypto provider?
+
 Run `cargo audit` before releases; it is not wired into CI yet — a
 deliberate Phase 4/5 ops item. Current state after this pass:
 
