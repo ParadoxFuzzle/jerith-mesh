@@ -71,7 +71,13 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Operator surfaces: `/status.experts` reports the activation counts,
     the hot set, the cold size, each sampled cold expert's shard owner,
     the ring size and the live replication policy
-- ✅ Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
+- ✅ Layer-group fallback (Petals-style placement) for high-latency links (Phase 2)
+  — expert dispatch plans route through the deterministic layer-ownership ring when
+  expert hosting falls short: every layer's owner is derived from the rendezvous ring
+  (`ShardMap::layer_ownership`, reassigning only the departed node's layers, just like
+  cold-expert sharding), and the QUIC dispatch planner prefers the owning peer for
+  each layer group. Placement-only today: the multi-hop residual-pipeline runtime is
+  the remaining part and stays on the Phase 3 list (§13)
 - 🔄 Speculative decoding + expert budgeting + prefetching (Phase 3)
 - 🔄 Asynchronous, timeout-tolerant forward passes; graceful degradation (Phase 3)
 - ✅ Dedicated local specialist models:
@@ -235,10 +241,19 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   signature recomputation, payload schema, retry bound, disabled no-op).
 
 ## 9. Incentives & Economics
-- 📋 Native JerithChain integration (default) — import/reuse `jerith_core` mining + RPC flow (Phase 4)
+- ✅ Native JerithChain integration (default chain) — a native Rust flow against the
+  local chain node (`economics.rs`, no external runtime): bearer-token RPC mining
+  attempts with wallet auto-creation on first use, the phase-5 escrow tier
+  (`/stake/lock|unlock`, `GET /stake`, `/stake/slash` with Ed25519-signed slash
+  notices) trueing up the chain view every tick, and the `/status` chain probe
+  (height, tip, circulating, miners, total mined) that the bot and the dashboard read
 - 📋 Optional Bitcoin, Ethereum, Dogecoin, Monero (user supplies own miner/wallet endpoints) (Phase 4)
 - ✅ Interval metering hooks (tokens, expert activations, bandwidth, uptime) wired through the ping loop
-- 📋 Automatic JER mining attempt on each served inference (Phase 4)
+- ✅ Automatic JER mining attempt on each served inference — the chain's passive-mining
+  mechanic reimplemented mesh-side: every served completion rolls `mine_chance_permille`
+  (default 120/1000; `0` disables; never blocks the inference path — the chain POST
+  runs in a spawned task), and wins/attempts land in the interval meters and on the
+  dashboard's earnings card
 - ✅ Optional staking + slashing tier (Phase 5, off by default) — live
   against the JerithChain escrow contract (`/stake/lock`, `/stake/unlock`,
   `GET /stake`, `/stake/slash`):
@@ -298,7 +313,11 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
 - 📋 TEE attestation & selective ZK proofs (Phase 5+, research-grade)
 
 ## 11. Setup & Onboarding
-- ✅ Guided flow: hardware scan → model (with live peer counts, overridable) → memory backend → contribution % (≥25) → optional wallets → enable/disable local vision & embeddings
+- ✅ Guided flow: hardware scan → model (with live peer counts, overridable) → memory
+  backend (with the DSN prompt when postgres is chosen) → contribution % (≥25) → chain
+  choice. Local vision/embeddings ship enabled by default and are set via config.toml
+  (`[specialists]`); prompting for them inside setup is a known gap queued for Phase 3
+  (§13)
 - ✅ Capability check with clear warnings before selecting a too-large model (`--ok-beyond-capacity` to override)
 - ✅ “Recommended meshes for your hardware” suggestion (Phase 1) — `suggest.rs`:
   the setup flow joins the hardware-capable model list (`detect_capable_models`)
@@ -391,3 +410,120 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
     (unit + wire tests: prefix listed, full-id requester refused by identity,
     a different requester served normally on the same server)
   - Content filters: Jerith Guard (§8) screens every outbound chat payload
+
+## 13. Roadmap ahead — everything left, phase by phase
+
+Everything here is a plan, not a promise. Items graduate into the numbered
+sections above as they land (statuses there are the ground truth); what this
+section adds is *why*, *what already exists to build on*, and the known
+gotchas surfaced while building the finished parts.
+
+### Phase 3 — finish the core mesh runtime
+
+- **Multi-hop pipeline forward passes** (completing §1's layer-group item).
+  The ownership map, deterministic ring placement and layer-group-aware
+  dispatch planner already exist — what remains is the runtime: activations
+  (residual streams) hopping across layer-group owners over QUIC, latency
+  budgeting per hop, and partial-answer semantics when one hop degrades.
+  Gotcha learned: everything must survive the existing commitment layer —
+  a pipeline hop is several `ExpertResult`-shaped exchanges, so the
+  anti-tamper plumbing composes rather than replaces.
+- **Speculative decoding + expert budgeting + prefetching (§1)**. The
+  measured-demand store (`expert_stats`, activation counts, hot/cold split)
+  is the prefetch oracle: predicted next experts preload into the LRU while
+  the current layer runs. Open design point: a per-request expert budget
+  so one huge speculative run cannot starve other askers.
+- **Asynchronous, timeout-tolerant forward passes + graceful degradation
+  (§1)**. Today's dispatch is plan-ordered with fallbacks but synchronous
+  per attempt; mesh hops need per-hop timeouts, retry walks that respect
+  non-idempotency (commitments prevent a tampered node from re-selling the
+  same answer, but a dead hop must not wedge the request) and flapping-peer
+  hysteresis at the router.
+- **Privacy levels: local-only / trusted-peers / full-mesh (§12)**. Memory
+  is strictly local already; what is left is a routing-tier policy for
+  *prompt* and metadata forwarding (logs, metrics, usage), a config
+  surface, and honest refusals at the gateway when a tier forbids a hop.
+- **Compatibility check for quantization / context length / tokenizer
+  version (§12)**. Model identity already hashes quantization and context
+  length; the remaining piece is a pre-join validation against live peers
+  with typed, readable refusals ("same model, wrong quant, this many nodes
+  could still take you").
+- **Plugin SDK surfaces (§7): Telegram / WhatsApp / others.** The shape to
+  copy already exists: the bot crate's SkillSpec registry + signed webhook
+  hooks are the SDK; an adapter only plugs a different transport in front
+  of the same loop.
+- **Setup prompts for the local specialists** (the audit gap): interactive
+  enable/disable for vision/embeddings (with persistence) + non-interactive
+  flags, mirroring the memory-backend treatment.
+- **Model-switch hot path (§2's model switching)**. Config hot-reload
+  deliberately leaves `[model]` cold (echo: model switching is mesh
+  re-identity work — disconnect then rejoin); the remaining piece is the
+  graceful-disconnect/rejoin machinery, then the cold-field WARN turns
+  into a live apply.
+- **Cold-list watch for the config hot-reload.** Every new hot field must
+  genuinely read from the running config at its use site — the reload
+  plan classifier (`ping.rs`) keeps the cold list short and deliberate.
+
+### Phase 4 — economics & reputation close the loop
+
+- **Coordinator-side quorum over contribution measurements** (§2's marked
+  MVP gap). The cryptographic substrate is done: per-interval signed
+  `measurement` blocks a pinger re-verifies field-for-field. What remains:
+  several peers talling the same interval at the bootstrap, aggregate
+  publishing, and protection against a single-biased-pinger world.
+- **Gossiped signed reputation (§10)**. Bootstrap-verified offenses today
+  score; the gossip layer carries signed scores node-to-node inside ads
+  (capped like the discovery rotation), with the no-statistics-slash
+  boundary kept: thresholds act through the Phase 5 stake tier, not
+  through reputation alone. Anti-sybil: identity age + stake weighting
+  before scores count.
+- **Per-node wallet surfaces on-chain**. The dashboard shows mining wins
+  and the chain-at-large stats; the natural next step is the node's own
+  JER balance from the chain RPC (payout address in config), keeping the
+  earnings card chain-truthful rather than locally-counted.
+- **Optional chains (§9): Bitcoin / Ethereum / Dogecoin / Monero.** The
+  config accepts the labels today and nothing else exists — each chain
+  needs its miner/wallet adapter against user-supplied endpoints, with
+  the *honest* answer being typed refusals until then (no fake mining
+  stats for an unconfigured chain).
+- **Chain-side hardening**: chain-RPC token rotation, mine-rate behavior
+  vs. the chain's bookkeeping (`total_mined_uj` drift watch), payout and
+  escrow edge cases on node exit (escrow returned on graceful shutdown —
+  what happens when the process is killed mid-cycle deserves its own
+  drill).
+
+### Phase 5+ — trust, attestation, scale
+
+- **Reputation-weighted placement + slashing interlock (§10's Phase 5
+  work)**: the stake tier exists and is live against the escrow contract;
+  wiring verified-offense thresholds into placement preference (and the
+  refusals) is the interlock that makes economics bite.
+- **TEE attestation & selective ZK proofs (research-grade §10)**. Honest
+  ground truth today is the commitment layer + spot-check ringer + signed
+  measurement blocks — hardware attestation arrives later, gated on a
+  chip-support survey across the fleet rather than a protocol built in a
+  vacuum.
+- **Vector-store scale beyond the retention cap**: HNSW is approximate —
+  exact scans stay correct under the 10 000-row cap; beyond that, an
+  IVFFlat alternative (or an optional uncap with index maintenance) plus
+  an in-node migration for legacy dimension-free tables (today they run
+  hnsw-less with exact scans — documented, silent-skip on the index
+  build). Postgres connection pooling only when query concurrency
+  actually grows — one client is the right default at this size.
+- **Ops observability**: metrics history beyond the single window (ring
+  retention on the node, trend lines on the dashboard), per-peer latency
+  breakdowns, and expert-budget telemetry once budgeting lands
+  (Phase 3).
+- **Testing posture**: the env-gated live-PG tests (`JERITH_TEST_PG_URL`,
+  `JERITH_TEST_PG_URL_NOEXT`) are the pattern to copy for any future
+  backend (chain node smoke tests are the likely next adopter) — skip
+  loudly with the reason, never silently.
+
+### Final note
+
+The honest status bar: stay suspicious of any ✅ that cannot show its code
+path and its test — this file's markers are audited against the tree
+(2026-10-15: pipeline/layer-group, auto-mining, native chain integration
+and the Phase 0.5 memory backend were all re-verified with code grep +
+live drills), and the roadmap section is where future claims land first —
+with the gotchas written down *before* the feature, not after.
