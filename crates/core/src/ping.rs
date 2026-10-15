@@ -83,6 +83,11 @@ pub struct MeshState {
     /// gate, placement (mesh_view filters candidates) and `/status`. The
     /// ping tick re-syncs it from config, so edits land live.
     pub peer_block: std::sync::Arc<crate::ratelimit::BlockedPeers>,
+    /// Bootstrap rotation (Phase 1 discovery redundancy): configured
+    /// servers + peer-gossiped learned URLs + last-good bookkeeping.
+    /// Persisted to `<data>/discovery-servers.json` when it grows.
+    pub discovery:
+        std::sync::Arc<tokio::sync::Mutex<crate::discovery::DiscoveryServers>>,
     /// Where those counters persist (see
     /// [`set_expert_stats`](Self::set_expert_stats)).
     expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
@@ -95,6 +100,15 @@ impl MeshState {
         let stake = crate::stake::StakeManager::new(&config.crypto, Some(identity.clone()));
         // Built BEFORE `config` moves into the RwLock below.
         let peer_block = crate::ratelimit::BlockedPeers::from_list(&config.peers.blocked);
+        // Discovery rotation: restore the learned set + last-good from the
+        // persisted file, then layer the config's server list on top.
+        let discovery = {
+            let mut d = crate::discovery::DiscoveryServers::load(
+                &crate::config::NodeConfig::data_dir().join("discovery-servers.json"),
+            );
+            d.configured = crate::discovery::sanitize(&config.discovery.servers, None);
+            d
+        };
         let state = Arc::new(Self {
             config: RwLock::new(config),
             registry: Mutex::new(PeerRegistry::new(None)),
@@ -112,6 +126,7 @@ impl MeshState {
             expert_stats_path: std::sync::Mutex::new(crate::expert_stats::default_stats_path()),
             isolate: std::sync::Arc::new(crate::isolate::IsolateState::default()),
             peer_block,
+            discovery: std::sync::Arc::new(tokio::sync::Mutex::new(discovery)),
         });
         Ok((state, rx))
     }
@@ -669,8 +684,10 @@ impl MeshLoop {
         let st = Arc::clone(&state);
         let mut loop_rx = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
-            let bootstrap = BootstrapClient::new(st.config.read().await.bootstrap_url.clone());
-            run_loop(st, bootstrap, ping_interval, &mut loop_rx).await;
+            // No fixed bootstrap client: the rotation lives in
+            // state.discovery (discovery.rs) — a dead primary degrades one
+            // tick, then the loop dials the next server in the order.
+            run_loop(st, ping_interval, &mut loop_rx).await;
         });
         Self {
             state,
@@ -686,9 +703,11 @@ impl MeshLoop {
 }
 
 /// One complete loop iteration: refresh peers, ping all, advertise self.
+/// Bootstrap legs run through the discovery rotation (discovery.rs): the
+/// last-good server first, then the rest — one dead bootstrap degrades a
+/// single tick instead of the process lifetime.
 async fn run_loop(
     state: Arc<MeshState>,
-    bootstrap: BootstrapClient,
     ping_interval: Duration,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
@@ -717,6 +736,15 @@ async fn run_loop(
             state.peer_block.set(&cfg.peers.blocked);
         }
 
+        // Hot-reload the discovery rotation (Phase 1): the operator can
+        // repoint the node at new bootstraps without a restart. The
+        // learned set is state-owned (peer gossip) and persisted.
+        {
+            let cfg = state.config.read().await;
+            let mut d = state.discovery.lock().await;
+            d.configured = crate::discovery::sanitize(&cfg.discovery.servers, None);
+        }
+
         // Initialize the registry's model gate on first iteration (or after
         // a model switch event, which cleared it).
         {
@@ -739,8 +767,25 @@ async fn run_loop(
             // Signed peers-fetch: the bootstrap's rate lane attributes the
             // hit to OUR identity bucket (generous allowance for NAT-
             // packed deployments) instead of the per-IP anonymous floor.
-            match bootstrap.fetch_peers_signed(&m.id, &state.identity).await {
-                Ok(peers) => {
+            // Disseminated rotation (discovery.rs): first good server wins
+            // and is remembered as the last-good for the following calls.
+            let order = { state.discovery.lock().await.order(None) };
+            // Borrows, not moves: try_each's closure is FnMut — a move of
+            // the Arc/identity would fail the second attempt.
+            let model_id = &m.id;
+            let identity_ref = &state.identity;
+            let fetched_leg = crate::discovery::try_each(&order, |url| {
+                let client = BootstrapClient::new(url.to_string());
+                async move {
+                    client
+                        .fetch_peers_signed(model_id, identity_ref)
+                        .await
+                }
+            })
+            .await;
+            match fetched_leg {
+                Ok((peers, used)) => {
+                    state.discovery.lock().await.note_good(&used);
                     let mut reg = state.registry.lock().await;
                     let fetched = peers.len();
                     for ad in peers {
@@ -749,12 +794,14 @@ async fn run_loop(
                     tracing::info!(
                         target: "mesh",
                         fetched,
+                        bootstrap = %used,
                         "peer list refreshed from bootstrap"
                     );
                 }
                 Err(e) => {
                     // Bootstrap turned this node away (signature/expiry) or
-                    // is unreachable — must be visible, not silent.
+                    // is unreachable (or every server failed) — must be
+                    // visible, not silent.
                     tracing::warn!(
                         target: "mesh",
                         error = %e,
@@ -764,8 +811,44 @@ async fn run_loop(
                 }
             }
 
-            // Ping every connectable peer.
-            ping_all(&state, &bootstrap).await;
+            // Gossip the discovery list (Phase 1): every fetched ad may
+            // carry bootstrap servers its sender rotates through. Merging
+            // keeps the rotation fresh with zero config; https-only +
+            // capped like every other path into the list.
+            {
+                let ads: Vec<String> = {
+                    let reg = state.registry.lock().await;
+                    reg.all_ads()
+                        .iter()
+                        .flat_map(|ad| ad.discovery_servers.iter().cloned())
+                        .collect()
+                };
+                let mut d = state.discovery.lock().await;
+                if d.merge_learned(&ads) {
+                    if let Err(e) = d.save() {
+                        tracing::warn!(target: "mesh", error = %e, "discovery list persist failed");
+                    } else {
+                        tracing::info!(
+                            target: "mesh",
+                            learned = d.learned.len(),
+                            "discovery list grew via peer gossip"
+                        );
+                    }
+                }
+            }
+
+            // Ping every connectable peer — via the last-good bootstrap's
+            // view: dead-server rotation happens at the fetch/advertise
+            // legs; the ping pass rides the server that just answered.
+            let ping_url = {
+                let d = state.discovery.lock().await;
+                d.last_good
+                    .clone()
+                    .or_else(|| d.order(None).first().cloned())
+            };
+            if let Some(url) = ping_url {
+                ping_all(&state, &BootstrapClient::new(url)).await;
+            }
 
             // Resource pooling (Phase 1): refresh OUR live sample right
             // before advertising so the mesh always placement-decides on
@@ -801,13 +884,31 @@ async fn run_loop(
                 resources: state.resources.lock().await.clone(),
                 hosted_experts,
                 hosted_expert_count,
+                // Gossip our rotation (Phase 1): capped, sanitized —
+                // every peer that hears this ad can dial a working
+                // bootstrap even if OUR primary dies.
+                discovery_servers: {
+                    let d = state.discovery.lock().await;
+                    d.ad_servers(None)
+                },
             };
-            let identity = state.identity.clone();
-            if let Err(e) = bootstrap.advertise(&ad, &identity).await {
-                // An advertise failure means the mesh can't see us — warn.
-                tracing::warn!(target: "mesh", error = %e, "advertise rejected/failed");
-            } else {
-                tracing::debug!(target: "mesh", "advertised to bootstrap");
+            let identity_ref = &state.identity;
+            let ad_ref = &ad;
+            let advertise_order = state.discovery.lock().await.order(None);
+            let advertise_leg = crate::discovery::try_each(&advertise_order, |url| {
+                let client = BootstrapClient::new(url.to_string());
+                async move { client.advertise(ad_ref, identity_ref).await }
+            })
+            .await;
+            match advertise_leg {
+                Ok(((), used)) => {
+                    state.discovery.lock().await.note_good(&used);
+                    tracing::debug!(target: "mesh", bootstrap = %used, "advertised to bootstrap");
+                }
+                Err(e) => {
+                    // An advertise failure means the mesh can't see us — warn.
+                    tracing::warn!(target: "mesh", error = %e, "advertise rejected/failed on every bootstrap");
+                }
             }
         }
 

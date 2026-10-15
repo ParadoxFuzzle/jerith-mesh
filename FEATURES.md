@@ -91,7 +91,9 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ Primary bootstrap at `p2p.jerithai.com` via Cloudflare Tunnel; overridable
 - ✅ Continuous health pings (minimal-resource requests); offline nodes deprecate and return on re-up
 - ✅ Fraudulent / non-contributing nodes deprecated and refused further work
-- 📋 Additional independent bootstrap nodes + gossip-based list maintenance (Phase 1)
+- ✅ Additional independent bootstrap nodes (`[discovery] servers`): per-call failover rotation — last-good server first, then primary, then the rest; one dead bootstrap degrades a single tick instead of the process lifetime
+- ✅ Gossip-based list maintenance: peers carry their rotation inside their signed ads (`PeerAd.discovery_servers`, capped at 8); recipients merge https-only (plain-HTTP entries stay config-only), capped at 16 total, and persist the learned set to `<data>/discovery-servers.json` so a restart keeps it
+- ✅ Discovery state visible in `/status` (`discovery` section) and in the bot's `/status` line
 
 ## 4. Resource Measurement & Capability Gating
 - ✅ OS detection with per-OS inventory tools:

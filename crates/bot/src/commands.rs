@@ -733,11 +733,37 @@ pub fn format_status_with_tokens(st: &serde_json::Value, tokens: Option<u64>) ->
     let you_line = tokens
         .map(|t| format!("\nyour token spend (this bot, cumulative): {t}"))
         .unwrap_or_default();
+    // Discovery rotation (Phase 1): a compact server-count line — the
+    // last-good server is the one discovery actually rode last tick, so
+    // a failover event is visible here without printing full URLs.
+    let discovery_section = st
+        .pointer("/discovery")
+        .and_then(|d| d.as_object())
+        .map(|d| {
+            let configured = d
+                .get("configured")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let learned = d
+                .get("learned")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let last_good = d
+                .get("last_good")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+            format!(
+                "\ndiscovery: {configured} configured · {learned} learned · last-good {last_good}"
+            )
+        })
+        .unwrap_or_default();
     format!(
         "📊 **node** `{}` · role `{}` · model `{}` ({})\n\
          peers: {} total / {} alive · contribution: {}%\n\
          served: {} tokens · {} expert activations · {} bytes relayed\n\
-         uptime: {}s · mines: {} attempted / {} won{}{}",
+         uptime: {}s · mines: {} attempted / {} won{}{}{}",
         get("node_id").as_str().unwrap_or("?"),
         get("role").as_str().unwrap_or("?"),
         get("model").as_str().unwrap_or("(none)"),
@@ -755,6 +781,7 @@ pub fn format_status_with_tokens(st: &serde_json::Value, tokens: Option<u64>) ->
             .unwrap_or(0),
         you_line,
         metrics_section,
+        discovery_section,
     )
 }
 
@@ -852,6 +879,25 @@ mod tests {
         assert!(out.contains("3 total / 2 alive"));
         assert!(out.contains("11 tokens"));
         assert!(out.contains("mines: 2 attempted / 1 won"));
+        // No discovery block in the snapshot → no discovery line at all.
+        assert!(!out.contains("discovery:"));
+    }
+
+    #[test]
+    fn status_discovery_line_counts_and_last_good() {
+        let st = json!({
+            "node_id": "n1", "role": "hybrid", "model": "glm-5.3", "quant": "q4",
+            "peer_count": 1, "peers_alive": 1, "contribution_percent": 10,
+            "meters": { "tokens_served": 1, "uptime_seconds": 1 },
+            "discovery": {
+                "configured": ["https://primary.example.org"],
+                "learned": ["https://a.example.org", "https://b.example.org"],
+                "last_good": "https://a.example.org",
+            }
+        });
+        let out = format_status(&st);
+        assert!(out
+            .contains("discovery: 1 configured · 2 learned · last-good https://a.example.org"));
     }
 
     #[test]

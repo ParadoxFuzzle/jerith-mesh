@@ -357,6 +357,13 @@ pub struct NodeConfig {
     /// next ping tick, no restart.
     #[serde(default)]
     pub peers: PeerPolicyConfig,
+    /// Bootstrap redundancy (`[discovery]` in config.toml): additional
+    /// independent bootstrap servers after the primary. See
+    /// `discovery.rs` — the rotation, the peer-gossip merge and the
+    /// persistence that together remove discovery's single point of
+    /// failure.
+    #[serde(default)]
+    pub discovery: crate::discovery::DiscoveryConfig,
 }
 
 /// `[peers]` — who this node refuses to work with, by node id.
@@ -601,6 +608,7 @@ impl Default for NodeConfig {
             experts: ExpertStoreConfig::default(),
             resources: ResourceIsolationConfig::default(),
             peers: PeerPolicyConfig::default(),
+            discovery: crate::discovery::DiscoveryConfig::default(),
         }
     }
 }
@@ -807,6 +815,9 @@ impl NodeConfig {
         // [peers]: a block entry that is blank or a 2-char typo would
         // silently match half the mesh (prefix matching runs BOTH ways).
         self.peers.validate()?;
+        // [discovery]: a dead bootstrap is survivable; a MALFORMED URL in
+        // the rotation is a per-tick error loop — fail the node at boot.
+        self.discovery.validate()?;
         Ok(())
     }
 }

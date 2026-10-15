@@ -5,6 +5,7 @@ pub mod backup;
 pub mod bootstrap;
 pub mod bootstrap_server;
 pub mod config;
+pub mod discovery;
 pub mod economics;
 pub mod expert_stats;
 pub mod expert_store;

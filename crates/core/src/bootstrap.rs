@@ -51,6 +51,14 @@ pub struct PeerAd {
     /// as hosts, known-not-listed as not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_expert_count: Option<u64>,
+    /// Bootstrap servers this node rotates through (Phase 1 discovery
+    /// redundancy): gossip so the fleet's server list stays fresh without
+    /// a coordinator. Sanitized by the sender (https, deduped, capped —
+    /// `discovery::AD_MAX_SERVERS`); the receiver merges only https URLs
+    /// from ads (plain http LAN bootstraps are config-only). Empty on
+    /// pre-discovery ads — wire-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_servers: Vec<String>,
 }
 
 /// Cap on the advertised expert-id list: a long tail is represented by
@@ -518,6 +526,7 @@ mod tests {
             resources: None,
             hosted_experts: None,
             hosted_expert_count: None,
+            discovery_servers: Vec::new(),
         }
     }
 

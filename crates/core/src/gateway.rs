@@ -743,6 +743,18 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "blocked": gw.state.peer_block.list(),
         "refused_rpcs": gw.state.peer_block.refusals(),
     });
+    // Discovery rotation (Phase 1): the live server list — config first,
+    // learned-from-peers behind it — plus last-good and the ad payload,
+    // so an operator can see WHERE discovery is failing when it does.
+    let discovery_value = {
+        let d = gw.state.discovery.lock().await;
+        json!({
+            "configured": d.configured,
+            "learned": d.learned,
+            "last_good": d.last_good,
+            "ad_servers": d.ad_servers(None),
+        })
+    };
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -774,6 +786,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "resources": resources_value,
         // Per-peer blocking (Phase 3): refused ids + refusal counter.
         "peer_block": peer_block_value,
+        // Discovery rotation (Phase 1): configured + learned + last-good.
+        "discovery": discovery_value,
         // Tensor transport (Phase 2): expert store state + cache counters.
         "experts": experts_value,
         "verify": verify_value,

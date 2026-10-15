@@ -251,6 +251,7 @@ mod tests {
             resources: None,
             hosted_experts: None,
             hosted_expert_count: None,
+            discovery_servers: Vec::new(),
         }
     }
 

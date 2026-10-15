@@ -624,6 +624,7 @@ async fn hot_expert_replication_pulls_a_replica_over_quic() {
                 resources: None,
                 hosted_experts: hosted,
                 hosted_expert_count: count,
+                discovery_servers: Vec::new(),
             }),
             "a same-model peer ad must pass the model-homogeneous gate"
         );
@@ -752,6 +753,7 @@ async fn cold_shard_ring_names_an_owner_when_nothing_is_advertised() {
             resources: None,
             hosted_experts: p.hosted_experts.clone(),
             hosted_expert_count: Some(0),
+            discovery_servers: Vec::new(),
         })
         .collect();
     let ring_a = ShardMap::from_ads("node-a", &ads);
@@ -864,6 +866,7 @@ async fn replica_manager_pulls_a_hot_expert_on_its_own_interval() {
             resources: None,
             hosted_experts: hosted,
             hosted_expert_count: count,
+            discovery_servers: Vec::new(),
         }));
         reg.record_ping_ok(&node_b, 3);
         *state_a.registry.lock().await = reg;

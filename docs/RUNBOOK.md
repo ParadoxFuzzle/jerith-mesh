@@ -217,6 +217,36 @@ Direct cross-host meshing (same day, commits `7924408` + `c79eca3`):
   `gateway_bind = "0.0.0.0"`. Verified live: cross-host `/health` 200 both
   directions, cross-host `POST /v1/chat/completions` 200.
 
+Discovery failover — `[discovery] servers` in `config.toml` (Phase 1):
+
+The primary bootstrap (`p2p.jerithai.com`, Cloudflare Tunnel) is now first
+among equals, not a single point of failure. Additional bootstraps go in
+`[discovery]`:
+
+```toml
+[discovery]
+servers = ["https://backup-1.example.org", "https://backup-2.example.org"]
+```
+
+- **Per-call failover, not per-process.** Every discovery HTTP leg (peer
+  fetch) tries last-good first, then config order, then learned: a dead
+  primary drops one tick, not the node. `/status` → `discovery` shows
+  `configured` / `learned` / `last_good` / `ad_servers` — check `last_good`
+  when suspicious (it names the server that answered the last tick).
+- **Gossip + persistence.** Servers learned from peers' signed ads
+  (https-only, max 8 per ad, 16 total in rotation) persist to
+  `<data>/discovery-servers.json` — a restart keeps the list; delete the
+  file to reset learned entries (configured ones always survive).
+- **Hot reload.** Editing `servers` (or `jerith config set`) takes effect
+  within one ping cycle — no restart needed.
+- **Validation is fail-closed.** Malformed URLs (`config check`) refuse to
+  boot: only `http(s)://host[:port][/path]` origins pass — no userinfo,
+  query or fragment (the `{url}/v1/peers…` join would splice those in).
+- **Plain http stays config-only.** LAN bootstraps (`http://192.168.1.6…`)
+  rotate fine, but are never learned from gossip and never gossiped in
+  ads from peers — a hostile ad can't repoint the fleet at a capture
+  proxy. Cap: the first 16 valid https entries win; the rest are dropped.
+
 ## Main-node runtime (LiteLLM) notes
 
 The main node's runtime is the local LiteLLM proxy (`127.0.0.1:8000`,

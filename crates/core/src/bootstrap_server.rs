@@ -794,6 +794,7 @@ mod tests {
             resources: None,
             hosted_experts: None,
             hosted_expert_count: None,
+            discovery_servers: Vec::new(),
         };
         (id, a)
     }
@@ -999,6 +1000,7 @@ mod tests {
                 resources: None,
                 hosted_experts: None,
                 hosted_expert_count: None,
+                discovery_servers: Vec::new(),
             };
             let r = client
                 .put(format!("{base}/v1/advertise"))
@@ -1504,6 +1506,7 @@ mod tests {
             resources: None,
             hosted_experts: None,
             hosted_expert_count: None,
+            discovery_servers: Vec::new(),
         };
         let r = client
             .put(format!("{base}/v1/advertise"))
@@ -1674,6 +1677,7 @@ mod tests {
             resources: None,
             hosted_experts: None,
             hosted_expert_count: None,
+            discovery_servers: Vec::new(),
         };
         // Re-sign with the accused's identity (same key, same node_id).
         let r = client
@@ -1720,6 +1724,7 @@ mod tests {
                 resources: None,
                 hosted_experts: None,
                 hosted_expert_count: None,
+                discovery_servers: Vec::new(),
             },
             last_refresh_ms: 0,
             dead_votes: 0,
@@ -1773,6 +1778,7 @@ mod tests {
             resources: None,
             hosted_experts: None,
             hosted_expert_count: None,
+            discovery_servers: Vec::new(),
         };
         // Two stamps: a fixed one for shape determinism, a fresh one for
         // the wire-auth freshness checks.
