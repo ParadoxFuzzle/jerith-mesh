@@ -139,6 +139,21 @@ pub struct MetricsSnapshot {
     pub recent: Vec<CompletionRecord>,
     /// When the metering window opened (node start).
     pub window_started_ms: u64,
+    /// M3 pipeline-route counters (see “PipelineMetrics”).
+    pub pipeline: PipelineMetrics,
+}
+
+/// Pipeline route counters (M3, FEATURES §13): planned and timed route
+/// walks plus the hops that overran their measured-demand budget. The
+/// fields are live as soon as a producer reports — routing has no live
+/// invocation path yet (pending the Colibri-side transport), so until
+/// then these read zero and the dashboard shows “no route data yet”.
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct PipelineMetrics {
+    pub routes_total: u64,
+    pub over_budget_hops: u64,
+    /// Duration of the most recent walk (sum of its attempt timings).
+    pub last_route_ms: u64,
 }
 
 /// Shared meter handle (inside the Gateway).
@@ -157,6 +172,10 @@ struct MetricsInner {
     tokens_total: u64,
     /// When the metering window opened (node start), epoch ms.
     window_started_ms: u64,
+    /// M3 pipeline-route counters.
+    pipeline_routes_total: u64,
+    pipeline_over_budget_hops: u64,
+    pipeline_last_route_ms: u64,
 }
 
 impl Default for Metrics {
@@ -240,6 +259,15 @@ impl Metrics {
         });
     }
 
+    /// Record one finished pipeline route walk (M3): its total attempt
+    /// latency and how many hops overran their priced budget.
+    pub fn record_pipeline_route(&self, walk_ms: u64, over_budget_hops: usize) {
+        let mut inner = self.inner.lock().expect("metrics lock");
+        inner.pipeline_routes_total += 1;
+        inner.pipeline_over_budget_hops += over_budget_hops as u64;
+        inner.pipeline_last_route_ms = walk_ms;
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let inner = self.inner.lock().expect("metrics lock");
         MetricsSnapshot {
@@ -250,6 +278,11 @@ impl Metrics {
             models: inner.models.clone(),
             recent: inner.ring.clone(),
             window_started_ms: inner.window_started_ms,
+            pipeline: PipelineMetrics {
+                routes_total: inner.pipeline_routes_total,
+                over_budget_hops: inner.pipeline_over_budget_hops,
+                last_route_ms: inner.pipeline_last_route_ms,
+            },
         }
     }
 }
@@ -305,6 +338,17 @@ mod tests {
         assert_eq!(snap.requests_total, (RING_CAP + 10) as u64);
         // Oldest dropped: first retained is the 11th record.
         assert_eq!(snap.recent[0].total_tokens, 10);
+    }
+
+    #[test]
+    fn pipeline_route_recorder_updates_the_snapshot() {
+        let m = Metrics::new();
+        m.record_pipeline_route(1_250, 2);
+        m.record_pipeline_route(750, 0);
+        let snap = m.snapshot();
+        assert_eq!(snap.pipeline.routes_total, 2);
+        assert_eq!(snap.pipeline.over_budget_hops, 2);
+        assert_eq!(snap.pipeline.last_route_ms, 750);
     }
 
     #[test]

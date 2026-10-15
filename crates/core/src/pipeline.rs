@@ -92,6 +92,94 @@ pub fn hop_timeout(base: Duration, rtt_ms: u64) -> Duration {
     base.saturating_add(Duration::from_nanos(extra))
 }
 
+// ---- M3 — latency budgeting: the walk is timed per attempt, and the
+// budgets it is held to are priced from the measured-activation ordering.
+
+/// One attempted hop's measured timing — all attempts, successes AND
+/// failures (a failed attempt's dead wait is as real to the route's
+/// latency as a slow success).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptTiming {
+    pub node: Option<String>,
+    pub layers: Vec<usize>,
+    pub ms: u64,
+    pub ok: bool,
+}
+
+/// A hop that overran the budget priced for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverBudgetHop {
+    pub node: Option<String>,
+    pub layers: Vec<usize>,
+    pub measured_ms: u64,
+    pub budget_ms: u64,
+}
+
+/// One hop's priced slice of a route walk budget: its RTT-floored
+/// deadline plus its share of whatever total budget remains, weighted
+/// by measured demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopBudget {
+    pub node: Option<String>,
+    pub layers: Vec<usize>,
+    pub demand_weight: u64,
+    pub budget_ms: u64,
+}
+
+/// Price a planned route against the measured-activation ordering, M3's
+/// contract with the demand signal: `demand_of` is the caller-wired
+/// view over [`crate::expert_stats::ExpertStats`] (per-hop measured
+/// activations — the same oracle prefetching will use, no new source of
+/// truth). Every hop first gets its RTT-floored deadline
+/// ([`hop_timeout`] — the M1 deadline IS the floor); whatever budget
+/// remains after all floors is spread across hops in proportion to
+/// measured demand, so hot hops win headroom while cold hops still get
+/// their floor (nobody starves the walk). Ties in demand keep the
+/// route's original order — stable sort, deterministic u128 arithmetic.
+/// Hops return SORTED BY DEMAND DESCENDING: the measured-activation
+/// order is the pricing contract, and callers walking the priced order
+/// are walking demand itself.
+pub fn plan_route_budget(
+    route: &[PipelineHop],
+    demand_of: impl Fn(&PipelineHop) -> u64,
+    rtt_of: impl Fn(&str) -> u64,
+    base: Duration,
+    total_budget_ms: u64,
+) -> Vec<HopBudget> {
+    let mut priced: Vec<HopBudget> = route
+        .iter()
+        .map(|hop| {
+            let floor_ms = match &hop.node {
+                Some(node) => hop_timeout(base, rtt_of(node)).as_millis() as u64,
+                None => base.as_millis() as u64,
+            };
+            HopBudget {
+                node: hop.node.clone(),
+                layers: hop.layers.clone(),
+                demand_weight: demand_of(hop),
+                budget_ms: floor_ms,
+            }
+        })
+        .collect();
+    // Stable sort: ties in demand keep the route's original order.
+    priced.sort_by_key(|b| std::cmp::Reverse(b.demand_weight));
+    let floors_sum: u128 = priced.iter().map(|b| b.budget_ms as u128).sum();
+    let remaining = (total_budget_ms as u128).saturating_sub(floors_sum);
+    let demand_sum: u128 = priced.iter().map(|b| b.demand_weight as u128).sum();
+    let hop_count = priced.len();
+    for b in priced.iter_mut() {
+        // Distribute by demand share; with no measured demand at all the
+        // shares degenerate to an even split (checked_div's None branch).
+        let extra = remaining
+            .checked_mul(b.demand_weight as u128)
+            .unwrap_or(0)
+            .checked_div(demand_sum)
+            .unwrap_or(remaining / hop_count as u128);
+        b.budget_ms = (b.budget_ms as u128 + extra) as u64;
+    }
+    priced
+}
+
 /// Typed failure of a route walk: which hop failed, who owned it, which
 /// layers it covered, why, and how much of the route completed before the
 /// failure (M2's partial-answer semantics build on that count).
@@ -260,6 +348,14 @@ pub struct RouteResult {
     pub hops_run: usize,
     pub degraded: Vec<DegradedHop>,
     pub reassigned: Vec<ReassignedHop>,
+    /// Per-attempt measured timings (M3), in walk order — successes and
+    /// failures alike; the failure timings count against the walk's
+    /// latency as much as a slow success.
+    pub attempts: Vec<AttemptTiming>,
+    /// Hops (M3) that overran the budget priced for them, typed with the
+    /// measured and budgeted durations. Budgets come from the caller's
+    /// `budget_of` hook — `None` leaves this empty.
+    pub over_budget: Vec<OverBudgetHop>,
 }
 
 impl RouteResult {
@@ -358,20 +454,47 @@ pub async fn execute_route_resilient(
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>>,
     rtt_of: impl Fn(&str) -> u64,
     base_timeout: Duration,
+    // M3: the caller-wired per-hop budget hook (ms). A hop that overruns
+    // it is typed into RouteResult::over_budget and the walk continues —
+    // budgeting reports, never clamps (M3 scopes the enforcement to
+    // observability; reordering/preemption is later roadmap). `None`
+    // disables the check silently.
+    budget_of: Option<impl Fn(&PipelineHop) -> u64>,
     stability: &mut RouteStability,
     reassign: impl Fn(&[usize], Option<&str>) -> Option<Vec<PipelineHop>>,
 ) -> RouteResult {
     let mut pending: VecDeque<PipelineHop> = route.into();
-    let mut budget = REASSIGN_BUDGET.saturating_add(pending.len());
+    let mut reassign_budget = REASSIGN_BUDGET.saturating_add(pending.len());
     let mut degraded: Vec<DegradedHop> = Vec::new();
     let mut reassigned: Vec<ReassignedHop> = Vec::new();
+    let mut attempts: Vec<AttemptTiming> = Vec::new();
+    let mut over_budget: Vec<OverBudgetHop> = Vec::new();
     let mut hops_run: usize = 0;
 
     while let Some(hop) = pending.pop_front() {
-        match attempt_one_hop(model_id, req_id, &hop, &activation, &local_run, &remote_run, &rtt_of, base_timeout)
-            .await
-        {
+        let started = std::time::Instant::now();
+        let outcome = attempt_one_hop(model_id, req_id, &hop, &activation, &local_run, &remote_run, &rtt_of, base_timeout)
+            .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let hop_budget_ms = budget_of.as_ref().map(|f| f(&hop));
+        match outcome {
             Ok(out) => {
+                attempts.push(AttemptTiming {
+                    node: hop.node.clone(),
+                    layers: hop.layers.clone(),
+                    ms: elapsed_ms,
+                    ok: true,
+                });
+                if let Some(budget_ms) = hop_budget_ms
+                    && elapsed_ms > budget_ms
+                {
+                    over_budget.push(OverBudgetHop {
+                        node: hop.node.clone(),
+                        layers: hop.layers.clone(),
+                        measured_ms: elapsed_ms,
+                        budget_ms,
+                    });
+                }
                 activation = out;
                 hops_run += 1;
                 if let Some(node) = &hop.node {
@@ -379,18 +502,24 @@ pub async fn execute_route_resilient(
                 }
             }
             Err(e) => {
+                attempts.push(AttemptTiming {
+                    node: hop.node.clone(),
+                    layers: hop.layers.clone(),
+                    ms: elapsed_ms,
+                    ok: false,
+                });
                 let reason = e.to_string();
                 if let Some(node) = &hop.node {
                     stability.note_failure(node);
                 }
-                let replacement = if budget > 0 {
+                let replacement = if reassign_budget > 0 {
                     reassign(&hop.layers, hop.node.as_deref())
                 } else {
                     None
                 };
                 match replacement {
                     Some(sub) if !sub.is_empty() => {
-                        budget -= 1;
+                        reassign_budget -= 1;
                         reassigned.push(ReassignedHop {
                             layers: hop.layers.clone(),
                             was_node: hop.node.clone(),
@@ -411,8 +540,9 @@ pub async fn execute_route_resilient(
             }
         }
     }
-    RouteResult { activation, hops_run, degraded, reassigned }
+    RouteResult { activation, hops_run, degraded, reassigned, attempts, over_budget }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +880,7 @@ mod tests {
             },
             |n| if n == "peer-a" { 5 } else { 40 },
             BASE,
+            None::<fn(&PipelineHop) -> u64>,
             &mut stability,
             reassign,
         )
@@ -805,6 +936,7 @@ mod tests {
             },
             |_| 20,
             BASE,
+            None::<fn(&PipelineHop) -> u64>,
             &mut stability,
             |_layers, _dead| None, // nobody alive to take the layers
         )
@@ -893,11 +1025,164 @@ mod tests {
                 })
             },
             |_| 20, BASE,
+            None::<fn(&PipelineHop) -> u64>,
             &mut stability,
             |_l, _d| None,
         )
         .await;
         assert_eq!(result.degraded.len(), 3);
         assert!(stability.is_excluded("dead"), "3 walk failures must raise the flag");
+    }
+
+    // ---- M3: latency budgeting ----
+
+    #[test]
+    fn route_budget_orders_by_measured_demand_and_floors_at_rtt() {
+        let route = vec![
+            PipelineHop { node: Some("peer-a".into()), layers: vec![0] },
+            PipelineHop { node: Some("peer-b".into()), layers: vec![1] },
+            PipelineHop { node: None, layers: vec![2] },
+        ];
+        let budgets = plan_route_budget(
+            &route,
+            |hop| match hop.node.as_deref() {
+                Some("peer-b") => 7,
+                Some("peer-a") => 3,
+                _ => 0,
+            },
+            |n| if n == "peer-a" { 400 } else { 20 },
+            Duration::from_millis(100),
+            10_000,
+        );
+        // The measured-activation ORDER is the pricing contract: most
+        // demanded hop first; the tie between the two zero-demand hops
+        // keeps the route's original order (peer-a before the local hop).
+        assert_eq!(
+            budgets.iter().map(|b| b.layers.as_slice()).collect::<Vec<_>>(),
+            vec![&[1_usize][..], &[0_usize][..], &[2_usize][..]]
+        );
+        // Exact arithmetic: floors a=1300 (100 + 3×400), b=160, local=100;
+        // remaining 8440 split by demand 3:7:0 → 2532:5908:0.
+        let by_layer = |layer: usize| {
+            budgets
+                .iter()
+                .find(|b| b.layers == [layer][..])
+                .unwrap()
+                .budget_ms
+        };
+        assert_eq!(by_layer(1), 6_068, "hot hop wins the demand share");
+        assert_eq!(by_layer(0), 3_832, "floored hop keeps its RTT deadline");
+        assert_eq!(by_layer(2), 100, "zero-demand hop keeps only its floor");
+    }
+
+    #[test]
+    fn equal_demand_splits_the_remaining_budget_evenly() {
+        let route = vec![
+            PipelineHop { node: None, layers: vec![0] },
+            PipelineHop { node: Some("a".into()), layers: vec![1] },
+            PipelineHop { node: Some("b".into()), layers: vec![2] },
+        ];
+        let budgets = plan_route_budget(
+            &route,
+            |_| 0,
+            |_| 10, // floors: 100 + 130 + 130 = 360
+            Duration::from_millis(100),
+            1_360,
+        );
+        // remaining 1000 across 3 equal-demand hops = 333 each (integer
+        // division; the 1 ms truncation is tolerance, never a giveaway):
+        // local 433, remotes 463 each. Every hop keeps its RTT floor.
+        assert_eq!(budgets[0].budget_ms, 433);
+        assert_eq!(budgets[1].budget_ms, 463);
+        assert_eq!(budgets[2].budget_ms, 463);
+    }
+
+    #[tokio::test]
+    async fn over_budget_hops_are_typed_into_the_result() {
+        let route = vec![
+            PipelineHop { node: Some("slow".into()), layers: vec![0] },
+            PipelineHop { node: Some("fast".into()), layers: vec![1] },
+        ];
+        let mut stability = RouteStability::new();
+        let result = execute_route_resilient(
+            "m",
+            "req",
+            route,
+            vec![0.0_f32; 4],
+            |_a, _l| Ok(vec![0.0_f32; 4]),
+            move |_e, node, _x, _t| {
+                let slow = node.to_owned() == "slow";
+                Box::pin(async move {
+                    if slow {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    Ok((vec![0.0_f32; 4], None))
+                })
+            },
+            |_| 10,
+            BASE,
+            // Only the sleeper is priced against 1 ms; the unprioritized
+            // fast hop gets u64::MAX so CI scheduling jitter can't flake it.
+            Some(|hop: &PipelineHop| {
+                if hop.node.as_deref() == Some("slow") { 1 } else { u64::MAX }
+            }),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        // The walk CONTINUED past the overrun (budgeting reports, never
+        // clamps) and the overrun is typed with both durations.
+        assert_eq!(result.hops_run, 2);
+        assert_eq!(result.over_budget.len(), 1);
+        assert_eq!(result.over_budget[0].node.as_deref(), Some("slow"));
+        assert_eq!(result.over_budget[0].budget_ms, 1);
+        assert!(
+            result.over_budget[0].measured_ms > 20,
+            "sleep(30ms) must measure above the 1 ms budget"
+        );
+        assert!(result.attempts.iter().all(|a| a.ok), "both hops ran clean");
+        assert_eq!(result.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attempts_are_timed_for_successes_and_failures_alike() {
+        let route = vec![
+            PipelineHop { node: None, layers: vec![0] },
+            PipelineHop { node: Some("gone".into()), layers: vec![1] },
+            PipelineHop { node: Some("peer-b".into()), layers: vec![2] },
+        ];
+        let mut stability = RouteStability::new();
+        let result = execute_route_resilient(
+            "m",
+            "req",
+            route,
+            vec![0.0_f32; 4],
+            |a, _l| Ok(a.to_vec()),
+            move |_e, node, _x, _t| {
+                let dead = node.to_owned() == "gone";
+                Box::pin(async move {
+                    if dead {
+                        anyhow::bail!("peer unreachable")
+                    }
+                    Ok((vec![0.0_f32; 4], None))
+                })
+            },
+            |_| 10,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        // Attempts mirror the walk's real order, ok-flags honest: the
+        // failed middle attempt keeps its (long-dead) wait on record.
+        assert_eq!(result.attempts.len(), 3);
+        assert!(result.attempts[0].ok);
+        assert!(!result.attempts[1].ok);
+        assert_eq!(result.attempts[1].node.as_deref(), Some("gone"));
+        assert!(result.attempts[2].ok);
+        assert_eq!(result.over_budget, Vec::new(), "no budgets → no overruns");
     }
 }

@@ -436,10 +436,19 @@ gotchas surfaced while building the finished parts.
   unrecoverable losses are honest hops-short partial answers typed in
   `RouteResult::degraded` (the router walks on, mirroring reject-continue),
   and `RouteStability`'s two-line hysteresis keeps a flapping owner from
-  chattering the route plan. What
+  chattering the route plan. M3 landed (2026-10-15):
+  `pipeline::plan_route_budget` prices each hop from the measured
+  activation ordering (`ExpertStats` via a caller-wired demand hook —
+  RTT-floored deadline first, demand-proportional share of the
+  remainder), the walk times every attempt and types overruns in
+  `RouteResult::over_budget` (reports, never clamps), and the metrics
+  snapshot gained a `pipeline` section (routes, over-budget hops, last
+  walk) rendered on the dashboard — producer-pending, like the transport.
+  What
   remains is live transport integration (the hop RPC rides
   `remote_expert_attempt` once the Colibri-side layer split provides real
-  runtime weights) and latency budgeting per hop (M3).
+  runtime weights) and budget *enforcement* on the live path (M3 scoped
+  budgeting to observability; reordering/preemption is downstream).
   Gotcha learned: everything must survive the existing commitment layer —
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.

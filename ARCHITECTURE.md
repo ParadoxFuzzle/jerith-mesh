@@ -210,9 +210,23 @@ Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
   clear only after decay below `HOP_CLEAR_SCORE`), fed by the walk itself;
   `filter_alive` drops excluded owners from the alive set but never
   empties it — a flaky hop beats an unroutable mesh.
-- **M3 — latency budgeting.** Per-hop deadlines from measured RTT, budget
-  checked against the `expert_stats` measured-activation order (the same
-  oracle prefetching will use), dashboard surfacing on `/v1/metrics`.
+- **M3 ✅ — latency budgeting.** `pipeline::plan_route_budget` prices a
+  planned route against the measured-activation ordering: the caller
+  wires a demand hook over `ExpertStats` (the same oracle prefetching
+  uses — no second source of truth), every hop gets its RTT-floored
+  deadline (`hop_timeout`, the M1 deadline IS the floor), and the
+  remaining budget spreads in proportion to measured demand (hot hops
+  win headroom, cold hops keep their floor; stable demand-descending
+  order, deterministic u128 arithmetic). The resilient walk times every
+  attempt (successes AND failures — a failed attempt's dead wait is as
+  real to the route), and hops that overrun their priced budget are
+  typed into `RouteResult::over_budget` with both durations; budgeting
+  reports, never clamps (enforcement/reordering is later roadmap).
+  Metrics surfacing is live-shaped but producer-pending: `Metrics`
+  carries `record_pipeline_route` + a `pipeline` section (routes, over-
+  budget hops, last-walk ms) rendered on the dashboard — zeroes until a
+  live producer reports, i.e. when routing transport lands with the
+  Colibri-side layer split (same pending status as M1/M2 transport).
 
 | Phase | Goal | What gets built | Latency expectation |
 |---|---|---|---|

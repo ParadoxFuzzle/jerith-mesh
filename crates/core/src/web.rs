@@ -146,6 +146,7 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Earnings (mined)</h2><p id="earn">—</p><div class="fine" id="earnfine">JER mining wins</div></div>
   <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
   <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
+  <div class="card"><h2>Pipeline routes</h2><p id="pipeline">—</p><div class="fine" id="pipelinefine">multi-hop walks</div></div>
 </div>
 <footer>
   jerith-mesh · a P2P compute mesh for MoE models ·
@@ -212,6 +213,14 @@ async function refresh() {
       document.getElementById('latencyfine').textContent =
         'no completions in the window yet';
     }
+    // M3 pipeline routes: counters exist and are tested; the live
+    // producer rides the routing transport (pending the Colibri-side
+    // layer split), so until then the card reads "no route data yet".
+    const pj = mj ? mj.pipeline || null : null;
+    document.getElementById('pipeline').textContent = pj ? (pj.routes_total ?? 0) : '—';
+    document.getElementById('pipelinefine').textContent = pj
+      ? `routes walked · over-budget hops ${pj.over_budget_hops ?? 0} · last walk ${pj.last_route_ms ?? 0} ms`
+      : 'no route data yet';
     // Earnings view: JER mining wins for this node + chain reachability.
     document.getElementById('earn').textContent = String(j.meters?.mines_won ?? 0);
     const ch = j.chain;
