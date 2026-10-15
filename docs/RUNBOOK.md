@@ -76,6 +76,41 @@ rm -rf /tmp/probe-$$ /tmp/probe.log
 #    NOTE: do NOT use a bare `pkill -f <pattern>` here — the pattern text
 #    also matches the invoking shell's own cmdline and it kills itself.
 
+# 5b. Discovery failover drill (Phase 1 rotation, verified live 2026-10-15):
+#     briefly DARK the primary bootstrap and watch the node degrade
+#     honestly tick-by-tick, then recover within one tick. Requires the
+#     node under test to run the discovery-aware binary.
+#
+#     a. Stop the primary (on the bootstrap host):
+systemctl --user stop jerith-bootstrap
+#
+#     b. For ~2 ping cycles watch the node's journal: every tick must
+#        WARN and NAME THE ROTATION — never crash, never fake success:
+journalctl --user -u jerith-node --since '1 minute ago' --no-pager | \
+  grep -E 'bootstrap list refresh failed|advertise rejected'
+#        expect: WARN ... error=all bootstrap servers failed
+#        (tried ["https://p2p.jerithai.com", "http://<lan>:8901"]), last: ...
+#
+#     c. Recover (restart the primary), wait one cycle, expect INFO:
+systemctl --user start jerith-bootstrap
+sleep 12 && journalctl --user -u jerith-node --since '30 sec ago' --no-pager | \
+  grep 'peer list refreshed'
+#        expect: INFO mesh: peer list refreshed from bootstrap fetched=N
+#        bootstrap=https://p2p.jerithai.com
+#
+#     d. Truth surface: /status discovery must carry the rotation and the
+#        re-pinned last-good:
+curl -s http://127.0.0.1:8900/status | python3 -c \
+  'import json,sys; d=json.load(sys.stdin)["discovery"];
+   print(len(d["configured"]), d["last_good"], len(d["ad_servers"]))'
+#        expect: 2 https://p2p.jerithai.com 2
+#
+#     NOTE: with BOTH servers dark the node must keep serving local
+#     traffic (degraded ≠ down); with the second (LAN) bootstrap live,
+#     steps (b) become 'refreshed from bootstrap=<lan-url>' instead —
+#     that is the two-server leg working. Run scripts/
+#     setup-lan-bootstrap.sh ON the second node to arm it.
+
 # 6. Design checks that must always hold (fail-closed, not fail-open):
 #    - unsigned/replayed advertisements and pings get 401/403, never accepted
 #    - peers list only returns same-model nodes
