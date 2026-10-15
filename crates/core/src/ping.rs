@@ -106,7 +106,7 @@ impl MeshState {
             let mut d = crate::discovery::DiscoveryServers::load(
                 &crate::config::NodeConfig::data_dir().join("discovery-servers.json"),
             );
-            d.configured = crate::discovery::sanitize(&config.discovery.servers, None);
+            d.configured = crate::discovery::sanitize(&config.discovery_seed_servers(), None);
             d
         };
         let state = Arc::new(Self {
@@ -742,7 +742,7 @@ async fn run_loop(
         {
             let cfg = state.config.read().await;
             let mut d = state.discovery.lock().await;
-            d.configured = crate::discovery::sanitize(&cfg.discovery.servers, None);
+            d.configured = crate::discovery::sanitize(&cfg.discovery_seed_servers(), None);
         }
 
         // Initialize the registry's model gate on first iteration (or after

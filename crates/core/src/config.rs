@@ -366,6 +366,23 @@ pub struct NodeConfig {
     pub discovery: crate::discovery::DiscoveryConfig,
 }
 
+impl NodeConfig {
+    /// The discovery rotation seed: the operator's `[discovery] servers`
+    /// when present, else just the primary bootstrap — the pre-discovery
+    /// contract ("Empty → the primary URL alone"). Without this fallback
+    /// a config with NO `[discovery]` section (every pre-Phase-1 config,
+    /// and every freshly provisioned node) would run with an EMPTY
+    /// rotation and dead bootstrap legs, so the seed is the single source
+    /// for both startup and per-tick hot reload.
+    pub fn discovery_seed_servers(&self) -> Vec<String> {
+        if self.discovery.servers.is_empty() {
+            vec![self.bootstrap_url.clone()]
+        } else {
+            self.discovery.servers.clone()
+        }
+    }
+}
+
 /// `[peers]` — who this node refuses to work with, by node id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PeerPolicyConfig {
@@ -1105,6 +1122,25 @@ mod tests {
         let back: NodeConfig = serde_json::from_value(obj.clone().into()).unwrap();
         assert_eq!(back.resources, ResourceIsolationConfig::default());
         assert!(back.resources.kill_switch, "kill switch defaults ARMED");
+    }
+
+    #[test]
+    /// Discovery seed: an empty `[discovery]` section must rotate the
+    /// primary bootstrap (the pre-Phase-1 contract), not an empty list.
+    #[test]
+    fn discovery_seed_falls_back_to_primary_bootstrap_url() {
+        let mut cfg = sample_choices().into_config(None).unwrap();
+        assert_eq!(
+            cfg.discovery_seed_servers(),
+            vec![cfg.bootstrap_url.clone()],
+            "empty section rotates the primary"
+        );
+        cfg.discovery.servers = vec!["https://backup.example.org".into()];
+        assert_eq!(
+            cfg.discovery_seed_servers(),
+            vec!["https://backup.example.org".to_string()],
+            "configured servers replace the seed verbatim"
+        );
     }
 
     #[test]
