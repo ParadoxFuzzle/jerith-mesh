@@ -665,3 +665,24 @@ Known remaining limitations (accepted, bounded):
 - Fraud-correctness: `verify_percent`/ringer counters live in `/status`
   (`meters`, `verify` fields); a spike in mismatches precedes scam/round
   slashing notices — check `GET /stake` on the chain node for who burned what.
+
+## Dependency security posture (cargo audit, 2026-10-15)
+
+Run `cargo audit` before releases; it is not wired into CI yet — a
+deliberate Phase 4/5 ops item. Current state after this pass:
+
+- **Fixed:** `rustls 0.23.45 → 0.23.46` (targeted `cargo update
+  --precise`). Clears four advisories on the core QUIC/reqwest serving
+  path — most importantly RUSTSEC-2026-0346 (medium), where `Debug`
+  impls can print TLS session secrets into logs. The workspace compiles
+  and the full suite is green on 0.23.46.
+- **Accepted for now (6 advisories, all one subgraph):** `rustls
+  0.22.4` + `rustls-webpki 0.102.8`, pulled *only* by `serenity 0.12.5`
+  → `tokio-tungstenite 0.21` (the bot's Discord websocket). The fixes
+  live in the 0.23/0.103 lines, so clearing them means bumping
+  serenity/poise/tokio-tungstenite majors — a deliberate migration task,
+  not a drive-by. Exposure is limited: those advisories concern
+  websocket handshake downgrade/cert-verification details on the bot's
+  TLS connection to Discord (a single well-known endpoint over an
+  upstream-verified channel), not the mesh's own QUIC mesh traffic,
+  which rides rustls 0.23.46. Revisit when serenity 0.13/poise lands.
