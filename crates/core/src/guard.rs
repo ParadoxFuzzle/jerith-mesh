@@ -608,7 +608,7 @@ fn luhn_valid(digits: &str) -> bool {
             }
         })
         .sum();
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 fn finished(

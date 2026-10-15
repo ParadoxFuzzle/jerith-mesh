@@ -485,23 +485,24 @@ impl MeshFallbackChat {
         if !advertised {
             let own_id = state.config.read().await.node_id.clone();
             let ring = crate::replication::ShardMap::from_ads(&own_id, &ads);
-            if let Some(owner) = ring.primary_owner(expert_id) {
-                if owner != own_id && !peers.iter().any(|(id, ..)| *id == owner) {
-                    let rtt = rtts.get(&owner).copied().unwrap_or(u64::MAX >> 2);
-                    let resources = ads
-                        .iter()
-                        .find(|ad| ad.node_id == owner)
-                        .and_then(|ad| ad.resources.clone());
-                    tracing::debug!(
-                        target: "mesh",
-                        expert = %expert_id,
-                        owner = %owner,
-                        "no advertised holder — asking the cold-shard owner"
-                    );
-                    // Behind any advertised holder (there are none) and
-                    // ahead of nothing: the owner is the candidate.
-                    peers.push((owner, rtt, true, true, resources));
-                }
+            if let Some(owner) = ring.primary_owner(expert_id)
+                && owner != own_id
+                && !peers.iter().any(|(id, ..)| *id == owner)
+            {
+                let rtt = rtts.get(&owner).copied().unwrap_or(u64::MAX >> 2);
+                let resources = ads
+                    .iter()
+                    .find(|ad| ad.node_id == owner)
+                    .and_then(|ad| ad.resources.clone());
+                tracing::debug!(
+                    target: "mesh",
+                    expert = %expert_id,
+                    owner = %owner,
+                    "no advertised holder — asking the cold-shard owner"
+                );
+                // Behind any advertised holder (there are none) and
+                // ahead of nothing: the owner is the candidate.
+                peers.push((owner, rtt, true, true, resources));
             }
         }
         // Demand signal: this node wants this expert.
@@ -1302,7 +1303,7 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             Ok(resp) if resp.status().is_success() => {
                 // Verify the signed health reply attributes it to the peer.
                 let rtt = started.elapsed().as_millis() as u64;
-                let (ok, meas) = verify_health_reply(&state, &node_id, resp).await;
+                let (ok, meas) = verify_health_reply(state, &node_id, resp).await;
                 if ok {
                     let mut reg = state.registry.lock().await;
                     reg.record_ping_ok(&node_id, rtt);
@@ -1569,7 +1570,7 @@ async fn verify_health_reply(
         return (false, None);
     }
     // The pubkey fingerprint must match the claimed identity.
-    if reply.pubkey.len() != 64 || &reply.pubkey[..16] != reply.node_id {
+    if reply.pubkey.len() != 64 || reply.pubkey[..16] != reply.node_id {
         return (false, None);
     }
     let payload = crate::signing::health_payload(

@@ -272,6 +272,13 @@ pub struct ExpertRouter {
     expert_store: RwLock<Option<Arc<crate::expert_store::ExpertStore>>>,
 }
 
+/// Borrow-capturing pre-flight attempt: the owning peer plus the RPC that
+/// churns in flight (typed alias — the raw shape is painful to read).
+type PreflightAttempt<'a> = (
+    String,
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<f32>>> + 'a>>,
+);
+
 impl ExpertRouter {
     pub fn new(options: RouterOptions) -> Self {
         Self::new_with_tracker(options, crate::verify::VerificationTracker::shared())
@@ -494,8 +501,8 @@ impl ExpertRouter {
         (u64::MAX - vram_free, u64::MAX - ram_free, rtt_ms)
     }
 
-    /// QUIC-backed dispatch: same candidate plan, but remote candidates
-    /// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
+/// QUIC-backed dispatch: same candidate plan, but remote candidates
+/// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
     /// `local_run` computes locally when the plan's first candidate is
     /// local. Feedback failures land in `completed` as usual; the caller
     /// receives the first successful result.
@@ -759,27 +766,23 @@ impl ExpertRouter {
 
         // Phase 2: build the borrow-capturing pre-flight *before* the
         // local arm runs, so the RPC churns while the local attempt spins.
-        let mut preflight: Option<(
-            String,
-            std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<f32>>> + '_>>,
-        )> = None;
-        if self.options.speculative_remote {
-            if let (Some(ExpertLocation::Local), Some(ExpertLocation::Remote { node_id, .. })) =
+        let mut preflight: Option<PreflightAttempt<'_>> = None;
+        if self.options.speculative_remote
+            && let (Some(ExpertLocation::Local), Some(ExpertLocation::Remote { node_id, .. })) =
                 (plan.first(), plan.get(1))
-            {
-                let fut = Self::remote_dispatch_once(
-                    &self.verify,
-                    self.options.dispatch_timeout,
-                    endpoint,
-                    identity,
-                    peer_addrs,
-                    req_id,
-                    expert_id,
-                    input,
-                    &node_id,
-                );
-                preflight = Some((node_id.clone(), Box::pin(fut)));
-            }
+        {
+            let fut = Self::remote_dispatch_once(
+                &self.verify,
+                self.options.dispatch_timeout,
+                endpoint,
+                identity,
+                peer_addrs,
+                req_id,
+                expert_id,
+                input,
+                node_id,
+            );
+            preflight = Some((node_id.clone(), Box::pin(fut)));
         }
         // Peers the pre-flight already covered — do not double-work them.
         let mut consumed = std::collections::HashSet::new();
@@ -1053,15 +1056,15 @@ impl ExpertRouter {
 
         // Pick the arbiter: local truth first, else the next remote.
         let mut arbiter: Option<(Vec<f32>, Option<String>)> = None;
-        if self.hosts_locally(expert_id).await {
-            if let Ok(local) = local_run(input) {
-                arbiter = Some((local, None)); // None = local (trusted self)
-            }
+        if self.hosts_locally(expert_id).await
+            && let Ok(local) = local_run(input)
+        {
+            arbiter = Some((local, None)); // None = local (trusted self)
         }
         if arbiter.is_none() {
             for loc in plan.iter().skip(origin_idx + 1) {
-                if let ExpertLocation::Remote { node_id, .. } = loc {
-                    if let Ok(out) = self
+                if let ExpertLocation::Remote { node_id, .. } = loc
+                    && let Ok(out) = self
                         .remote_expert_attempt(
                             endpoint,
                             identity,
@@ -1072,11 +1075,10 @@ impl ExpertRouter {
                             node_id,
                         )
                         .await
-                    {
-                        self.verify.note_expert_result().await;
-                        arbiter = Some((out, Some(node_id.clone())));
-                        break;
-                    }
+                {
+                    self.verify.note_expert_result().await;
+                    arbiter = Some((out, Some(node_id.clone())));
+                    break;
                 }
             }
         }
@@ -1467,10 +1469,10 @@ fn extract_ed25519_spki_hex(
         let mut i = oid_pos + 5;
         // Skip a possible 0x05 0x00 NULL inside the alg id (not expected
         // for ed25519, but harmless to allow).
-        if der.get(i) == Some(&0x05) {
-            if let Some(l) = der.get(i + 1).copied() {
-                i += 2 + l as usize;
-            }
+        if der.get(i) == Some(&0x05)
+            && let Some(l) = der.get(i + 1).copied()
+        {
+            i += 2 + l as usize;
         }
         // A BIT STRING of exactly 33 bytes (1 unused-bits byte + 32 key)
         // right after the alg id = this is the SPKI. (The signature's BIT
@@ -1690,15 +1692,15 @@ async fn handle_connection(
                 // never worked for, never fed fabricated data.
                 if let Ok(req) = serde_json::from_slice::<NodeRpcRequest>(&line) {
                     let requester = request_from(&req).to_string();
-                    if let Some(block) = &peer_block {
-                        if block.blocked(&requester) {
-                            block.refuse(&requester, "rpc");
-                            let reply = build_blocked_reply(&req);
-                            if send_reply(&mut send, reply).await {
-                                let _ = send.finish();
-                            }
-                            continue;
+                    if let Some(block) = &peer_block
+                        && block.blocked(&requester)
+                    {
+                        block.refuse(&requester, "rpc");
+                        let reply = build_blocked_reply(&req);
+                        if send_reply(&mut send, reply).await {
+                            let _ = send.finish();
                         }
+                        continue;
                     }
                 }
                 let reply = match serde_json::from_slice::<NodeRpcRequest>(&line) {
@@ -2117,25 +2119,25 @@ impl ExpertHandler for ExpertServing {
         // or runtime is touched. (Serving/dispatch is the workload the
         // ceilings bound; a tripped switch does not *lie* to peers, it
         // refuses so the router walks on to a healthier node.)
-        if let Some(iso) = &self.isolate {
-            if iso.tripped() {
-                anyhow::bail!(
-                    "kill switch tripped: {} — expert serving refused (local-only mode)",
-                    iso.tripped_reason()
-                        .unwrap_or_else(|| "resource ceiling breached".into())
-                );
-            }
+        if let Some(iso) = &self.isolate
+            && iso.tripped()
+        {
+            anyhow::bail!(
+                "kill switch tripped: {} — expert serving refused (local-only mode)",
+                iso.tripped_reason()
+                    .unwrap_or_else(|| "resource ceiling breached".into())
+            );
         }
-        if let Some(store) = &self.store {
-            if store.contains(expert_id) {
-                let out = store.run(expert_id, input)?;
-                if let Some(stats) = &self.stats {
-                    if let Ok(mut stats) = stats.lock() {
-                        stats.record(expert_id);
-                    }
-                }
-                return Ok(out);
+        if let Some(store) = &self.store
+            && store.contains(expert_id)
+        {
+            let out = store.run(expert_id, input)?;
+            if let Some(stats) = &self.stats
+                && let Ok(mut stats) = stats.lock()
+            {
+                stats.record(expert_id);
             }
+            return Ok(out);
         }
         match (&self.runtime, self.tensors_only) {
             (Some(runtime), false) => {
@@ -2257,10 +2259,12 @@ impl RuntimeExpert {
         // tier disabled by config `""` never engages).
         let vision = self.vision_model.as_ref().filter(|s| !s.is_empty());
         let deep = self.deep_model.as_ref().filter(|s| !s.is_empty());
-        let model = if vision.is_some() && crate::model_router::has_image_content(messages) {
-            vision.unwrap().clone()
-        } else if deep.is_some() && crate::model_router::is_complex(messages) {
-            deep.unwrap().clone()
+        let model = if let Some(v) = vision
+            .filter(|_| crate::model_router::has_image_content(messages))
+        {
+            v.clone()
+        } else if let Some(d) = deep.filter(|_| crate::model_router::is_complex(messages)) {
+            d.clone()
         } else {
             self.model.clone()
         };

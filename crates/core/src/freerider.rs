@@ -191,7 +191,7 @@ impl FreeriderDetector {
                     .push(s.latency_ms);
             }
         }
-        for (_expert, per_peer) in &by_expert {
+        for per_peer in by_expert.values() {
             // Per-peer median of successful serves for this expert.
             let per_median: HashMap<String, f32> = per_peer
                 .iter()
@@ -272,7 +272,7 @@ impl FreeriderDetector {
             .filter(|(_, s)| **s > 0.0)
             .map(|(id, s)| (id.clone(), (*s * 10.0) as i32))
             .collect();
-        suspicious.sort_by(|a, b| b.1.cmp(&a.1));
+        suspicious.sort_by_key(|b| std::cmp::Reverse(b.1));
         suspicious.truncate(5);
         json!({
             "dispatches_observed": self.dispatches_observed,
@@ -291,7 +291,7 @@ impl FreeriderDetector {
     }
 }
 
-fn median(lats: &Vec<u64>) -> Option<f32> {
+fn median(lats: &[u64]) -> Option<f32> {
     if lats.is_empty() {
         return None;
     }

@@ -585,7 +585,7 @@ async fn health(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
     // owns every number it publishes and cannot edit them in flight.
     let measurement = {
         let contrib = gw.state.contrib.lock().await;
-        contrib.measurement_point().and_then(|(interval, measured)| {
+        contrib.measurement_point().map(|(interval, measured)| {
             let payload = crate::signing::measurement_payload(
                 &cfg.node_id,
                 stamp,
@@ -800,11 +800,11 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             "declared_percent": cfg.contribution_percent,
             "healthy": *gw.state.contribution_healthy.borrow(),
         });
-        if let Some(obj) = v.as_object_mut() {
-            if let Value::Object(measured) = contrib.status_json() {
-                for (k, val) in measured {
-                    obj.insert(k, val);
-                }
+        if let Some(obj) = v.as_object_mut()
+            && let Value::Object(measured) = contrib.status_json()
+        {
+            for (k, val) in measured {
+                obj.insert(k, val);
             }
         }
         v
@@ -974,28 +974,28 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
 async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<Value>) -> Response {
     // Jerith Guard: screen everything about to leave the node — this gate
     // covers both the local runtime forward and mesh fallback below.
-    if let Some(guard) = &gw.guard {
-        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            match guard.screen_messages(messages) {
-                Ok(Some(patched)) => {
-                    body["messages"] = Value::Array(patched);
-                    tracing::debug!(target: "guard", "outbound payload redacted before forwarding");
-                }
-                Ok(None) => {} // clean payload, pass touch-free
-                Err(verdict) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": verdict.block_reason(),
-                            "guard": {
-                                "blocked": true,
-                                "detections": verdict.detections,
-                            },
-                            "mesh_fallback": Value::Null,
-                        })),
-                    )
-                        .into_response();
-                }
+    if let Some(guard) = &gw.guard
+        && let Some(messages) = body.get("messages").and_then(|m| m.as_array())
+    {
+        match guard.screen_messages(messages) {
+            Ok(Some(patched)) => {
+                body["messages"] = Value::Array(patched);
+                tracing::debug!(target: "guard", "outbound payload redacted before forwarding");
+            }
+            Ok(None) => {} // clean payload, pass touch-free
+            Err(verdict) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": verdict.block_reason(),
+                        "guard": {
+                            "blocked": true,
+                            "detections": verdict.detections,
+                        },
+                        "mesh_fallback": Value::Null,
+                    })),
+                )
+                    .into_response();
             }
         }
     }

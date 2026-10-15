@@ -205,18 +205,16 @@ fn probe_gpus() -> Vec<GpuInfo> {
         "--query-gpu=name,memory.total",
         "--format=csv,noheader,nounits",
     ]);
-    if let Ok(out) = smi.output() {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-                if fields.len() == 2 {
-                    let vram_mib: u64 = fields[1].parse().unwrap_or(0);
-                    gpus.push(GpuInfo {
-                        vendor: GpuVendor::Nvidia,
-                        name: fields[0].to_string(),
-                        vram_bytes: vram_mib * 1024 * 1024,
-                    });
-                }
+    if let Ok(out) = smi.output() && out.status.success() {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.len() == 2 {
+                let vram_mib: u64 = fields[1].parse().unwrap_or(0);
+                gpus.push(GpuInfo {
+                    vendor: GpuVendor::Nvidia,
+                    name: fields[0].to_string(),
+                    vram_bytes: vram_mib * 1024 * 1024,
+                });
             }
         }
     }

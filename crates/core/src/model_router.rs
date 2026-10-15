@@ -117,7 +117,7 @@ pub fn is_complex(messages: &[serde_json::Value]) -> bool {
 /// model. Returns the override (`Some(vision|deep)`) or `None` = "keep the
 /// caller's model" (the overwhelmingly common basic-chat outcome).
 pub fn route(messages: &[serde_json::Value], base: Option<&str>) -> Option<&'static str> {
-    let Some(base) = base else { return None };
+    let base = base?;
     if base.is_empty() {
         return None;
     }

@@ -87,7 +87,7 @@ pub fn read_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-//// Effective chain RPC base URL for a crypto config.
+/// Effective chain RPC base URL for a crypto config.
 pub fn chain_rpc_url(crypto: &CryptoConfig) -> String {
     crypto
         .wallet_endpoint

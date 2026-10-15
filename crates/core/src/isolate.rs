@@ -316,13 +316,12 @@ fn usage_from_sample(
 ) -> Usage {
     let vram = sample
         .as_ref()
-        .map(|s| {
+        .and_then(|s| {
             s.gpus
                 .iter()
                 .filter_map(|g| g.vram_used_bytes)
                 .reduce(|a, b| a + b)
-        })
-        .flatten();
+        });
     Usage {
         rss_bytes,
         vram_used_bytes: vram,

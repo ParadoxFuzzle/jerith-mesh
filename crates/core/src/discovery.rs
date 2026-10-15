@@ -297,18 +297,12 @@ where
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct DiscoveryConfig {
     /// Additional independent bootstrap nodes, primary first
     /// (`[discovery] servers = [...]`). Empty → the primary URL alone.
     pub servers: Vec<String>,
-}
-
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        Self { servers: Vec::new() }
-    }
 }
 
 impl DiscoveryConfig {

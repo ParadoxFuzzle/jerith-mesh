@@ -27,9 +27,9 @@
 //!    Ed25519 wire auth the bootstrap uses (`WireAuth::with_stamp`); the
 //!    reporter is derived from the signing key (pubkey[:16]) so the
 //!    chain's reporter↔pubkey binding always holds:
-//!      POST {chain}/stake/slash
-//!      {"reporter","target","amount_uj","reason","evidence_digest","stamp_ms"}
-//!      payload: jerith-slash1|{reporter}|{target}|{amount_uj}|{stamp}
+//!    POST {chain}/stake/slash
+//!    {"reporter","target","amount_uj","reason","evidence_digest","stamp_ms"}
+//!    payload: jerith-slash1|{reporter}|{target}|{amount_uj}|{stamp}
 //!    Failure to submit is degraded to a log entry — the ledger keeps the
 //!    record either way, so nothing rides on the endpoint responding.
 

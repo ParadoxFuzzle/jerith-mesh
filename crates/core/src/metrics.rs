@@ -118,19 +118,11 @@ pub struct ModelStats {
 impl ModelStats {
     /// Mean latency in ms (0 when no requests).
     pub fn latency_ms_mean(&self) -> u64 {
-        if self.requests == 0 {
-            0
-        } else {
-            self.latency_ms_total / self.requests
-        }
+        self.latency_ms_total.checked_div(self.requests).unwrap_or(0)
     }
     /// Success ratio in percent (0 when no requests).
     pub fn ok_percent(&self) -> u64 {
-        if self.requests == 0 {
-            0
-        } else {
-            (self.ok * 100) / self.requests
-        }
+        (self.ok * 100).checked_div(self.requests).unwrap_or(0)
     }
 }
 
@@ -165,6 +157,12 @@ struct MetricsInner {
     tokens_total: u64,
     /// When the metering window opened (node start), epoch ms.
     window_started_ms: u64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Metrics {

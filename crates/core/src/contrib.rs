@@ -68,11 +68,7 @@ impl IntervalStat {
     /// nothing served and nothing consumed — not a 0 %, an absence.
     pub fn share_percent(&self) -> Option<u64> {
         let total = self.tokens_served + self.tokens_consumed;
-        if total == 0 {
-            None
-        } else {
-            Some(self.tokens_served * 100 / total)
-        }
+        (self.tokens_served * 100).checked_div(total)
     }
 }
 
@@ -261,10 +257,10 @@ impl PeerContribLedger {
     fn bound(&mut self) {
         // (cap check happens at the call sites via length; nodes smaller
         // than LEDGER_PEER_CAP never evict.)
-        if self.peers.len() >= LEDGER_PEER_CAP {
-            if let Some(oldest) = self.peers.keys().next().cloned() {
-                self.peers.remove(&oldest);
-            }
+        if self.peers.len() >= LEDGER_PEER_CAP
+            && let Some(oldest) = self.peers.keys().next().cloned()
+        {
+            self.peers.remove(&oldest);
         }
     }
 }

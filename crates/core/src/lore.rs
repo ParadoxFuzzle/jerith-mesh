@@ -221,7 +221,7 @@ fn excerpt_of(text: &str, n: usize) -> String {
     if out.chars().count() < n {
         return out.trim().to_string();
     }
-    if let Some(pos) = out.rfind(|c| c == '.' || c == '!' || c == '?') {
+    if let Some(pos) = out.rfind(['.', '!', '?']) {
         out.truncate(pos + 1);
     }
     out.trim().to_string()
@@ -328,12 +328,12 @@ fn excerpt_around(text: &str, terms: &[String], cap: usize) -> String {
     // the next one following the match.
     let before = &text[..first];
     let start = before
-        .rfind(|c| c == '.' || c == '!' || c == '?')
+        .rfind(['.', '!', '?'])
         .map(|i| i + 1)
         .unwrap_or(0);
     let after = &text[first..];
     let end = after
-        .find(|c| c == '.' || c == '!' || c == '?')
+        .find(['.', '!', '?'])
         .map(|i| first + i + 1)
         .unwrap_or(text.len());
     let sentence = text[start..end].trim();

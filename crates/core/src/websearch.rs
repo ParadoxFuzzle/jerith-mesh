@@ -422,20 +422,15 @@ impl WebSearchService {
         // Bounded read: stop after the cap — `chunk()` keeps even a
         // content-length-less hostile response from ballooning memory.
         let mut buf: Vec<u8> = Vec::new();
-        loop {
-            match resp
-                .chunk()
-                .await
-                .map_err(|e| anyhow!("reading body: {e}"))?
-            {
-                Some(chunk) => {
-                    buf.extend_from_slice(&chunk);
-                    if buf.len() >= FETCH_BODY_CAP_BYTES {
-                        buf.truncate(FETCH_BODY_CAP_BYTES);
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| anyhow!("reading body: {e}"))?
+        {
+            buf.extend_from_slice(&chunk);
+            if buf.len() >= FETCH_BODY_CAP_BYTES {
+                buf.truncate(FETCH_BODY_CAP_BYTES);
+                break;
             }
         }
         let html = String::from_utf8_lossy(&buf);

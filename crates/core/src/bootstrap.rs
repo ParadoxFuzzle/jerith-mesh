@@ -80,11 +80,10 @@ impl PeerAd {
                 if list.iter().any(|e| e == expert_id) {
                     return true;
                 }
-                let unlisted = self
+                self
                     .hosted_expert_count
                     .map(|c| c as usize > list.len())
-                    .unwrap_or(false);
-                unlisted
+                    .unwrap_or(false)
             }
         }
     }
