@@ -83,8 +83,9 @@ impl Default for Registry {
 /// Field-length sanity on an incoming advertisement. Length-only checks —
 /// semantic validation (signature, identity binding) happens later in the
 /// handler; this gate runs BEFORE any crypto work so oversized junk is
-/// refused without spending CPU.
-fn validate_ad_fields(ad: &PeerAd) -> Result<(), Response> {
+/// refused without spending CPU. The `Response` error is heap-boxed so the
+/// `Result` itself stays register-sized (`result_large_err`).
+fn validate_ad_fields(ad: &PeerAd) -> Result<(), Box<Response>> {
     let too_long = |field: &str, cap| {
         crate::metrics::bump(&crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS);
         (
@@ -96,19 +97,19 @@ fn validate_ad_fields(ad: &PeerAd) -> Result<(), Response> {
             .into_response()
     };
     if ad.node_id.chars().count() > AD_NODE_ID_CAP_CHARS {
-        return Err(too_long("node_id", AD_NODE_ID_CAP_CHARS));
+        return Err(too_long("node_id", AD_NODE_ID_CAP_CHARS).into());
     }
     if ad.model_id.chars().count() > AD_MODEL_CAP_CHARS {
-        return Err(too_long("model_id", AD_MODEL_CAP_CHARS));
+        return Err(too_long("model_id", AD_MODEL_CAP_CHARS).into());
     }
     if ad.quant.chars().count() > AD_QUANT_CAP_CHARS {
-        return Err(too_long("quant", AD_QUANT_CAP_CHARS));
+        return Err(too_long("quant", AD_QUANT_CAP_CHARS).into());
     }
     if ad.address.chars().count() > AD_ADDRESS_CAP_CHARS {
-        return Err(too_long("address", AD_ADDRESS_CAP_CHARS));
+        return Err(too_long("address", AD_ADDRESS_CAP_CHARS).into());
     }
     if ad.rpc_address.chars().count() > AD_ADDRESS_CAP_CHARS {
-        return Err(too_long("rpc_address", AD_ADDRESS_CAP_CHARS));
+        return Err(too_long("rpc_address", AD_ADDRESS_CAP_CHARS).into());
     }
     if ad.contribution_percent > 100 {
         return Err((
@@ -117,7 +118,8 @@ fn validate_ad_fields(ad: &PeerAd) -> Result<(), Response> {
                 "error": "field 'contribution_percent' must be 0-100"
             })),
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     Ok(())
 }
@@ -388,7 +390,7 @@ async fn advertise(
             .into_response();
     }
     if let Err(resp) = validate_ad_fields(&ad) {
-        return resp;
+        return *resp;
     }
 
     // --- Wire auth: Ed25519 signature over the canonical payload ---
@@ -496,7 +498,7 @@ async fn report_dead(
         &report.reporter,
         &crate::signing::dead_payload(&report.reporter, &report.node_id, stamp),
     ) {
-        return resp;
+        return *resp;
     }
     let mut entries = registry.entries.write().await;
     match entries.get_mut(&report.node_id) {
@@ -539,18 +541,18 @@ fn verify_report_auth(
     headers: &axum::http::HeaderMap,
     reporter_node_id: &str,
     expected_payload: &str,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let (pubkey, stamp, sig) = match (
         headers.get("x-jerith-pubkey").and_then(|v| v.to_str().ok()),
         headers.get("x-jerith-stamp").and_then(|v| v.to_str().ok()),
         headers.get("x-jerith-sig").and_then(|v| v.to_str().ok()),
     ) {
         (Some(p), Some(s), Some(g)) => (p.to_string(), s.to_string(), g.to_string()),
-        _ => return Err(unauthorized("missing wire-auth headers")),
+        _ => return Err(unauthorized("missing wire-auth headers").into()),
     };
     let stamp_ms = match stamp.parse::<u64>() {
         Ok(s) => s,
-        Err(_) => return Err(unauthorized("bad stamp")),
+        Err(_) => return Err(unauthorized("bad stamp").into()),
     };
     let auth = crate::signing::WireAuth {
         pubkey,
@@ -559,7 +561,7 @@ fn verify_report_auth(
     };
     if let Err(e) = auth.validate(expected_payload.as_bytes(), reporter_node_id) {
         tracing::warn!(reporter = %reporter_node_id, error = ?e, "rejected unsigned/forged report");
-        return Err(unauthorized(&format!("wire auth failed: {e:?}")));
+        return Err(unauthorized(&format!("wire auth failed: {e:?}")).into());
     }
     Ok(())
 }
@@ -634,7 +636,7 @@ async fn report_fraud(
         rep.node_id,
     );
     if let Err(resp) = verify_report_auth(&headers, &rep.reporter, &payload) {
-        return resp;
+        return *resp;
     }
     let mut entries = registry.entries.write().await;
     let Some(entry) = entries.get_mut(&rep.node_id) else {
