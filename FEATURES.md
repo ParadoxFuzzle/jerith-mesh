@@ -247,7 +247,15 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
 ## 11. Setup & Onboarding
 - ✅ Guided flow: hardware scan → model (with live peer counts, overridable) → memory backend → contribution % (≥25) → optional wallets → enable/disable local vision & embeddings
 - ✅ Capability check with clear warnings before selecting a too-large model (`--ok-beyond-capacity` to override)
-- 📋 “Recommended meshes for your hardware” suggestion (Phase 1)
+- ✅ “Recommended meshes for your hardware” suggestion (Phase 1) — `suggest.rs`:
+  the setup flow joins the hardware-capable model list (`detect_capable_models`)
+  with the bootstrap's live peer counts (`/v1/models/counts`) into a
+  deterministic ranking — joinable-today beats empty (a mesh exists to find
+  peers), bigger live meshes first, curated order as the tiebreak so
+  suggestions never flip-flop; the top pick is the setup default (falling
+  back to the hardware recommendation when the bootstrap is unreachable or
+  empty), with the honest per-mesh rationale printed ("N nodes live" vs
+  "you would be seeding this mesh"); 5 unit tests
 
 ## 12. Quality-of-life
 - ✅ Graceful offline/degradation: the node starts and runs locally even if the bootstrap is unreachable
@@ -273,7 +281,20 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   and Jerith Guard counters (screens, blocked, redacted, logged) on the
   node status page, fed from `/status`
 - 📋 Dashboard with earnings/expert-hit-rate/latency views (Phase 2–3)
-- 📋 Bandwidth caps (soft/hard) and cost estimation (Phase 2)
+- ✅ Bandwidth caps (soft/hard) and cost estimation (Phase 2) — `[resources]
+  bandwidth_ceiling_bytes_per_min` in the isolation governor:
+  - measures `meters.bytes_relayed` over a rolling window (rate published to
+    `/status` only once the window spans ≥ 45 s — unknown ≠ zero, the VRAM
+    rule); soft line (90 %) sheds + warns with mesh work running, the hard
+    line trips the kill switch exactly like RAM/VRAM and recedes the same
+    (hysteresis: recovery only under the soft line, a too-young window never
+    holds a trip)
+  - failed-loud validation at boot (256 MiB/min sanity floor, `jerith config
+    check` gates on it); `/status.resources` shows ceiling + live rate + a
+    monthly projection (`bandwidth_est_gib_month`)
+  - bandwidth-only ceilings arm the governor (a previously no-op config is
+    now a live one); 5 dedicated isolate tests (trip/shed/skip/hold/recover
+    + state publication)
 - ✅ Backup/restore/migrate full node state (Phase 2) — `jerith backup
   create|verify|restore` over one self-describing checksummed container
   (`core::backup`, magic+version / manifest frame / per-entry sha256+payload

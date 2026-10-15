@@ -728,6 +728,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     // its live kill-switch state (policy lives in isolate.rs; this is
     // truth — snapshot() re-reads the switch at render time, so the
     // no-store cache header above matters here too).
+    // Phase 2 cost estimation: bytes/min × 43 200 min/month → GB projection.
+    let bw_rate = gw.state.isolate.bandwidth_rate_min();
+    let bw_gib_month = bw_rate
+        .map(|r| ((r as f64) * 60.0 * 24.0 * 30.0) / (1024.0 * 1024.0 * 1024.0));
     let resources_value = json!({
         "ram_ceiling_bytes": cfg.resources.ram_ceiling_bytes,
         "vram_ceiling_bytes": cfg.resources.vram_ceiling_bytes,
@@ -735,6 +739,11 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "kill_switch": cfg.resources.kill_switch,
         "switch": crate::isolate::snapshot(&gw.state.isolate),
         "node_rss_bytes": crate::isolate::self_rss_bytes(),
+        // Bandwidth caps (Phase 2): ceiling + the governor's live rate (0
+        // while the window warms up) + cost estimation (GB/month).
+        "bandwidth_ceiling_bytes_per_min": cfg.resources.bandwidth_ceiling_bytes_per_min,
+        "bandwidth_rate_min": bw_rate,
+        "bandwidth_est_gib_month": bw_gib_month,
     });
     // Phase 3 per-peer blocking: the list + how many refused RPCs it
     // yielded. Live truth from the shared BlockedPeers (hot-reloaded by

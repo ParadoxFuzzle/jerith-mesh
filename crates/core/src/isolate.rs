@@ -39,6 +39,9 @@ pub struct Usage {
     /// VRAM used summed over GPUs that report it (None = unknown: without
     /// nvidia-smi the VRAM branch is skipped entirely).
     pub vram_used_bytes: Option<u64>,
+    /// Mesh-relayed bytes per rolling minute (None = window too young to
+    /// measure: unknown ≠ zero, same rule as VRAM).
+    pub bandwidth_bytes_per_min: Option<u64>,
 }
 
 /// The governor's verdict for one sample. Pure, hysteresis-aware: `tripped`
@@ -76,6 +79,11 @@ pub fn decide(usage: &Usage, cfg: &ResourceIsolationConfig, tripped: bool) -> Ve
             // No ceiling or no readings → that branch cannot hold a trip.
             _ => true,
         };
+        let bandwidth_ok = match (cfg.bandwidth_ceiling_bytes_per_min, usage.bandwidth_bytes_per_min) {
+            (Some(c), Some(rate)) => rate < soft_line(c),
+            // No ceiling or a too-young measurement window → cannot hold a trip.
+            _ => true,
+        };
         let recover_reason = cfg
             .ram_ceiling_bytes
             .map(|c| {
@@ -86,7 +94,7 @@ pub fn decide(usage: &Usage, cfg: &ResourceIsolationConfig, tripped: bool) -> Ve
                 )
             })
             .unwrap_or_default();
-        if ram_ok && vram_ok {
+        if ram_ok && vram_ok && bandwidth_ok {
             return Verdict::Recover;
         }
         return Verdict::RemainTripped(recover_reason);
@@ -116,15 +124,33 @@ pub fn decide(usage: &Usage, cfg: &ResourceIsolationConfig, tripped: bool) -> Ve
                 "GPU VRAM used {:.1}/{:.1} GiB reached the ceiling",
                 used as f64 / (1024.0 * 1024.0 * 1024.0),
                 vram as f64 / (1024.0 * 1024.0 * 1024.0)
-            ));
-        } else if soft.is_none() && used >= soft_line(vram) {
+            ));        } else if soft.is_none() && used >= soft_line(vram) {
             soft = Some(format!(
                 "GPU VRAM used {:.1}/{:.1} GiB crossed the soft line",
                 used as f64 / (1024.0 * 1024.0 * 1024.0),
                 vram as f64 / (1024.0 * 1024.0 * 1024.0)
             ));
         }
-    }        if let Some(reason) = hard {
+    }
+    if let (Some(bw_ceiling), Some(rate)) = (
+        cfg.bandwidth_ceiling_bytes_per_min,
+        usage.bandwidth_bytes_per_min,
+    ) {
+        if rate >= bw_ceiling {
+            hard = Some(format!(
+                "relayed bandwidth {:.1} MiB/min reached the ceiling {:.1} MiB/min",
+                rate as f64 / (1024.0 * 1024.0),
+                bw_ceiling as f64 / (1024.0 * 1024.0)
+            ));
+        } else if soft.is_none() && rate >= soft_line(bw_ceiling) {
+            soft = Some(format!(
+                "relayed bandwidth {:.1}/{:.1} MiB/min crossed the soft line",
+                rate as f64 / (1024.0 * 1024.0),
+                bw_ceiling as f64 / (1024.0 * 1024.0)
+            ));
+        }
+    }
+        if let Some(reason) = hard {
         return if cfg.kill_switch {
             Verdict::Trip(reason)
         } else {
@@ -151,6 +177,9 @@ pub struct IsolateState {
     cache_sheds: AtomicU64,
     /// Unix ms of the last trip (0 = never).
     tripped_since_ms: AtomicU64,
+    /// Latest measured relayed bandwidth (bytes/min). 0 = window too young
+    /// to measure (unknown ≠ zero, same rule as VRAM).
+    bandwidth_rate_min: AtomicU64,
 }
 
 impl IsolateState {
@@ -196,6 +225,21 @@ impl IsolateState {
     pub fn count_shed(&self) {
         self.cache_sheds.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Publication point for the governor's latest bandwidth measurement
+    /// (bytes/min; 0 = window too young). `/status` reads this live.
+    pub fn record_bandwidth_rate(&self, bytes_per_min: Option<u64>) {
+        self.bandwidth_rate_min
+            .store(bytes_per_min.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// The latest measured relayed bandwidth (None = unmeasured yet).
+    pub fn bandwidth_rate_min(&self) -> Option<u64> {
+        match self.bandwidth_rate_min.load(Ordering::Relaxed) {
+            0 => None,
+            r => Some(r),
+        }
+    }
 }
 
 /// Status view for `/status` (governor counters + live switch state).
@@ -207,6 +251,7 @@ pub fn snapshot(iso: &IsolateState) -> Value {
         "recovers": iso.recovers.load(Ordering::Relaxed),
         "cache_sheds": iso.cache_sheds.load(Ordering::Relaxed),
         "tripped_since_ms": iso.tripped_since_ms.load(Ordering::Relaxed),
+        "bandwidth_rate_min": iso.bandwidth_rate_min.load(Ordering::Relaxed),
     })
 }
 
@@ -264,7 +309,11 @@ pub fn apply_pinning(pin_cores: u32) -> bool {
 
 /// Extract the governor's usage from this node's latest ping-cycle sample
 /// (VRAM only; RSS is probed fresh — the ping sample is stale for us).
-fn usage_from_sample(rss_bytes: u64, sample: &Option<ResourceSample>) -> Usage {
+fn usage_from_sample(
+    rss_bytes: u64,
+    sample: &Option<ResourceSample>,
+    bandwidth_bytes_per_min: Option<u64>,
+) -> Usage {
     let vram = sample
         .as_ref()
         .map(|s| {
@@ -277,6 +326,7 @@ fn usage_from_sample(rss_bytes: u64, sample: &Option<ResourceSample>) -> Usage {
     Usage {
         rss_bytes,
         vram_used_bytes: vram,
+        bandwidth_bytes_per_min,
     }
 }
 
@@ -289,19 +339,50 @@ pub fn spawn_governor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let standby = Duration::from_secs(5).max(interval);
+        // Bandwidth window: consecutive (ts, counter) snapshots of the
+        // relayed-bytes meter. The rate is only published once the oldest
+        // spanning sample is ≥ 45 s old — a fresh node reports unknown,
+        // never a fake zero.
+        let mut bw_window: Vec<(std::time::Instant, u64)> = Vec::new();
         loop {
             let (cfg, iso) = {
                 let c = state.config.read().await;
                 (c.resources.clone(), state.isolate.clone())
             };
             // Armed at all? Ceiling-free + no VRAM ceiling = pure no-op.
-            if cfg.ram_ceiling_bytes.is_none() && cfg.vram_ceiling_bytes.is_none() {
+            if cfg.ram_ceiling_bytes.is_none()
+                && cfg.vram_ceiling_bytes.is_none()
+                && cfg.bandwidth_ceiling_bytes_per_min.is_none()
+            {
                 tokio::time::sleep(standby).await;
                 continue;
             }
+            // Measure the relayed-bytes rate against the counter window.
+            let now_counter = state.meters.lock().await.bytes_relayed;
+            let now = std::time::Instant::now();
+            if bw_window.last().map(|(t, _)| now - *t) >= Some(interval) || bw_window.is_empty() {
+                if bw_window.len() >= 8 {
+                    bw_window.remove(0);
+                }
+                bw_window.push((now, now_counter));
+            }
+            let bandwidth_rate = bw_window
+                .first()
+                .and_then(|(old_ts, old_counter)| {
+                    let secs = now - *old_ts;
+                    if secs.as_secs() >= 45 {
+                        Some(
+                            ((now_counter.saturating_sub(*old_counter) as f64)
+                                / (secs.as_secs_f64() / 60.0)) as u64,
+                        )
+                    } else {
+                        None
+                    }
+                });
+            iso.record_bandwidth_rate(bandwidth_rate);
             let usage = {
                 let sample = state.resources.lock().await;
-                usage_from_sample(self_rss_bytes(), &sample)
+                usage_from_sample(self_rss_bytes(), &sample, bandwidth_rate)
             };
             apply_verdict(&state, &iso, &cfg, decide(&usage, &cfg, iso.tripped())).await;
             tokio::time::sleep(interval).await;
@@ -362,6 +443,7 @@ mod tests {
         ResourceIsolationConfig {
             ram_ceiling_bytes: ram_ceiling,
             vram_ceiling_bytes: vram_ceiling,
+            bandwidth_ceiling_bytes_per_min: None,
             pin_cores: 0,
             kill_switch: kill,
         }
@@ -373,6 +455,7 @@ mod tests {
         let u = Usage {
             rss_bytes: 5 * GIB,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         assert_eq!(decide(&u, &c, false), Verdict::Nominal);
     }
@@ -384,6 +467,7 @@ mod tests {
         let u = Usage {
             rss_bytes: 19 * GIB / 2,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         let v = decide(&u, &c, false);
         assert!(matches!(v, Verdict::Shed(_)), "got {v:?}");
@@ -395,6 +479,7 @@ mod tests {
         let u = Usage {
             rss_bytes: 10 * GIB,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&u, &c, false), Verdict::Trip(_)));
     }
@@ -405,6 +490,7 @@ mod tests {
         let u = Usage {
             rss_bytes: 11 * GIB,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&u, &c, false), Verdict::Shed(_)));
     }
@@ -415,6 +501,7 @@ mod tests {
         let u = Usage {
             rss_bytes: u64::MAX / 2,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         assert_eq!(decide(&u, &c, false), Verdict::Nominal);
     }
@@ -427,6 +514,7 @@ mod tests {
         let u = Usage {
             rss_bytes: 0,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         assert_eq!(decide(&u, &c, false), Verdict::Nominal);
     }
@@ -437,11 +525,13 @@ mod tests {
         let soft = Usage {
             rss_bytes: 0,
             vram_used_bytes: Some(39 * GIB / 5),
+            bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&soft, &c, false), Verdict::Shed(_)));
         let hard = Usage {
             rss_bytes: 0,
             vram_used_bytes: Some(8 * GIB),
+            bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&hard, &c, false), Verdict::Trip(_)));
     }
@@ -452,14 +542,17 @@ mod tests {
         let hard = Usage {
             rss_bytes: 10 * GIB,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         let between = Usage {
             rss_bytes: 9 * GIB,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         let under = Usage {
             rss_bytes: (9 * GIB) - 1,
             vram_used_bytes: None,
+            bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&hard, &c, true), Verdict::RemainTripped(_)));
         assert!(matches!(decide(&between, &c, true), Verdict::RemainTripped(_)));
@@ -473,6 +566,7 @@ mod tests {
         let u = Usage {
             rss_bytes: 1 * GIB,
             vram_used_bytes: Some(39 * GIB / 5),
+            bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&u, &c, true), Verdict::RemainTripped(_)));
     }
@@ -509,11 +603,97 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let u = usage_from_sample(1 * GIB, &Some(sample));
+        let u = usage_from_sample(1 * GIB, &Some(sample), Some(100 * 1024 * 1024));
         assert_eq!(u.rss_bytes, 1 * GIB);
         assert_eq!(u.vram_used_bytes, Some(5 * GIB));
-        // Unknown VRAM stays None, never 0.
-        let u2 = usage_from_sample(0, &None);
+        assert_eq!(u.bandwidth_bytes_per_min, Some(100 * 1024 * 1024));
+        // Unknown VRAM stays None, never 0. Same for an unmeasured window.
+        let u2 = usage_from_sample(0, &None, None);
         assert_eq!(u2.vram_used_bytes, None);
+        assert_eq!(u2.bandwidth_bytes_per_min, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Bandwidth caps (Phase 2): soft/hard lines on relayed MiB/min. The
+    // unknown-rate rule mirrors VRAM: a too-young window is skipped (None),
+    // never treated as zero traffic.
+    // ------------------------------------------------------------------
+
+    const MIBMIN: u64 = 1024 * 1024;
+
+    fn bw_usage(rate: Option<u64>) -> Usage {
+        Usage {
+            rss_bytes: 0,
+            vram_used_bytes: None,
+            bandwidth_bytes_per_min: rate,
+        }
+    }
+
+    #[test]
+    fn bandwidth_hard_line_trips_and_soft_line_sheds() {
+        let c = ResourceIsolationConfig {
+            bandwidth_ceiling_bytes_per_min: Some(1024 * MIBMIN),
+            ..ResourceIsolationConfig::default()
+        };
+        // Hard breach: 1 GiB/min reached.
+        assert!(
+            matches!(decide(&bw_usage(Some(1024 * MIBMIN)), &c, false), Verdict::Trip(_)),
+            "hard bandwidth breach trips"
+        );
+        // Soft breach: 95 % of the ceiling.
+        assert!(
+            matches!(
+                decide(&bw_usage(Some(970 * MIBMIN)), &c, false),
+                Verdict::Shed(_)
+            ),
+            "soft bandwidth breach sheds"
+        );
+        // Under the soft line: nominal.
+        assert_eq!(
+            decide(&bw_usage(Some(500 * MIBMIN)), &c, false),
+            Verdict::Nominal
+        );
+    }
+
+    #[test]
+    fn bandwidth_unknown_rate_is_skipped_not_zero() {
+        let c = ResourceIsolationConfig {
+            bandwidth_ceiling_bytes_per_min: Some(64 * MIBMIN),
+            ..ResourceIsolationConfig::default()
+        };
+        // A too-young measurement window (None) cannot trip: unknown ≠ 0.
+        assert_eq!(decide(&bw_usage(None), &c, false), Verdict::Nominal);
+    }
+
+    #[test]
+    fn bandwidth_breach_holds_recover_until_under_soft_line() {
+        let c = ResourceIsolationConfig {
+            bandwidth_ceiling_bytes_per_min: Some(1024 * MIBMIN),
+            ..ResourceIsolationConfig::default()
+        };
+        // Tripped by bandwidth; still over the soft line → stay tripped.
+        assert!(matches!(
+            decide(&bw_usage(Some(950 * MIBMIN)), &c, true),
+            Verdict::RemainTripped(_)
+        ));
+        // Receded under the soft line → recover.
+        assert_eq!(
+            decide(&bw_usage(Some(500 * MIBMIN)), &c, true),
+            Verdict::Recover
+        );
+        // A too-young window can no longer hold the trip either.
+        assert_eq!(decide(&bw_usage(None), &c, true), Verdict::Recover);
+    }
+
+    #[test]
+    fn bandwidth_rate_publication_roundtrips_through_state() {
+        let iso = IsolateState::default();
+        assert_eq!(iso.bandwidth_rate_min(), None, "unmeasured at boot");
+        iso.record_bandwidth_rate(Some(300 * MIBMIN));
+        assert_eq!(iso.bandwidth_rate_min(), Some(300 * MIBMIN));
+        iso.record_bandwidth_rate(None);
+        assert_eq!(iso.bandwidth_rate_min(), None, "unknown ≠ zero");
+        let snap = snapshot(&iso);
+        assert_eq!(snap["bandwidth_rate_min"], serde_json::json!(0));
     }
 }

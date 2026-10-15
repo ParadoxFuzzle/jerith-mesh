@@ -1129,10 +1129,29 @@ fn setup_flow(
                 }
             }
         }
-        let _ = bootstrap_counts;
+        // Recommended meshes for your hardware (Phase 1): the capable-model
+        // list joined with live peer counts — a small machine that can join
+        // a live mesh beats a bigger one that would sit alone.
+        let default_pick = {
+            let sug = jerith_mesh_core::suggest::recommended_meshes(
+                &fits,
+                bootstrap_counts.as_deref().unwrap_or(&[]),
+            );
+            let pick = sug.first().map(|s| s.model_id.clone());
+            if let Some(s) = sug.first() {
+                println!(
+                    "\n  Recommended mesh: {} ({} peer{} online) — {}",
+                    s.model_id,
+                    s.peers_online,
+                    if s.peers_online == 1 { "" } else { "s" },
+                    s.rationale
+                );
+            }
+            pick.unwrap_or_else(|| "recommendation".to_string())
+        };
         prompt(
             "\nModel to run? (id, or huggingface:<repo> / ollama:<name> / path:<file>)",
-            "recommendation",
+            &default_pick,
         )?
     } else {
         bail!("--model is required in non-interactive mode")

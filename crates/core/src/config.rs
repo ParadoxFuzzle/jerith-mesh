@@ -431,6 +431,13 @@ pub struct ResourceIsolationConfig {
     /// discrete GPUs). Same soft/hard semantics as the RAM ceiling.
     #[serde(default)]
     pub vram_ceiling_bytes: Option<u64>,
+    /// Bandwidth ceiling (Phase 2): mesh-relayed bytes per ROLLING MINUTE
+    /// (`meters.bytes_relayed` delta over the window the governor samples).
+    /// Same soft/hard semantics as the RAM ceiling — soft (90 %) keeps mesh
+    /// work running (cache shed + warn), hard trips the kill switch when
+    /// armed. Unknown rates are never treated as zero. None → uncapped.
+    #[serde(default)]
+    pub bandwidth_ceiling_bytes_per_min: Option<u64>,
     /// Restrict this process to the first `N` logical cores (Linux,
     /// best-effort sched_setaffinity). 0 = off.
     #[serde(default)]
@@ -448,6 +455,7 @@ impl Default for ResourceIsolationConfig {
         Self {
             ram_ceiling_bytes: None,
             vram_ceiling_bytes: None,
+            bandwidth_ceiling_bytes_per_min: None,
             pin_cores: 0,
             kill_switch: true,
         }
@@ -466,6 +474,10 @@ impl ResourceIsolationConfig {
         for (name, ceiling) in [
             ("ram_ceiling_bytes", self.ram_ceiling_bytes),
             ("vram_ceiling_bytes", self.vram_ceiling_bytes),
+            (
+                "bandwidth_ceiling_bytes_per_min",
+                self.bandwidth_ceiling_bytes_per_min,
+            ),
         ] {
             if let Some(b) = ceiling {
                 anyhow::ensure!(
@@ -1105,6 +1117,7 @@ mod tests {
         let real = ResourceIsolationConfig {
             ram_ceiling_bytes: Some(12 * 1024 * 1024 * 1024),
             vram_ceiling_bytes: Some(6 * 1024 * 1024 * 1024),
+            bandwidth_ceiling_bytes_per_min: Some(1024 * 1024 * 1024),
             pin_cores: 4,
             kill_switch: true,
         };

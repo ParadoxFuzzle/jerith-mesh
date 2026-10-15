@@ -25,6 +25,7 @@ pub mod ratelimit;
 pub mod replication;
 pub mod signing;
 pub mod stake;
+pub mod suggest;
 pub mod verify;
 pub mod web;
 pub mod websearch;
