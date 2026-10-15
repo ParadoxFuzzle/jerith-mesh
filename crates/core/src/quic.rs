@@ -124,22 +124,22 @@ pub fn sign_request(req: &mut NodeRpcRequest, identity: &SigningIdentity) {
     let stamp = crate::bootstrap::now_ms();
     match req {
         NodeRpcRequest::Ping {
-            stamp_ms, sig: _, ..
+            stamp_ms, ..
         } => {
             *stamp_ms = stamp;
         }
         NodeRpcRequest::ExpertQuery {
-            stamp_ms, sig: _, ..
+            stamp_ms, ..
         } => {
             *stamp_ms = stamp;
         }
         NodeRpcRequest::ExpertFetch {
-            stamp_ms, sig: _, ..
+            stamp_ms, ..
         } => {
             *stamp_ms = stamp;
         }
         NodeRpcRequest::ChatQuery {
-            stamp_ms, sig: _, ..
+            stamp_ms, ..
         } => {
             *stamp_ms = stamp;
         }
@@ -221,8 +221,10 @@ pub(crate) fn pack_f32_hex(v: &[f32]) -> String {
 #[allow(dead_code)]
 fn unpack_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

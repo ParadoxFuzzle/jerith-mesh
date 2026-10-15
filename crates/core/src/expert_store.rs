@@ -216,8 +216,10 @@ impl ExpertWeights {
         let read_tensor = |cur: &mut usize| -> Result<Vec<f32>> {
             let raw = take(cur, n * 4)?;
             Ok(raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect())
         };
         let gate = read_tensor(&mut cur)?;

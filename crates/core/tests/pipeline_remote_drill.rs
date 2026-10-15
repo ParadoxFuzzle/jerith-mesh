@@ -236,7 +236,22 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             };
             sign_request(&mut req, &walker);
             // The deadline the executor priced is applied at the wire.
-            let reply = tokio::time::timeout(deadline, call(&client, addr, &node, &req, &walker, deadline))
+            // `call` gets a strictly LARGER internal budget (the margin
+            // keeps the two timers from racing): the priced deadline
+            // below must always be the one that fires, so the failure
+            // reason names the deadline on every platform — not which
+            // same-length timer happened to win the scheduling race.
+            let reply = tokio::time::timeout(
+                deadline,
+                call(
+                    &client,
+                    addr,
+                    &node,
+                    &req,
+                    &walker,
+                    deadline.saturating_add(Duration::from_secs(5)),
+                ),
+            )
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(

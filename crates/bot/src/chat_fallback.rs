@@ -132,7 +132,7 @@ pub async fn handle(
                 match sink {
                     Some(sink) => sink.finish(text).await,
                     None => {
-                        let _ = send_long(&http_ctx, channel, &text).await;
+                        send_long(&http_ctx, channel, &text).await;
                     }
                 }
             }
@@ -160,7 +160,7 @@ pub async fn handle(
                 match sink {
                     Some(sink) => sink.finish(text).await,
                     None => {
-                        let _ = send_long(&http_ctx, channel, &text).await;
+                        send_long(&http_ctx, channel, &text).await;
                     }
                 }
             }
@@ -358,20 +358,21 @@ impl LiveSink {
             .await
         {
             tracing::debug!(error = %e, "live sink final edit failed — resending");
-            let _ = send_long(&self.http_ctx, self.channel, &text).await;
+            send_long(&self.http_ctx, self.channel, &text).await;
         }
     }
 }
 
 /// Discord's per-message cap is 2000 chars — keep the tail (the answer end)
 /// with the same `say_long` convention used by every command.
-async fn send_long(
-    http_ctx: &serenityall::Context,
-    channel: serenityall::ChannelId,
-    text: &str,
-) -> Result<(), serenityall::Error> {
+/// Fire-and-forget: every caller already discards the error, so the helper
+/// logs its own failure and returns nothing (a fat `serenity::Error` has no
+/// business being smuggled through a Result nobody reads).
+async fn send_long(http_ctx: &serenityall::Context, channel: serenityall::ChannelId, text: &str) {
     let clipped = clip_tail(text, 1990);
-    channel.say(http_ctx, clipped).await.map(|_| ())
+    if let Err(e) = channel.say(http_ctx, clipped).await {
+        tracing::debug!(error = %e, "send_long: tail resend failed");
+    }
 }
 
 pub(crate) fn clip_tail(text: &str, max: usize) -> String {
