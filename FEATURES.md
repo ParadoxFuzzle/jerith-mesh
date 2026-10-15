@@ -427,15 +427,19 @@ gotchas surfaced while building the finished parts.
   ordered by ring position, consecutive same-owner layers merged into one
   hop, all-local meshes planning as a single hop. The layer-aware dispatch
   planner delegates to it. M1 landed (2026-10-15): `pipeline::execute_route`
-  walks those hops with the residual stream chaining hop-to-hop, per-hop
-  RTT-derived deadlines, and per-hop commitments recomputed against a
+  walks those hops with the residual stream chaining hop-to-hop,  per-hop RTT-derived deadlines, and per-hop commitments recomputed against a
   per-hop expert id so a tampering hop is caught downstream (typed
-  `RouteError` aborts carry the hop, owner, and completed-hop count). What
+  `RouteError` aborts carry the hop, owner, and completed-hop count).
+  M2 landed (2026-10-15): `pipeline::execute_route_resilient` keeps walking
+  past owner death — dead hops get their layers re-hosted by the ring's own
+  rule (re-pin only the departed owner's layers, `REASSIGN_BUDGET`-bounded),
+  unrecoverable losses are honest hops-short partial answers typed in
+  `RouteResult::degraded` (the router walks on, mirroring reject-continue),
+  and `RouteStability`'s two-line hysteresis keeps a flapping owner from
+  chattering the route plan. What
   remains is live transport integration (the hop RPC rides
   `remote_expert_attempt` once the Colibri-side layer split provides real
-  runtime weights), latency budgeting per hop (M3), and partial-answer
-  semantics when one hop degrades (M2 — today an abort, never a silent
-  layer skip).
+  runtime weights) and latency budgeting per hop (M3).
   Gotcha learned: everything must survive the existing commitment layer —
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.

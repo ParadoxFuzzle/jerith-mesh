@@ -196,11 +196,20 @@ Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
   weights-agnostic: tests use the synthetic expert weights; real runtime
   layer splits arrive with the Colibri-side work, and live QUIC wiring
   (`remote_expert_attempt` as the hop transport) rides along with it.
-- **M2 — degradation + hysteresis.** A skipped/dead hop only reassigns the
-  layers the departed node owned (the ring's own rule), never the whole
-  route; flapping owners get the freerider-style hysteresis instead of
-  route flapping; partial answers are honest hops-short with a typed
-  reason — the router walks on, mirrors `reject-continue`.
+- **M2 ✅ — degradation + hysteresis.** `pipeline::execute_route_resilient`
+  keeps routes alive through owner death: a failed hop's layers go to the
+  caller-wired reassignment (shaped to
+  `ShardMap::layer_ownership` over the alive set minus the dead owner —
+  dropping a node re-pins *only its layers*, bounded by `REASSIGN_BUDGET`
+  so the walk can never spin), replacement sub-hops re-enter the walk in
+  order. When nobody can host the layers, the hop is skipped and typed
+  into `RouteResult::degraded` and the walk continues — honest hops-short
+  answers, mirroring `reject-continue`; `RouteResult` carries the residual,
+  the successful-hop count, and the typed losses. `RouteStability` is the
+  freerider-style two-line hysteresis (exclude at `HOP_EXCLUDE_SCORE`,
+  clear only after decay below `HOP_CLEAR_SCORE`), fed by the walk itself;
+  `filter_alive` drops excluded owners from the alive set but never
+  empties it — a flaky hop beats an unroutable mesh.
 - **M3 — latency budgeting.** Per-hop deadlines from measured RTT, budget
   checked against the `expert_stats` measured-activation order (the same
   oracle prefetching will use), dashboard surfacing on `/v1/metrics`.

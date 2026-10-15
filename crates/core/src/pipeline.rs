@@ -13,16 +13,24 @@
 //! no I/O, no runtime, no clocks: deterministic, unit-testable, and
 //! naturally degradable (a single hop when only the local node is alive).
 //!
-//! M0 + M1 (this module): pure route planning from the ring's full layer map
-//! and the route executor that walks it. Planning is I/O-free and
+//! M0 + M1 + M2 (this module): pure route planning from the ring's full layer
+//! map, the route executor that walks it, and the degradation layer that
+//! keeps routes alive when an owner dies mid-walk. Planning is I/O-free and
 //! clock-free (deterministic, unit-testable, naturally degradable); the
 //! executor is the M1 hop runtime over the same f32-vector wire contract
 //! expert dispatch already uses, with the Phase 4 commitment recomputed
 //! *per hop* (each hop's expert id names its layer run, so a tampering hop
 //! is caught downstream exactly like a single-expert reply) and per-hop
 //! deadlines derived from the owner's measured RTT.
+//!
+//! M2 adds the degradation layer: a dead hop's layers are re-hosted per the
+//! ring's own rule (dropping the departed owner re-pins only its layers),
+//! unrecoverable losses produce honest hops-short partial answers with a
+//! typed reason (the router walks on, mirroring reject-continue), and
+//! flapping owners are dampened by a freerider-style two-line hysteresis
+//! so a bouncing node cannot chatter the route plan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 /// One pipeline hop: the node that owns this run of consecutive layers
@@ -113,6 +121,59 @@ impl std::fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
+/// One hop attempt shared by both walks: local executor, remote executor
+/// under its RTT-derived deadline, plus the Phase 4 commitment recomputed
+/// against the hop's own expert id (a tampering hop reads exactly like a
+/// single-expert commitment mismatch).
+async fn attempt_one_hop(
+    model_id: &str,
+    req_id: &str,
+    hop: &PipelineHop,
+    activation: &[f32],
+    local_run: &impl Fn(&[f32], &[usize]) -> anyhow::Result<Vec<f32>>,
+    remote_run: &impl Fn(
+        &str,
+        &str,
+        Vec<f32>,
+        Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>>,
+    rtt_of: &impl Fn(&str) -> u64,
+    base_timeout: Duration,
+) -> anyhow::Result<Vec<f32>> {
+    let expert_id = hop_expert_id(model_id, hop);
+    match &hop.node {
+        None => local_run(activation, &hop.layers),
+        Some(node) => {
+            let activation = activation.to_vec();
+            let (out, commitment) = remote_run(
+                &expert_id,
+                node,
+                activation.clone(),
+                hop_timeout(base_timeout, rtt_of(node)),
+            )
+            .await?;
+            match commitment {
+                Some(c)
+                    if crate::verify::verify_commitment(
+                        req_id,
+                        &expert_id,
+                        node,
+                        &activation,
+                        &out,
+                        &c,
+                    ) =>
+                {
+                    Ok(out)
+                }
+                Some(_) => {
+                    Err(anyhow::anyhow!("commitment mismatch from hop {node}: body altered"))
+                }
+                None => Ok(out),
+            }
+        }
+    }
+}
+
 /// Walk [`plan_route`]'s sequence hop-by-hop, carrying the residual stream:
 /// each hop's output becomes the next hop's input. Composition mirrors the
 /// existing single-expert contract —
@@ -129,8 +190,8 @@ impl std::error::Error for RouteError {}
 ///   in, out): a hop's commitment names its own layer run, so a tampering
 ///   hop is caught downstream exactly like a single-expert reply.
 /// - Any failure aborts the route with a typed [`RouteError`] — no silent
-///   skipping of a hop's layers (M2 replaces abort with ring-rule
-///   reassignment; the count of completed hops is already recorded).
+///   skipping. The degradation lives in
+///   [`execute_route_resilient`], which reassigns and walks on instead.
 pub async fn execute_route(
     model_id: &str,
     req_id: &str,
@@ -147,32 +208,10 @@ pub async fn execute_route(
     base_timeout: Duration,
 ) -> Result<Vec<f32>, RouteError> {
     for (idx, hop) in route.iter().enumerate() {
-        let expert_id = hop_expert_id(model_id, hop);
-        let outcome = match &hop.node {
-            None => local_run(&activation, &hop.layers).map(|out| (out, None::<String>)),
-            Some(node) => remote_run(&expert_id, node, activation.clone(), hop_timeout(base_timeout, rtt_of(node)))
-                .await
-                .and_then(|(out, commitment)| {
-                    match commitment {
-                        // The committing side is the mesh's tamper-evidence
-                        // contract for one expert; compose it per hop.
-                        Some(c) if crate::verify::verify_commitment(
-                            req_id,
-                            &expert_id,
-                            node,
-                            &activation,
-                            &out,
-                            &c,
-                        ) => Ok((out, None)),
-                        Some(_) => Err(anyhow::anyhow!(
-                            "commitment mismatch from hop {node}: body altered"
-                        )),
-                        None => Ok((out, None)),
-                    }
-                }),
-        };
-        match outcome {
-            Ok((out, _)) => activation = out,
+        match attempt_one_hop(model_id, req_id, hop, &activation, &local_run, &remote_run, &rtt_of, base_timeout)
+            .await
+        {
+            Ok(out) => activation = out,
             Err(e) => {
                 return Err(RouteError {
                     hop_index: idx,
@@ -185,6 +224,193 @@ pub async fn execute_route(
         }
     }
     Ok(activation)
+}
+
+/// Cap on route surgery per walk: how many times a failed hop's layers may
+/// be re-hosted before the executor gives up and degrades honestly. A
+/// replacement that itself fails can be re-reassigned once more — but the
+/// walk can never spin (the budget sums what the route plus a bounded
+/// headroom allows).
+pub const REASSIGN_BUDGET: usize = 12;
+
+/// Layers an unrecovered hop left undone (honest hops-short answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedHop {
+    pub layers: Vec<usize>,
+    pub node: Option<String>,
+    pub reason: String,
+}
+
+/// Layers a dead owner's hop gave up, re-hosted via the ring's own rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReassignedHop {
+    pub layers: Vec<usize>,
+    pub was_node: Option<String>,
+    pub reason: String,
+}
+
+/// Result of a perhaps-degraded route walk. Never an error unless the walk
+/// truly cannot answer: a degraded walk returns the residual as far as the
+/// chain carried it, in [`RouteResult::activation`], with the typing in
+/// [`RouteResult::degraded`] (skipped) and [`RouteResult::reassigned`]
+/// (re-hosted). Mirrors reject-continue — the router walks on.
+#[derive(Debug, Clone)]
+pub struct RouteResult {
+    pub activation: Vec<f32>,
+    pub hops_run: usize,
+    pub degraded: Vec<DegradedHop>,
+    pub reassigned: Vec<ReassignedHop>,
+}
+
+impl RouteResult {
+    pub fn is_complete(&self) -> bool {
+        self.degraded.is_empty()
+    }
+}
+
+/// Availability hysteresis for route planning: the freerider module's
+/// decay-then-flag shape, pointed at liveness instead of honesty. A node's
+/// failure score rises on failures and decays on successes; crossing
+/// [`HOP_EXCLUDE_SCORE`] excludes it from route planning, and it returns
+/// only after decay below [`HOP_CLEAR_SCORE`] — one line to raise, a lower
+/// one to clear, so a flapping peer cannot chatter the plan.
+pub const HOP_EXCLUDE_SCORE: u32 = 3;
+pub const HOP_CLEAR_SCORE: u32 = 1;
+
+#[derive(Debug, Clone, Default)]
+pub struct RouteStability {
+    scores: HashMap<String, u32>,
+    excluded: HashSet<String>,
+}
+
+impl RouteStability {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn note_failure(&mut self, node: &str) {
+        let s = self.scores.entry(node.to_string()).or_insert(0);
+        *s = s.saturating_add(1);
+        if *s >= HOP_EXCLUDE_SCORE {
+            self.excluded.insert(node.to_string());
+        }
+    }
+
+    pub fn note_success(&mut self, node: &str) {
+        if let Some(s) = self.scores.get_mut(node) {
+            *s = s.saturating_sub(1);
+            if *s <= HOP_CLEAR_SCORE {
+                self.excluded.remove(node);
+            }
+        }
+    }
+
+    pub fn is_excluded(&self, node: &str) -> bool {
+        self.excluded.contains(node)
+    }
+
+    /// Alive set minus excluded owners — never empty: a mesh whose every
+    /// owner flapped still routes (better a flaky hop than no hop at all;
+    /// the committed-replay layers catch a dishonest node separately).
+    pub fn filter_alive(&self, alive: &[String]) -> Vec<String> {
+        let kept: Vec<String> = alive
+            .iter()
+            .filter(|a| !self.excluded.contains(*a))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            alive.to_vec()
+        } else {
+            kept
+        }
+    }
+}
+
+/// The resilient walk over [`plan_route`]'s sequence: like [`execute_route`]
+/// but a failure need not kill the answer —
+///
+/// - **Dead-hop reassignment (the ring's own rule):** the failed hop's
+///   layers go to `reassign(layers, dead_owner)`, which the caller wires to
+///   [`ShardMap::layer_ownership`](crate::replication::ShardMap::layer_ownership)
+///   over the alive set minus the dead owner — dropping a node re-pins
+///   only its layers, never the whole route. The replacement sub-hops are
+///   walked in order (front of the queue), bounded by [`REASSIGN_BUDGET`].
+/// - **Honest parity between hops:** every failure and success feeds
+///   `stability` (`note_*`), so repeated deaths exclude a flapping owner
+///   from *future* route plans without this walk's outcomed changing.
+/// - **Partial answers:** when `reassign` yields nothing (nobody alive to
+///   take the layers, or the caller refuses), the hop's layers are skipped
+///   and typed into [`RouteResult::degraded`] — the router walks on and the
+///   caller receives the residual as far as the chain carried it, with the
+///   lost layers named.
+pub async fn execute_route_resilient(
+    model_id: &str,
+    req_id: &str,
+    route: Vec<PipelineHop>,
+    mut activation: Vec<f32>,
+    local_run: impl Fn(&[f32], &[usize]) -> anyhow::Result<Vec<f32>>, 
+    remote_run: impl Fn(
+        &str,
+        &str,
+        Vec<f32>,
+        Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>>,
+    rtt_of: impl Fn(&str) -> u64,
+    base_timeout: Duration,
+    stability: &mut RouteStability,
+    reassign: impl Fn(&[usize], Option<&str>) -> Option<Vec<PipelineHop>>,
+) -> RouteResult {
+    let mut pending: VecDeque<PipelineHop> = route.into();
+    let mut budget = REASSIGN_BUDGET.saturating_add(pending.len());
+    let mut degraded: Vec<DegradedHop> = Vec::new();
+    let mut reassigned: Vec<ReassignedHop> = Vec::new();
+    let mut hops_run: usize = 0;
+
+    while let Some(hop) = pending.pop_front() {
+        match attempt_one_hop(model_id, req_id, &hop, &activation, &local_run, &remote_run, &rtt_of, base_timeout)
+            .await
+        {
+            Ok(out) => {
+                activation = out;
+                hops_run += 1;
+                if let Some(node) = &hop.node {
+                    stability.note_success(node);
+                }
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                if let Some(node) = &hop.node {
+                    stability.note_failure(node);
+                }
+                let replacement = if budget > 0 {
+                    reassign(&hop.layers, hop.node.as_deref())
+                } else {
+                    None
+                };
+                match replacement {
+                    Some(sub) if !sub.is_empty() => {
+                        budget -= 1;
+                        reassigned.push(ReassignedHop {
+                            layers: hop.layers.clone(),
+                            was_node: hop.node.clone(),
+                            reason: reason.clone(),
+                        });
+                        for replacement_hop in sub.into_iter().rev() {
+                            pending.push_front(replacement_hop);
+                        }
+                    }
+                    _ => {
+                        degraded.push(DegradedHop {
+                            layers: hop.layers.clone(),
+                            node: hop.node.clone(),
+                            reason: format!("skipped: {reason}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    RouteResult { activation, hops_run, degraded, reassigned }
 }
 #[cfg(test)]
 mod tests {
@@ -463,5 +689,214 @@ mod tests {
                 .await.unwrap(),
             vec![1.0_f32; 4]
         );
+    }
+
+    // ---- M2: degradation + hysteresis ----
+
+    /// Local executor used by the M2 resilience tests: keyed by the same
+    /// per-hop expert id so replacement hops answer deterministically.
+    fn local_of(model: &'static str) -> impl Fn(&[f32], &[usize]) -> anyhow::Result<Vec<f32>> {
+        move |a, layers| {
+            run_hop(
+                &hop_expert_id(model, &PipelineHop { node: None, layers: layers.to_vec() }),
+                a,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_hop_layers_reassigned_by_the_ring_rule_and_route_completes() {
+        let model = "moe-v2";
+        let req = "req-m2-1";
+        let route = vec![
+            PipelineHop { node: None, layers: vec![0] },
+            PipelineHop { node: Some("peer-a".into()), layers: vec![1, 2] },
+            PipelineHop { node: Some("peer-b".into()), layers: vec![3] },
+        ];
+
+        // The caller's reassign closure IS the ring's own rule: layers re-
+        // pinned over the alive set minus the dead owner, merged per owner.
+        let reassign = |layers: &[usize], dead: Option<&str>| {
+            assert_eq!(dead, Some("peer-a"), "only the dead owner is dropped");
+            if layers == [1_usize, 2] {
+                Some(vec![PipelineHop { node: Some("peer-b".into()), layers: vec![1, 2] }])
+            } else {
+                None
+            }
+        };
+        let mut stability = RouteStability::new();
+
+        let mut input = vec![0.5_f32; 8];
+        input[3] = -0.25;
+        let result = execute_route_resilient(
+            model, req, route, input,
+            local_of(model),
+            move |expert_id, node, activation, _t| {
+                let expert_id = expert_id.to_owned();
+                let node = node.to_owned();
+                let fut = async move {
+                    if node == "peer-a" {
+                        // The production closure honors the hop deadline from
+                        // the QUIC dispatch; here the dead peer just fails.
+                        anyhow::bail!("peer unreachable");
+                    }
+                    run_hop(&expert_id, &activation).map(|out| {
+                        let c = result_commitment(req, &expert_id, &node, &activation, &out);
+                        (out, Some(c))
+                    })
+                };
+                Box::pin(fut)
+            },
+            |n| if n == "peer-a" { 5 } else { 40 },
+            BASE,
+            &mut stability,
+            reassign,
+        )
+        .await;
+
+        // Complete walk: the failed hop was RE-HOSTED, not skipped.
+        assert!(result.degraded.is_empty(), "no honest losses: {:?}", result.degraded);
+        assert_eq!(result.reassigned.len(), 1, "the dead hop was re-hosted");
+        assert_eq!(result.reassigned[0].layers, vec![1, 2]);
+        assert_eq!(result.reassigned[0].was_node.as_deref(), Some("peer-a"));
+        // hops_run counts successful executions: the dead attempt is not one.
+        assert_eq!(result.hops_run, 3, "local 0, replacement 1-2, tail 3");
+
+        // Serial reference: layer 1-2 ran under the replacement id.
+        let serial = vec![
+            PipelineHop { node: None, layers: vec![0] },
+            PipelineHop { node: Some("peer-b".into()), layers: vec![1, 2] },
+            PipelineHop { node: Some("peer-b".into()), layers: vec![3] },
+        ];
+        let mut expect = vec![0.5_f32; 8];
+        expect[3] = -0.25;
+        for hop in &serial {
+            expect = run_hop(&hop_expert_id(model, hop), &expect).unwrap();
+        }
+        assert_eq!(result.activation, expect, "reassigned walk must equal the re-planned serial walk");
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_hop_walks_on_with_an_honest_partial_answer() {
+        let model = "moe-v3";
+        let req = "req-m2-2";
+        let route = vec![
+            PipelineHop { node: None, layers: vec![0] },
+            PipelineHop { node: Some("gone".into()), layers: vec![1] },
+            PipelineHop { node: Some("peer-b".into()), layers: vec![2] },
+        ];
+        let mut stability = RouteStability::new();
+
+        let input = vec![0.5_f32; 8];
+        let result = execute_route_resilient(
+            model, req, route, input,
+            local_of(model),
+            move |expert_id, node, activation, _t| {
+                let expert_id = expert_id.to_owned();
+                let node = node.to_owned();
+                let fut = async move {
+                    if node == "gone" {
+                        anyhow::bail!("peer unreachable")
+                    }
+                    run_hop(&expert_id, &activation).map(|out| (out, None))
+                };
+                Box::pin(fut)
+            },
+            |_| 20,
+            BASE,
+            &mut stability,
+            |_layers, _dead| None, // nobody alive to take the layers
+        )
+        .await;
+
+        // The router walked ON past the lost hop:
+        assert_eq!(result.hops_run, 2, "local hop 0 and peer-b hop 2 ran");
+        assert_eq!(result.degraded.len(), 1, "exactly the lost layer typed");
+        assert_eq!(result.degraded[0].layers, vec![1]);
+        assert_eq!(result.degraded[0].node.as_deref(), Some("gone"));
+        assert!(result.degraded[0].reason.contains("skipped"));
+        assert!(result.degraded[0].reason.contains("peer unreachable"));
+        assert!(!result.is_complete());
+
+        // Honest hops-short: residual = local(0) then peer-b(2) — layer 1
+        // skipped inside the chain deterministically, not silently dropped.
+        let local0 = run_hop(
+            &hop_expert_id(model, &PipelineHop { node: None, layers: vec![0] }),
+            &vec![0.5_f32; 8],
+        )
+        .unwrap();
+        let expect_b2 = run_hop(
+            &hop_expert_id(model, &PipelineHop { node: Some("peer-b".into()), layers: vec![2] }),
+            &local0,
+        )
+        .unwrap();
+        assert_eq!(result.activation, expect_b2);
+    }
+
+    #[test]
+    fn flapping_owner_is_dampened_by_two_line_hysteresis() {
+        let mut stability = RouteStability::new();
+        assert!(!stability.is_excluded("flapper"));
+        stability.note_failure("flapper");
+        stability.note_failure("flapper");
+        stability.note_failure("flapper");
+        assert!(stability.is_excluded("flapper"), "raise at {HOP_EXCLUDE_SCORE}");
+
+        // One success only decays — no instant re-inclusion mid-flap.
+        stability.note_success("flapper");
+        assert!(stability.is_excluded("flapper"), "score 2 sits in the hysteresis band");
+        stability.note_success("flapper");
+        assert!(!stability.is_excluded("flapper"), "cleared below {HOP_CLEAR_SCORE}");
+
+        // Unknown nodes are never excluded; healthy peers are untouched.
+        assert!(!stability.is_excluded("stranger"));
+        stability.note_success("stranger");
+        assert!(!stability.is_excluded("stranger"));
+    }
+
+    #[test]
+    fn filter_alive_drops_excluded_but_never_empties_the_set() {
+        let mut stability = RouteStability::new();
+        for _ in 0..3 {
+            stability.note_failure("a");
+        }
+        let alive = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(stability.filter_alive(&alive), vec!["b".to_string()]);
+
+        // Everyone flapped: route anyway (a isogenic flaky hop beats no hop).
+        for _ in 0..3 {
+            stability.note_failure("b");
+        }
+        assert_eq!(stability.filter_alive(&alive), alive, "never hand back an empty routing set");
+    }
+
+    #[tokio::test]
+    async fn walk_failures_feed_the_stability_tracker() {
+        let model = "moe-v4";
+        let req = "req-m2-3";
+        // Three hops all owned by the same dead node — the walk notes each.
+        let route = vec![
+            PipelineHop { node: Some("dead".into()), layers: vec![0] },
+            PipelineHop { node: Some("dead".into()), layers: vec![1] },
+            PipelineHop { node: Some("dead".into()), layers: vec![2] },
+        ];
+        let mut stability = RouteStability::new();
+        let result = execute_route_resilient(
+            model, req, route, vec![0.0_f32; 4],
+            local_of(model),
+            |_e, node, _x, _t| {
+                let dead = node.to_owned();
+                Box::pin(async move {
+                    anyhow::ensure!(dead != "dead", "peer unreachable");
+                    Ok::<_, anyhow::Error>((vec![0.0_f32; 4], None))
+                })
+            },
+            |_| 20, BASE,
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+        assert_eq!(result.degraded.len(), 3);
+        assert!(stability.is_excluded("dead"), "3 walk failures must raise the flag");
     }
 }
