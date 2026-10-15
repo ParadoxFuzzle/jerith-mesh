@@ -80,7 +80,8 @@ cargo build --release
 ./target/release/jerith status
 ./target/release/jerith peers
 
-# Local memory skills (SQLite + nomic embeddings, never leaves the node)
+# Local memory skills (SQLite or PostgreSQL+pgvector — your setup choice —
+# + nomic embeddings, never leaves the node)
 ./target/release/jerith memory add "my note"
 ./target/release/jerith memory search "note"
 
@@ -99,7 +100,7 @@ scripts/dev-e2e.sh
 | Ed25519-signed advertise/pings (forged & replayed requests rejected) | ✅ live |
 | Model-homogeneous meshing (GLM↔GLM, never GLM↔Qwen) | ✅ live |
 | 3-failed-ping deprecation + failed-worker fraud reports & scoring | ✅ live |
-| Local SQLite memory + nomic embeddings (`memory.*` skills) | ✅ live |
+| Local memory + nomic embeddings (`memory.*` skills; SQLite or the chosen PostgreSQL+pgvector store) | ✅ live |
 | Web access skills (Brave Search + URL fetch — OpenClaw migration, bot tool loop) | ✅ live |
 | QUIC NodeRPC expert dispatch (runtime-backed) | ✅ Phase 1 |
 | JER mining on served inference | ✅ live |
@@ -116,7 +117,9 @@ scripts/dev-e2e.sh
 2. **Model choice** — waits for you to confirm; can show live peer counts from
    the bootstrap node first so you see which meshes are actually alive.
 3. **Memory backend** — PostgreSQL+pgvector or SQLite (strictly local, never
-   replicated; no distributed databases in the mesh).
+   replicated; no distributed databases in the mesh; the chosen backend is the
+   one used — postgres needs `memory_dsn`, memory skills refuse to run
+   against a different store than the configured one).
 4. **Contribution %** — minimum **25 %** required to be eligible; configurable
    upward.
 5. **Optional crypto wallets** — JerithChain by default; you provide BTC/ETH/

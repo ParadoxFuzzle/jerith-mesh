@@ -118,11 +118,41 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 #     - two-server: with a working second bootstrap in the rotation,
 #       the FIRST tick after the primary went dark already refreshed
 #       `fetched=N bootstrap=http://127.0.0.1:8902` — zero degrades,
-#       zero warns; `last_good` followed the server that answered.
-#     - ops detail learned: raw config.toml edits do NOT hot-apply —
+#       zero warns; `last_good` followed the server that answered.#     - ops detail learned: raw config.toml edits do NOT hot-apply —
 #       a restart (or `jerith config set`) loads them; /status's
 #       discovery section is the truth of what the loop is using.
-
+#
+# 5c. Memory backend switch drill (PostgreSQL+pgvector, Phase 0.5,
+#     verified live 2026-10-15 against pgvector/pgvector:pg16 in Docker):
+#
+#     a. Choose it at setup — `--memory postgres --memory-dsn
+#        postgres://user:pass@127.0.0.1:5432/<db>?sslmode=disable` —
+#        or set `memory_backend = "postgres_pgvector"` + `memory_dsn`
+#        in config.toml (env override JERITH_MEMORY_DSN wins). Memory
+#        stays strictly node-private: the DB is the operator's own.
+#     b. Boot banner is honest about the store that actually opened:
+#        "memory PostgreSQL + pgvector (dim 256), local-only" when the
+#        extension is installed, "PostgreSQL (bytea polyfill — no
+#        pgvector extension)" when the connection lacks it (e.g.
+#        non-superuser on a bare install) — cosine in Rust, same
+#        semantics, mode always reported.
+#     c. Round-trip: `jerith memory add`, memory.search embeds nomic and
+#        ranks via `<=>` (or the polyfill scan); skills say so:
+#        POST /v1/skills/memory/{embed,search} return
+#        {"id":N,"provider":"nomic"} / scored hits; verify the scored
+#        ordering matches reality before trusting the backend switch.
+#     d. Fail-loud checks: postgres chosen WITHOUT memory_dsn → the
+#        process refuses to start (typed error naming the missing DSN —
+#        never a silent swap to SQLite); unreachable DSN → node runs
+#        degraded with "memory unavailable" and memory.* skills return
+#        the honest "memory backend not configured" error.
+#     e. Layout guardrail: a memories table written by the OTHER mode
+#        (bytea vs vector) is refused at connect with a migrate
+#        manually note — the node never reshapes the user's table.
+#        Env-gated live tests prove both modes:
+#        JERITH_TEST_PG_URL (superuser, extension present) and
+#        JERITH_TEST_PG_URL_NOEXT (extension-less DB) with
+#        `cargo test -p jerith-mesh-core memory::tests::pg`.
 # 6. Design checks that must always hold (fail-closed, not fail-open):
 #    - unsigned/replayed advertisements and pings get 401/403, never accepted
 #    - peers list only returns same-model nodes

@@ -128,9 +128,25 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ Local specialists (MiniCPM-V vision + nomic embeddings) routed locally, never meshed
 
 ## 6. Memory & State
-- ✅ Backend choice at setup: **PostgreSQL+pgvector** or **SQLite**
+- ✅ Backend choice at setup: **PostgreSQL+pgvector** or **SQLite** — and the *chosen* store is
+  the one actually used (`MemoryHandle`): a postgres choice without a usable store fails
+  honest and loud (misconfiguration at boot, refused = never a silent swap to a different
+  store); the DSN lives in `config.toml` `memory_dsn` (or `JERITH_MEMORY_DSN`),
+  described with credentials redacted everywhere
+- ✅ PostgreSQL+pgvector backend (`core::memory::PgMemoryStore`): long-lived tokio-postgres
+  connection, `vector` columns + index-eligible `<=>` cosine ordering when the extension is
+  present; an honest bytea polyfill (packed-f32 blobs, cosine in Rust — the exact SQLite
+  semantics) when the extension is unavailable to the connection, always reported in the
+  banner/describe; a table written in the other layout is refused, never reshaped under the
+  user's data; retention cap (10 000 rows, newest survive) and mixed-dim scan degradation to
+  the shared prefix, both inherited from the SQLite store
+- ✅ Local embedding pipeline integrated with the chosen vector store (Phase 0.5): local
+  nomic nomic-embed-text-v2-moe via Ollama with Matryoshka truncation (768/512/256), offline
+  hashing fallback always labeled in results (`provider` on every hit/skill response — raw
+  text goes only to the node's embedder and its own store); identical behavior on both
+  backends; env-gated live tests (`JERITH_TEST_PG_URL` / `JERITH_TEST_PG_URL_NOEXT`)
+  verified against a real pgvector server in both modes
 - ✅ Memory is strictly local — never replicated into the mesh, never distributed in the mesh
-- ✅ Local embedding pipeline integrated with the chosen vector store (Phase 0.5)
 
 ## 7. User Interfaces & Access Surfaces
 - ✅ CLI (setup, run, status, peers, config);

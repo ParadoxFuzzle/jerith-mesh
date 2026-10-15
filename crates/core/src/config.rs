@@ -271,6 +271,14 @@ pub struct NodeConfig {
     pub role: NodeRole,
     pub contribution_percent: u64,
     pub memory_backend: MemoryBackend,
+    /// PostgreSQL connection string for the pgvector memory backend
+    /// (`postgres://user:pass@host:5432/db`; `sslmode=disable` — memory is
+    /// strictly node-local, TLS is the deployment's job). Used only when
+    /// `memory_backend = "postgres"`; the `JERITH_MEMORY_DSN` environment
+    /// variable overrides it. A postgres backend with no DSN anywhere is
+    /// a boot-time misconfiguration, not a silent SQLite swap.
+    #[serde(default)]
+    pub memory_dsn: Option<String>,
     pub bootstrap_url: String,
     pub crypto: CryptoConfig,
     pub specialists: SpecialistConfig,
@@ -623,6 +631,7 @@ impl Default for NodeConfig {
             role: NodeRole::Hybrid,
             contribution_percent: MIN_CONTRIBUTION_PERCENT,
             memory_backend: MemoryBackend::Sqlite,
+            memory_dsn: None,
             bootstrap_url: "https://p2p.jerithai.com".to_string(),
             crypto: CryptoConfig::default(),
             specialists: SpecialistConfig::default(),
@@ -741,6 +750,22 @@ impl NodeConfig {
     }
     pub fn memory_db_path() -> PathBuf {
         Self::data_dir().join("memory.sqlite")
+    }
+
+    /// The pgvector DSN to use when `memory_backend = "postgres"`:
+    /// config value, or the `JERITH_MEMORY_DSN` environment variable as
+    /// the deployment override. `None` → postgres backend is a
+    /// misconfiguration (callers fail loud, never swap backends silently).
+    pub fn effective_memory_dsn(&self) -> Option<String> {
+        self.memory_dsn
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("JERITH_MEMORY_DSN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
     }
 
     /// Load config, tolerating a missing file (caller decides what to do).
@@ -864,6 +889,8 @@ impl NodeConfig {
 pub struct SetupChoices {
     pub model: ModelId,
     pub memory_backend: MemoryBackend,
+    /// Postgres DSN captured at setup when `memory_backend` is postgres.
+    pub memory_dsn: Option<String>,
     pub contribution_percent: u64,
     pub role: NodeRole,
     pub crypto: CryptoConfig,
@@ -879,6 +906,9 @@ impl SetupChoices {
         cfg.ensure_identity()?;
         cfg.set_model(self.model);
         cfg.memory_backend = self.memory_backend;
+        if let Some(dsn) = self.memory_dsn {
+            cfg.memory_dsn = Some(dsn);
+        }
         cfg.contribution_percent = self.contribution_percent;
         cfg.role = self.role;
         cfg.crypto = self.crypto;
@@ -925,6 +955,7 @@ mod tests {
         SetupChoices {
             model: sample_model(),
             memory_backend: MemoryBackend::Sqlite,
+            memory_dsn: None,
             contribution_percent: 40,
             role: NodeRole::Hybrid,
             crypto: CryptoConfig::default(),

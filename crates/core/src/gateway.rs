@@ -1370,6 +1370,7 @@ mod tests {
             ..crate::memory::EmbedConfig::default()
         })
         .expect("test memory db");
+        let memory = crate::memory::MemoryHandle::Sqlite(memory);
         let gw = Gateway {
             state,
             runtime_url: "http://127.0.0.1:1".to_string(),

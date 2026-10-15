@@ -49,6 +49,11 @@ enum Cmd {
         /// "sqlite" or "postgres"
         #[arg(long)]
         memory: Option<String>,
+        /// Postgres DSN (memory_backend postgres only): 
+        /// "postgres://user:pass@127.0.0.1:5432/db" — also readable from
+        /// JERITH_MEMORY_DSN.
+        #[arg(long = "memory-dsn")]
+        memory_dsn: Option<String>,
         /// Contribution percent (>= 25).
         #[arg(long)]
         contribution: Option<u64>,
@@ -275,6 +280,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Setup {
             model,
             memory,
+            memory_dsn,
             contribution,
             role,
             crypto,
@@ -283,6 +289,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         } => setup_flow(
             model,
             memory,
+            memory_dsn,
             contribution,
             role,
             crypto,
@@ -768,14 +775,22 @@ async fn chain_cmd(cmd: ChainCmd) -> anyhow::Result<()> {
 }
 
 async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
-    use jerith_mesh_core::memory::{EmbedConfig, MemoryStore};
+    use jerith_mesh_core::memory::{EmbedConfig, MemoryHandle};
     let cfg = NodeConfig::load()?.context("no config — run setup first")?;
     let embed_cfg = EmbedConfig {
         ollama_url: cfg.specialists.ollama_url.clone(),
         dim: cfg.specialists.embedding_dim as usize,
         ..Default::default()
     };
-    let store = MemoryStore::open(&NodeConfig::memory_db_path(), embed_cfg)?;
+    // Same choose-and-open rules as the run path: configured backend,
+    // honest failure (never a different store) when it is unusable.
+    let store = MemoryHandle::open(
+        cfg.memory_backend,
+        &NodeConfig::memory_db_path(),
+        cfg.effective_memory_dsn().as_deref(),
+        embed_cfg,
+    )
+    .await?;
     match cmd {
         MemoryCmd::Add { text } => {
             let (id, provider) = store.embed_and_store(&text).await?;
@@ -1060,6 +1075,7 @@ fn parse_crypto(s: &str) -> anyhow::Result<jerith_mesh_core::config::CryptoConfi
 fn setup_flow(
     model: Option<String>,
     memory: Option<String>,
+    memory_dsn: Option<String>,
     contribution: Option<u64>,
     role: Option<String>,
     crypto: Option<String>,
@@ -1188,6 +1204,32 @@ fn setup_flow(
         None => bail!("--memory is required in non-interactive mode"),
     };
     let memory_backend = parse_memory(&memory_spec)?;
+    // A postgres backend is useless (and refused at boot) without the
+    // connection string, so capture it here — flag, prompt, or env.
+    let memory_dsn = match memory_backend {
+        MemoryBackend::PostgresPgvector => {
+            match memory_dsn {
+                Some(d) if !d.trim().is_empty() => Some(d),
+                None if interactive => {
+                    let d = prompt(
+                        "\nPostgres DSN for memory? (postgres://user:pass@host:5432/db, sslmode=disable)",
+                        "postgres://postgres@127.0.0.1:5432/jerith?sslmode=disable",
+                    )?;
+                    Some(d)
+                }
+                // Flag missing (or blank): the deployment env may supply it.
+                _ => std::env::var("JERITH_MEMORY_DSN")
+                    .ok()
+                    .filter(|d| !d.trim().is_empty()),
+            }
+        }
+        MemoryBackend::Sqlite => None,
+    };
+    if memory_backend == MemoryBackend::PostgresPgvector && memory_dsn.is_none() {
+        bail!(
+            "--memory postgres needs --memory-dsn (or JERITH_MEMORY_DSN) — the DSN is stored \n         in config.toml's memory_dsn"
+        );
+    }
     println!("[3/5] Memory: {} (strictly local)", memory_backend.label());
 
     // 4. Contribution % — min 25 hard-coded by spec.
@@ -1230,6 +1272,7 @@ fn setup_flow(
     let choices = SetupChoices {
         model,
         memory_backend,
+        memory_dsn,
         contribution_percent: contribution_pct,
         role,
         crypto,
@@ -1315,7 +1358,6 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         cfg.contribution_percent, MIN_CONTRIBUTION_PERCENT
     );
     println!("   bootstrap   {}", cfg.bootstrap_url);
-    println!("   memory      {}", cfg.memory_backend.label());
     println!("   crypto      {}", crypto_label(cfg.crypto.chain));
     println!("   gateway     http://127.0.0.1:{}", cfg.gateway_port);
 
@@ -1334,24 +1376,40 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         None => println!("   economics   off"),
     }
 
-    // Local memory (SQLite + local embeddings; strictly node-private).
+    // Local memory: the backend the operator chose is the one opened.
+    // A postgres choice without a usable store fails honest and loud —
+    // refused up front when no DSN is configured at all, degraded to
+    // "no memory" (warned, never swapped) when the chosen store itself
+    // cannot be reached. Embeddings stay local either way.
     let memory = if cfg.specialists.embeddings_enabled {
         let embed_cfg = jerith_mesh_core::memory::EmbedConfig {
             ollama_url: cfg.specialists.ollama_url.clone(),
             dim: cfg.specialists.embedding_dim as usize,
             ..Default::default()
         };
-        match jerith_mesh_core::memory::MemoryStore::open(&NodeConfig::memory_db_path(), embed_cfg)
+        match jerith_mesh_core::memory::MemoryHandle::open(
+            cfg.memory_backend,
+            &NodeConfig::memory_db_path(),
+            cfg.effective_memory_dsn().as_deref(),
+            embed_cfg,
+        )
+        .await
         {
             Ok(store) => {
-                println!(
-                    "   memory      SQLite at {} (dim {}, local-only)",
-                    NodeConfig::memory_db_path().display(),
-                    cfg.specialists.embedding_dim
-                );
+                println!("   memory      {}, local-only", store.describe());
                 Some(std::sync::Arc::new(store))
             }
             Err(e) => {
+                if cfg.memory_backend == MemoryBackend::PostgresPgvector
+                    && cfg
+                        .memory_dsn
+                        .as_deref()
+                        .filter(|d| !d.trim().is_empty())
+                        .is_none()
+                    && std::env::var("JERITH_MEMORY_DSN").is_err()
+                {
+                    return Err(e);
+                }
                 tracing::warn!(error = %e, "memory store unavailable");
                 println!("   memory      unavailable ({e})");
                 None
