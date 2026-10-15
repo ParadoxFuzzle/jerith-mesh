@@ -171,6 +171,32 @@ Local specialists (not meshed):
 
 ## 10. Implementation phases
 
+### Phase 3 in progress — multi-hop pipeline runtime (milestones)
+
+Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
+
+- **M0 ✅ — route planning on the honest ownership map.** The layer-ownership
+  ring previously handed the planners a SELF-ONLY map, so their remote path
+  was dead code. The full map (every layer's owner, self or remote) now feeds
+  `pipeline::plan_route` — deterministic, ordered, consecutive same-owner
+  layers merged into hops (`None` = local run); the layer-aware dispatch
+  planner delegates to it, drops the wrong `has_expert` gate (a layer owner
+  is not an expert host), and an all-local mesh plans as a single hop.
+- **M1 — hop execution over the existing activation contract.** Residual
+  vectors walk the route hop-by-hop on the QUIC expert connection shape
+  (same f32-vector wire contract, commitments recomputed per hop so a
+  tampering hop is caught downstream), with per-hop timeouts derived from
+  RTT. A layer-run executor stub first, real runtime weights when the
+  Colibri-side layer split lands.
+- **M2 — degradation + hysteresis.** A skipped/dead hop only reassigns the
+  layers the departed node owned (the ring's own rule), never the whole
+  route; flapping owners get the freerider-style hysteresis instead of
+  route flapping; partial answers are honest hops-short with a typed
+  reason — the router walks on, mirrors `reject-continue`.
+- **M3 — latency budgeting.** Per-hop deadlines from measured RTT, budget
+  checked against the `expert_stats` measured-activation order (the same
+  oracle prefetching will use), dashboard surfacing on `/v1/metrics`.
+
 | Phase | Goal | What gets built | Latency expectation |
 |---|---|---|---|
 | 0 ✅ | Local-only foundation | hardware probe, setup flow, bootstrap discovery, health pings, local gateway + OpenAI endpoint, web status | Baseline |

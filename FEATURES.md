@@ -421,10 +421,14 @@ gotchas surfaced while building the finished parts.
 ### Phase 3 — finish the core mesh runtime
 
 - **Multi-hop pipeline forward passes** (completing §1's layer-group item).
-  The ownership map, deterministic ring placement and layer-group-aware
-  dispatch planner already exist — what remains is the runtime: activations
-  (residual streams) hopping across layer-group owners over QUIC, latency
-  budgeting per hop, and partial-answer semantics when one hop degrades.
+  M0 landed (2026-10-15): the ownership ring now reports the *full* map (it
+  previously handed planners a self-only map, leaving their remote path dead
+  code), and `pipeline::plan_route` builds deterministic multi-hop routes —
+  ordered by ring position, consecutive same-owner layers merged into one
+  hop, all-local meshes planning as a single hop. The layer-aware dispatch
+  planner delegates to it. What remains is the runtime: activations (residual
+  streams) hopping across layer-group owners over QUIC, latency budgeting
+  per hop, and partial-answer semantics when one hop degrades.
   Gotcha learned: everything must survive the existing commitment layer —
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.

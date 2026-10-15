@@ -19,6 +19,7 @@ pub mod lore;
 pub mod memory;
 pub mod metrics;
 pub mod model_router;
+pub mod pipeline;
 pub mod models;
 pub mod ping;
 pub mod quic;

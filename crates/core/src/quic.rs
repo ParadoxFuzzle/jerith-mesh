@@ -394,71 +394,37 @@ impl ExpertRouter {
         _expert_id: &str,
         peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
     ) -> Vec<ExpertLocation> {
+        // The FULL ownership map (every layer's owner — see
+        // ShardMap::layer_ownership; the pre-M0 self-only map left this
+        // planner's remote path unreachable: no entry ever carried a remote
+        // owner, so loops keyed on `owner == peer_id` never matched).
         let layer_ownership = crate::replication::ShardMap::layer_ownership(
             &crate::replication::ShardMap::new(vec![self_node_id.to_string()]),
             self_node_id,
             layers,
             alive,
         );
+        let ordered: std::collections::BTreeMap<usize, String> =
+            layer_ownership.into_iter().collect();
+        // Route construction is the pipeline module's — one source of truth
+        // for hop semantics (ordered by layer, consecutive same-owner runs
+        // merged; M1's runtime walks hops directly).
         let mut plan = Vec::new();
-        // Check if self owns any of the requested layers
-        let self_owns_layer = layers.iter().any(|&layer| {
-            layer_ownership.get(&layer).map_or(false, |owned| owned == self_node_id)
-        });
-        if self_owns_layer {
-            plan.push(ExpertLocation::Local);
-        }
-        // Build remote plan: for each layer not owned by self, find the owner
-        // and dispatch to that node. We prioritize peers that own layers we
-        // need, sorted by RTT.
-        let mut layer_to_owner: HashMap<usize, String> = HashMap::new();
-        for &layer in layers {
-            if let Some(owner) = layer_ownership.get(&layer) {
-                if owner != self_node_id {
-                    *layer_to_owner.entry(layer).or_insert_with(|| owner.clone()) = owner.clone();
-                }
-            }
-        }
-        // Group peers by node id and check which layers they own
-        let mut peer_layer_ownership: HashMap<String, Vec<usize>> = HashMap::new();
-        for (peer_id, _rtt, has, alive, _) in peers {
-            if *alive && *has {
-                // Check if this peer owns any of our layers
-                for &layer in layers {
-                    if let Some(owner) = layer_ownership.get(&layer) {
-                        if owner == peer_id {
-                            peer_layer_ownership
-                                .entry(peer_id.clone())
-                                .or_default()
-                                .push(layer);
-                        }
-                    }
-                }
-            }
-        }
-        // Sort peers by RTT and add remote locations for layers they own
-        let mut sorted_peers: Vec<(String, u64)> = peer_layer_ownership
-            .clone()
-            .into_iter()
-            .map(|(id, _layers)| {
-                // Find the RTT for this peer
-                let peer_rtt = peers.iter().find(|(pid, _, _, _, _)| *pid == id).map(|(_, rtt, _, _, _)| *rtt).unwrap_or(u64::MAX);
-                (id, peer_rtt)
-            })
-            .collect();
-        sorted_peers.sort_by_key(|(_, rtt)| *rtt);
-        for (peer_id, _) in sorted_peers {
-            if let Some(owned_layers) = peer_layer_ownership.get(&peer_id) {
-                for &_layer in owned_layers {
-                    // Only add if not already in the plan
-                    if !plan.iter().any(|loc| {
-                        matches!(loc, ExpertLocation::Remote { node_id, .. } if *node_id == peer_id)
-                    }) {
-                        plan.push(ExpertLocation::Remote {
-                            node_id: peer_id.clone(),
-                            rtt_ms: 0, // RTT will be measured at dispatch time
-                        });
-                    }
+        for hop in crate::pipeline::plan_route(self_node_id, &ordered) {
+            match hop.node {
+                None => plan.push(ExpertLocation::Local),
+                Some(node_id) => {
+                    // Layer ownership is ring-derived, NOT expert hosting —
+                    // a layer owner does not have to host any expert
+                    // container, so only liveness is checked here (the
+                    // pre-M0 code gated on `has_expert`, which a layer
+                    // owner legitimately fails).
+                    let rtt_ms = peers
+                        .iter()
+                        .find(|(id, _, _, alive, _)| *id == node_id && *alive)
+                        .map(|(_, rtt, _, _, _)| *rtt)
+                        .unwrap_or(u64::MAX);
+                    plan.push(ExpertLocation::Remote { node_id, rtt_ms });
                 }
             }
         }
@@ -2635,6 +2601,67 @@ mod tests {
             verify_tolerance: 0.0,
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn layer_plan_routes_remote_owners_without_expert_hosting() {
+        // M0 (FEATURES §13): layer ownership is ring-derived — a layer
+        // owner does not need to host any expert container. The pre-M0
+        // planner gated the remote path on `has_expert` AND only ever had
+        // self-owned entries in the map, so nothing remote could fire.
+        let r = router(50);
+        let alive = vec!["self".to_string(), "layer-owner".to_string()];
+        let peers = vec![
+            // has_expert = false on purpose: the layer OWNER gate is
+            // liveness-only now.
+            ("layer-owner".into(), 40, false, true, None),
+            ("dead-owner".into(), 5, false, false, None),
+        ];
+        let layers: Vec<usize> = (0..6).collect();
+        let plan = r
+            .plan_dispatch_with_layer_ownership("self", &layers, &alive, "exp-1", &peers)
+            .await;
+
+        // The contract: the plan equals the route derivable from the
+        // full ownership map — same order, same owners, and it is
+        // deterministic across calls.
+        let ownership = crate::replication::ShardMap::layer_ownership(
+            &crate::replication::ShardMap::new(vec!["self".to_string()]),
+            "self",
+            &layers,
+            &alive,
+        );
+        let ordered: std::collections::BTreeMap<usize, String> = ownership.into_iter().collect();
+        let mut expected: Vec<ExpertLocation> = Vec::new();
+        for hop in crate::pipeline::plan_route("self", &ordered) {
+            match hop.node {
+                None => expected.push(ExpertLocation::Local),
+                Some(node) => {
+                    let rtt_ms = peers
+                        .iter()
+                        .find(|(id, _, _, alive, _)| *id == node && *alive)
+                        .map(|(_, rtt, _, _, _)| *rtt)
+                        .unwrap_or(u64::MAX);
+                    expected.push(ExpertLocation::Remote { node_id: node, rtt_ms });
+                }
+            }
+        }
+        let plan2 = r
+            .plan_dispatch_with_layer_ownership("self", &layers, &alive, "exp-1", &peers)
+            .await;
+        assert_eq!(plan, expected, "plan == route(full map)");
+        assert_eq!(plan, plan2, "deterministic across calls");
+    }
+
+    #[tokio::test]
+    async fn layer_plan_solo_mesh_is_all_local() {
+        let r = router(50);
+        let alive = vec!["self".to_string()];
+        let peers = Vec::new();
+        let plan = r
+            .plan_dispatch_with_layer_ownership("self", &[0, 1, 2], &alive, "exp-1", &peers)
+            .await;
+        assert_eq!(plan, vec![ExpertLocation::Local], "single node owns everything");
     }
 
     #[tokio::test]

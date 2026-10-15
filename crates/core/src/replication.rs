@@ -245,11 +245,14 @@ impl ShardMap {
         self.primary_owner(expert_id).as_deref() == Some(self_node_id)
     }
 
-    /// Layer ownership map for pipeline / layer-group fallback (Petals-style).
-    /// Each node owns a contiguous slice of model layers. Given a set of
-    /// alive node ids (including self), this assigns each layer a primary
-    /// owner from the ring, forming a deterministic layer-group assignment
-    /// that reassigns only the departed node's layers when the set changes.
+    /// Layer ownership map for pipeline / layer-group planning (Petals-style,
+    /// §13 M0). Each node owns a contiguous slice of model layers. Given the
+    /// alive node set (including self), this deterministically assigns every
+    /// layer its primary owner from the ring and returns the FULL map — own
+    /// layers AND the ones that belong elsewhere. Restricting the map to
+    /// self-owned layers left every layer-aware planner's remote path
+    /// unreachable (the pre-M0 defect); the dispatch planner and the
+    /// pipeline route builder both need the complete picture.
     pub fn layer_ownership(
         &self,
         self_node_id: &str,
@@ -257,15 +260,15 @@ impl ShardMap {
         alive: &[String],
     ) -> HashMap<usize, String> {
         let mut out: HashMap<usize, String> = HashMap::new();
-        let _ring = ShardMap::from_ads(self_node_id, &[]);
         for &layer in layers {
-            // Use the shard map's rendezvous hash to deterministically assign
-            // each layer to a node. The node ids in the ring are sorted and
-            // deduped; the score function gives every node a stable weight.
-            let owner = self.primary_owner_for_layer(&layer, alive);
-            if owner.as_deref() == Some(self_node_id) {
-                out.insert(layer, self_node_id.to_string());
-            }
+            // Rendezvous hash over the alive set: deterministic per layer,
+            // stable weights per node (see `score`). An empty alive set is
+            // a caller bug — fall back to self rather than dropping the
+            // layer silently.
+            let owner = self
+                .primary_owner_for_layer(&layer, alive)
+                .unwrap_or_else(|| self_node_id.to_string());
+            out.insert(layer, owner);
         }
         out
     }
@@ -295,6 +298,47 @@ mod tests {
             rtt_ms: rtt,
             hosted_experts: hosted.map(|l| l.iter().map(|s| s.to_string()).collect()),
             alive: true,
+        }
+    }
+
+    #[test]
+    fn layer_ownership_maps_every_layer_to_an_alive_owner() {
+        // M0 (FEATURES §13): the map is the FULL ownership picture —
+        // every requested layer gets an entry with its deterministic ring
+        // owner (previously only self-owned layers were inserted, which
+        // left every layer-aware planner's remote path unreachable).
+        let sm = ShardMap::new(vec!["self".to_string()]);
+        let alive = vec!["self".to_string(), "b".to_string()];
+        let m1 = sm.layer_ownership("self", &[0, 1, 2], &alive);
+        let m2 = sm.layer_ownership("self", &[0, 1, 2], &alive);
+        assert_eq!(m1, m2, "deterministic per layer");
+        assert_eq!(m1.len(), 3, "all layers mapped, self-owned or not");
+        for owner in m1.values() {
+            assert!(owner == "self" || owner == "b", "owners ⊆ alive: {owner}");
+        }
+        // Solo mesh: everything is self-owned.
+        let solo = vec!["self".to_string()];
+        let m = sm.layer_ownership("self", &[0, 1], &solo);
+        assert!(m.values().all(|o| o == "self"));
+        // Departed-node reassignment: dropping a node re-pins only the
+        // layers it owned (the whole point of a rendezvous ring).
+        let with_c = sm.layer_ownership("self", &[0, 1, 2, 3], &[
+            "self".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]);
+        let without_c = sm.layer_ownership("self", &[0, 1, 2, 3], &[
+            "self".to_string(),
+            "b".to_string(),
+        ]);
+        for (layer, owner_with) in &with_c {
+            if owner_with != "c" {
+                assert_eq!(
+                    without_c.get(layer),
+                    Some(owner_with),
+                    "layer {layer} not owned by c must be a stable pin"
+                );
+            }
         }
     }
 
