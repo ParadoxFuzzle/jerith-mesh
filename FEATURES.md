@@ -446,17 +446,23 @@ gotchas surfaced while building the finished parts.
   rendered on the dashboard — producer-pending, like the transport.
   The live gate is passed (2026-10-15):
   `tests/pipeline_remote_drill.rs` drives the whole ladder through the
-  real QUIC transport — a weight-source node plus two serving nodes that
-  boot with empty stores, wire commitments with pinned attribution, a
-  hung (mute) owner dying at its deadline and ring-rule re-hosted, the
-  honest partial variant, and demand-priced budgets against measured
-  latencies. The hop owners' weights travel: each container is
-  harvested over the wire (chunked `ExpertFetch` + checksummed
-  `put_bytes`) and proven byte-identical, and an empty-store node
-  refuses to fabricate rather than invent activations. 5/5 repeat
-  runs green. Still pending: real model shard contents (the
-  Colibri-side layer split — the served containers stay synthetic
-  inside) and wide-area RTT realism.
+  real QUIC transport — a weight-source node plus three serving nodes
+  that boot with empty stores, wire commitments with pinned
+  attribution, a hung (mute) owner dying at its deadline and ring-rule
+  re-hosted, the honest partial variant, and demand-priced budgets
+  against measured latencies. The hop owners' weights travel: each
+  container is harvested over the wire (chunked `ExpertFetch` +
+  checksummed `put_bytes`) and proven byte-identical, an empty-store
+  node refuses to fabricate rather than invent activations, and a
+  forged replica with one flipped byte is rejected at the ingest
+  checksum. A third hop owner is priced as a simulated wide-area hop
+  (180 ms `rtt_of`): its budget is floored on `base + 3×RTT` —
+  strictly above the near hops' — and the three-node walk still
+  completes with honest empty over-budget. 5/5 repeat runs green.
+  Still pending: real model shard contents (the Colibri-side layer
+  split — the served containers stay synthetic inside) and real
+  inter-region links (the wide-area RTT is simulated through pricing;
+  the latencies themselves stay loopback-real).
   What
   remains is live transport integration (the hop RPC rides
   `remote_expert_attempt` once the Colibri-side layer split provides real

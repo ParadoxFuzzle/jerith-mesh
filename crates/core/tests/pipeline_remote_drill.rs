@@ -21,7 +21,9 @@
 //!      invent activations, then harvest each hop container through the
 //!      runtime transfer path; every weight the walk multiplies is
 //!      therefore byte-identical to the source container and provably
-//!      arrived through the transport itself.
+//!      arrived through the transport itself. A forged replica with one
+//!      flipped payload byte is rejected by the checksummed ingest —
+//!      tampered bytes can never enter the served weight set.
 //!   1. SUCCESS ROUTE over the wire — the two-hop route completes with
 //!      no degradation, and the final activation equals the
 //!      independently chained reference forward pass bit-comparable
@@ -46,10 +48,18 @@
 //!      and two dead-hop failures sit exactly below the stability
 //!      hysteresis raise line (a flapping peer doesn't self-exclude at
 //!      the boundary).
+//!   6. THREE-NODE RTT BUDGETS — a third serving node is priced as a
+//!      simulated wide-area hop (180 ms `rtt_of`): the walk runs
+//!      A → B → far-D, the far hop's budget is floored on
+//!      base + 3×RTT and sits strictly above the near hops', the walk
+//!      still completes with honest empty over-budget, and the
+//!      activation bit-compares to the three-hop serial reference.
 //!
 //! Honest limits: loopback nodes, and the containers are synthetic
-//! until the Colibri-side layer split yields real model shards; wide-area
-//! RTT is not exercised. The `runtime` stand-in stays OFF (`tensors_only
+//! until the Colibri-side layer split yields real model shards; the
+//! wide-area RTT is SIMULATED (`rtt_of` prices a far hop at 180 ms and
+//! floors its budget on it — the latencies themselves stay
+//! loopback-real). The `runtime` stand-in stays OFF (`tensors_only
 //! = true`): a hashed text completion is not expert math, so wiring that
 //! path here would fabricate activations instead of moving real weights.
 
@@ -174,12 +184,14 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     }
     let (node_a, addr_a, store_a) = spin_node().await?;
     let (node_b, addr_b, store_b) = spin_node().await?;
+    let (node_d, addr_d, store_d) = spin_node().await?;
     let (node_c, addr_c) = spin_mute_node().await;
 
     let mut pin_map: PinMap = HashMap::new();
     pin_map.insert(node_a.clone(), addr_a);
     pin_map.insert(node_b.clone(), addr_b);
     pin_map.insert(node_s.clone(), addr_s);
+    pin_map.insert(node_d.clone(), addr_d);
     pin_map.insert(node_c.clone(), addr_c);
     let pins: SharedPinMap = Arc::new(tokio::sync::RwLock::new(pin_map.clone()));
     let client = pinned_client_endpoint_dyn(pins).expect("drill client endpoint");
@@ -295,9 +307,13 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         format!("{MODEL}#2-2"),
         format!("{MODEL}#3-3"),
     ];
+    // D is the wide-area third owner (criterion 6 below) and hosts the
+    // #3 replica — harvested through the same runtime path as the rest.
+    let d_targets = [format!("{MODEL}#3-3")];
     for (owner_id, owner_store, targets) in [
         (&node_a, &store_a, &a_targets[..]),
         (&node_b, &store_b, &b_targets[..]),
+        (&node_d, &store_d, &d_targets[..]),
     ] {
         for id in targets {
             let bytes =
@@ -322,12 +338,38 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     }
     for id in &experts {
         let (want, _) = store_s.bytes_of(id, 0, u32::MAX)?;
-        for store in [&store_a, &store_b] {
+        for store in [&store_a, &store_b, &store_d] {
             if store.contains(id) {
                 let (got, _) = store.bytes_of(id, 0, u32::MAX)?;
                 assert_eq!(got, want, "{id} mutated across the transport");
             }
         }
+    }
+
+    // Tamper gate (criterion 0, continued): a corrupted replica can
+    // never enter the served weight set. Forge the #2-3 bytes with one
+    // payload byte flipped — magic, id and shape stay honest, only the
+    // checksum now lies — and prove the checksummed ingest refuses it.
+    // The honest replica on disk stays untouched, so the hops keep
+    // multiplying provenance-clean weights no matter what travels.
+    {
+        let id = format!("{MODEL}#2-3");
+        let (mut evil, _) = store_s.bytes_of(&id, 0, u32::MAX)?;
+        let mid = evil.len() / 2;
+        evil[mid] ^= 0xFF;
+        let err = store_b
+            .put_bytes(&evil)
+            .expect_err("tampered container must never ingest");
+        assert!(
+            format!("{err:#}").contains("checksum mismatch"),
+            "the rejection must name the checksum, got: {err:#}"
+        );
+        let (still, _) = store_b.bytes_of(&id, 0, u32::MAX)?;
+        let (origin, _) = store_s.bytes_of(&id, 0, u32::MAX)?;
+        assert_eq!(
+            still, origin,
+            "ingest refusal leaves the honest replica intact"
+        );
     }
 
     // --- Criterion 1 + 5: success route over the wire, priced honestly.
@@ -599,6 +641,134 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         !stability.is_excluded(&node_c),
         "two failures must not self-exclude at the boundary"
     );
+
+    // --- Criterion 6: three nodes and simulated wide-area RTT. D is a
+    // real serving node the pricer sees as 180 ms away. The walk runs
+    // A → B → far-D and the budget pricer must FLOOR the far hop's
+    // budget on its RTT (base + 3×RTT headroom) while the near hops keep
+    // their own floors; under honest loopback latencies nothing can be
+    // over-budget — the point here is the priced numbers themselves.
+    {
+        let ownership_far: BTreeMap<usize, String> = [
+            (0, node_a.clone()),
+            (1, node_a.clone()),
+            (2, node_b.clone()),
+            (3, node_d.clone()),
+        ]
+        .into();
+        let far_route = plan_route(&walk_node_id, &ownership_far);
+        assert_eq!(
+            far_route
+                .iter()
+                .map(|h| (h.node.clone(), h.layers.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(node_a.clone()), vec![0, 1]),
+                (Some(node_b.clone()), vec![2]),
+                (Some(node_d.clone()), vec![3]),
+            ],
+            "planner: A, B, far D in walk order"
+        );
+        let rtt_far =
+            |n: &str| if n == node_d.as_str() { 180_u64 } else { 5_u64 };
+        let priced_far = plan_route_budget(
+            &far_route,
+            |_| 1,
+            rtt_far,
+            Duration::from_millis(250),
+            20_000,
+        );
+        let budget_of_far = move |hop: &PipelineHop| {
+            priced_far
+                .iter()
+                .find(|b| b.layers == hop.layers.as_slice() && b.node == hop.node)
+                .map(|b| b.budget_ms)
+                .unwrap_or(u64::MAX)
+        };
+        let far_hop = far_route
+            .iter()
+            .find(|h| h.node.as_deref() == Some(node_d.as_str()))
+            .expect("far hop present")
+            .clone();
+        let near_hop = far_route
+            .iter()
+            .find(|h| h.node.as_deref() == Some(node_a.as_str()))
+            .expect("near hop present")
+            .clone();
+        let far_floor = jerith_mesh_core::pipeline::hop_timeout(
+            Duration::from_millis(250),
+            180,
+        )
+        .as_millis() as u64;
+        let near_floor = jerith_mesh_core::pipeline::hop_timeout(
+            Duration::from_millis(250),
+            5,
+        )
+        .as_millis() as u64;
+        assert!(
+            budget_of_far(&far_hop) >= far_floor,
+            "far hop budget floored on base + 3×RTT: {} < {far_floor}",
+            budget_of_far(&far_hop)
+        );
+        assert!(
+            budget_of_far(&near_hop) >= near_floor,
+            "near hop keeps its own RTT floor"
+        );
+        assert!(
+            budget_of_far(&far_hop) > budget_of_far(&near_hop),
+            "the RTT floor must lift the far hop above the near hops': {} vs {}",
+            budget_of_far(&far_hop),
+            budget_of_far(&near_hop)
+        );
+        let result6 = execute_route_resilient(
+            MODEL,
+            &walk_req_id,
+            far_route.clone(),
+            input.clone(),
+            |_a, _l| anyhow::bail!("drill router hosts no layers"),
+            remote_run.clone(),
+            rtt_far,
+            Duration::from_millis(250),
+            Some(budget_of_far),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+        assert!(
+            result6.is_complete() && result6.reassigned.is_empty(),
+            "the three-node walk must complete: {:?}",
+            result6.degraded
+        );
+        assert_eq!(result6.hops_run, 3, "A, B and far D all walked");
+        assert!(
+            result6.over_budget.is_empty(),
+            "RTT-floored honest pricing must hold: {:?}",
+            result6.over_budget
+        );
+        assert_eq!(
+            result6.attempts.last().map(|a| a.node.as_deref()),
+            Some(Some(node_d.as_str())),
+            "the far hop ran last"
+        );
+        let r1f = run_hop(
+            &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![0, 1] }),
+            &input,
+        )?;
+        let r2f = run_hop(
+            &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![2] }),
+            &r1f,
+        )?;
+        let want6 = run_hop(
+            &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![3] }),
+            &r2f,
+        )?;
+        for (got, expected) in result6.activation.iter().zip(&want6) {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "three-node activation mismatch: got {got}, want {expected}"
+            );
+        }
+    }
 
     // The whole drill stayed inside its own deadlines.
     assert!(

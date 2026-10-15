@@ -200,7 +200,8 @@ Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
   **Live gate, passed (2026-10-15):** the wire-level semantics are no
   longer unit claims — `tests/pipeline_remote_drill.rs` runs the whole
   M-ladder through the real QUIC transport: a weight-source node plus
-  two serving nodes that boot with empty stores, plan →
+  three serving nodes that boot with empty stores (the third is priced
+  as a simulated wide-area hop: `rtt_of` says 180 ms), plan →
   execute → commit-verify over signed `NodeRPC ExpertQuery`, the
   per-hop deadline enforced at the wire, a mute (hung) owner tripping
   its deadline and getting ring-rule re-hosted onto the healthy node,
@@ -208,10 +209,14 @@ Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
   against measured attempt latencies. The hop owners' weights are not
   seed-mirrored synthetics: each container is harvested over the wire
   (chunked `ExpertFetch` + checksummed `put_bytes`) and proven
-  byte-identical end-to-end, and an empty-store node must honestly
-  refuse to fabricate before it can host. 5/5 repeat runs green. What
-  the Colibri split still brings: real model shards (the containers'
-  contents stay synthetic) and wide-area RTT realism.
+  byte-identical end-to-end, an empty-store node must honestly
+  refuse to fabricate before it can host, and a forged replica with
+  one flipped byte is rejected at the ingest checksum — tampered
+  bytes can never enter the served weight set. The wide-area hop's
+  budget is floored on `base + 3×RTT` and sits strictly above the
+  near hops'. 5/5 repeat runs green. What the Colibri split still
+  brings: real model shards (the containers' contents stay synthetic)
+  and real inter-region links (loopback latencies themselves).
 - **M2 ✅ — degradation + hysteresis.** `pipeline::execute_route_resilient`
   keeps routes alive through owner death: a failed hop's layers go to the
   caller-wired reassignment (shaped to
