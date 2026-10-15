@@ -726,6 +726,20 @@ Three paths, in preference order:
    upstream moving target into the supply chain to chase one advisory
    set; not worth it while exposure is limited (see above).
 
+Measured on the evaluation branch `stopgap-native-tls` (never merged):
+the native_tls_backend stopgap DOES work — audit goes to zero — but the
+flip exposed two durable facts worth knowing on migration day. (a)
+poise 0.7's `default` feature is what bundles serenity's
+`rustls_backend`; leaving `poise` default-features on makes ANY serenity
+backend flip a no-op. (b) serenity's native_tls_backend also enables
+`reqwest/native-tls` on the workspace's shared reqwest — and with
+default-tls + rustls-tls both compiled in, reqwest's default backend
+becomes OpenSSL, and 33 unpinned client-construction sites across the
+crates would silently switch the mesh's HTTP path. Adopting that
+stopgap therefore requires `.use_rustls_tls()` at every site (recipe
+and trade-offs in the branch commit) — the reason it stays an emergency
+path and the primary answer remains serenity 0.13.
+
 Interim guardrail (done this pass): `cargo audit` now gates CI
 (`.github/workflows/ci.yml`, `dependency-audit` job) against every
 advisory EXCEPT the six documented here — `.cargo/audit.toml` ignores
