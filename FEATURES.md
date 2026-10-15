@@ -446,12 +446,17 @@ gotchas surfaced while building the finished parts.
   rendered on the dashboard — producer-pending, like the transport.
   The live gate is passed (2026-10-15):
   `tests/pipeline_remote_drill.rs` drives the whole ladder through the
-  real QUIC transport — two serving nodes with on-disk synthetic
-  stores, wire commitments with pinned attribution, a hung (mute) owner
-  dying at its deadline and ring-rule re-hosted, the honest partial
-  variant, and demand-priced budgets against measured latencies —
-  5/5 repeat runs green. Still pending: real runtime weights (the
-  Colibri-side layer split) and wide-area RTT realism.
+  real QUIC transport — a weight-source node plus two serving nodes that
+  boot with empty stores, wire commitments with pinned attribution, a
+  hung (mute) owner dying at its deadline and ring-rule re-hosted, the
+  honest partial variant, and demand-priced budgets against measured
+  latencies. The hop owners' weights travel: each container is
+  harvested over the wire (chunked `ExpertFetch` + checksummed
+  `put_bytes`) and proven byte-identical, and an empty-store node
+  refuses to fabricate rather than invent activations. 5/5 repeat
+  runs green. Still pending: real model shard contents (the
+  Colibri-side layer split — the served containers stay synthetic
+  inside) and wide-area RTT realism.
   What
   remains is live transport integration (the hop RPC rides
   `remote_expert_attempt` once the Colibri-side layer split provides real

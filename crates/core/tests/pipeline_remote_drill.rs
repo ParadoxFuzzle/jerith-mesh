@@ -5,11 +5,23 @@
 //! with per-hop commitments, ring-rule reassignment, honest partial
 //! answers, measured budgets — driven through the **real QUIC
 //! transport**: signed `NodeRPC ExpertQuery` over cert-pinned wire to
-//! in-process serving nodes holding real on-disk synthetic weights (the
-//! store shape production uses; weights are synthetic because the
-//! Colibri-side layer split is the only piece still pending).
+//! in-process serving nodes (the store shape production uses). The
+//! weights are real-and-traveling too: a source node holds the
+//! containers, the hop owners boot with EMPTY stores and harvest every
+//! expert they serve through the runtime transfer path (chunked
+//! `ExpertFetch` over this same transport + checksummed `put_bytes`
+//! ingest) — so every tensor a hop multiplies arrived on the wire,
+//! byte-identical to its source container. (The containers themselves
+//! are synthetic because the Colibri-side layer split is the only piece
+//! still pending.)
 //!
 //! Pass/fail criteria (any assert firing is a drill failure):
+//!   0. RUNTIME WEIGHT PROVENANCE — the hop owners boot with empty
+//!      stores, honestly REFUSE an expert on the wire rather than
+//!      invent activations, then harvest each hop container through the
+//!      runtime transfer path; every weight the walk multiplies is
+//!      therefore byte-identical to the source container and provably
+//!      arrived through the transport itself.
 //!   1. SUCCESS ROUTE over the wire — the two-hop route completes with
 //!      no degradation, and the final activation equals the
 //!      independently chained reference forward pass bit-comparable
@@ -35,16 +47,18 @@
 //!      hysteresis raise line (a flapping peer doesn't self-exclude at
 //!      the boundary).
 //!
-//! Honest limits: loopback nodes with synthetic store weights — this
-//! drills transport + planner + walker semantics, not runtime model
-//! weights or wide-area latency (Colibri layer split and realistic RTTs
-//! are the integration beyond this gate).
+//! Honest limits: loopback nodes, and the containers are synthetic
+//! until the Colibri-side layer split yields real model shards; wide-area
+//! RTT is not exercised. The `runtime` stand-in stays OFF (`tensors_only
+//! = true`): a hashed text completion is not expert math, so wiring that
+//! path here would fabricate activations instead of moving real weights.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
 use jerith_mesh_core::pipeline::{
     PipelineHop, RouteStability, execute_route_resilient, hop_expert_id, plan_route,
@@ -52,7 +66,7 @@ use jerith_mesh_core::pipeline::{
 };
 use jerith_mesh_core::quic::{
     ExpertServing, NodeRpcReply, NodeRpcRequest, PinMap, SharedPinMap, call,
-    pinned_client_endpoint_dyn, server_endpoint_for, sign_request,
+    fetch_expert, pinned_client_endpoint_dyn, sign_request,
 };
 use jerith_mesh_core::signing::SigningIdentity;
 
@@ -60,31 +74,29 @@ const MODEL: &str = "drill-m";
 const HIDDEN: usize = 8;
 const INTER: usize = 16;
 
-/// Reference forward for one hop, computed locally from the same
-/// deterministic synthetic weights the serving node holds (seeded from
-/// the expert id — the whole mesh derives identical weights for one id).
+/// Reference forward for one hop, computed locally on the drill's
+/// deterministic synthetic containers (the same seed the source node
+/// turned into the containers its hop owners harvested — so a mismatch
+/// means bytes lost in the transport, not a different expert).
 fn run_hop(expert_id: &str, x: &[f32]) -> anyhow::Result<Vec<f32>> {
     ExpertWeights::synthetic(expert_id, HIDDEN, INTER).forward(x)
 }
 
 static DRILL_NODE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// A real serving node: on-disk store seeded with the named synthetic
-/// experts, real QUIC server loop, cert-pinned identity. Lives until the
-/// test process exits (the watch sender is leaked deliberately).
-async fn spin_node(expert_ids: &[String]) -> (String, SocketAddr) {
+/// A real serving node: real QUIC server loop, cert-pinned identity, an
+/// EMPTY weight store — what it hosts is the caller's decision (the
+/// weight source seeds its containers; the hop owners are filled by
+/// harvesting over the wire in the test body). Lives until the test
+/// process exits (the watch sender is leaked deliberately).
+async fn spin_node() -> anyhow::Result<(String, SocketAddr, Arc<ExpertStore>)> {
     let dir = std::env::temp_dir().join(format!(
         "jerith-pipeline-drill-{}-{}",
         std::process::id(),
         DRILL_NODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Arc::new(ExpertStore::new(&dir, 8).expect("drill store"));
-    for id in expert_ids {
-        store
-            .put(&ExpertWeights::synthetic(id, HIDDEN, INTER))
-            .expect("seed expert");
-    }
+    let store = Arc::new(ExpertStore::new(&dir, 8).context("drill store")?);
 
     let identity = SigningIdentity::generate();
     let server =
@@ -93,7 +105,7 @@ async fn spin_node(expert_ids: &[String]) -> (String, SocketAddr) {
     let addr = server.local_addr().unwrap();
     let node_id = identity.node_id();
     let serving = Arc::new(ExpertServing {
-        store: Some(store),
+        store: Some(store.clone()),
         runtime: None,
         tensors_only: true,
         stats: None,
@@ -107,7 +119,7 @@ async fn spin_node(expert_ids: &[String]) -> (String, SocketAddr) {
         });
     }
     std::mem::forget(_kill_tx); // keep the server's kill channel open
-    (node_id, addr)
+    Ok((node_id, addr, store))
 }
 
 /// A mute node: a real QUIC endpoint whose connections are accepted but
@@ -145,18 +157,29 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     // --- The mesh: A hosts layers 0–1, B hosts 2–3 plus the re-host
     // targets (2–2, 3–3) so the dead-hop variants land their
     // reassignment on a healthy node without a second boot; C is mute.
-    let (node_a, addr_a) = spin_node(&[format!("{MODEL}#0-1")]).await;
-    let (node_b, addr_b) = spin_node(&[
+    // S holds every expert container the hop owners will serve — and A
+    // and B boot with EMPTY stores: the weights they multiply arrive
+    // through the transport (criterion 0 below), not a mirrored seed.
+    let (node_s, addr_s, store_s) = spin_node().await?;
+    let experts: Vec<String> = vec![
+        format!("{MODEL}#0-1"),
         format!("{MODEL}#2-3"),
         format!("{MODEL}#2-2"),
         format!("{MODEL}#3-3"),
-    ])
-    .await;
+    ];
+    for id in &experts {
+        store_s
+            .put(&ExpertWeights::synthetic(id, HIDDEN, INTER))
+            .expect("seed source container");
+    }
+    let (node_a, addr_a, store_a) = spin_node().await?;
+    let (node_b, addr_b, store_b) = spin_node().await?;
     let (node_c, addr_c) = spin_mute_node().await;
 
     let mut pin_map: PinMap = HashMap::new();
     pin_map.insert(node_a.clone(), addr_a);
     pin_map.insert(node_b.clone(), addr_b);
+    pin_map.insert(node_s.clone(), addr_s);
     pin_map.insert(node_c.clone(), addr_c);
     let pins: SharedPinMap = Arc::new(tokio::sync::RwLock::new(pin_map.clone()));
     let client = pinned_client_endpoint_dyn(pins).expect("drill client endpoint");
@@ -177,13 +200,12 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     let walker_for_adapter = walker.clone();
     let req_id_for_adapter = walk_req_id.clone();
     let adapter_client = client.clone();
-    let remote_run = move |expert_id: &str,
-                           node: &str,
-                           input: Vec<f32>,
-                           deadline: Duration|
-          -> std::pin::Pin<
+    // The adapter is the live integration's transport shape: a hop call
+    // returns a boxed future carrying (output, server commitment).
+    type RemoteHopper = std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
-    > {
+    >;
+    let remote_run = move |expert_id: &str, node: &str, input: Vec<f32>, deadline: Duration| -> RemoteHopper {
         let client = adapter_client.clone();
         let walker = walker_for_adapter.clone();
         let walk_req = req_id_for_adapter.clone();
@@ -227,6 +249,87 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         })
     };
 
+    // --- Criterion 0: RUNTIME WEIGHT PROVENANCE. The serving nodes
+    // under test boot with empty stores: they first honestly REFUSE an
+    // expert on the wire rather than invent activations, then harvest
+    // every hop container through the runtime transfer path (chunked
+    // ExpertFetch over this same transport, checksummed ingest — the
+    // exact replication path production nodes run). From here on, every
+    // tensor a hop multiplies provably arrived on the wire.
+    let input = vec![0.5_f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
+
+    // Empty-store honesty, on the wire: B does not host 2–3 yet.
+    {
+        let mut req = NodeRpcRequest::ExpertQuery {
+            req_id: "drill-probe-empty".into(),
+            expert_id: format!("{MODEL}#2-3"),
+            input: input.clone(),
+            from_node_id: walk_node_id.clone(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut req, &walker);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            call(&client, addr_b, &node_b, &req, &walker, Duration::from_secs(5)),
+        )
+        .await
+        .expect("refusal probe timeout")
+        .expect("refusal probe rpc failed");
+        match reply {
+            NodeRpcReply::Error { message, .. } => assert!(
+                message.contains("refusing to fabricate"),
+                "empty-store B must refuse, not invent: {message}"
+            ),
+            other => panic!("empty-store B must Error, got {other:?}"),
+        }
+    }
+
+    // The harvest: each hop owner pulls its containers from S and
+    // ingests them byte-checksummed. Prove provenance end-to-end: the
+    // ingested tensors equal the source's exactly, and the expert sits
+    // on disk, load-on-demand (hosted but never resident).
+    let a_targets = [format!("{MODEL}#0-1")];
+    let b_targets = [
+        format!("{MODEL}#2-3"),
+        format!("{MODEL}#2-2"),
+        format!("{MODEL}#3-3"),
+    ];
+    for (owner_id, owner_store, targets) in [
+        (&node_a, &store_a, &a_targets[..]),
+        (&node_b, &store_b, &b_targets[..]),
+    ] {
+        for id in targets {
+            let bytes =
+                fetch_expert(&client, addr_s, &node_s, &walker, id, Duration::from_secs(15))
+                    .await
+                    .with_context(|| format!("harvesting {id} over QUIC"))?;
+            let ingested = owner_store
+                .put_bytes(&bytes)
+                .with_context(|| format!("ingesting harvested {id}"))?;
+            assert_eq!(*id, ingested.id, "container keeps its id through the wire");
+            assert_eq!(
+                ingested,
+                ExpertWeights::synthetic(id, HIDDEN, INTER),
+                "harvested {id} is the tensors the source seeded, byte for byte"
+            );
+            assert!(owner_store.contains(id), "{owner_id} now hosts {id}");
+            assert!(
+                !owner_store.is_resident(id),
+                "{id} sits on disk (load-on-demand), never resident"
+            );
+        }
+    }
+    for id in &experts {
+        let (want, _) = store_s.bytes_of(id, 0, u32::MAX)?;
+        for store in [&store_a, &store_b] {
+            if store.contains(id) {
+                let (got, _) = store.bytes_of(id, 0, u32::MAX)?;
+                assert_eq!(got, want, "{id} mutated across the transport");
+            }
+        }
+    }
+
     // --- Criterion 1 + 5: success route over the wire, priced honestly.
     let ownership: BTreeMap<usize, String> = [
         (0, node_a.clone()),
@@ -259,7 +362,6 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     };
 
     let mut stability = RouteStability::new();
-    let input = vec![0.5_f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
     let result = execute_route_resilient(
         MODEL,
         &walk_req_id,
@@ -305,7 +407,8 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     );
     assert!(result.attempts[0].ms > 0, "wire latency is measured");
 
-    // Serial reference on the same synthetic weights (chained).
+    // Serial reference on the containers now living on the hop owners
+    // (chained hop by hop).
     let r1 = run_hop(&hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![0, 1] }), &input)?;
     let want = run_hop(&hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![2, 3] }), &r1)?;
     assert_eq!(want.len(), result.activation.len());
