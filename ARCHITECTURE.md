@@ -182,12 +182,20 @@ Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
   layers merged into hops (`None` = local run); the layer-aware dispatch
   planner delegates to it, drops the wrong `has_expert` gate (a layer owner
   is not an expert host), and an all-local mesh plans as a single hop.
-- **M1 — hop execution over the existing activation contract.** Residual
-  vectors walk the route hop-by-hop on the QUIC expert connection shape
-  (same f32-vector wire contract, commitments recomputed per hop so a
-  tampering hop is caught downstream), with per-hop timeouts derived from
-  RTT. A layer-run executor stub first, real runtime weights when the
-  Colibri-side layer split lands.
+- **M1 ✅ — hop execution over the existing activation contract.**
+  `pipeline::execute_route` walks `plan_route`'s hops carrying the
+  residual stream: each hop's output becomes the next hop's input, local
+  slice = local executor, remote slice = the same signed expert RPC with
+  a per-hop deadline (dispatch base + 3× the owner's measured RTT). On
+  the anti-tamper side, each hop's commitment is recomputed locally
+  against a *per-hop* expert id (`{model}#{first}-{last}`), so a
+  tampering hop is caught downstream exactly like a single-expert reply
+  (PR-composed, not replaced). Failures are typed `RouteError` (hop
+  index, owner, layers, reason, hops-completed) — no silent layer skips;
+  M2 turns the abort into ring-rule reassignment. The hop executor is
+  weights-agnostic: tests use the synthetic expert weights; real runtime
+  layer splits arrive with the Colibri-side work, and live QUIC wiring
+  (`remote_expert_attempt` as the hop transport) rides along with it.
 - **M2 — degradation + hysteresis.** A skipped/dead hop only reassigns the
   layers the departed node owned (the ring's own rule), never the whole
   route; flapping owners get the freerider-style hysteresis instead of
