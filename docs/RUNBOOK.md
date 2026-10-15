@@ -707,8 +707,15 @@ intent. The hazard to re-check whenever a new dependency arrives: does
 it (or its default features) enable `reqwest/native-tls`,
 `tokio-tungstenite/native-tls`, or a second rustls crypto provider?
 
-Run `cargo audit` before releases; it is not wired into CI yet — a
-deliberate Phase 4/5 ops item. Current state after this pass:
+`cargo audit` runs itself now — no manual pre-release run to remember.
+It is wired into CI twice: on every push/PR
+(`ci.yml` → `dependency-audit`, advisory tripwire so a new RUSTSEC
+advisory surfaces the moment it lands) and as a blocking gate on the
+release workflow (`release.yml` → `dependency-audit`, which must pass
+before any tag builds or ships binaries — evaluated at the moment of
+the release cut, not at the moment of the last push that may be weeks
+older). The accepted serenity-websocket advisories remain the only
+exceptions, via `.cargo/audit.toml`. Current state after this pass:
 
 - **Pipeline live drill (Phase 3 gate, 2026-10-15):**
   `cargo test -p jerith-mesh-core --test pipeline_remote_drill` spins a

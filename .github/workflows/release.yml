@@ -21,7 +21,26 @@ permissions:
   contents: write
 
 jobs:
+  dependency-audit:
+    # Pre-release advisory gate: no tag builds or ships binaries until
+    # the workspace audit is clean. Same policy as ci.yml's push-time
+    # dependency-audit job (the six accepted serenity-websocket
+    # advisories in .cargo/audit.toml are the only exceptions), but
+    # evaluated NOW — the moment of the release cut, not the moment of
+    # the last push that may be weeks older. The manual pre-release
+    # audit reminder this replaces was the long tail of that gap.
+    name: cargo audit (pre-release advisory gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit the dependency graph before anything ships
+        run: cargo audit
+
   binaries:
+    needs: dependency-audit
     name: build ${{ matrix.artifact }}
     strategy:
       fail-fast: false
