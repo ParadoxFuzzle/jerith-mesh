@@ -18,6 +18,43 @@ jobs:
       - name: Run the full workspace test suite
         run: cargo test --workspace
 
+  clippy-all-targets:
+    # Lint gate: every binary, lib, and test target must build clean
+    # under warning-as-error clippy (--all-targets). Driven clean
+    # 2026-10-15 — keep it that way. One OS suffices: the lints this
+    # workspace trips are platform-independent; OS-specific behavior is
+    # what the test matrix above already covers on both runners.
+    name: cargo clippy --all-targets -- -D warnings (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint the whole workspace, warning-as-error
+        run: cargo clippy --all-targets -- -D warnings
+
+  pipeline-drill:
+    # The live gate (RUNBOOK → "Pipeline live drill"), on every push:
+    # one in-process drill spins real stores + real QUIC and runs the
+    # whole M0–M3 ladder — weight provenance (dead nodes must refuse,
+    # harvest is checksummed and byte-identical, forged replicas rejected
+    # at the ingest), wire commitments with pinned attribution, a mute
+    # owner dying at its deadline and ring-rule re-hosted, honest
+    # partials, and RTT-floored demand-priced budgets. Around a second
+    # of runtime; keep it parallel with the suites (no needs).
+    name: pipeline live drill (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the two-node live drill
+        run: cargo test -p jerith-mesh-core --test pipeline_remote_drill
+
   tests-macos:
     # macOS parity for the test suite (first-install operators on Apple
     # hardware rely on the same code paths: rusqlite bundled, quinn, sysinfo

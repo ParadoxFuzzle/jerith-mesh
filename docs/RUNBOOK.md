@@ -721,9 +721,12 @@ deliberate Phase 4/5 ops item. Current state after this pass:
   owner dying at its deadline and ring-rule re-hosted, honest
   partials, priced budgets — including a simulated wide-area hop
   (180 ms `rtt_of`) whose budget is floored on `base + 3×RTT`. Pass
-  runs in under a second; repeated green 5/5. Run it before any
-  release that touches the pipeline, transport, stores, or budget
-  pricing, and after any replica/ingest-path change.
+  runs in under a second; repeated green 5/5. The drill AND the full
+  clippy `--all-targets -D warnings` gate both run in CI on every push
+  (`.github/workflows/ci.yml`, jobs `pipeline-drill` and
+  `clippy-all-targets`), so branch work lands on them pre-merged; the
+  manual run still matters locally before touching the pipeline,
+  transport, stores, or budget pricing.
 - **Fixed:** `rustls 0.23.45 → 0.23.46` (targeted `cargo update
   --precise`). Clears four advisories on the core QUIC/reqwest serving
   path — most importantly RUSTSEC-2026-0346 (medium), where `Debug`
