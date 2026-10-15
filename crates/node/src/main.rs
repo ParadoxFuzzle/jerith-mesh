@@ -69,6 +69,14 @@ enum Cmd {
         /// Skip the live peer-count fetch during model listing.
         #[arg(long, default_value_t = false)]
         no_wait: bool,
+        /// Disable the local vision specialist (MiniCPM-V; enabled by
+        /// default — the interactive prompt's default as well).
+        #[arg(long, default_value_t = false)]
+        no_vision: bool,
+        /// Disable the local embedding specialist (nomic text vectors;
+        /// enabled by default — the interactive prompt's default as well).
+        #[arg(long, default_value_t = false)]
+        no_embeddings: bool,
     },
     /// Run the node until Ctrl+C.
     Run {
@@ -296,6 +304,8 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
             crypto,
             bootstrap,
             no_wait,
+            no_vision,
+            no_embeddings,
         } => setup_flow(
             model,
             memory,
@@ -305,6 +315,8 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
             crypto,
             bootstrap,
             no_wait,
+            no_vision,
+            no_embeddings,
         ),
         Cmd::Run { model } => run_node(model).await,
         Cmd::Bootstrap { port, ttl_ms } => {
@@ -1147,6 +1159,8 @@ fn setup_flow(
     crypto: Option<String>,
     bootstrap: Option<String>,
     no_wait: bool,
+    no_vision: bool,
+    no_embeddings: bool,
 ) -> anyhow::Result<()> {
     println!("🦜 jerith-mesh setup");
     println!("───────────────────");
@@ -1298,6 +1312,42 @@ fn setup_flow(
     }
     println!("[3/5] Memory: {} (strictly local)", memory_backend.label());
 
+    // 3b. Local specialists — the config defaults are both-on, so the
+    // prompts mirror that and the flags override without a question.
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    let vision_enabled = if no_vision {
+        false
+    } else if interactive {
+        matches!(
+            prompt(
+                "\nEnable the local vision specialist? (y/n)",
+                "y"
+            )?
+            .to_lowercase()
+            .as_str(),
+            "y" | "yes"
+        )
+    } else {
+        true
+    };
+    let embeddings_enabled = if no_embeddings {
+        false
+    } else if interactive {
+        matches!(
+            prompt("\nEnable the local embedding specialist? (y/n)", "y")?
+                .to_lowercase()
+                .as_str(),
+            "y" | "yes"
+        )
+    } else {
+        true
+    };
+    println!(
+        "[3/5b] Local skills: vision {}, embeddings {} (excluded from the contribution accounting)",
+        on_off(vision_enabled),
+        on_off(embeddings_enabled)
+    );
+
     // 4. Contribution % — min 25 hard-coded by spec.
     let contribution_pct = match contribution {
         Some(c) => c,
@@ -1342,7 +1392,11 @@ fn setup_flow(
         contribution_percent: contribution_pct,
         role,
         crypto,
-        specialists: Default::default(),
+        specialists: jerith_mesh_core::config::SpecialistConfig {
+            vision_enabled,
+            embeddings_enabled,
+            ..Default::default()
+        },
         bootstrap_url: bootstrap,
         gateway_port: NodeConfig::default().gateway_port,
         runtime_url: None,

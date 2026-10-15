@@ -314,10 +314,10 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
 
 ## 11. Setup & Onboarding
 - ✅ Guided flow: hardware scan → model (with live peer counts, overridable) → memory
-  backend (with the DSN prompt when postgres is chosen) → contribution % (≥25) → chain
-  choice. Local vision/embeddings ship enabled by default and are set via config.toml
-  (`[specialists]`); prompting for them inside setup is a known gap queued for Phase 3
-  (§13)
+  backend (with the DSN prompt when postgres is chosen) → local specialists (interactive
+  y/n prompts for vision + embeddings; `--no-vision` / `--no-embeddings` for scripted
+  setups — defaults both-on, identical to config.toml's `[specialists]` defaults) →
+  contribution % (≥25) → chain choice
 - ✅ Capability check with clear warnings before selecting a too-large model (`--ok-beyond-capacity` to override)
 - ✅ “Recommended meshes for your hardware” suggestion (Phase 1) — `suggest.rs`:
   the setup flow joins the hardware-capable model list (`detect_capable_models`)
@@ -452,9 +452,6 @@ gotchas surfaced while building the finished parts.
   copy already exists: the bot crate's SkillSpec registry + signed webhook
   hooks are the SDK; an adapter only plugs a different transport in front
   of the same loop.
-- **Setup prompts for the local specialists** (the audit gap): interactive
-  enable/disable for vision/embeddings (with persistence) + non-interactive
-  flags, mirroring the memory-backend treatment.
 - **Model-switch hot path (§2's model switching)**. Config hot-reload
   deliberately leaves `[model]` cold (echo: model switching is mesh
   re-identity work — disconnect then rejoin); the remaining piece is the

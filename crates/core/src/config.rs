@@ -967,6 +967,24 @@ mod tests {
     }
 
     #[test]
+    fn setup_specialist_toggles_carry_through_into_config() {
+        // Defaults: both specialists on (what the interactive prompt's
+        // default and the absent flags both mean).
+        let cfg = sample_choices().into_config(None).unwrap();
+        assert!(cfg.specialists.vision_enabled);
+        assert!(cfg.specialists.embeddings_enabled);
+
+        // The setup prompt/flag writes the toggles — and what setup
+        // persists is what the run path honors.
+        let mut choices = sample_choices();
+        choices.specialists.vision_enabled = false;
+        choices.specialists.embeddings_enabled = false;
+        let cfg = choices.into_config(None).unwrap();
+        assert!(!cfg.specialists.vision_enabled);
+        assert!(!cfg.specialists.embeddings_enabled);
+    }
+
+    #[test]
     fn default_config_passes_min_contribution() {
         assert_eq!(
             NodeConfig::default().contribution_percent,
