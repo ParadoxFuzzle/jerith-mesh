@@ -154,9 +154,18 @@ impl DiscoveryServers {
         changed
     }
 
+    /// Clear the last-good pin (no persist at this call site — the next
+    /// re-pinning writes it back). Hostile-ad audit (F2) support: an
+    /// answered-but-empty peer list does not earn stickiness.
+    pub fn clear_last_good(&mut self) {
+        self.last_good = None;
+    }
+
     /// Merge a batch of learned URLs (from one ad batch). Returns true if
     /// the learned set grew (persist signal). Gossip adds are NEVER
-    /// auto-promoted to plain http — see the module docs.
+    /// auto-promoted to plain http — see the module docs. Full learned
+    /// slots evict FIFO (oldest first, last-good exempt) instead of
+    /// wedging shut under a hostile ad flood (audit F1).
     pub fn merge_learned(&mut self, incoming: &[String]) -> bool {
         let mut grew = false;
         for url in sanitize(incoming, None) {
@@ -169,7 +178,23 @@ impl DiscoveryServers {
                 continue;
             }
             if self.configured.len() + self.learned.len() >= ROTATION_CAP {
-                break;
+                // Hostile-ad audit (F1): without eviction, hostile signed ads
+                // could PERMANENTLY fill every learned slot — the node stops
+                // learning real bootstraps and keeps dialing the attacker's
+                // list forever. Fair FIFO: the oldest learned entry makes
+                // room for a fresh one; a pinned last-good is never evicted
+                // (stickiness beats pedantry), configured entries are
+                // principal and out of reach entirely.
+                let evict_idx = self
+                    .learned
+                    .iter()
+                    .position(|s| self.last_good.as_deref() != Some(s.as_str()));
+                match evict_idx {
+                    Some(i) => {
+                        self.learned.remove(i);
+                    }
+                    None => break, // cap genuinely full of pinned entries
+                }
             }
             self.learned.push(url);
             grew = true;
@@ -354,6 +379,55 @@ mod tests {
             .map(|i| format!("https://s{i}.example.org"))
             .collect();
         assert_eq!(sanitize(&many, None).len(), ROTATION_CAP);
+    }
+
+    /// Audit F1: a full learned list evicts FIFO so hostile ads cannot
+    /// wedge learning shut; the pinned last-good is exempt from eviction.
+    #[test]
+    fn learned_slots_evict_fifo_and_never_evict_last_good() {
+        let mut d = DiscoveryServers::default();
+        d.configured = sanitize(&["https://primary.example.org".into()], None);
+
+        // Fill every non-configured slot (cap 16) flush: the flood is
+        // one short of the cap so no eviction happens during this merge.
+        let flood: Vec<String> = (0..ROTATION_CAP - d.configured.len())
+            .map(|i| format!("https://hostile-{i}.example.org"))
+            .collect();
+        assert!(d.merge_learned(&flood));
+        assert_eq!(
+            d.learned.len(),
+            ROTATION_CAP - d.configured.len(),
+            "slots stop at the rotation cap"
+        );
+        assert_eq!(d.learned[0], "https://hostile-0.example.org");
+
+        // A fresh legitimate bootstrap still lands (FIFO eviction).
+        assert!(d.merge_learned(&["https://legit.example.org".into()]));
+        assert_eq!(d.learned.last().unwrap(), "https://legit.example.org");
+        assert!(!d.learned.iter().any(|s| s == "https://hostile-0.example.org"));
+        assert_eq!(d.learned.len(), ROTATION_CAP - d.configured.len());
+
+        // Pinned last-good survives even as the rotation turns over.
+        d.note_good("https://hostile-3.example.org");
+        assert!(d.merge_learned(&["https://legit-2.example.org".into()]));
+        assert!(
+            d.learned.iter().any(|s| s == "https://hostile-3.example.org"),
+            "pinned entry is never evicted"
+        );
+    }
+
+    /// Audit F2 support: clearing the pin re-diversifies the order.
+    #[test]
+    fn clear_last_good_rediversifies_order() {
+        let mut d = DiscoveryServers::default();
+        d.configured = sanitize(
+            &["https://primary.example.org".into(), "https://backup.example.org".into()],
+            None,
+        );
+        d.note_good("https://backup.example.org");
+        assert_eq!(d.order(None)[0], "https://backup.example.org");
+        d.clear_last_good();
+        assert_eq!(d.order(None)[0], "https://primary.example.org");
     }
 
     #[test]

@@ -247,6 +247,31 @@ servers = ["https://backup-1.example.org", "https://backup-2.example.org"]
   ads from peers — a hostile ad can't repoint the fleet at a capture
   proxy. Cap: the first 16 valid https entries win; the rest are dropped.
 
+Hostile-ads audit (2026-10-15) — what a malicious peer CAN and CANNOT do
+through its signed ad's `discovery_servers`:
+
+- **URL injection: no.** Only `http(s)://host[:port][/path]` origins pass
+  validation (no userinfo `@`, no `?`/`#`, no whitespace) — the
+  `{url}/v1/peers…` join cannot be spliced (unit-tested).
+- **Plain-http multiplication: no.** `http://` never auto-learns; a
+  hostile ad can't flood the fleet with its capture proxy. And learned
+  https hosts go through normal cert validation — no bypass.
+- **Slot exhaustion: contained.** Learned slots are capped at 16
+  (configured entries protected first). Since the audit, a full learned
+  list evicts FIFO (oldest first, pinned last-good exempt) instead of
+  wedging shut — a flood can slow learning, never stop it permanently.
+- **Stickiness capture: contained.** A hostile learned server that
+  answers with a valid-but-EMPTY peer list does not keep the hoisted
+  last-good slot (`clear_last_good` on empty) — a lying bootstrap can't
+  privatize discovery's view of the mesh.
+- **Signed-header forwarding: accepted.** Learned hosts receive the same
+  signed fetch headers the primary does (signature covers only the fetch
+  payload); no new capability, just exposure by design.
+- **Availability (not security):** per-call failover is serial — each
+  dead server costs up to 10 s per tick; survives, but a large hostile
+  list in the rotation can stretch a tick. Delete
+  `<data>/discovery-servers.json` to flush learned entries.
+
 ## Main-node runtime (LiteLLM) notes
 
 The main node's runtime is the local LiteLLM proxy (`127.0.0.1:8000`,

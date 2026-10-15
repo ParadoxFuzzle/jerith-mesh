@@ -785,7 +785,19 @@ async fn run_loop(
             .await;
             match fetched_leg {
                 Ok((peers, used)) => {
-                    state.discovery.lock().await.note_good(&used);
+                    {
+                        let mut d = state.discovery.lock().await;
+                        // Hostile-ad audit (F2): "answered" alone does not
+                        // earn stickiness. A lying bootstrap can hoard the
+                        // top slot with valid-but-EMPTY responses and starve
+                        // discovery's peer view; an empty result clears the
+                        // pin so the next tick diversifies from config order.
+                        if peers.is_empty() {
+                            d.clear_last_good();
+                        } else {
+                            d.note_good(&used);
+                        }
+                    }
                     let mut reg = state.registry.lock().await;
                     let fetched = peers.len();
                     for ad in peers {
