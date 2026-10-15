@@ -139,6 +139,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// The receiver's exact verification: HMAC-SHA256 over `"{ts}.{body}"`.
 /// Used in tests to prove signatures recompute from (ts, body, secret).
+#[cfg(test)]
 pub fn verify_signature(ts_ms: u64, body: &str, secret: &str, sig_hex: &str) -> bool {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts any key length");

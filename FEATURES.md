@@ -84,7 +84,23 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ Minimum **25 %** resource contribution required to be eligible to connect; user-configurable upward
 - ✅ Contribution changeable at any time (hot reload via `jerith config set contribution_percent N`)
 - ✅ Model switching cleanly disconnects from all current peers, then joins the new mesh
-- 📋 Real-time contribution measurement and cryptographic verification (Phase 4)
+- ✅ Real-time contribution measurement and cryptographic verification
+  (Phase 4): every ping tick diffs the cumulative serve/consume meters
+  into an interval share (idle = absence, not 0 %), EWMA-smooths it
+  (α=0.5), and drives the contribution-health gate from the *measured*
+  ratio against the *declared* one (Requesters never gate; two dry
+  intervals in a row drop below a 25 % floor). The last completed
+  interval is signed as a `measurement` block inside the health reply
+  (`crates/core/src/contrib.rs` + `signing::measurement_payload`) —
+  same identity, pinger recomputes it field-for-field, so a node owns
+  every number it publishes. Pingers tally verified verdicts per peer:
+  two tampered blocks or three consecutive verified shortfalls (measured
+  < half the declared, ≥25 % floor) queue signed `Leeching` evidence —
+  statistics never slash; `/status.contribution` shows declared vs
+  measured side by side. 10 dedicated tests incl. the crypto roundtrip.
+  (MVP scope: this measurement is the node's own statement, signed and
+  locally verified — a coordinator-side quorum over multiple pingers'
+  tallies stays with the Phase 4–5 reputation work.)
 
 ## 3. Connectivity & Discovery
 - ✅ Bootstrap + DHT hybrid discovery (Phase 0: single bootstrap file + HTTP peer list)

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState, now_ms};
-use crate::config::{NodeConfig, NodeRole};
+use crate::config::NodeConfig;
 
 /// Shared Phase 4 verification tracker: counters + pending fraud evidence.
 pub type SharedVerifyTracker = std::sync::Arc<crate::verify::VerificationTracker>;
@@ -57,6 +57,15 @@ pub struct MeshState {
     pub identity: crate::signing::SigningIdentity,
     /// Set when the contribution ratio dips below the minimum (rolling).
     pub contribution_healthy: watch::Sender<bool>,
+    /// Real-time contribution measurement (FEATURES §2): the node's own
+    /// rolling measured serve share — per-tick diff of the cumulative
+    /// meters, EWMA-smoothed, and signed into health replies.
+    pub contrib: std::sync::Arc<tokio::sync::Mutex<crate::contrib::ContributionMeter>>,
+    /// Per-peer verdicts over peers' SIGNED measurement blocks (the
+    /// verification half): tampered blocks and demonstrated declared-vs-
+    /// measured shortfalls queue Leeching evidence on the tick cadence.
+    pub contrib_ledger:
+        std::sync::Arc<tokio::sync::Mutex<crate::contrib::PeerContribLedger>>,
     pub started_at: std::time::Instant,
     /// What THIS node can offer right now — refreshed at ping cadence
     /// (see hw::sample) and shipped inside our advertise (resource
@@ -120,6 +129,12 @@ impl MeshState {
             meters: Mutex::new(Meters::default()),
             identity,
             contribution_healthy: tx,
+            contrib: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::contrib::ContributionMeter::default(),
+            )),
+            contrib_ledger: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::contrib::PeerContribLedger::default(),
+            )),
             started_at: std::time::Instant::now(),
             resources: Mutex::new(None),
             verify: crate::verify::VerificationTracker::shared(),
@@ -994,15 +1009,27 @@ async fn run_loop(
             }
         }
 
-        // Uptime metering on every tick.
+        // Uptime metering + real-time contribution measurement on every
+        // tick (FEATURES §2): the meters are cumulative, so the tick diffs
+        // them into an interval share (idle = absence, not 0 %), and the
+        // gate now reads the MEASURED share against the DECLARED minimum
+        // — claim-aside, the old rule was a token instead of a truth.
         {
-            let mut meters = state.meters.lock().await;
-            meters.uptime_seconds += ping_interval.as_secs();
-            // Node contributes if it has served anything, or is a pure
-            // Requester consuming modestly.
-            let healthy = meters.tokens_served > 0
-                || meters.expert_activations > 0
-                || state.config.read().await.role == NodeRole::Requester;
+            let (total_served, total_consumed, role, declared) = {
+                let mut meters = state.meters.lock().await;
+                meters.uptime_seconds += ping_interval.as_secs();
+                let cfg = state.config.read().await;
+                (
+                    meters.tokens_served,
+                    meters.tokens_consumed,
+                    cfg.role,
+                    cfg.contribution_percent,
+                )
+            };
+            let mut contrib = state.contrib.lock().await;
+            contrib.observe_totals(total_served, total_consumed, ping_interval.as_secs());
+            let healthy = contrib.healthy_for(role, declared);
+            drop(contrib);
             let _ = state.contribution_healthy.send(healthy);
         }
 
@@ -1064,10 +1091,38 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             Ok(resp) if resp.status().is_success() => {
                 // Verify the signed health reply attributes it to the peer.
                 let rtt = started.elapsed().as_millis() as u64;
-                let ok = verify_health_reply(&state, &node_id, resp).await;
+                let (ok, meas) = verify_health_reply(&state, &node_id, resp).await;
                 if ok {
                     let mut reg = state.registry.lock().await;
                     reg.record_ping_ok(&node_id, rtt);
+                    drop(reg);
+                    // FEATURES §2: tally the peer's signed measurement
+                    // verdicts — tampered blocks and demonstrated
+                    // declared-vs-measured shortfalls queue Leeching
+                    // evidence through the same flush cadence as every
+                    // other fraud layer (verified here locally, signed by
+                    // the peer's own key, so the bootstrap can weigh it).
+                    let targets = match meas {
+                        Some(Ok((declared, measured))) => {
+                            state
+                                .contrib_ledger
+                                .lock()
+                                .await
+                                .record_verified(&node_id, declared, measured)
+                        }
+                        Some(Err(())) => {
+                            state.contrib_ledger.lock().await.record_tampered(&node_id)
+                        }
+                        None => Vec::new(),
+                    };
+                    if !targets.is_empty() {
+                        let refs: Vec<&str> =
+                            targets.iter().map(|s| s.as_str()).collect();
+                        state
+                            .verify
+                            .flag_fraud(crate::bootstrap_server::FraudKind::Leeching, &refs)
+                            .await;
+                    }
                 } else {
                     tracing::warn!(peer = %node_id, "health reply signature invalid — not counted alive");
                     failed.push(node_id);
@@ -1264,11 +1319,27 @@ async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
 /// Body must include node_id, pubkey, stamp, sig, uptime_seconds,
 /// contribution_percent — signature over the canonical health payload,
 /// made by a key whose fingerprint equals the claimed node_id.
+///
+/// FEATURES §2: when the reply carries a signed `measurement` block its
+/// signature is re-verified the same way; invalid → tampered (evidence
+/// path), absent → plain liveness only. Returns whether the peer counts
+/// as alive, plus the verified (declared, measured) sample or a tamper
+/// marker. The verification-phase check of the payload signature uses the
+/// very identity whose key signed the whole reply.
 async fn verify_health_reply(
     _state: &Arc<MeshState>,
     expected_node_id: &str,
     resp: reqwest::Response,
-) -> bool {
+) -> (bool, Option<Result<(u64, u64), ()>>) {
+    #[derive(serde::Deserialize)]
+    struct MeasurementBlock {
+        window_secs: u64,
+        tokens_served: u64,
+        tokens_consumed: u64,
+        declared_percent: u64,
+        measured_percent: u64,
+        sig: String,
+    }
     #[derive(serde::Deserialize)]
     struct HealthReply {
         node_id: String,
@@ -1277,16 +1348,18 @@ async fn verify_health_reply(
         sig: String,
         uptime_seconds: u64,
         contribution_percent: u64,
+        #[serde(default)]
+        measurement: Option<MeasurementBlock>,
     }
     let Ok(reply) = resp.json::<HealthReply>().await else {
-        return false;
+        return (false, None);
     };
     if reply.node_id != expected_node_id {
-        return false;
+        return (false, None);
     }
     // The pubkey fingerprint must match the claimed identity.
     if reply.pubkey.len() != 64 || &reply.pubkey[..16] != reply.node_id {
-        return false;
+        return (false, None);
     }
     let payload = crate::signing::health_payload(
         &reply.node_id,
@@ -1294,8 +1367,31 @@ async fn verify_health_reply(
         reply.uptime_seconds,
         reply.contribution_percent,
     );
-    crate::signing::verify(&reply.pubkey, payload.as_bytes(), &reply.sig)
-        && now_ms().saturating_sub(reply.stamp_ms) <= crate::signing::STAMP_MAX_AGE_MS
+    let alive = crate::signing::verify(&reply.pubkey, payload.as_bytes(), &reply.sig)
+        && now_ms().saturating_sub(reply.stamp_ms) <= crate::signing::STAMP_MAX_AGE_MS;
+    let measurement = reply.measurement.map(|m| {
+        if m.declared_percent != reply.contribution_percent {
+            // A block declaring a different floor than the reply itself is
+            // internally inconsistent — treat as tampered.
+            return Err(());
+        }
+        let payload = crate::signing::measurement_payload(
+            &reply.node_id,
+            reply.stamp_ms,
+            m.window_secs,
+            m.tokens_served,
+            m.tokens_consumed,
+            m.declared_percent,
+            m.measured_percent,
+        );
+        if crate::signing::verify(&reply.pubkey, payload.as_bytes(), &m.sig) {
+            let _ = m.window_secs;
+            Ok((m.declared_percent, m.measured_percent))
+        } else {
+            Err(())
+        }
+    });
+    (alive, measurement)
 }
 
 /// Statistics about the most recent ping cycle, surfaced to the web UI.

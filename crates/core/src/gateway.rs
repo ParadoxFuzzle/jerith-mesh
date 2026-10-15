@@ -581,6 +581,33 @@ async fn health(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
     let sig = gw.state.identity.sign(payload.as_bytes());
     let pubkey = gw.state.identity.pubkey_hex();
 
+    // Real-time measured contribution (FEATURES §2): the last COMPLETED
+    // ping interval, signed with the SAME identity + stamp as the reply —
+    // the pinger recomputes both signatures field-for-field, so a node
+    // owns every number it publishes and cannot edit them in flight.
+    let measurement = {
+        let contrib = gw.state.contrib.lock().await;
+        contrib.measurement_point().and_then(|(interval, measured)| {
+            let payload = crate::signing::measurement_payload(
+                &cfg.node_id,
+                stamp,
+                interval.window_secs,
+                interval.tokens_served,
+                interval.tokens_consumed,
+                cfg.contribution_percent,
+                measured,
+            );
+            Some(json!({
+                "window_secs": interval.window_secs,
+                "tokens_served": interval.tokens_served,
+                "tokens_consumed": interval.tokens_consumed,
+                "declared_percent": cfg.contribution_percent,
+                "measured_percent": measured,
+                "sig": gw.state.identity.sign(payload.as_bytes()),
+            }))
+        })
+    };
+
     Json(json!({
         "ok": true,
         "node_id": cfg.node_id,
@@ -594,6 +621,7 @@ async fn health(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
         "tokens_served": meters.tokens_served,
         "expert_activations": meters.expert_activations,
         "bytes_relayed": meters.bytes_relayed,
+        "measurement": measurement,
     }))
     .into_response()
 }
@@ -764,6 +792,25 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             "ad_servers": d.ad_servers(None),
         })
     };
+    // Real-time contribution measurement (FEATURES §2): declared vs
+    // MEASURED serve share side by side, plus the gate verdict the watch
+    // signal carries. The signed per-interval numbers ride /health for
+    // peers to verify; this section is the operator's view.
+    let contribution_value = {
+        let contrib = gw.state.contrib.lock().await;
+        let mut v = json!({
+            "declared_percent": cfg.contribution_percent,
+            "healthy": *gw.state.contribution_healthy.borrow(),
+        });
+        if let Some(obj) = v.as_object_mut() {
+            if let Value::Object(measured) = contrib.status_json() {
+                for (k, val) in measured {
+                    obj.insert(k, val);
+                }
+            }
+        }
+        v
+    };
     // Statistical freerider detection (Phase 4): running coordinator-side
     // suspicion (decayed scores, evidence flags) — statistics, not verdicts;
     // the bootstrap weighs what we queue. Null when the phase is off.
@@ -779,6 +826,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "model": cfg.model.as_ref().map(|m| m.id.clone()),
         "quant": cfg.model.as_ref().map(|m| m.quant.clone()),
         "contribution_percent": cfg.contribution_percent,
+        // Real-time contribution (FEATURES §2): measured share + gate.
+        "contribution": contribution_value,
         "peer_count": reg.len(),
         "peers_alive": alive,
         "meters": {

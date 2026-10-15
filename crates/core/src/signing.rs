@@ -103,6 +103,27 @@ pub fn health_payload(
     format!("{HEALTH_PREFIX}|{stamp_ms}|{node_id}|{uptime_seconds}|{contribution_percent}")
 }
 
+/// Canonical signed-contribution-measurement payload (FEATURES §2): the
+/// last completed ping interval's serve/consume meters, signed separately
+/// from the health reply so old verifiers stay byte-compatible and a peer
+/// OWNS every number it publishes. Same identity that signs the health
+/// reply; the pinger recomputes it field-for-field.
+pub const MEASUREMENT_PREFIX: &str = "health-meas1";
+
+pub fn measurement_payload(
+    node_id: &str,
+    stamp_ms: u64,
+    window_secs: u64,
+    tokens_served: u64,
+    tokens_consumed: u64,
+    declared_percent: u64,
+    measured_percent: u64,
+) -> String {
+    format!(
+        "{MEASUREMENT_PREFIX}|{stamp_ms}|{node_id}|{window_secs}|{tokens_served}|{tokens_consumed}|{declared_percent}|{measured_percent}"
+    )
+}
+
 /// Transitional: the canonical payload exactly as it existed before
 /// `rpc_address` was appended. Server-side only, for rolling upgrades.
 pub fn legacy_ad_excerpt(ad: &PeerAd, stamp_ms: u64) -> String {
@@ -367,6 +388,11 @@ mod tests {
         let p = ping_payload("x", "y", stamp);
         assert!(p.starts_with(PING_PREFIX));
         let h = health_payload("x", stamp, 10, 25);
+        // Measurement payload roundtrip (FEATURES §2; full crypto roundtrip
+        // lives in contrib.rs where it belongs logically).
+        let m = measurement_payload("x", stamp, 60, 400, 100, 25, 80);
+        assert!(m.starts_with(MEASUREMENT_PREFIX));
+        assert!(m.contains("|400|100|25|80"));
         assert!(h.starts_with(HEALTH_PREFIX));
         let _ = id;
     }
