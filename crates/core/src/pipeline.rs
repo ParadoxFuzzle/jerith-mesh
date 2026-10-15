@@ -88,11 +88,7 @@ pub fn hop_expert_id(model_id: &str, hop: &PipelineHop) -> String {
 /// (round-trip plus the run plus generous jitter headroom — the same
 /// conservative multiplier the mesh uses for one-expert dispatch).
 pub fn hop_timeout(base: Duration, rtt_ms: u64) -> Duration {
-    let extra = rtt_ms
-        .saturating_mul(3)
-        .saturating_mul(1_000_000)
-        .try_into()
-        .unwrap_or(u64::MAX);
+    let extra = rtt_ms.saturating_mul(3).saturating_mul(1_000_000);
     base.saturating_add(Duration::from_nanos(extra))
 }
 
@@ -125,6 +121,9 @@ impl std::error::Error for RouteError {}
 /// under its RTT-derived deadline, plus the Phase 4 commitment recomputed
 /// against the hop's own expert id (a tampering hop reads exactly like a
 /// single-expert commitment mismatch).
+// Parameter list mirrors the single-expert dispatch contract: two identity
+// strings, the closures, and the clock inputs travel together.
+#[allow(clippy::too_many_arguments)]
 async fn attempt_one_hop(
     model_id: &str,
     req_id: &str,
@@ -192,6 +191,7 @@ async fn attempt_one_hop(
 /// - Any failure aborts the route with a typed [`RouteError`] — no silent
 ///   skipping. The degradation lives in
 ///   [`execute_route_resilient`], which reassigns and walks on instead.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_route(
     model_id: &str,
     req_id: &str,
@@ -343,6 +343,7 @@ impl RouteStability {
 ///   and typed into [`RouteResult::degraded`] — the router walks on and the
 ///   caller receives the residual as far as the chain carried it, with the
 ///   lost layers named.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_route_resilient(
     model_id: &str,
     req_id: &str,
