@@ -701,13 +701,21 @@ Three paths, in preference order:
    bump is a day's work when it lands: keep the bot's serenity/poise
    API surface concentrated in `crates/bot/src/{main,commands,api}.rs`
    (already true); do NOT reach into serenity internals from other
-   files. When 0.13 ships: bump `serenity` + `poise` + `tokio-tungstenite`
-   together, fix CompileError-level API breaks (framework builder,
-   context/gateway plumbing, `EditMessage` builder changes), then
-   `cargo tree -i rustls` MUST report only the 0.23 line and
-   `cargo audit` must come back clean — that is the exit criterion,
-   after which the six `ignore` entries in `.cargo/audit.toml`
-   are deleted (their comments say exactly that).
+   files. Upstream snapshot (checked 2026-10-15, no committed date):
+   serenity has NO 0.13 milestone and no milestone carries a due date,
+   and the 0.12 cadence shows majors shipping whenever ready (0.12.0
+   2023-11 → 0.12.4 2024-11 → 0.12.5 2025-12). The concrete thing to
+   watch instead is **serenity PR #3599** (open, 2026-08-24):
+   tokio-tungstenite 0.21 → 0.23.1 — if merged into a serenity
+   release, the websocket stack lands on rustls 0.23 even without a
+   0.13, and this milestone's exit criterion below can be met on a
+   serenity patch-line bump. When the day comes: bump `serenity` +
+   `poise` + `tokio-tungstenite` together, fix CompileError-level API
+   breaks (framework builder, context/gateway plumbing, `EditMessage`
+   builder changes), then `cargo tree -i rustls` MUST report only the
+   0.23 line and `cargo audit` must come back clean — that is the exit
+   criterion, after which the six `ignore` entries in
+   `.cargo/audit.toml` are deleted (their comments say exactly that).
 2. **Stopgap: flip serenity to `native_tls_backend`** (only if the
    risk calculus changes — not the current default). Serenity 0.12.5
    exposes `default_native_tls` / `native_tls_backend`, which moves
