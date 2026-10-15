@@ -472,7 +472,7 @@ async fn skill_vision_analyze(State(gw): State<Arc<Gateway>>, Json(body): Json<V
 
 async fn vision_call(gw: &Arc<Gateway>, prompt: &str, image: &str) -> Response {
     let url = format!("{}/v1/chat/completions", gw.runtime_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
         .build()
@@ -918,7 +918,7 @@ async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
         return Value::Null;
     }
     let url = format!("{base}/status");
-    let resp = reqwest::Client::builder()
+    let resp = reqwest::Client::builder().use_rustls_tls()
         .timeout(Duration::from_secs(3))
         .build()
         .ok()
@@ -946,7 +946,7 @@ async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
 /// OpenAI-style model list (mirrors the runtime's list when reachable).
 async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
     let url = format!("{}/v1/models", gw.runtime_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = crate::http::mesh_http();
     let mut req = client.get(&url);
     if let Some(k) = &gw.runtime_api_key {
         req = req.bearer_auth(k);
@@ -1042,7 +1042,7 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body["max_tokens"] = serde_json::json!(cap);
         }
     }
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         // Distinguishes "host down" from "host up but wedged": a dead route
         // fails fast here, while a slow/hung runtime is caught by the
         // header-wait bound below instead.

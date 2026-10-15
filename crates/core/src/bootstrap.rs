@@ -290,7 +290,7 @@ impl BootstrapClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            inner: reqwest::Client::builder()
+            inner: reqwest::Client::builder().use_rustls_tls()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),

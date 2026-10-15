@@ -1276,7 +1276,7 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
         return;
     }
 
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .timeout(Duration::from_secs(4))
         .build()
         .expect("reqwest client");

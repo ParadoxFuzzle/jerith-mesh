@@ -448,7 +448,7 @@ pub async fn lore_search(
     top_k: u64,
 ) -> Result<Vec<serde_json::Value>, Error> {
     let url = format!("{}/v1/skills/lore/search", cfg.gateway_url);
-    let resp = reqwest::Client::new()
+    let resp = jerith_mesh_core::http::mesh_http()
         .post(&url)
         .timeout(std::time::Duration::from_secs(30))
         .json(&serde_json::json!({ "query": query, "top_k": top_k }))

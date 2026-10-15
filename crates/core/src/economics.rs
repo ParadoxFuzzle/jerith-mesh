@@ -104,7 +104,7 @@ pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u
         rpc_url.trim_end_matches('/'),
         identity
     );
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .timeout(Duration::from_secs(5))
         .build()?;
     let resp = client
@@ -214,7 +214,7 @@ pub async fn attempt_mine(
     })?;
     let message_id = format!("{node_id}:{attempt}:{}", crate::bootstrap::now_ms());
     let url = format!("{}/mine", config.rpc_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .timeout(Duration::from_secs(15))
         .build()?;
     let resp = client

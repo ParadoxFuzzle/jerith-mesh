@@ -55,7 +55,7 @@ fn model_from_status(body: &Value) -> Option<String> {
 }
 
 pub(crate) fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    reqwest::Client::builder().use_rustls_tls()
         .timeout(TIMEOUT)
         .build()
         .expect("static reqwest client config")

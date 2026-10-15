@@ -2011,7 +2011,7 @@ impl RuntimeExpert {
         api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
         let url = format!("{}/v1/models", runtime_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
+        let client = reqwest::Client::builder().use_rustls_tls()
             .timeout(Duration::from_secs(10))
             .build()?;
         let mut req = client.get(&url);
@@ -2238,7 +2238,7 @@ impl RuntimeExpert {
             api_key: None,
             vision_model: None,
             deep_model: None,
-            client: reqwest::Client::new(),
+            client: crate::http::mesh_http(),
         }
     }
 

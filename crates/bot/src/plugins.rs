@@ -303,7 +303,7 @@ async fn vision_call(
     image: &str,
     prompt: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
     let url = format!("{}/v1/skills/vision/describe", cfg.gateway_url);

@@ -423,7 +423,7 @@ impl MemoryStore {
 
 async fn ollama_embed(cfg: &EmbedConfig, text: &str) -> anyhow::Result<Vec<f32>> {
     let url = format!("{}/api/embeddings", cfg.ollama_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
     #[derive(serde::Deserialize)]

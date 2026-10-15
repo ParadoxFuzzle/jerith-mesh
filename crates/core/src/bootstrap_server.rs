@@ -818,7 +818,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
 
         // Empty at first.
         let counts: Vec<serde_json::Value> = client
@@ -878,7 +878,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
 
         let (id, a) = make_peer("glm-5.3");
         client
@@ -937,7 +937,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
 
         let (id, a) = make_peer("glm-5.3");
         client
@@ -985,7 +985,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
         let id = crate::signing::SigningIdentity::generate();
 
         const ROUNDS: usize = 50;
@@ -1068,7 +1068,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
         let url = format!("http://{addr}/v1/advertise");
 
         // Real identity, correctly signed → accepted and listed.
@@ -1145,7 +1145,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
         // Complete body but blank identity fields → handler must reject 400
         // (field validation happens before wire auth).
         let mut bad = serde_json::to_value(make_peer("glm-5.3").1).unwrap();
@@ -1176,7 +1176,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
         let base = format!("http://{addr}");
 
         // Every string field over its sanity cap → 400, rejected BEFORE any
@@ -1260,7 +1260,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
         let url = format!("http://{addr}/v1/advertise");
 
         // First identity: accepted.
@@ -1365,7 +1365,7 @@ mod tests {
             .await
             .unwrap();
         });
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
         let url = format!("http://{addr}/v1/models/counts");
 
         for _ in 0..3 {
@@ -1411,7 +1411,7 @@ mod tests {
             .unwrap();
         });
         (
-            reqwest::Client::new(),
+            crate::http::mesh_http(),
             format!("http://{addr}/v1/peers?model=lane-test"),
         )
     }
@@ -1558,7 +1558,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
 
         let accused = crate::signing::SigningIdentity::generate();
         let r1 = crate::signing::SigningIdentity::generate();
@@ -1653,7 +1653,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let client = crate::http::mesh_http();
 
         let accused = crate::signing::SigningIdentity::generate();
         let reporter = crate::signing::SigningIdentity::generate();

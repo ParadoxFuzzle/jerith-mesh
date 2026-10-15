@@ -170,7 +170,7 @@ impl Hooks {
         Self {
             cfg: Arc::new(cfg),
             http: enabled.then(|| {
-                reqwest::Client::builder()
+                reqwest::Client::builder().use_rustls_tls()
                     .timeout(timeout)
                     .build()
                     .expect("reqwest client for hooks")

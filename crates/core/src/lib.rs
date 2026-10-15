@@ -12,6 +12,7 @@ pub mod expert_stats;
 pub mod expert_store;
 pub mod freerider;
 pub mod gateway;
+pub mod http;
 pub mod guard;
 pub mod hw;
 pub mod isolate;

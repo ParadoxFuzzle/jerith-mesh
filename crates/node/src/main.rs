@@ -523,7 +523,7 @@ async fn chain_get(
         "no chain api token — stage ~/.jerith-mesh/keys/api.token (see docs/RUNBOOK.md) \\
          or set $JERITH_TOKEN",
     )?;
-    let client = reqwest::Client::builder()
+    let client = reqwest::Client::builder().use_rustls_tls()
         .timeout(Duration::from_secs(15))
         .build()?;
     let mut url = format!("{base}{path}");
