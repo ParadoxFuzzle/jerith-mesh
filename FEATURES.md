@@ -333,7 +333,13 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   (commitment checks/failures, replay match rate, fraud reports flushed)
   and Jerith Guard counters (screens, blocked, redacted, logged) on the
   node status page, fed from `/status`
-- 📋 Dashboard with earnings/expert-hit-rate/latency views (Phase 2–3)
+- ✅ Dashboard with earnings/expert-hit-rate/latency views (Phase 2–3) — same-origin only
+  (CSP-pinned, no remote content): earnings = JER mining wins + attempts for this node
+  with the chain probe's height/circulating line (honest "chain view unreachable"
+  when the co-hosted chain node is down), expert hit-rate = the expert store's LRU
+  cache hit/miss ratio plus the measured activation demand (total/distinct, hot/cold
+  split; "off" with no expert store), latency = per-model mean/p-max/ok%/mesh share
+  from `/v1/metrics` (busiest model as the headline; honest empty-window state)
 - ✅ Bandwidth caps (soft/hard) and cost estimation (Phase 2) — `[resources]
   bandwidth_ceiling_bytes_per_min` in the isolation governor:
   - measures `meters.bytes_relayed` over a rolling window (rate published to

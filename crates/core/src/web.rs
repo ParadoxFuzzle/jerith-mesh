@@ -1,7 +1,10 @@
 //! Minimal web UI: single-file status page served at the gateway port.
 //!
 //! Phase 0 scope: live status cards (model, contribution %, peers, meters).
-//! Later phases turn this into the full observability dashboard.
+//! Phase 2/3 scope: the dashboard adds earnings (mining + chain view),
+//! expert hit-rate (LRU cache + measured activations) and per-model
+//! latency views — all fed from the node's own /status and /v1/metrics,
+//! same-origin only.
 //!
 //! Hardening: the page is served with a strict security-header set —
 //! `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
@@ -140,6 +143,9 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Expert activations</h2><p id="acts">—</p><div class="fine">loads served to peers</div></div>
   <div class="card"><h2>Phase 4 verification</h2><p id="ccommit">—</p><div class="fine" id="ccommitfine">commitment checks</div></div>
   <div class="card"><h2>Jerith Guard</h2><p id="guard">—</p><div class="fine" id="guardfine">outbound screens</div></div>
+  <div class="card"><h2>Earnings (mined)</h2><p id="earn">—</p><div class="fine" id="earnfine">JER mining wins</div></div>
+  <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
+  <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
 </div>
 <footer>
   jerith-mesh · a P2P compute mesh for MoE models ·
@@ -150,8 +156,12 @@ const PAGE: &str = r#"<!doctype html>
 <script>
 async function refresh() {
   try {
-    const r = await fetch('/status');
+    const [r, mr] = await Promise.all([
+      fetch('/status'),
+      fetch('/v1/metrics').catch(() => null),
+    ]);
     const j = await r.json();
+    const mj = mr && mr.ok ? await mr.json() : null;
     document.getElementById('model').textContent = j.model || 'not set';
     document.getElementById('contrib').textContent = (j.contribution_percent ?? '—') + '%';
     document.getElementById('peers').textContent = j.peers_alive ?? '—';
@@ -171,6 +181,45 @@ async function refresh() {
     document.getElementById('guardfine').textContent = g
       ? `outbound screens · blocked ${g.requests_blocked ?? 0} · redacted ${g.values_redacted ?? 0} · logged ${g.detections_logged ?? 0}`
       : 'guard disabled in config.toml ([guard] enabled = false)';
+    // Phase 2 modernity: expert hit-rate (LRU cache hit ratio + measured
+    // demand from /status.experts; "off" when no expert store lives here).
+    const ex = j.experts;
+    if (ex && (ex.hits ?? 0) + (ex.misses ?? 0) > 0) {
+      const hr = Math.round(100 * ex.hits / (ex.hits + ex.misses));
+      document.getElementById('hit').textContent = hr + '%';
+      document.getElementById('hitfine').textContent =
+        `cache hits/misses ${ex.hits}/${ex.misses} · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts · hot ${Array.isArray(ex.hot) ? ex.hot.length : '?'} / cold ${ex.cold ?? '?'}`;
+    } else if (ex) {
+      document.getElementById('hit').textContent = '—';
+      document.getElementById('hitfine').textContent =
+        `no loads yet · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts`;
+    } else {
+      document.getElementById('hit').textContent = 'off';
+      document.getElementById('hitfine').textContent = 'no expert store on this node';
+    }
+    // Phase 2/3 dashboard view: latency from /v1/metrics (busiest model
+    // headline; per-model detail rides the fine line pattern).
+    const models = Object.entries((mj && mj.models) || {});
+    if (models.length) {
+      const busiest = models.reduce((a, b) => ((b[1].requests ?? 0) >= (a[1].requests ?? 0) ? b : a));
+      const st = busiest[1];
+      document.getElementById('latency').textContent =
+        st.latency_ms_mean != null && st.requests ? st.latency_ms_mean + ' ms' : '—';
+      document.getElementById('latencyfine').textContent =
+        `${busiest[0]} · p-max ${st.latency_ms_max ?? '—'} ms · ok ${st.ok_percent ?? '—'}% · mesh ${st.mesh_served ?? 0}/${st.requests ?? 0}`;
+    } else {
+      document.getElementById('latency').textContent = '—';
+      document.getElementById('latencyfine').textContent =
+        'no completions in the window yet';
+    }
+    // Earnings view: JER mining wins for this node + chain reachability.
+    document.getElementById('earn').textContent = String(j.meters?.mines_won ?? 0);
+    const ch = j.chain;
+    document.getElementById('earnfine').textContent =
+      `mining attempts ${j.meters?.mines_attempted ?? 0}` +
+      (ch && ch.reachable
+        ? ` · chain height ${ch.height ?? '—'} · circulating ${(ch.circulating_jer ?? '—')} JER`
+        : ' · chain view unreachable');
   } catch (e) { /* node stopped */ }
 }
 refresh();
