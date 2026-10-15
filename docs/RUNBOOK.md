@@ -710,6 +710,15 @@ it (or its default features) enable `reqwest/native-tls`,
 Run `cargo audit` before releases; it is not wired into CI yet — a
 deliberate Phase 4/5 ops item. Current state after this pass:
 
+- **Pipeline live drill (Phase 3 gate, 2026-10-15):**
+  `cargo test -p jerith-mesh-core --test pipeline_remote_drill` spins a
+  two-node mesh in-process — real stores with synthetic weights, real
+  QUIC — and drills the M0–M3 ladder end-to-end: route over the wire,
+  wire commitments with pinned attribution, a hung owner dying at its
+  deadline and ring-rule re-hosted, honest partials, priced budgets.
+  Pass runs in under a second; repeated green 5/5. Run it before any
+  release that touches the pipeline, transport, or stores, and after
+  runtime-weight integration landings.
 - **Fixed:** `rustls 0.23.45 → 0.23.46` (targeted `cargo update
   --precise`). Clears four advisories on the core QUIC/reqwest serving
   path — most importantly RUSTSEC-2026-0346 (medium), where `Debug`
