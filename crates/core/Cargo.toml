@@ -26,6 +26,8 @@ futures-util.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+# Linux-only CPU pinning (`[resources] pin_cores`, sched_setaffinity).
+libc = { version = "0.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 axum-test = "17"

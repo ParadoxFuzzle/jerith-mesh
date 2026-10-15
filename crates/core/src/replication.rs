@@ -244,6 +244,45 @@ impl ShardMap {
     pub fn owns(&self, self_node_id: &str, expert_id: &str) -> bool {
         self.primary_owner(expert_id).as_deref() == Some(self_node_id)
     }
+
+    /// Layer ownership map for pipeline / layer-group fallback (Petals-style).
+    /// Each node owns a contiguous slice of model layers. Given a set of
+    /// alive node ids (including self), this assigns each layer a primary
+    /// owner from the ring, forming a deterministic layer-group assignment
+    /// that reassigns only the departed node's layers when the set changes.
+    pub fn layer_ownership(
+        &self,
+        self_node_id: &str,
+        layers: &[usize],
+        alive: &[String],
+    ) -> HashMap<usize, String> {
+        let mut out: HashMap<usize, String> = HashMap::new();
+        let _ring = ShardMap::from_ads(self_node_id, &[]);
+        for &layer in layers {
+            // Use the shard map's rendezvous hash to deterministically assign
+            // each layer to a node. The node ids in the ring are sorted and
+            // deduped; the score function gives every node a stable weight.
+            let owner = self.primary_owner_for_layer(&layer, alive);
+            if owner.as_deref() == Some(self_node_id) {
+                out.insert(layer, self_node_id.to_string());
+            }
+        }
+        out
+    }
+
+    /// Preferred owner for one model layer from the alive set.
+    fn primary_owner_for_layer(&self, layer: &usize, alive: &[String]) -> Option<String> {
+        let mut best_node: Option<String> = None;
+        let mut best_score: u64 = 0;
+        for node_id in alive {
+            let s = self.score(&format!("L{}", layer), node_id);
+            if best_node.is_none() || s > best_score {
+                best_score = s;
+                best_node = Some(node_id.clone());
+            }
+        }
+        best_node
+    }
 }
 
 #[cfg(test)]

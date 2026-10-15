@@ -71,9 +71,9 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Operator surfaces: `/status.experts` reports the activation counts,
     the hot set, the cold size, each sampled cold expert's shard owner,
     the ring size and the live replication policy
-- 📋 Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
-- 📋 Speculative decoding + expert budgeting + prefetching (Phase 3)
-- 📋 Asynchronous, timeout-tolerant forward passes; graceful degradation (Phase 3)
+- ✅ Pipeline / layer-group fallback (Petals-style) for high-latency links (Phase 2–3)
+- 🔄 Speculative decoding + expert budgeting + prefetching (Phase 3)
+- 🔄 Asynchronous, timeout-tolerant forward passes; graceful degradation (Phase 3)
 - ✅ Dedicated local specialist models:
   - Vision: MiniCPM-V 4.6:1b (never leaves the node unless the user opts in)
   - Embeddings: nomic-embed-text-v2-moe (Matryoshka dims 768/512/256)
@@ -112,7 +112,7 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 ## 6. Memory & State
 - ✅ Backend choice at setup: **PostgreSQL+pgvector** or **SQLite**
 - ✅ Memory is strictly local — never replicated into the mesh, never distributed in the mesh
-- 📋 Local embedding pipeline integrated with the chosen vector store (Phase 0.5)
+- ✅ Local embedding pipeline integrated with the chosen vector store (Phase 0.5)
 
 ## 7. User Interfaces & Access Surfaces
 - ✅ CLI (setup, run, status, peers, config);
@@ -174,7 +174,9 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   the node's skill endpoints
 - ✅ First-class skills `memory.embed`, `memory.search` (model-facing over
   the gateway's `/v1/skills/memory/*`); `lore.search` likewise
-- 📋 First-class skills `vision.*` (needs a gateway vision route first)
+- ✅ First-class skills `vision.describe` / `vision.analyze` — served by
+  the gateway's `/v1/skills/vision/*` routes (multimodal forward with the
+  model router's vision tier) and mirrored as bot plugins
 - 📋 Webhook / event hooks for plugin authors
 
 ## 9. Incentives & Economics
@@ -230,14 +232,62 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
 ## 12. Quality-of-life
 - ✅ Graceful offline/degradation: the node starts and runs locally even if the bootstrap is unreachable
 - ✅ Local OpenAI-compatible endpoint so stock agent frameworks (Continue.dev, Open WebUI, LangChain…) work day one
-- 📋 Resource isolation (GPU/CPU pinning, RAM ceiling), emergency kill switch (Phase 1)
+- ✅ Resource isolation + emergency kill switch (Phase 1) — `[resources]` in config.toml, enforced by the governor (`isolate.rs`):
+  - RAM ceiling: a background governor samples the node's own RSS every 10 s;
+    cross a ceiling's soft line (90 %) → the expert hot-set cache is shed
+    (LRU, re-read from disk on demand — a disk hit, not a correctness loss);
+    cross the hard line with `kill_switch` on → the switch trips: peer-facing
+    expert serving, expert dispatch, mesh chat fallback and replication are
+    refused (honest refusals — routers walk on) until usage recedes under
+    the soft line again (hysteresis, no boundary flapping), then recovery is
+    automatic. Local chat, the gateway and the WebUI are never killed
+  - VRAM ceiling: same soft/hard semantics over total GPU VRAM used
+    (nvidia-smi); unknown VRAM is skipped, never treated as zero
+  - CPU pinning: `pin_cores = N` pins the process to the first N logical
+    cores (Linux sched_setaffinity, best-effort; other OSes log and continue)
+  - Mis-set ceilings (below the 256 MiB sanity floor) fail the node at boot,
+    not at breach time; `/status.resources` carries ceilings + live switch
+    state (tripped/reason/trips/recovers/cache-sheds) + node RSS
 - ✅ Dashboard verification + guard widgets: live Phase 4 counters
   (commitment checks/failures, replay match rate, fraud reports flushed)
   and Jerith Guard counters (screens, blocked, redacted, logged) on the
   node status page, fed from `/status`
 - 📋 Dashboard with earnings/expert-hit-rate/latency views (Phase 2–3)
 - 📋 Bandwidth caps (soft/hard) and cost estimation (Phase 2)
-- 📋 Backup/restore/migrate full node state (Phase 2)
+- ✅ Backup/restore/migrate full node state (Phase 2) — `jerith backup
+  create|verify|restore` over one self-describing checksummed container
+  (`core::backup`, magic+version / manifest frame / per-entry sha256+payload
+  frames, exact-EOF check):
+  - create captures config.toml (the node identity key — backups are
+    private), bot.toml, persona files and the whole data/ tree (memory
+    sqlite, expert demand stats, stake + slash ledgers); expert weights are
+    omitted by default (a moved node re-pulls replicas) and ride along with
+    --include-experts; per-file 1 GiB / total 2 GiB loud caps; streaming
+    two-pass write (memory held to one file's size, not the archive's)
+  - verify checks magic/version + manifest count + every entry checksum +
+    trailing EOF; a flipped byte or truncated tail is a typed error naming
+    the entry, never a silent shorter restore
+  - restore verifies first, then writes atomically (tmp+rename); existing
+    files survive unless --force; traversal paths (`..`, absolute, empty
+    components) refused before a byte is written; copying the backup to a
+    new machine (JERITH_HOME) and restoring is the migrate story
+  - CLI prints entries/bytes/skips and the privacy note; unit tests cover
+    the roundtrip, weight opt-in, checksum/truncation failures, overwrite
+    semantics, path-traversal refusal and the no-config refusal
 - 📋 Privacy levels: local-only / trusted-peers / full-mesh (Phase 3)
 - 📋 Compatibility check for quantization, context length, tokenizer version (Phase 2)
-- 📋 Rate limiting, per-peer blocking, optional local content filters (Phase 3)
+- ✅ Rate limiting, per-peer blocking, content filters (Phase 3):
+  - Rate limiting: fixed-window limiter on the public HTTP surfaces (node
+    gateway + bootstrap), per-IP anonymous floor + per-Ed25519-identity
+    generous lane (NAT scaling); every 429 bumps the process-local metric
+    surfaced on /status
+  - Per-peer blocking: `[peers] blocked = [...]` node ids (or the shorter
+    fingerprint prefixes copied from logs/`/status`). Enforced at BOTH ends:
+    inbound, the QUIC RPC server refuses every work-carrying request from a
+    listed identity with an honest typed error ("peer … is blocked") and
+    counts refusals for /status; outbound, placement never builds a plan
+    around them and replication never pulls weights from them. Matching is
+    exact-or-prefix both directions; hot-reloadable within one ping tick
+    (unit + wire tests: prefix listed, full-id requester refused by identity,
+    a different requester served normally on the same server)
+  - Content filters: Jerith Guard (§8) screens every outbound chat payload

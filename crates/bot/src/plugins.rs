@@ -64,7 +64,7 @@ impl SkillSpec {
 }
 
 /// Pre-packaged plugin ids (`[plugins] enabled = [...]` in bot.toml).
-pub const PREPACKAGED_PLUGINS: [&str; 4] = ["websearch", "memory", "lore", "squeeze"];
+pub const PREPACKAGED_PLUGINS: [&str; 5] = ["websearch", "memory", "lore", "squeeze", "vision"];
 
 /// All pre-packaged model-facing skills. The bot-side `squeeze` plugin
 /// intentionally has no entries (it registers no skills).
@@ -139,6 +139,34 @@ fn standard_skills() -> Vec<SkillSpec> {
                 "required": ["query"]
             }),
             run: lore_search_runner,
+        },
+        SkillSpec {
+            name: "vision.describe",
+            plugin: "vision",
+            description: "Describe or analyze an image using the local vision model. Returns a text description of the image.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string", "description": "Base64-encoded image data or data URL (data:image/...)"},
+                    "prompt": {"type": "string", "description": "Optional prompt to guide the description (default: 'Describe this image')"}
+                },
+                "required": ["image"]
+            }),
+            run: vision_describe_runner,
+        },
+        SkillSpec {
+            name: "vision.analyze",
+            plugin: "vision",
+            description: "Analyze an image for objects, text, or specific details using the local vision model.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "image": {"type": "string", "description": "Base64-encoded image data or data URL (data:image/...)"},
+                    "prompt": {"type": "string", "description": "Analysis prompt (e.g., 'What text is in this image?')"}
+                },
+                "required": ["image", "prompt"]
+            }),
+            run: vision_analyze_runner,
         },
     ]
 }
@@ -243,6 +271,58 @@ fn lore_search_runner<'args>(
         }
         Ok(body)
     })
+}
+
+fn vision_describe_runner<'args>(
+    cfg: &'args crate::config::BotConfig,
+    args: &'args Value,
+) -> BoxedSkillFut<'args> {
+    Box::pin(async move {
+        let image = args.get("image").and_then(Value::as_str).unwrap_or_default();
+        anyhow::ensure!(!image.trim().is_empty(), "vision.describe: empty image");
+        let prompt = args.get("prompt").and_then(Value::as_str);
+        vision_call(cfg, image, prompt).await
+    })
+}
+
+fn vision_analyze_runner<'args>(
+    cfg: &'args crate::config::BotConfig,
+    args: &'args Value,
+) -> BoxedSkillFut<'args> {
+    Box::pin(async move {
+        let image = args.get("image").and_then(Value::as_str).unwrap_or_default();
+        anyhow::ensure!(!image.trim().is_empty(), "vision.analyze: empty image");
+        let prompt = args.get("prompt").and_then(Value::as_str);
+        let prompt = prompt.ok_or_else(|| anyhow::anyhow!("vision.analyze: prompt required"))?;
+        vision_call(cfg, image, Some(prompt)).await
+    })
+}
+
+async fn vision_call(
+    cfg: &crate::config::BotConfig,
+    image: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let url = format!("{}/v1/skills/vision/describe", cfg.gateway_url);
+    let body = json!({
+        "image": image,
+        "prompt": prompt.unwrap_or("Describe this image"),
+    });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("calling gateway /v1/skills/vision/describe")?;
+    let status = resp.status();
+    let body: Value = resp.json().await.context("reading gateway vision response")?;
+    if !status.is_success() {
+        anyhow::bail!("vision failed: {}", status);
+    }
+    Ok(body)
 }
 
 /// The registry: every skill the bot could have, plus the enabled-plugin
@@ -388,11 +468,13 @@ mod tests {
             "memory.embed",
             "memory.search",
             "lore.search",
+            "vision.describe",
+            "vision.analyze",
         ] {
             assert!(names.contains(&expect), "missing {expect}");
         }
-        // 5 model-facing skills; squeeze is bot-side (no tool def anywhere).
-        assert_eq!(names.len(), 5);
+        // 7 model-facing skills; squeeze is bot-side (no tool def anywhere).
+        assert_eq!(names.len(), 7);
         assert!(!names.iter().any(|n| n.contains("squeeze")));
     }
 

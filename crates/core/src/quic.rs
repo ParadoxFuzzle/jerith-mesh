@@ -369,6 +369,102 @@ impl ExpertRouter {
         plan
     }
 
+    /// Plan dispatch using layer-ownership (Petals-style). Each node owns
+    /// a contiguous slice of model layers. Given the alive node set (including
+    /// self), this assigns each layer to a primary owner from the ring,
+    /// forming a deterministic layer-group that reassigns only the departed
+    /// node's layers when the set changes. For high-latency links, we route
+    /// to the node that owns the requested layer rather than using pure
+    /// RTT ordering.
+    ///
+    /// Returns `ExpertLocation::Local` if self owns the layer, otherwise
+    /// `ExpertLocation::Remote` for the node that owns it.
+    ///
+    /// # Arguments
+    /// - `self_node_id`: This node's identity string
+    /// - `layers`: The model layer indices being requested
+    /// - `alive`: List of all alive node ids in the mesh
+    /// - `expert_id`: The expert being dispatched (for context)
+    /// - `peers`: Peer list with (node_id, rtt, has_expert, alive, resources)
+    pub async fn plan_dispatch_with_layer_ownership(
+        &self,
+        self_node_id: &str,
+        layers: &[usize],
+        alive: &[String],
+        _expert_id: &str,
+        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+    ) -> Vec<ExpertLocation> {
+        let layer_ownership = crate::replication::ShardMap::layer_ownership(
+            &crate::replication::ShardMap::new(vec![self_node_id.to_string()]),
+            self_node_id,
+            layers,
+            alive,
+        );
+        let mut plan = Vec::new();
+        // Check if self owns any of the requested layers
+        let self_owns_layer = layers.iter().any(|&layer| {
+            layer_ownership.get(&layer).map_or(false, |owned| owned == self_node_id)
+        });
+        if self_owns_layer {
+            plan.push(ExpertLocation::Local);
+        }
+        // Build remote plan: for each layer not owned by self, find the owner
+        // and dispatch to that node. We prioritize peers that own layers we
+        // need, sorted by RTT.
+        let mut layer_to_owner: HashMap<usize, String> = HashMap::new();
+        for &layer in layers {
+            if let Some(owner) = layer_ownership.get(&layer) {
+                if owner != self_node_id {
+                    *layer_to_owner.entry(layer).or_insert_with(|| owner.clone()) = owner.clone();
+                }
+            }
+        }
+        // Group peers by node id and check which layers they own
+        let mut peer_layer_ownership: HashMap<String, Vec<usize>> = HashMap::new();
+        for (peer_id, _rtt, has, alive, _) in peers {
+            if *alive && *has {
+                // Check if this peer owns any of our layers
+                for &layer in layers {
+                    if let Some(owner) = layer_ownership.get(&layer) {
+                        if owner == peer_id {
+                            peer_layer_ownership
+                                .entry(peer_id.clone())
+                                .or_default()
+                                .push(layer);
+                        }
+                    }
+                }
+            }
+        }
+        // Sort peers by RTT and add remote locations for layers they own
+        let mut sorted_peers: Vec<(String, u64)> = peer_layer_ownership
+            .clone()
+            .into_iter()
+            .map(|(id, _layers)| {
+                // Find the RTT for this peer
+                let peer_rtt = peers.iter().find(|(pid, _, _, _, _)| *pid == id).map(|(_, rtt, _, _, _)| *rtt).unwrap_or(u64::MAX);
+                (id, peer_rtt)
+            })
+            .collect();
+        sorted_peers.sort_by_key(|(_, rtt)| *rtt);
+        for (peer_id, _) in sorted_peers {
+            if let Some(owned_layers) = peer_layer_ownership.get(&peer_id) {
+                for &_layer in owned_layers {
+                    // Only add if not already in the plan
+                    if !plan.iter().any(|loc| {
+                        matches!(loc, ExpertLocation::Remote { node_id, .. } if *node_id == peer_id)
+                    }) {
+                        plan.push(ExpertLocation::Remote {
+                            node_id: peer_id.clone(),
+                            rtt_ms: 0, // RTT will be measured at dispatch time
+                        });
+                    }
+                }
+            }
+        }
+        plan
+    }
+
     /// Execute a dispatch following the plan with per-candidate timeouts.
     /// `dispatch` performs one remote/local attempt. Results are idempotent
     /// per `req_id` — later (duplicate) results are ignored by callers who
@@ -1529,6 +1625,28 @@ pub async fn serve(
         server_node_id,
         shutdown,
         MAX_CONCURRENT_QUIC_CONNECTIONS,
+        None,
+    )
+    .await
+}
+
+/// Serve with a per-peer block list (Phase 3 anti-abuse). Every inbound
+/// RPC whose `from_node_id` is on the list gets an honest typed refusal
+/// instead of work — see [`crate::ratelimit::BlockedPeers`].
+pub async fn serve_with_peer_block(
+    endpoint: quinn::Endpoint,
+    handler: Arc<dyn ExpertHandler>,
+    server_node_id: String,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    peer_block: Arc<crate::ratelimit::BlockedPeers>,
+) -> anyhow::Result<()> {
+    serve_with_limit(
+        endpoint,
+        handler,
+        server_node_id,
+        shutdown,
+        MAX_CONCURRENT_QUIC_CONNECTIONS,
+        Some(peer_block),
     )
     .await
 }
@@ -1549,6 +1667,7 @@ pub async fn serve_with_limit(
     server_node_id: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
     max_concurrent_connections: usize,
+    peer_block: Option<Arc<crate::ratelimit::BlockedPeers>>,
 ) -> anyhow::Result<()> {
     let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_connections));
     let mut shutdown = shutdown;
@@ -1567,10 +1686,11 @@ pub async fn serve_with_limit(
                 let Some(conn) = conn else { break };
                 let handler = Arc::clone(&handler);
                 let server_node_id = server_node_id.clone();
+                let block = peer_block.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Ok(connection) = conn.await {
-                        handle_connection(connection, handler, server_node_id).await;
+                        handle_connection(connection, handler, server_node_id, block).await;
                     }
                 });
             }
@@ -1592,131 +1712,33 @@ async fn handle_connection(
     connection: quinn::Connection,
     handler: Arc<dyn ExpertHandler>,
     server_node_id: String,
+    peer_block: Option<Arc<crate::ratelimit::BlockedPeers>>,
 ) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         match read_frame(&mut recv).await {
             Ok(line) => {
                 let server_id = server_node_id.clone();
+                // Per-peer block list FIRST — before even the stamp-
+                // freshness check. A blocked peer is refused honestly (a
+                // typed error naming the block, counted for /status),
+                // never worked for, never fed fabricated data.
+                if let Ok(req) = serde_json::from_slice::<NodeRpcRequest>(&line) {
+                    let requester = request_from(&req).to_string();
+                    if let Some(block) = &peer_block {
+                        if block.blocked(&requester) {
+                            block.refuse(&requester, "rpc");
+                            let reply = build_blocked_reply(&req);
+                            if send_reply(&mut send, reply).await {
+                                let _ = send.finish();
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let reply = match serde_json::from_slice::<NodeRpcRequest>(&line) {
-                    Ok(req) if verify_request(&req) => match req {
-                        NodeRpcRequest::Ping { .. } => Outbound::Json(NodeRpcReply::Pong {
-                            node_id: server_id,
-                            stamp_ms: crate::bootstrap::now_ms(),
-                        }),
-                        NodeRpcRequest::ExpertQuery {
-                            req_id,
-                            expert_id,
-                            input,
-                            ..
-                        } => {
-                            // Bound what reaches the handler (and its
-                            // runtime forward): the frame cap bounds the
-                            // wire, but a parsed 200M-float input would
-                            // still burn runtime compute + memory on top.
-                            // Real MoE expert activations sit far below.
-                            const MAX_EXPERT_INPUT_FLOATS: usize = 65_536;
-                            if input.len() > MAX_EXPERT_INPUT_FLOATS {
-                                Outbound::Json(NodeRpcReply::Error {
-                                    req_id,
-                                    message: format!(
-                                        "expert input exceeds {MAX_EXPERT_INPUT_FLOATS} floats",
-                                    ),
-                                })
-                            } else {
-                                match handler.run(&expert_id, &input) {
-                                    Ok(output) => {
-                                        // Phase 4: commit to the result *before*
-                                        // the requester has decided whether it
-                                        // will replay-check — enables efficient
-                                        // fraud proofs later.
-                                        let commitment = crate::verify::result_commitment(
-                                            &req_id, &expert_id, &server_id, &input, &output,
-                                        );
-                                        Outbound::Json(NodeRpcReply::ExpertResult {
-                                            req_id,
-                                            output,
-                                            node_id: server_id,
-                                            commitment: Some(commitment),
-                                        })
-                                    }
-                                    Err(e) => Outbound::Json(NodeRpcReply::Error {
-                                        req_id,
-                                        message: e.to_string(),
-                                    }),
-                                }
-                            }
-                        }
-                        NodeRpcRequest::ExpertFetch {
-                            req_id,
-                            expert_id,
-                            offset,
-                            len,
-                            ..
-                        } => {
-                            let want = (len as usize).min(EXPERT_CHUNK_MAX_BYTES);
-                            if want == 0 {
-                                Outbound::Json(NodeRpcReply::Error {
-                                    req_id,
-                                    message: "expert fetch requested zero bytes".into(),
-                                })
-                            } else {
-                                match handler.expert_chunk(&expert_id, offset, want as u32) {
-                                    Ok(Some(chunk)) => Outbound::Chunk {
-                                        header: NodeRpcReply::ExpertChunk {
-                                            req_id,
-                                            expert_id,
-                                            offset,
-                                            data_len: chunk.data.len() as u32,
-                                            total_bytes: chunk.total_bytes,
-                                            node_id: server_id,
-                                        },
-                                        data: chunk.data,
-                                    },
-                                    Ok(None) => Outbound::Json(NodeRpcReply::Error {
-                                        req_id,
-                                        message: format!(
-                                            "expert {expert_id} is not hosted on this node — no weights to serve"
-                                        ),
-                                    }),
-                                    Err(e) => Outbound::Json(NodeRpcReply::Error {
-                                        req_id,
-                                        message: e.to_string(),
-                                    }),
-                                }
-                            }
-                        }
-                        NodeRpcRequest::ChatQuery {
-                            req_id, messages, ..
-                        } => {
-                            // Mirror the gateway's chat forward cap: the
-                            // per-peer runtime visit is one request, and
-                            // an oversized chat body would relay the
-                            // memory pin to every peer runtime in one
-                            // quic cone.
-                            if chat_messages_over_cap(&messages) {
-                                Outbound::Json(NodeRpcReply::Error {
-                                    req_id,
-                                    message: format!(
-                                        "chat messages exceed {MAX_CHAT_MESSAGES_BYTES} bytes",
-                                    ),
-                                })
-                            } else {
-                                match handler.chat(&messages).await {
-                                    Ok(content) => Outbound::Json(NodeRpcReply::ChatResult {
-                                        req_id,
-                                        content,
-                                        node_id: server_id,
-                                    }),
-                                    Err(e) => Outbound::Json(NodeRpcReply::Error {
-                                        req_id,
-                                        message: e.to_string(),
-                                    }),
-                                }
-                            }
-                        }
-                    },
-                    Ok(_) => Outbound::Json(NodeRpcReply::Error {
-                        req_id: "unknown".into(),
+                    Ok(req) if verify_request(&req) => reply_to(req, &handler, &server_id).await,
+                    Ok(req) => Outbound::Json(NodeRpcReply::Error {
+                        req_id: request_req_id(&req).to_string(),
                         message: "stale request stamp".into(),
                     }),
                     Err(e) => Outbound::Json(NodeRpcReply::Error {
@@ -1724,24 +1746,9 @@ async fn handle_connection(
                         message: format!("bad request: {e}"),
                     }),
                 };
-                let (json_reply, payload) = match reply {
-                    Outbound::Json(r) => (r, Vec::new()),
-                    Outbound::Chunk { header, data } => (header, data),
-                };
-                let mut out = match serde_json::to_vec(&json_reply) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                out.push(b'\n');
-                if send.write_all(&out).await.is_err() {
-                    break;
+                if send_reply(&mut send, reply).await {
+                    let _ = send.finish();
                 }
-                // Raw payload after the header: one slice, no encoding
-                // overhead (weights dominate any transfer).
-                if !payload.is_empty() && send.write_all(&payload).await.is_err() {
-                    break;
-                }
-                let _ = send.finish();
             }
             Err(_) => break,
         }
@@ -1787,6 +1794,186 @@ fn chat_messages_over_cap(messages: &[serde_json::Value]) -> bool {
         .unwrap_or(true)
 }
 
+/// The claimed (self-reported) requester identity of any RPC variant.
+/// Blocking keys on this — the same id every log line, ad and `/status`
+/// entry shows; the request signature covers it, so spoofing another
+/// node's id is a forgery, not a misdirection.
+fn request_from(req: &NodeRpcRequest) -> &str {
+    match req {
+        NodeRpcRequest::Ping { from_node_id, .. }
+        | NodeRpcRequest::ExpertQuery { from_node_id, .. }
+        | NodeRpcRequest::ExpertFetch { from_node_id, .. }
+        | NodeRpcRequest::ChatQuery { from_node_id, .. } => from_node_id,
+    }
+}
+
+/// The req_id the caller supplied (Ping carries none — a stable "ping"
+/// keeps every reply shape ≥ an identifier without inventing one).
+fn request_req_id(req: &NodeRpcRequest) -> &str {
+    match req {
+        NodeRpcRequest::Ping { .. } => "ping",
+        NodeRpcRequest::ExpertQuery { req_id, .. }
+        | NodeRpcRequest::ExpertFetch { req_id, .. }
+        | NodeRpcRequest::ChatQuery { req_id, .. } => req_id,
+    }
+}
+
+/// The typed refusal a blocked peer gets for ANY request: naming the
+/// block so the peer's operator can read the reason, and so a router
+/// treats this node as walked-off rather than wedged.
+fn build_blocked_reply(req: &NodeRpcRequest) -> Outbound {
+    Outbound::Json(NodeRpcReply::Error {
+        req_id: request_req_id(req).to_string(),
+        message: format!(
+            "peer {} is blocked on this node — refusing all RPC work",
+            request_from(req)
+        ),
+    })
+}
+
+/// Serialize + write one reply (JSON frame, optional raw payload after
+/// it). Returns false when the peer closed early — the connection loop
+/// then ends for this stream.
+async fn send_reply(send: &mut quinn::SendStream, reply: Outbound) -> bool {
+    let (json_reply, payload) = match reply {
+        Outbound::Json(r) => (r, Vec::new()),
+        Outbound::Chunk { header, data } => (header, data),
+    };
+    let mut out = match serde_json::to_vec(&json_reply) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    out.push(b'\n');
+    if send.write_all(&out).await.is_err() {
+        return false;
+    }
+    // Raw payload after the header: one slice, no encoding overhead
+    // (weights dominate any transfer).
+    if !payload.is_empty() && send.write_all(&payload).await.is_err() {
+        return false;
+    }
+    true
+}
+
+/// One verified request routed to the handler — the arm bodies the reply
+/// match would otherwise carry inline. Extracted so the block gate and
+/// freshness gate above it stay thin and the arms live in one place.
+async fn reply_to(
+    req: NodeRpcRequest,
+    handler: &Arc<dyn ExpertHandler>,
+    server_id: &str,
+) -> Outbound {
+    match req {
+        NodeRpcRequest::Ping { .. } => Outbound::Json(NodeRpcReply::Pong {
+            node_id: server_id.to_string(),
+            stamp_ms: crate::bootstrap::now_ms(),
+        }),
+        NodeRpcRequest::ExpertQuery {
+            req_id,
+            expert_id,
+            input,
+            ..
+        } => {
+            // Bound what reaches the handler (and its runtime forward):
+            // the frame cap bounds the wire, but a parsed half-gig float
+            // input would still burn compute + memory on top. Real MoE
+            // expert activations sit far below.
+            const MAX_EXPERT_INPUT_FLOATS: usize = 65_536;
+            if input.len() > MAX_EXPERT_INPUT_FLOATS {
+                Outbound::Json(NodeRpcReply::Error {
+                    req_id,
+                    message: format!("expert input exceeds {MAX_EXPERT_INPUT_FLOATS} floats"),
+                })
+            } else {
+                match handler.run(&expert_id, &input) {
+                    Ok(output) => {
+                        // Phase 4: commit to the result BEFORE the requester
+                        // has decided whether to replay-check — enables
+                        // efficient fraud proofs later.
+                        let commitment = crate::verify::result_commitment(
+                            &req_id, &expert_id, server_id, &input, &output,
+                        );
+                        Outbound::Json(NodeRpcReply::ExpertResult {
+                            req_id,
+                            output,
+                            node_id: server_id.to_string(),
+                            commitment: Some(commitment),
+                        })
+                    }
+                    Err(e) => Outbound::Json(NodeRpcReply::Error {
+                        req_id,
+                        message: e.to_string(),
+                    }),
+                }
+            }
+        }
+        NodeRpcRequest::ExpertFetch {
+            req_id,
+            expert_id,
+            offset,
+            len,
+            ..
+        } => {
+            let want = (len as usize).min(EXPERT_CHUNK_MAX_BYTES);
+            if want == 0 {
+                Outbound::Json(NodeRpcReply::Error {
+                    req_id,
+                    message: "expert fetch requested zero bytes".into(),
+                })
+            } else {
+                match handler.expert_chunk(&expert_id, offset, want as u32) {
+                    Ok(Some(chunk)) => Outbound::Chunk {
+                        header: NodeRpcReply::ExpertChunk {
+                            req_id,
+                            expert_id,
+                            offset,
+                            data_len: chunk.data.len() as u32,
+                            total_bytes: chunk.total_bytes,
+                            node_id: server_id.to_string(),
+                        },
+                        data: chunk.data,
+                    },
+                    Ok(None) => Outbound::Json(NodeRpcReply::Error {
+                        req_id,
+                        message: format!(
+                            "expert {expert_id} is not hosted on this node — no weights to serve"
+                        ),
+                    }),
+                    Err(e) => Outbound::Json(NodeRpcReply::Error {
+                        req_id,
+                        message: e.to_string(),
+                    }),
+                }
+            }
+        }
+        NodeRpcRequest::ChatQuery {
+            req_id, messages, ..
+        } => {
+            // Mirror the gateway's chat forward cap: the per-peer runtime
+            // visit is one request, and an oversized chat body would
+            // relay the memory pin through every peer runtime in one
+            // quic cone.
+            if chat_messages_over_cap(&messages) {
+                Outbound::Json(NodeRpcReply::Error {
+                    req_id,
+                    message: format!("chat messages exceed {MAX_CHAT_MESSAGES_BYTES} bytes"),
+                })
+            } else {
+                match handler.chat(&messages).await {
+                    Ok(content) => Outbound::Json(NodeRpcReply::ChatResult {
+                        req_id,
+                        content,
+                        node_id: server_id.to_string(),
+                    }),
+                    Err(e) => Outbound::Json(NodeRpcReply::Error {
+                        req_id,
+                        message: e.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+}
 async fn read_frame(recv: &mut quinn::RecvStream) -> anyhow::Result<Vec<u8>> {
     // A stream that never emits `\n` would otherwise grow `buf` without
     // bound — one dial, one cheap stream, one resident-growth DoS. The
@@ -1919,6 +2106,11 @@ pub struct ExpertServing {
     /// counted here, which is what makes an expert "hot" and therefore
     /// worth replicating.
     pub stats: Option<crate::expert_stats::SharedExpertStats>,
+    /// Resource isolation (Phase 1): when the kill switch is tripped, ALL
+    /// serving gates shut — an expert this node hosts on disk too. Local
+    /// traffic (the gateway + WebUI) is untouched; only mesh work stops.
+    /// None (tests) = the gate is simply absent.
+    pub isolate: Option<Arc<crate::isolate::IsolateState>>,
 }
 
 impl ExpertServing {
@@ -1949,8 +2141,24 @@ impl ExpertServing {
 
 impl ExpertHandler for ExpertServing {
     fn run(&self, expert_id: &str, input: &[f32]) -> anyhow::Result<Vec<f32>> {
+        // Builtin/ringer experts first, always: they are microseconds of
+        // pure math that Phase 4 verification depends on, and starving
+        // them would blind the mesh's honesty check mid-incident.
         if let Some(kind) = expert_id.strip_prefix(crate::verify::RINGER_EXPERT_PREFIX) {
             return Ok(crate::verify::builtin_expert_answer(kind, input));
+        }
+        // Kill switch: refuse everything else, honestly, before the store
+        // or runtime is touched. (Serving/dispatch is the workload the
+        // ceilings bound; a tripped switch does not *lie* to peers, it
+        // refuses so the router walks on to a healthier node.)
+        if let Some(iso) = &self.isolate {
+            if iso.tripped() {
+                anyhow::bail!(
+                    "kill switch tripped: {} — expert serving refused (local-only mode)",
+                    iso.tripped_reason()
+                        .unwrap_or_else(|| "resource ceiling breached".into())
+                );
+            }
         }
         if let Some(store) = &self.store {
             if store.contains(expert_id) {
@@ -2863,6 +3071,7 @@ mod tests {
                 server_node,
                 rx,
                 1,
+                None,
             )
             .await;
         });

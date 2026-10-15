@@ -529,8 +529,42 @@ pub async fn chat_with_usage_live(
                 .pointer("/usage/total_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            // JSON envelope answers (the 5:45 live incident: a plain
+            // question answered as `{"status": …, "message": "the prose"}`
+            // rendered brace-wrapped into Discord): when the body carries a
+            // known text key, surface the prose — keys are metadata. Runs
+            // BEFORE the degenerate check, so an envelope whose text field
+            // is empty still falls through to the retry/refusal gate.
+            let content = match unwrap_json_text_envelope(&content) {
+                Some(inner) => {
+                    tracing::info!(
+                        target: "bot",
+                        envelope_len = content.len(),
+                        unfolded_len = inner.len(),
+                        "unwrapped JSON envelope answer into its text field"
+                    );
+                    inner
+                }
+                None => content,
+            };
             if answer_is_degenerate(&content) {
-                if tools_enabled && rounds == 0 {
+                // Journal trace so an operator can confirm the gate fired
+                // (the '{'-reply incident was invisible in the logs). Only
+                // a short head of the content goes out — a debug aid, not a
+                // byte dump of whatever the model emitted.
+                tracing::warn!(
+                    target: "bot",
+                    degenerate_len = content.len(),
+                    round = rounds,
+                    tools_were_enabled = tools_enabled,
+                    degenerate_head = %truncate_degenerate_head(&content),
+                    "degenerate answer caught — one toolless retry, then the graceful refusal"
+                );
+                // One retry even when tools were never on (the bare-`{`
+                // case above comes from the plain lane). When tools WERE on,
+                // the retry runs toolless: a `{` opener usually means the
+                // model was fumbling a tool intent it cannot really make.
+                if rounds == 0 {
                     tools_enabled = false;
                     continue;
                 }
@@ -628,11 +662,87 @@ fn prompt_requests_web(prompt: &str) -> bool {
 
 /// An answer the model effectively failed to produce: empty, whitespace,
 /// or a braces-only JSON stub ("{}" / null fields) — never shown to users.
+/// Extract the prose from a JSON envelope answer, when the body carries a
+/// known text key. Discord-facing chat wants prose: a plain question
+/// answered as `{"status": …, "message": "the actual prose"}` renders
+/// brace-wrapped and reads as a malfunction even when everything inside
+/// is correct. Behavior: object with a non-empty string `message` /
+/// `content` / `text` / `answer` field → that string; anything else
+/// (non-object, no text key, non-string field, parse failure, brace-only
+/// junk) → unchanged, and the degenerate gate handles its share.
+pub fn unwrap_json_text_envelope(content: &str) -> Option<String> {
+    let t = content.trim();
+    if !(t.starts_with('{') && t.ends_with('}')) {
+        return None;
+    }
+    json_text_field(t)
+}
+
+/// Parse a brace-bounded body and return its chat-prose field, if any —
+/// the one key list the envelope unwrap AND the degenerate check share,
+/// so a body the unwrap can salvage is never flagged degenerate (they can
+/// never disagree about what "has prose" means).
+fn json_text_field(t: &str) -> Option<String> {
+    let v = serde_json::from_str::<Value>(t).ok()?;
+    let obj = v.as_object()?;
+    for key in ["message", "content", "text", "answer"] {
+        if let Some(s) = obj.get(key).and_then(Value::as_str) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Short, loggable head of a degenerate answer: bounded, single-line, and
+/// safe to print in a journal next to user prompts.
+fn truncate_degenerate_head(content: &str) -> String {
+    let head: String = content.chars().take(24).collect();
+    head.chars()
+        .map(|c| {
+            if c == '{' || c == '}' {
+                c
+            } else if c.is_whitespace() {
+                ' '
+            } else {
+                '\u{25CF}' // redacted dot — the shape carries, the bytes don't
+            }
+        })
+        .collect()
+}
+
 pub fn answer_is_degenerate(content: &str) -> bool {
     let t = content.trim();
     if t.is_empty() {
         return true;
     }
+    // Braces-and-nothing-else is the live incident shape: observed verbatim
+    // in Discord as  `{` — a bare opener (a JSON tool-intent the model
+    // started and never finished, or a `{}`-style answer the stream cut
+    // short). None of these are text; ALL of them rendered as garbage
+    // because the old check required a CLOSE brace too (`starts_with('{')
+    // && ends_with('}')`), so a lone `{` sailed through to the chat.
+    if t.chars().all(|c| c == '{' || c == '}' || c.is_whitespace()) {
+        return true;
+    }
+    if t.starts_with('{') {
+        // Brace-led serde intent: a chat answer opens with `{` + a quoted
+        // field (the 05:57 render: `{ "` opening an object the stream never
+        // balanced, or `{…} trailing prose`). Renderable only by extracting
+        // a text field; everything else is degenerate — retry, then the
+        // graceful refusal. Legit prose that merely MENTIONS braces (e.g.
+        // `{} is an empty set`) has no quoted field right after the brace
+        // and passes through untouched.
+        let opens_a_field = t[1..].trim_start().starts_with('"');
+        if opens_a_field && json_text_field(t).is_none() {
+            return true;
+        }
+    }
+    // Parseable JSON object with no text payload inside (the original
+    // incident: `{}` and `{"function_name": …}` intent slop that is not
+    // text the user can read).
     if t.starts_with('{') && t.ends_with('}') {
         if let Ok(v) = serde_json::from_str::<Value>(t) {
             let has_text = ["content", "text", "answer", "message"]
@@ -1108,6 +1218,72 @@ mod tests {
         assert!(!answer_is_degenerate("{ \"content\": \"A real answer.\" }"));
         assert!(!answer_is_degenerate("The kiln fires at 980 degrees."));
         assert!(!answer_is_degenerate("{} is an empty set, in plain prose."));
+        // The live Discord incident shape: a BARE opener (no close brace —
+        // the old check needed `{…}` on both ends, so this rendered into
+        // the chat verbatim). Whitespace-padded and paired variants too.
+        assert!(answer_is_degenerate("{"));
+        assert!(answer_is_degenerate("{ "));
+        assert!(answer_is_degenerate(" { } "));
+        assert!(answer_is_degenerate("  {}  "));
+        assert!(answer_is_degenerate("}}"));
+        // The 05:57 render: an answer that OPENS with `{ "` — JSON intent
+        // the stream never balanced (or balanced with trailing prose).
+        // Degenerate either way; a chat never leads with a field list.
+        assert!(answer_is_degenerate("{ \"status\": \"done\", \"sum\""));
+        assert!(answer_is_degenerate("{ \"status\": \"ok\" } here is what happened"));
+        assert!(answer_is_degenerate("{\n  \"note\": \"never closed\""));
+        // Prose that merely MENTIONS braces stays legit — no quoted field
+        // right after the opener.
+        assert!(!answer_is_degenerate("{} is an empty set, in plain prose."));
+    }
+
+    /// The 5:45 live incident shape: envelope WITH prose in a text field —
+    /// not degenerate, but brace-wrapped render is wrong too. Unwrapping
+    /// surfaces the prose; everything else passes untouched (and any
+    /// bracketless non-JSON stays playable as literal text).
+    #[test]
+    fn json_envelope_answers_unwrap_their_text_field() {
+        let envelope = json!({
+            "status": "no_recent_update",
+            "message": "No recent information about Glenn Lee's status was found in the node's memory. Would you like me to check other sources?"
+        });
+        let raw = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(
+            unwrap_json_text_envelope(&raw).as_deref(),
+            Some("No recent information about Glenn Lee's status was found in the node's memory. Would you like me to check other sources?"),
+            "the prose reaches the chat, never the braces"
+        );
+
+        // Whitespace/newline-padded — the incident rendered the `{` on its
+        // own line, so the text brought leading structure. Pretty-printed
+        // JSON is the realistic shape (the paste showed the brace, then
+        // indented fields, one per line).
+        let padded = serde_json::to_string_pretty(&envelope).unwrap();
+        assert_eq!(unwrap_json_text_envelope(&padded), unwrap_json_text_envelope(&raw));
+
+        // Other text keys serve too; first key wins.
+        assert_eq!(
+            unwrap_json_text_envelope("{\"content\": \"plain\"}").as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            unwrap_json_text_envelope("{ \"answer\": \"4 bars\" }").as_deref(),
+            Some("4 bars")
+        );
+
+        // What stays untouched: not an object, no usable text field,
+        // non-string field, unterminated JSON, and plain prose.
+        assert_eq!(unwrap_json_text_envelope("{}"), None);
+        assert_eq!(unwrap_json_text_envelope("{ \"status\": 42 }"), None);
+        assert_eq!(unwrap_json_text_envelope("{ \"message\": \"\" }"), None);
+        assert_eq!(unwrap_json_text_envelope("{"), None);
+        assert_eq!(unwrap_json_text_envelope("The kiln fires at 980 degrees."), None);
+        assert_eq!(unwrap_json_text_envelope(""), None);
+        // Prose that MENTIONS braces is not an envelope.
+        assert_eq!(
+            unwrap_json_text_envelope("{} is an empty set, in plain prose."),
+            None
+        );
     }
 
     #[test]
@@ -1697,7 +1873,6 @@ mod tests {
         // with content after the tap has seen a RoundStart boundary. The
         // sink must clear between rounds so web-informed answers type live.
         use std::sync::Arc;
-        use tokio::sync::Mutex as TMutex;
 
         let app = axum::Router::new()
             .route(

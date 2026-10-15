@@ -10,6 +10,7 @@
 //!   stake       show or drive the stake escrow (status | lock | unlock)
 
 use std::io::{BufRead, Write as _};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -118,6 +119,43 @@ enum Cmd {
     Experts {
         #[command(subcommand)]
         cmd: ExpertsCmd,
+    },
+    /// Full node-state backup / verify / restore (Phase 2).
+    Backup {
+        #[command(subcommand)]
+        cmd: BackupCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Snapshot the node's state into one checksummed file (config + bot
+    /// config + persona files + the whole data tree; expert weights are
+    /// omitted unless --include-experts — a moved node re-pulls replicas).
+    Create {
+        /// Explicit output path (default <home>/backups/jerith-state-<ms>.jbak).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Also archive the expert weight store (may be gigabytes).
+        #[arg(long, default_value_t = false)]
+        include_experts: bool,
+    },
+    /// Check a backup's integrity end to end (magic, manifest, checksums,
+    /// exact EOF) without touching any state.
+    Verify {
+        /// The .jbak file to check.
+        path: PathBuf,
+    },
+    /// Re-install a verified backup's state under this node's home dir.
+    /// Existing files are left alone unless --force. Copying a backup to
+    /// another machine (export JERITH_HOME first) and restoring is the
+    /// migrate story.
+    Restore {
+        /// The .jbak file to restore from.
+        path: PathBuf,
+        /// Overwrite files that already exist (default: skip them).
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -270,6 +308,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Chain { cmd } => chain_cmd(cmd).await,
         Cmd::Lore { query, top_k } => lore_cmd(&query, top_k).await,
         Cmd::Experts { cmd } => experts_cmd(cmd).await,
+        Cmd::Backup { cmd } => backup_cmd(cmd).await,
     }
 }
 
@@ -577,6 +616,69 @@ mod chain_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+/// `jerith backup create|verify|restore` — the full node-state
+/// backup/restore/migrate story (Phase 2). The container format lives in
+/// `core::backup`; this is the human surface: one line per report field.
+async fn backup_cmd(cmd: BackupCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::backup::{self, BackupOptions};
+
+    let home = jerith_mesh_core::config::NodeConfig::home();
+    match cmd {
+        BackupCmd::Create {
+            out,
+            include_experts,
+        } => {
+            let report = backup::create_into(&home, out.as_deref(), BackupOptions {
+                include_experts,
+            })?;
+            println!(
+                "backup written: {} ({} files, {:.2} MiB)",
+                report.path.display(),
+                report.entries,
+                report.total_bytes as f64 / (1024.0 * 1024.0)
+            );
+            if !report.skipped.is_empty() {
+                println!("skipped ({}):", report.skipped.len());
+                for s in &report.skipped {
+                    println!("  - {s}");
+                }
+            }
+            println!(
+                "note: config.toml carries the node identity key — keep the backup private"
+            );
+        }
+        BackupCmd::Verify { path } => {
+            let report = backup::verify(&path)?;
+            println!(
+                "backup OK: {} files, {:.2} MiB, format v{}",
+                report.entries,
+                report.total_bytes as f64 / (1024.0 * 1024.0),
+                report.version
+            );
+            println!(
+                "from node {} at {}",
+                report.node_id.unwrap_or_else(|| "(unknown)".into()),
+                report.created_at_ms
+            );
+        }
+        BackupCmd::Restore { path, force } => {
+            let report = backup::restore_into(&home, &path, force)?;
+            println!("restored {} files under {}", report.written.len(), home.display());
+            if !report.skipped_existing.is_empty() {
+                println!(
+                    "skipped {} existing file(s) (rerun with --force to overwrite)",
+                    report.skipped_existing.len()
+                );
+                for s in &report.skipped_existing {
+                    println!("  - {s}");
+                }
+            }
+            println!("next: jerith run (config.toml restored with this node's identity)");
+        }
+    }
+    Ok(())
+}
+
 async fn chain_cmd(cmd: ChainCmd) -> anyhow::Result<()> {
     let cfg = jerith_mesh_core::config::NodeConfig::load()?.unwrap_or_default();
     match cmd {
@@ -1297,6 +1399,49 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         }
     };
 
+    // Phase 1 resource isolation: CPU pinning (best-effort, Linux) + the
+    // background governor enforcing RAM/VRAM ceilings with the kill switch.
+    // Local chat + the WebUI NEVER stop; only mesh work is gated.
+    if cfg.resources.pin_cores > 0 {
+        jerith_mesh_core::isolate::apply_pinning(cfg.resources.pin_cores);
+    }
+    // Phase 3 per-peer blocking: quiet when the block list is empty (no
+    // ids configured), visible when it is not — the operator set a policy.
+    if !cfg.peers.blocked.is_empty() {
+        println!(
+            "   peers       block list: {} id(s) — inbound RPC refused, placement + replication never use them",
+            cfg.peers.blocked.len()
+        );
+    }
+    let governor = match (
+        cfg.resources.ram_ceiling_bytes,
+        cfg.resources.vram_ceiling_bytes,
+    ) {
+        (None, None) => {
+            println!("   resources   no ceilings configured — governor idle");
+            None
+        }
+        _ => {
+            println!(
+                "   resources   {}{}kill switch {} — governs mesh work only",
+                cfg.resources
+                    .ram_ceiling_bytes
+                    .map(|b| format!("RAM ceiling {:.1} GiB ", b as f64 / (1024.0 * 1024.0 * 1024.0)))
+                    .unwrap_or_default(),
+                cfg.resources
+                    .vram_ceiling_bytes
+                    .map(|b| format!("VRAM ceiling {:.1} GiB ", b as f64 / (1024.0 * 1024.0 * 1024.0)))
+                    .unwrap_or_default(),
+                if cfg.resources.kill_switch { "ARMED" } else { "off" }
+            );
+            Some(jerith_mesh_core::isolate::spawn_governor(
+                state.clone(),
+                Duration::from_secs(10),
+            ))
+        }
+    };
+    let _ = &governor; // bound for the whole run; dropping it would stop the loop
+
     // Phase 2 replication: pull under-replicated hot experts from peers
     // that hold them. Runs only when a store is attached and the config
     // leaves it on; weight transfer itself stays available either way.
@@ -1431,6 +1576,8 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             // Demand signal: every expert this node actually runs feeds the
             // hot set that drives replication.
             stats: Some(state.expert_stats.clone()),
+            // Kill switch: peer-facing serving closes when the governor trips.
+            isolate: Some(state.isolate.clone()),
         };
         let banner = serving.describe();
         // Identity-bound QUIC cert: the transport cert key IS the node's
@@ -1443,9 +1590,14 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     let handler_handler: std::sync::Arc<dyn jerith_mesh_core::quic::ExpertHandler> =
                         std::sync::Arc::new(serving);
-                    if let Err(e) =
-                        jerith_mesh_core::quic::serve(endpoint, handler_handler, node_id, rpc_rx)
-                            .await
+                    if let Err(e) = jerith_mesh_core::quic::serve_with_peer_block(
+                        endpoint,
+                        handler_handler,
+                        node_id,
+                        rpc_rx,
+                        state.peer_block.clone(),
+                    )
+                    .await
                     {
                         tracing::error!(error = %e, "rpc server died");
                     }

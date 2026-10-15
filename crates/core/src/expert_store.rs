@@ -400,6 +400,36 @@ impl ExpertStore {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).bytes
     }
 
+    /// Shed resident experts until at most `max_bytes` stay hot (LRU order,
+    /// coldest first). The resource governor calls this at the RAM soft
+    /// line: the hot set is the node's biggest *discretionary* allocation,
+    /// and every evicted expert is re-read on demand — shedding costs a
+    /// disk hit, not correctness. Returns the bytes evicted.
+    pub fn evict_to(&self, max_bytes: usize) -> usize {
+        let mut shed = 0usize;
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            while cache.bytes > max_bytes {
+                let Some(victim) = cache.order.pop_front() else {
+                    break;
+                };
+                if let Some(entry) = cache.entries.remove(&victim) {
+                    cache.bytes = cache.bytes.saturating_sub(entry.bytes);
+                    shed += entry.bytes;
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if shed > 0 {
+            tracing::info!(
+                target: "mesh",
+                shed_bytes = shed,
+                "resource governor: shed expert hot-set under memory pressure"
+            );
+        }
+        shed
+    }
+
     pub fn stats(&self) -> StoreStatsSnapshot {
         StoreStatsSnapshot {
             hits: self.stats.hits.load(Ordering::Relaxed),
@@ -781,6 +811,57 @@ mod tests {
         let (dir, store) = tmp_store(4);
         assert!(store.hosted().is_empty());
         assert_eq!(store.stats(), StoreStatsSnapshot::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The resource governor's shedding hook: `evict_to` must drop the
+    /// LRU-coldest experts until the resident budget holds, count real
+    /// evictions, and leave hosted experts re-loadable from disk.
+    #[test]
+    fn evict_to_sheds_resident_hot_set_and_keeps_experts_hosted() {
+        // Each synthetic 4×3 expert is 144 bytes of payload — one byte
+        // over the first budget, so two can't stay resident together.
+        let (dir, store) = tmp_store(0);
+        for id in ["L0.E1", "L0.E2", "L0.E3"] {
+            store.put(&ExpertWeights::synthetic(id, 4, 3)).unwrap();
+        }
+        // Big budget picture first: load all three via the cache path.
+        drop(store);
+        let store = ExpertStore::new(&dir, 1).unwrap(); // 1 MiB — fits all
+        let x = vec![1.0f32; 4];
+        for id in ["L0.E1", "L0.E2", "L0.E3"] {
+            store.run(id, &x).unwrap();
+        }
+        assert_eq!(store.resident_bytes(), 3 * 144);
+
+        // Shed to two experts: one eviction, bytes drop, hosted stays.
+        let before = store.stats().evictions;
+        let shed = store.evict_to(2 * 144);
+        assert_eq!(shed, 144, "the single coldest expert was shed");
+        assert_eq!(store.resident_bytes(), 2 * 144);
+        assert_eq!(store.stats().evictions, before + 1);
+        for id in ["L0.E1", "L0.E2", "L0.E3"] {
+            assert!(
+                store.contains(id),
+                "shedding never unhosts {id} — it only drops the RAM copy"
+            );
+        }
+
+        // Shed to zero: fully cold, still loadable (disk hit, not a miss
+        // of the expert itself).
+        let shed_all = store.evict_to(0);
+        assert_eq!(shed_all, 2 * 144);
+        assert_eq!(store.resident_bytes(), 0);
+        for id in ["L0.E1", "L0.E2", "L0.E3"] {
+            assert!(store.contains(id));
+        }
+        store.run("L0.E1", &x).unwrap();
+        assert!(store.is_resident("L0.E1"), "re-read from disk works");
+
+        // Idempotent: the re-read above re-resident E1 (144 B), so the
+        // next shed evicts exactly it — and the one after is a no-op.
+        assert_eq!(store.evict_to(0), 144);
+        assert_eq!(store.evict_to(0), 0, "shedding an empty set is a no-op");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

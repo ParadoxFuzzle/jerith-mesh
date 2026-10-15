@@ -76,6 +76,13 @@ pub struct MeshState {
     /// (served here, or dispatched from here). The hot/cold split and the
     /// shard ring both read it.
     pub expert_stats: crate::expert_stats::SharedExpertStats,
+    /// Resource isolation (Phase 1): the kill-switch state the governor
+    /// trips and everything mesh-facing consults before doing real work.
+    pub isolate: std::sync::Arc<crate::isolate::IsolateState>,
+    /// Per-peer block list (Phase 3): shared by the QUIC server's refusal
+    /// gate, placement (mesh_view filters candidates) and `/status`. The
+    /// ping tick re-syncs it from config, so edits land live.
+    pub peer_block: std::sync::Arc<crate::ratelimit::BlockedPeers>,
     /// Where those counters persist (see
     /// [`set_expert_stats`](Self::set_expert_stats)).
     expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
@@ -86,6 +93,8 @@ impl MeshState {
         let (tx, rx) = watch::channel(true);
         let identity = config.identity()?;
         let stake = crate::stake::StakeManager::new(&config.crypto, Some(identity.clone()));
+        // Built BEFORE `config` moves into the RwLock below.
+        let peer_block = crate::ratelimit::BlockedPeers::from_list(&config.peers.blocked);
         let state = Arc::new(Self {
             config: RwLock::new(config),
             registry: Mutex::new(PeerRegistry::new(None)),
@@ -101,6 +110,8 @@ impl MeshState {
                 crate::expert_stats::ExpertStats::load(&crate::expert_stats::default_stats_path()),
             )),
             expert_stats_path: std::sync::Mutex::new(crate::expert_stats::default_stats_path()),
+            isolate: std::sync::Arc::new(crate::isolate::IsolateState::default()),
+            peer_block,
         });
         Ok((state, rx))
     }
@@ -344,11 +355,20 @@ impl MeshFallbackChat {
                     ad.resources.clone(),
                 ))
             })
+            // Per-peer blocking (Phase 3): a blocked peer is never a
+            // placement candidate — sending it work is exactly what it
+            // was blocked to stop. Refusals still happen server-side if
+            // a stale ad slips through; this keeps the router from even
+            // building a plan around it.
+            .filter(|(id, ..)| !state.peer_block.blocked(id))
             .collect();
         let addrs: HashMap<String, SocketAddr> = reg
             .all_ads()
             .into_iter()
             .filter(|ad| !ad.rpc_address.is_empty())
+            // Replication dials live here too: a blocked peer is never a
+            // weight source either way.
+            .filter(|ad| !state.peer_block.blocked(&ad.node_id))
             .filter_map(|ad| {
                 ad.rpc_address
                     .parse::<SocketAddr>()
@@ -374,6 +394,18 @@ impl MeshFallbackChat {
         expert_id: &str,
         input: &[f32],
     ) -> anyhow::Result<(Vec<f32>, Option<String>)> {
+        // Kill switch (Phase 1): real dispatch into the mesh is the exact
+        // workload the ceiling protects. A tripped switch refuses up front
+        // — before demand is even recorded — so the plan is never built.
+        if state.isolate.tripped() {
+            anyhow::bail!(
+                "kill switch tripped: {} — expert dispatch refused (local-only mode)",
+                state
+                    .isolate
+                    .tripped_reason()
+                    .unwrap_or_else(|| "resource ceiling breached".into())
+            );
+        }
         let (mut peers, addrs) = self.mesh_view(state, Some(expert_id)).await;
         // Cold-expert sharding (Phase 2): when nobody *advertises* this
         // expert, the deterministic shard ring says which node owns it. We
@@ -468,6 +500,12 @@ impl MeshFallbackChat {
         let Some(store) = state.expert_store().await else {
             return Vec::new();
         };
+        // Kill switch: replication is discretionary mesh work — weight
+        // fetches pause under a tripped switch and the next round retries.
+        if state.isolate.tripped() {
+            tracing::debug!(target: "mesh", "kill switch tripped — replication round skipped");
+            return Vec::new();
+        }
         let level = state.config.read().await.experts.replication_config();
         let stats = state.expert_stats_snapshot();
         let hot = stats.hot_set(config.hot_percent);
@@ -669,6 +707,15 @@ async fn run_loop(
                 None => (None, (String::new(), String::new())),
             }
         };
+
+        // Hot-reload the per-peer block list: the only consumer outside
+        // startup, and every other gate (QUIC server, placement, status)
+        // reads the shared set — so a config.toml edit (or `jerith config
+        // set`) takes effect within one tick, no restart.
+        {
+            let cfg = state.config.read().await;
+            state.peer_block.set(&cfg.peers.blocked);
+        }
 
         // Initialize the registry's model gate on first iteration (or after
         // a model switch event, which cleared it).

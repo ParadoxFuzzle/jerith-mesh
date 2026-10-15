@@ -52,7 +52,6 @@ struct Bucket {
 pub fn ip_key(ip: IpAddr) -> String {
     format!("ip-{ip}")
 }
-
 /// Bucket key for a peer-identity lane hit (Ed25519 pubkey fingerprint
 /// = the node_id prefix; holdings require key control, so identity
 /// buckets cannot be spoofed or spent by others).
@@ -195,6 +194,104 @@ pub async fn axum_guard(
     enforce(&limiter, key, req, next).await
 }
 
+// ============================================================================
+// Per-peer blocking (Phase 3): the operator's no-work-for-this-node list.
+// ============================================================================
+
+/// The operator's per-peer block list, shared by every refusal gate:
+/// the QUIC RPC server (inbound), the dispatch/replication placement
+/// (outbound) and `/status`. A blocked peer is refused *honestly* — a
+/// typed "peer is blocked" error, never silence, hang, or fabricated
+/// data — so the requester's router walks on to a healthy candidate.
+///
+/// Deliberately list-shaped (exact node_id), not pattern-shaped: node ids
+/// are Ed25519 fingerprint prefixes the operator copies from an ad, log
+/// line or `/status` entry. Blocking is == blocking; anything fancier
+/// (pattern blocking) belongs at the network edge, not in the mesh.
+#[derive(Debug, Default)]
+pub struct BlockedPeers {
+    set: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    refusals: std::sync::atomic::AtomicU64,
+}
+
+impl BlockedPeers {
+    /// An empty list (the default: nothing is ever blocked).
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Build from a config list (deduped, trimmed). Empty/whitespace
+    /// entries are dropped rather than becoming an impossible-to-match id.
+    pub fn from_list(list: &[String]) -> Arc<Self> {
+        let b = Self::default();
+        b.set(list);
+        Arc::new(b)
+    }
+
+    /// Replace the contents in place (hot reload: the ping tick re-reads
+    /// the section and re-syncs, so adding an id takes effect within one
+    /// interval without a restart).
+    pub fn set(&self, list: &[String]) {
+        let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        *set = list
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    /// Is this node on the block list?
+    pub fn blocked(&self, node_id: &str) -> bool {
+        if node_id.trim().is_empty() {
+            return false; // refuse to match (almost) everything
+        }
+        let set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        // Exact match first; then a prefix match against the configured
+        // prefixes — the fingerprint the operator sees in logs/ads/status
+        // is the node_id prefix, so a shorter reference is usable as-is.
+        set.contains(node_id)
+            || set
+                .iter()
+                .any(|b| node_id.starts_with(b) || b.starts_with(node_id))
+    }
+
+    /// How many ids are blocked (for `/status`).
+    pub fn len(&self) -> usize {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Snapshot of the entries (sorted) for `/status`.
+    pub fn list(&self) -> Vec<String> {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Count one handled refusal (counter for `/status`, log-dedupe fuel).
+    fn count_refusal(&self) {
+        self.refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn refusals(&self) -> u64 {
+        self.refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The one place a refusal is registered against the list so counters
+    /// and logs stay consistent across every gate that uses it.
+    pub fn refuse(&self, node_id: &str, what: &str) {
+        self.count_refusal();
+        tracing::debug!(target: "mesh", peer = %node_id, what = %what, "refused RPC from a blocked peer");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +412,57 @@ mod tests {
         // And the exhausted identity budget stays exhausted: no cross-
         // replenishing through IP traffic.
         assert!(!rl.allow(idk2), "identity budget must stay exhausted");
+    }
+
+    /// The operator's block list: exact ids AND the log-line prefix form;
+    /// blanks never become entries; replacement is a hot reload.
+    #[test]
+    fn blocked_peers_match_exact_and_prefix() {
+        let b = BlockedPeers::from_list(&[
+            "aabbccddeeff".into(),
+            "   ".into(), // blank: dropped, never an entry
+            "".repeat(0),
+        ]);
+        assert_eq!(b.len(), 1);
+
+        // The exact id from an ad.
+        assert!(b.blocked("aabbccddeeff"));
+        // The full fingerprint whose prefix was configured (operators
+        // copy the short form from logs + /status).
+        assert!(b.blocked("aabbccddeeff4ee8b74899c545594b4115851"));
+        // And vice versa: configured the long form, asked with the prefix.
+        let long = BlockedPeers::from_list(&["aabbccddeeff4ee8b7".into()]);
+        assert!(long.blocked("aabbccddeeff"));
+
+        // Everyone else sails through, and the empty id matches nothing.
+        assert!(!b.blocked("112233445566"));
+        assert!(!b.blocked(""));
+        let empty = BlockedPeers::empty();
+        assert!(empty.is_empty());
+        assert!(!empty.blocked("aabbccddeeff"));
+        assert_eq!(empty.refusals(), 0);
+    }
+
+    #[test]
+    fn blocked_peers_replace_in_place_and_count_refusals() {
+        let b = BlockedPeers::from_list(&["aabbccddeeff".into()]);
+        assert!(b.blocked("aabbccddeeff"));
+        assert_eq!(b.refusals(), 0);
+
+        // Each gate refusal bumps the one counter (/status shows totals).
+        b.refuse("aabbccddeeff", "expert_query");
+        b.refuse("aabbccddeeff", "chat_query");
+        assert_eq!(b.refusals(), 2);
+        assert_eq!(
+            b.list(),
+            vec!["aabbccddeeff".to_string()],
+            "list() is the sorted snapshot"
+        );
+
+        // Hot reload: replace the set; old ids leave matching immediately.
+        b.set(&["112233445566".into()]);
+        assert!(!b.blocked("aabbccddeeff"), "old id leaves with the reload");
+        assert!(b.blocked("112233445566"));
+        assert_eq!(b.refusals(), 2, "counter survives the reload");
     }
 }

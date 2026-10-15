@@ -98,6 +98,8 @@ impl Gateway {
             .route("/v1/skills/lore/search", post(skill_lore_search))
             .route("/v1/skills/web/search", post(skill_web_search))
             .route("/v1/skills/web/fetch", post(skill_web_fetch))
+            .route("/v1/skills/vision/describe", post(skill_vision_describe))
+            .route("/v1/skills/vision/analyze", post(skill_vision_analyze))
             .route("/v1/metrics", get(metrics_handler))
             .with_state(state)
             .layer(axum::middleware::from_fn_with_state(
@@ -446,6 +448,80 @@ async fn skill_web_fetch(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>
     }
 }
 
+/// skill: vision.describe — describe an image using the local vision model
+async fn skill_vision_describe(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
+    let Some(image) = body.get("image").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return bad_request("field 'image' is required");
+    };
+    let prompt = body
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Describe this image")
+        .to_string();
+    vision_call(&gw, &prompt, &image).await
+}
+
+/// skill: vision.analyze — analyze an image with a custom prompt
+async fn skill_vision_analyze(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
+    let Some(image) = body.get("image").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return bad_request("field 'image' is required");
+    };
+    let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return bad_request("field 'prompt' is required");
+    };
+    vision_call(&gw, &prompt, &image).await
+}
+
+async fn vision_call(gw: &Arc<Gateway>, prompt: &str, image: &str) -> Response {
+    let url = format!("{}/v1/chat/completions", gw.runtime_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("vision client builder");
+    let messages = json!([
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image}}
+            ]
+        }
+    ]);
+    let mut req_body = json!({
+        "model": gw.base_model.as_deref().unwrap_or(""),
+        "messages": messages,
+        "max_tokens": 512
+    });
+    if let (Some(router), Some(msgs)) = (&gw.model_router, req_body.get("messages").and_then(|m| m.as_array())) {
+        let requested = req_body.get("model").and_then(|m| m.as_str());
+        if let Some(next) = crate::model_router::reroute_for_gateway(
+            requested,
+            gw.base_model.as_deref(),
+            msgs,
+            router,
+        ) {
+            req_body["model"] = serde_json::Value::String(next);
+        }
+    }
+    let mut req = client.post(&url).json(&req_body);
+    if let Some(k) = &gw.runtime_api_key {
+        req = req.bearer_auth(k);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body: Value = resp.json().await.unwrap_or_else(|e| json!({"error": e.to_string()}));
+            (status, Json(body)).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// Minimal-resource ping target for other nodes. <1 ms CPU; reports only
 /// identity + liveness data, never user data.
 ///
@@ -648,6 +724,25 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         }
         None => Value::Null,
     };
+    // Phase 1 resource isolation: the ceilings that arm the governor and
+    // its live kill-switch state (policy lives in isolate.rs; this is
+    // truth — snapshot() re-reads the switch at render time, so the
+    // no-store cache header above matters here too).
+    let resources_value = json!({
+        "ram_ceiling_bytes": cfg.resources.ram_ceiling_bytes,
+        "vram_ceiling_bytes": cfg.resources.vram_ceiling_bytes,
+        "pin_cores": cfg.resources.pin_cores,
+        "kill_switch": cfg.resources.kill_switch,
+        "switch": crate::isolate::snapshot(&gw.state.isolate),
+        "node_rss_bytes": crate::isolate::self_rss_bytes(),
+    });
+    // Phase 3 per-peer blocking: the list + how many refused RPCs it
+    // yielded. Live truth from the shared BlockedPeers (hot-reloaded by
+    // the ping tick, so edits show up here within one interval).
+    let peer_block_value = json!({
+        "blocked": gw.state.peer_block.list(),
+        "refused_rpcs": gw.state.peer_block.refusals(),
+    });
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -675,6 +770,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "runtime_num_predict": gw.runtime_num_predict,
         // Resource pooling (Phase 1): live fleet census.
         "fleet_resources": fleet_value,
+        // Resource isolation (Phase 1): ceilings + kill-switch state.
+        "resources": resources_value,
+        // Per-peer blocking (Phase 3): refused ids + refusal counter.
+        "peer_block": peer_block_value,
         // Tensor transport (Phase 2): expert store state + cache counters.
         "experts": experts_value,
         "verify": verify_value,
@@ -903,6 +1002,26 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             // peers over QUIC (lowest RTT first). The request's messages are
             // privacy-scoped by the caller config; we send them verbatim.
             if let Some(mf) = &gw.mesh_fallback {
+                // Phase 1 kill switch: mesh chat fallback is exactly the
+                // "borrowed capacity" that ceilings bound. Tripped → reply
+                // 502 with mesh_fallback: null (the field is never missing,
+                // so clients see an honest refusal, not a hang).
+                if gw.state.isolate.tripped() {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": format!(
+                                "local runtime unreachable: {local_err}; mesh fallback refused — kill switch tripped ({})",
+                                gw.state
+                                    .isolate
+                                    .tripped_reason()
+                                    .unwrap_or_else(|| "resource ceiling breached".into())
+                            ),
+                            "mesh_fallback": Value::Null,
+                        })),
+                    )
+                        .into_response();
+                }
                 let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
                     return (
                         StatusCode::BAD_GATEWAY,

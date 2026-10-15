@@ -109,6 +109,28 @@ pub fn probe() -> HardwareReport {
     }
 }
 
+/// Check if a hardware report satisfies resource isolation constraints.
+pub fn resource_isolate(hw: &HardwareReport) -> bool {
+    // FIXME: This should check:
+    // - CPU pinning: whether we can pin to specific cores
+    // - GPU VRAM ceiling: whether we respect the configured VRAM cap
+    // - RAM ceiling: whether we respect the configured RAM cap
+    //
+    // For now: just check that we have enough RAM to run the mesh.
+    hw.ram_total_bytes >= 8 * 1024 * 1024 * 1024
+        && hw.cpu_logical_cores >= 2
+        && hw.cpu_physical_cores >= 1
+}
+
+/// Verify that a model fits within the resource isolation limits.
+pub fn verify_fit(hw: &HardwareReport) -> bool {
+    // FIXME: This should verify that the current workload fits within
+    // the resource isolation limits (RAM ceiling, VRAM ceiling, CPU cores).
+    //
+    // For now: just check that we have enough RAM to host a model.
+    hw.ram_total_bytes >= 8 * 1024 * 1024 * 1024
+}
+
 fn detect_os() -> OsKind {
     match std::env::consts::OS {
         "linux" => OsKind::Linux,

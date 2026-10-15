@@ -162,6 +162,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
         runtime: None,
         tensors_only: true,
         stats: None,
+        isolate: None,
     });
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
@@ -270,6 +271,252 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Phase 1 resource isolation, on the wire: a node whose kill switch has
+/// tripped refuses an expert query HONESTLY — a typed error that names
+/// the switch, never invented activations, never a hang. The router must
+/// surface that refusal as its walk error (no other candidate exists).
+/// The ringer/builtin path is exercised separately (it must stay live
+/// even tripped); this covers the real weight-serving gate.
+#[tokio::test]
+async fn kill_switch_tripped_refuses_serving_honestly_over_quic() {
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+    use jerith_mesh_core::isolate::IsolateState;
+    use jerith_mesh_core::quic::{ExpertRouter, ExpertServing, RouterOptions, SharedPinMap};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // --- Node B: a real hosted expert, but the switch is TRIPPED ---------
+    let dir = std::env::temp_dir().join(format!("jerith-killswitch-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(ExpertStore::new(&dir, 8).expect("store"));
+    let weights = ExpertWeights::synthetic("L3.E17", 8, 6);
+    store.put(&weights).expect("publish expert");
+
+    let iso = Arc::new(IsolateState::default());
+    assert!(!iso.tripped());
+    // Trip it exactly as the governor would: one transition, root cause.
+    assert!(iso.record_trip("test: RAM ceiling breached"));
+    assert!(iso.tripped());
+
+    let identity = SigningIdentity::generate();
+    let server =
+        jerith_mesh_core::quic::server_endpoint_for(&identity, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+    let addr = server.local_addr().unwrap();
+    let node_id = identity.node_id();
+    let serving = Arc::new(ExpertServing {
+        store: Some(store.clone()),
+        runtime: None,
+        tensors_only: true,
+        stats: None,
+        isolate: Some(iso.clone()),
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    {
+        let node_id = node_id.clone();
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve(server, serving, node_id, rx).await;
+        });
+    }
+    let mut pins: jerith_mesh_core::quic::PinMap = HashMap::new();
+    pins.insert(node_id.clone(), addr);
+    let pins: SharedPinMap = Arc::new(tokio::sync::RwLock::new(pins));
+    let client = jerith_mesh_core::quic::pinned_client_endpoint_dyn(pins).expect("client endpoint");
+
+    // --- Node A: dispatch to B and expect the honest refusal -------------
+    let router = ExpertRouter::new(RouterOptions {
+        nearby_rtt_ms: 50,
+        dispatch_timeout: Duration::from_secs(10),
+        ..Default::default()
+    });
+    let requester = SigningIdentity::generate();
+    let mut peer_addrs: HashMap<String, SocketAddr> = HashMap::new();
+    peer_addrs.insert(node_id.clone(), addr);
+    let peers = vec![(node_id.clone(), 5u64, true, true, None)];
+    let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
+    let local_run = |_: &[f32]| -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("node A holds no local expert weights")
+    };
+
+    let mut completed = HashMap::new();
+    let mut served_by = None;
+    let err = router
+        .execute_over_quic_speculative_attributed(
+            &client,
+            &requester,
+            &peer_addrs,
+            "killswitch-1",
+            "L3.E17",
+            &input,
+            &peers,
+            &mut completed,
+            local_run,
+            &mut served_by,
+        )
+        .await
+        .expect_err("tripped peer must refuse, not serve");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("kill switch"),
+        "refusal must NAME the kill switch (honest, typed): {msg}"
+    );
+    assert!(
+        msg.contains("refused"),
+        "refusal must be a refusal, not data: {msg}"
+    );
+    assert_eq!(served_by, None, "nobody computed anything");
+
+    // The same node, untripped, serves the expert normally — proving the
+    // refusal is the switch's doing and recovery is just the flag (the
+    // governor's automatic un-trip has no other path to re-arm serving).
+    assert!(iso.record_recover());
+    let mut completed2 = HashMap::new();
+    let mut served_by2: Option<String> = None;
+    let out = router
+        .execute_over_quic_speculative_attributed(
+            &client,
+            &requester,
+            &peer_addrs,
+            "killswitch-2",
+            "L3.E17",
+            &input,
+            &peers,
+            &mut completed2,
+            |_x: &[f32]| anyhow::bail!("still no local weights"),
+            &mut served_by2,
+        )
+        .await
+        .expect("untripped peer must serve again");
+    assert_eq!(served_by2.as_deref(), Some(node_id.as_str()));
+    let want = reference_swiglu(&weights, &input);
+    for (got, expected) in out.iter().zip(&want) {
+        assert!((got - expected).abs() < 1e-6, "recovered result wrong");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Phase 3 per-peer blocking, on the wire: a node's block list refuses
+/// EVERY inbound RPC from the listed peer — honestly (typed error naming
+/// the block), while a different requester is served normally by the same
+/// server. Blocking is personal, not a node-wide shutdown.
+#[tokio::test]
+async fn peer_block_refuses_listed_requester_and_serves_others() {
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+    use jerith_mesh_core::quic::{ExpertRouter, ExpertServing, RouterOptions, SharedPinMap};
+    use jerith_mesh_core::ratelimit::BlockedPeers;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // Node B hosts one real expert (so "refused" cannot be confused with
+    // "not hosted" — the refusal must name the block).
+    let dir = std::env::temp_dir().join(format!("jerith-peerblock-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(ExpertStore::new(&dir, 8).expect("store"));
+    let weights = ExpertWeights::synthetic("L3.E17", 8, 6);
+    store.put(&weights).expect("publish expert");
+
+    // The block list carries the OPERATOR view first: a shorter prefix
+    // (what you copy from a log line) must still match the full id.
+    let blocked_identity = SigningIdentity::generate();
+    let blocked_prefix = &blocked_identity.node_id()[..8];
+    let block = BlockedPeers::from_list(&[blocked_prefix.to_string()]);
+
+    let identity = SigningIdentity::generate();
+    let server =
+        jerith_mesh_core::quic::server_endpoint_for(&identity, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+    let addr = server.local_addr().unwrap();
+    let node_id = identity.node_id();
+    let serving = Arc::new(ExpertServing {
+        store: Some(store.clone()),
+        runtime: None,
+        tensors_only: true,
+        stats: None,
+        isolate: None,
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    {
+        let node_id = node_id.clone();
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve_with_peer_block(
+                server,
+                serving,
+                node_id,
+                rx,
+                block,
+            )
+            .await;
+        });
+    }
+    let mut pins: jerith_mesh_core::quic::PinMap = HashMap::new();
+    pins.insert(node_id.clone(), addr);
+    let pins: SharedPinMap = Arc::new(tokio::sync::RwLock::new(pins));
+    let client = jerith_mesh_core::quic::pinned_client_endpoint_dyn(pins).expect("client endpoint");
+
+    let router = ExpertRouter::new(RouterOptions {
+        nearby_rtt_ms: 50,
+        dispatch_timeout: Duration::from_secs(10),
+        ..Default::default()
+    });
+    let mut peer_addrs: HashMap<String, SocketAddr> = HashMap::new();
+    peer_addrs.insert(node_id.clone(), addr);
+    let peers = vec![(node_id.clone(), 5u64, true, true, None)];
+    let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
+
+    // --- The BLOCKED requester: prefix-listed, refused by identity -------
+    let refused = router
+        .execute_over_quic_speculative_attributed(
+            &client,
+            &blocked_identity,
+            &peer_addrs,
+            "peerblock-1",
+            "L3.E17",
+            &input,
+            &peers,
+            &mut HashMap::new(),
+            |_: &[f32]| anyhow::bail!("no local weights here"),
+            &mut None,
+        )
+        .await
+        .expect_err("blocked requester must be refused");
+    let msg = format!("{refused:#}");
+    assert!(
+        msg.contains("blocked"),
+        "refusal must name the block, not masquerade as 'not hosted': {msg}"
+    );
+    assert!(
+        !msg.contains("not hosted"),
+        "a blocked peer is a policy refusal, not a hosting miss: {msg}"
+    );
+
+    // --- A DIFFERENT requester: the same server serves it normally -------
+    let approved = SigningIdentity::generate();
+    let mut served_by: Option<String> = None;
+    let out = router
+        .execute_over_quic_speculative_attributed(
+            &client,
+            &approved,
+            &peer_addrs,
+            "peerblock-2",
+            "L3.E17",
+            &input,
+            &peers,
+            &mut HashMap::new(),
+            |_: &[f32]| anyhow::bail!("no local weights here"),
+            &mut served_by,
+        )
+        .await
+        .expect("non-blocked requester must be served");
+    assert_eq!(served_by.as_deref(), Some(node_id.as_str()));
+    let want = reference_swiglu(&weights, &input);
+    for (got, expected) in out.iter().zip(&want) {
+        assert!((got - expected).abs() < 1e-6, "wrong result for allowed peer");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Independent SwiGLU reference (loops only, no shared helpers) — the
 /// arithmetic this test holds the wire result to.
 fn reference_swiglu(w: &jerith_mesh_core::expert_store::ExpertWeights, x: &[f32]) -> Vec<f32> {
@@ -329,6 +576,7 @@ async fn hot_expert_replication_pulls_a_replica_over_quic() {
         runtime: None,
         tensors_only: true,
         stats: None,
+        isolate: None,
     });
     let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
     {
@@ -573,6 +821,7 @@ async fn replica_manager_pulls_a_hot_expert_on_its_own_interval() {
         runtime: None,
         tensors_only: true,
         stats: None,
+        isolate: None,
     });
     let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
     {

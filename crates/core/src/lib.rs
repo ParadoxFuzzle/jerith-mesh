@@ -1,6 +1,7 @@
 //! jerith-mesh core: hardware probing, config, discovery, mesh runtime,
 //! gateway and web surfaces.
 
+pub mod backup;
 pub mod bootstrap;
 pub mod bootstrap_server;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod expert_store;
 pub mod gateway;
 pub mod guard;
 pub mod hw;
+pub mod isolate;
 pub mod lore;
 pub mod memory;
 pub mod metrics;

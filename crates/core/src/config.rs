@@ -343,6 +343,113 @@ pub struct NodeConfig {
     /// (`[experts]` in config.toml). See `expert_store.rs`.
     #[serde(default)]
     pub experts: ExpertStoreConfig,
+    /// Resource isolation (`[resources]` in config.toml): RAM/VRAM
+    /// ceilings, CPU pinning and the emergency kill switch (Phase 1).
+    /// See `isolate.rs` — the governor that enforces it.
+    #[serde(default)]
+    pub resources: ResourceIsolationConfig,
+    /// Peer policy (`[peers]` in config.toml): the per-peer block list
+    /// (Phase 3 anti-abuse). Blocked node_ids are refused at BOTH ends of
+    /// the mesh: inbound (the QUIC server refuses any RPC carrying their
+    /// identity — honest typed error, counted), and outbound (placement
+    /// never hands them work; replication never pulls weights from them).
+    /// Hot-reloadable: `jerith config set` or a hand-edit lands on the
+    /// next ping tick, no restart.
+    #[serde(default)]
+    pub peers: PeerPolicyConfig,
+}
+
+/// `[peers]` — who this node refuses to work with, by node id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PeerPolicyConfig {
+    /// Blocked node_ids (or their fingerprint prefixes as seen in logs/
+    /// `/status`). Empty → nothing is blocked; matching is exact-or-prefix
+    /// both directions, because operators copy the short form.
+    #[serde(default)]
+    pub blocked: Vec<String>,
+}
+
+impl PeerPolicyConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for id in &self.blocked {
+            anyhow::ensure!(
+                !id.trim().is_empty(),
+                "[peers] blocked: blank entries are not node ids"
+            );
+            anyhow::ensure!(
+                id.trim().len() >= 4,
+                "[peers] blocked: {id:?} is too short to be a node id (≥ 4 hex chars)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[resources]` — what this node is willing to give the mesh, hard-bound:
+/// the RAM/VRAM ceilings cap the mesh's footprint on the operator's
+/// machine and the kill switch turns mesh work off before a wedged
+/// request can take the box down.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceIsolationConfig {
+    /// Ceiling on this NODE's own RAM footprint (bytes). Soft line (90 %)
+    /// sheds the expert hot-set cache; the hard line trips the kill switch
+    /// when `kill_switch` is on. None → no ceiling (legacy behavior).
+    #[serde(default)]
+    pub ram_ceiling_bytes: Option<u64>,
+    /// Ceiling on total GPU VRAM used (bytes, from nvidia-smi across all
+    /// discrete GPUs). Same soft/hard semantics as the RAM ceiling.
+    #[serde(default)]
+    pub vram_ceiling_bytes: Option<u64>,
+    /// Restrict this process to the first `N` logical cores (Linux,
+    /// best-effort sched_setaffinity). 0 = off.
+    #[serde(default)]
+    pub pin_cores: u32,
+    /// When true (default), breaching a ceiling hard-trips the kill
+    /// switch: expert serving/dispatch, mesh chat fallback and replication
+    /// are refused until usage recedes. Local chat + the WebUI stay up —
+    /// the operator's own access surface is never killed.
+    #[serde(default = "default_true")]
+    pub kill_switch: bool,
+}
+
+impl Default for ResourceIsolationConfig {
+    fn default() -> Self {
+        Self {
+            ram_ceiling_bytes: None,
+            vram_ceiling_bytes: None,
+            pin_cores: 0,
+            kill_switch: true,
+        }
+    }
+}
+
+impl ResourceIsolationConfig {
+    /// The soft line: at/above this share of a ceiling the governor sheds
+    /// discretionary memory (the expert hot-set cache).
+    pub const SOFT_SHARE_PCT: u64 = 90;
+
+    /// Validate before the node starts: a mis-set ceiling must fail loud
+    /// at boot, not be discovered the first time a sample crosses it.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        const MIN_CEILING_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+        for (name, ceiling) in [
+            ("ram_ceiling_bytes", self.ram_ceiling_bytes),
+            ("vram_ceiling_bytes", self.vram_ceiling_bytes),
+        ] {
+            if let Some(b) = ceiling {
+                anyhow::ensure!(
+                    b >= MIN_CEILING_BYTES,
+                    "[resources] {name} = {b} is below the 256 MiB sanity floor — unset it or set a real ceiling"
+                );
+            }
+        }
+        anyhow::ensure!(
+            self.pin_cores <= 1024,
+            "[resources] pin_cores = {} is not a sane core count",
+            self.pin_cores
+        );
+        Ok(())
+    }
 }
 
 /// `[experts]` — the local expert weight store backing real tensor
@@ -492,6 +599,8 @@ impl Default for NodeConfig {
             chain_url: default_chain_url(),
             chain_data_dir: None,
             experts: ExpertStoreConfig::default(),
+            resources: ResourceIsolationConfig::default(),
+            peers: PeerPolicyConfig::default(),
         }
     }
 }
@@ -692,6 +801,12 @@ impl NodeConfig {
                 MIN_CONTRIBUTION_PERCENT
             );
         }
+        // [resources]: a mis-set ceiling fails the node at boot, loud and
+        // early, instead of being discovered when a sample first crosses it.
+        self.resources.validate()?;
+        // [peers]: a block entry that is blank or a 2-char typo would
+        // silently match half the mesh (prefix matching runs BOTH ways).
+        self.peers.validate()?;
         Ok(())
     }
 }
@@ -929,6 +1044,56 @@ mod tests {
         let mut cfg = NodeConfig::default();
         cfg.contribution_percent = 10;
         assert!(cfg.validate().is_err());
+    }
+
+    /// `[resources]` validation: a mis-set ceiling fails loud at boot.
+    #[test]
+    fn resources_validate_rejects_sub_floor_ceilings() {
+        // Defaults (no ceilings, no pinning) always validate.
+        let c = ResourceIsolationConfig::default();
+        assert!(c.validate().is_ok());
+
+        // A ceiling below the 256 MiB floor is a mis-set, rejected.
+        let tiny = ResourceIsolationConfig {
+            ram_ceiling_bytes: Some(16 * 1024 * 1024),
+            ..ResourceIsolationConfig::default()
+        };
+        assert!(tiny.validate().is_err());
+        let tiny_vram = ResourceIsolationConfig {
+            vram_ceiling_bytes: Some(1024 * 1024),
+            ..ResourceIsolationConfig::default()
+        };
+        assert!(tiny_vram.validate().is_err());
+
+        // Real ceilings pass, on both rounds.
+        let real = ResourceIsolationConfig {
+            ram_ceiling_bytes: Some(12 * 1024 * 1024 * 1024),
+            vram_ceiling_bytes: Some(6 * 1024 * 1024 * 1024),
+            pin_cores: 4,
+            kill_switch: true,
+        };
+        assert!(real.validate().is_ok());
+
+        // And the node-level validate(...) chains it: a bad ceiling fails
+        // the whole config, not just the section.
+        let mut cfg = NodeConfig::default();
+        cfg.resources.ram_ceiling_bytes = Some(1024);
+        assert!(cfg.validate().is_err());
+    }
+
+    /// Wire-compat: config files written before isolation existed (no
+    /// `[resources]` section at all) deserialize to defaults through the
+    /// same serde path TOML uses — the section map serializes a real
+    /// config, drops `resources`, and round-trips with actived defaults.
+    #[test]
+    fn missing_resources_section_deserializes_to_defaults() {
+        let cfg = sample_choices().into_config(None).unwrap();
+        let mut base: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        let obj = base.as_object_mut().unwrap();
+        assert!(obj.remove("resources").is_some(), "the field serializes");
+        let back: NodeConfig = serde_json::from_value(obj.clone().into()).unwrap();
+        assert_eq!(back.resources, ResourceIsolationConfig::default());
+        assert!(back.resources.kill_switch, "kill switch defaults ARMED");
     }
 
     #[test]
