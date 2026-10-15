@@ -116,11 +116,11 @@ pub struct VerificationStats {
 /// into spamming the bootstrap by sending us self-sabotaged work.
 pub struct VerificationTracker {
     stats: Mutex<VerificationStats>,
-    /// node_id → last flag time (ms), for flood-control dedup.
+    /// “kind|node_id” → last flag time (ms), for flood-control dedup.
     last_flagged: Mutex<HashMap<String, u64>>,
-    /// Targets queued for a DishonestResults report (drained on flush).
-    pending: Mutex<Vec<String>>,
-    /// Minimum interval between repeat queueing of the same target.
+    /// (kind, target) pairs queued for submission (drained on flush).
+    pending: Mutex<Vec<(crate::bootstrap_server::FraudKind, String)>>,
+    /// Minimum interval between repeat queueing of the same target+kind.
     cooldown_ms: u64,
 }
 
@@ -181,17 +181,31 @@ impl VerificationTracker {
 
     /// Queue (with cooldown) the given nodes for a DishonestResults report.
     pub async fn flag_dishonest(&self, node_ids: &[&str]) {
+        self.flag_fraud(crate::bootstrap_server::FraudKind::DishonestResults, node_ids)
+            .await;
+    }
+
+    /// Queue (with cooldown, per kind+target) the given nodes for the given
+    /// fraud kind. Freerider detection (Phase 4) queues Leeching evidence
+    /// here; statistical reports carry the same cooldown discipline as
+    /// hard-evidence reports so neither channel can flood the bootstrap.
+    pub async fn flag_fraud(
+        &self,
+        kind: crate::bootstrap_server::FraudKind,
+        node_ids: &[&str],
+    ) {
         let mut last = self.last_flagged.lock().await;
         let mut queued = self.pending.lock().await;
         let now = crate::bootstrap::now_ms();
         for id in node_ids.iter().copied().filter(|id| !id.is_empty()) {
+            let key = format!("{kind:?}|{id}");
             let allowed = last
-                .get(id)
+                .get(&key)
                 .map(|t| now.saturating_sub(*t) >= self.cooldown_ms)
                 .unwrap_or(true);
             if allowed {
-                last.insert(id.to_string(), now);
-                queued.push(id.to_string());
+                last.insert(key, now);
+                queued.push((kind.clone(), id.to_string()));
             }
         }
     }
@@ -203,11 +217,11 @@ impl VerificationTracker {
     pub async fn flush_fraud_reports(&self, state: &Arc<crate::ping::MeshState>) -> Vec<String> {
         // Drain before the await: targets flagged while we submit go to the
         // next flush instead of double-sending within one batch.
-        let mut to_report: Vec<String> = {
+        let mut to_report: Vec<(crate::bootstrap_server::FraudKind, String)> = {
             let mut q = self.pending.lock().await;
             q.drain(..).collect()
         };
-        to_report.sort();
+        to_report.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0))));
         to_report.dedup();
         if to_report.is_empty() {
             return Vec::new();
@@ -217,17 +231,12 @@ impl VerificationTracker {
         let bootstrap =
             crate::bootstrap::BootstrapClient::new(state.config.read().await.bootstrap_url.clone());
         let mut sent: Vec<String> = Vec::new();
-        for node_id in &to_report {
+        for (kind, node_id) in &to_report {
             if node_id == &reporter {
                 continue; // a node cannot report itself
             }
             match bootstrap
-                .report_fraud(
-                    crate::bootstrap_server::FraudKind::DishonestResults,
-                    node_id,
-                    &reporter,
-                    &state.identity,
-                )
+                .report_fraud(kind.clone(), node_id, &reporter, &state.identity)
                 .await
             {
                 Ok(_) => {
@@ -235,7 +244,8 @@ impl VerificationTracker {
                     tracing::warn!(
                         target: "mesh",
                         node = %node_id,
-                        "dishonest-result evidence submitted to bootstrap"
+                        kind = ?kind,
+                        "fraud evidence submitted to bootstrap"
                     );
                 }
                 Err(e) => {

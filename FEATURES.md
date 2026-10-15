@@ -222,7 +222,25 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   exact answer + tamper-proof commitment are graded locally. Mismatches queue
   `DishonestResults` evidence to the bootstrap; timeouts and infra failures
   are never treated as dishonesty
-- 📋 Statistical freerider detection (latency-vs-claim, activation patterns, work ratios) (Phase 4)
+- ✅ Statistical freerider detection (Phase 4) — `freerider.rs`, evidence-not-verdict:
+  - Coordinator-side ledger feeds on every COMPLETED peer-served dispatch
+    (candidates walked + who answered + latency); failed dispatches and
+    local-served runs feed nothing — honest blackouts are never outliers
+  - Two conservative signals over a recency window: **latency-vs-pool**
+    (peer median > 4× the median of ≥ 3 other peers serving the SAME
+    expert, ≥ 3 samples) and **selected-but-absent** (walk-order asks: a
+    peer answering ≤ 25 % of its last ≥ 10 asks while ≥ 2 other peers
+    answer ≥ 40 % — ranks BEHIND the server never count as asks)
+  - Suspicion decays every evaluation (0.93/round on a 0–100 scale); the
+    Leeching evidence flag raises once per crossing and re-arms only
+    under half the line (hysteresis) — behavior, not one clean round,
+    restores trust; the whole ledger is in-memory per process
+  - Crossings queue signed `Leeching` evidence through the SAME
+    per-kind-cooldown channel as every other fraud report (`verify.rs`
+    carries (kind, target) pairs now); the bootstrap weighs it (+20
+    reputation) — statistics never slash
+  - `freerider_enabled` config gate (default on, hot per tick); running
+    suspicion visible on `/status.freerider` (top-5 scores + counters)
 - 📋 Reputation system with gossiped signed scores (Phase 4–5)
 - 📋 TEE attestation & selective ZK proofs (Phase 5+, research-grade)
 

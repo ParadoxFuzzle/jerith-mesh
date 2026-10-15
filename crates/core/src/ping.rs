@@ -65,6 +65,11 @@ pub struct MeshState {
     /// Phase 4 verification counters; the ping loop flushes queued
     /// DishonestResults evidence to the bootstrap on its regular cadence.
     pub verify: SharedVerifyTracker,
+    /// Statistical freerider detection (Phase 4): coordinator-side evidence
+    /// only — the ledger rides the dispatch loop (feed_dispatch) and the
+    /// evaluator runs on the ping tick, off the inference hot path.
+    pub freerider:
+        std::sync::Arc<tokio::sync::Mutex<crate::freerider::FreeriderDetector>>,
     /// Phase 5 stake + slashing handle (ledger persists across restarts).
     pub stake: Arc<crate::stake::StakeManager>,
     /// Phase 2 tensor transport: local expert weights (set by the node
@@ -126,6 +131,9 @@ impl MeshState {
             expert_stats_path: std::sync::Mutex::new(crate::expert_stats::default_stats_path()),
             isolate: std::sync::Arc::new(crate::isolate::IsolateState::default()),
             peer_block,
+            freerider: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::freerider::FreeriderDetector::default(),
+            )),
             discovery: std::sync::Arc::new(tokio::sync::Mutex::new(discovery)),
         });
         Ok((state, rx))
@@ -483,6 +491,7 @@ impl MeshFallbackChat {
         // Attribution comes from the router: `served_by` is the node id
         // that actually replied, None when the local weights ran.
         let mut served_by = None;
+        let dispatch_started = std::time::Instant::now();
         let out = self
             .router
             .execute_over_quic_speculative_attributed(
@@ -498,6 +507,25 @@ impl MeshFallbackChat {
                 &mut served_by,
             )
             .await?;
+        let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
+        // Phase 4 freerider evidence: only COMPLETED peer-served runs feed
+        // the ledger. Failed dispatches and local-served runs feed nothing —
+        // honest blackouts and local wins must never read as outliers.
+        if let Some(served) = served_by.as_ref() {
+            let own_id = state.config.read().await.node_id.clone();
+            if *served != own_id {
+                let candidates: Vec<String> = peers
+                    .iter()
+                    .filter(|(id, ..)| *id != own_id)
+                    .map(|(id, ..)| id.clone())
+                    .collect();
+                state
+                    .freerider
+                    .lock()
+                    .await
+                    .feed_dispatch(expert_id, &candidates, served, dispatch_ms);
+            }
+        }
         Ok((out, served_by))
     }
 
@@ -927,6 +955,26 @@ async fn run_loop(
         // Phase 4: ringer spot-check (per config) against a random alive
         // peer, THEN (same cadence) flush queued DishonestResults evidence
         // to the bootstrap — never on the inference hot path.
+        // Statistical freerider detection (Phase 4): evaluate the
+        // coordinator ledger once per tick — pure in-memory work, no I/O on
+        // the hot path. Crossings queue signed Leeching evidence through the
+        // same flush cadence as every other fraud report; the config gate
+        // is read per tick so `jerith config set` (or an edit) lands live.
+        if state.config.read().await.freerider_enabled {
+            let targets = state.freerider.lock().await.evaluate();
+            if !targets.is_empty() {
+                tracing::warn!(
+                    target: "mesh",
+                    targets = ?targets,
+                    "statistical freerider evidence queued (Leeching)"
+                );
+                let refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
+                state
+                    .verify
+                    .flag_fraud(crate::bootstrap_server::FraudKind::Leeching, &refs)
+                    .await;
+            }
+        }
         maybe_spot_check_ringer(&state).await;
         let flushed_targets = state.verify.flush_fraud_reports(&state).await;
         if !flushed_targets.is_empty() {

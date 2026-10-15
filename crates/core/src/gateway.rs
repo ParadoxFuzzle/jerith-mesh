@@ -755,6 +755,15 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             "ad_servers": d.ad_servers(None),
         })
     };
+    // Statistical freerider detection (Phase 4): running coordinator-side
+    // suspicion (decayed scores, evidence flags) — statistics, not verdicts;
+    // the bootstrap weighs what we queue. Null when the phase is off.
+    let freerider_value = if cfg.freerider_enabled {
+        let d = gw.state.freerider.lock().await;
+        d.snapshot()
+    } else {
+        Value::Null
+    };
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -788,6 +797,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "peer_block": peer_block_value,
         // Discovery rotation (Phase 1): configured + learned + last-good.
         "discovery": discovery_value,
+        // Statistical freerider detection (Phase 4): running suspicion.
+        "freerider": freerider_value,
         // Tensor transport (Phase 2): expert store state + cache counters.
         "experts": experts_value,
         "verify": verify_value,

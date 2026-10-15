@@ -322,6 +322,13 @@ pub struct NodeConfig {
     /// alive peer; a wrong answer queues DishonestResults evidence.
     #[serde(default = "default_ringer_percent")]
     pub ringer_percent: u32,
+    /// Statistical freerider detection (Phase 4): coordinator-side evidence
+    /// only — per-peer latency-vs-pool and selected-but-absent signals over
+    /// decaying windows (see freerider.rs). A threshold crossing queues
+    /// signed Leeching evidence for the bootstrap to weigh — statistics
+    /// never slash. `false` switches the phase off entirely.
+    #[serde(default = "default_true")]
+    pub freerider_enabled: bool,
     /// Jerith Guard: outbound content filter (PII redaction/blocking,
     /// prompt-injection and malware-request blocklists). See guard.rs.
     #[serde(default)]
@@ -618,6 +625,7 @@ impl Default for NodeConfig {
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
             ringer_percent: default_ringer_percent(),
+            freerider_enabled: true,
             guard: crate::guard::GuardConfig::default(),
             websearch: WebSearchConfig::default(),
             chain_url: default_chain_url(),

@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod economics;
 pub mod expert_stats;
 pub mod expert_store;
+pub mod freerider;
 pub mod gateway;
 pub mod guard;
 pub mod hw;
