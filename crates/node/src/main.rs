@@ -240,6 +240,16 @@ enum MemoryCmd {
     },
     /// Store health: count, dimensions, providers, footprint.
     Stats,
+    /// Copy every row from the previously-configured store into the
+    /// store the config now names (migration guidance direction — the
+    /// inverse of the switch `jerith config set memory_backend` made).
+    /// Vectors are copied verbatim (no re-embedding); duplicates by text
+    /// are skipped, so re-running is idempotent.
+    Migrate {
+        /// Empty the source store after a verified copy.
+        #[arg(long)]
+        drop_source: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -775,22 +785,11 @@ async fn chain_cmd(cmd: ChainCmd) -> anyhow::Result<()> {
 }
 
 async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
-    use jerith_mesh_core::memory::{EmbedConfig, MemoryHandle};
+    use jerith_mesh_core::memory::MemoryHandle;
     let cfg = NodeConfig::load()?.context("no config — run setup first")?;
-    let embed_cfg = EmbedConfig {
-        ollama_url: cfg.specialists.ollama_url.clone(),
-        dim: cfg.specialists.embedding_dim as usize,
-        ..Default::default()
-    };
     // Same choose-and-open rules as the run path: configured backend,
     // honest failure (never a different store) when it is unusable.
-    let store = MemoryHandle::open(
-        cfg.memory_backend,
-        &NodeConfig::memory_db_path(),
-        cfg.effective_memory_dsn().as_deref(),
-        embed_cfg,
-    )
-    .await?;
+    let store = MemoryHandle::open_for_config(&cfg).await?;
     match cmd {
         MemoryCmd::Add { text } => {
             let (id, provider) = store.embed_and_store(&text).await?;
@@ -846,6 +845,73 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
             println!("embedding bytes: {}", st.embedding_bytes);
             if let Some(ms) = st.newest_created_ms {
                 println!("newest entry: {} ms epoch", ms);
+            }
+        }
+        MemoryCmd::Migrate { drop_source } => {
+            // Direction: from the store the config LEFT to the store it
+            // now names. Postgres→sqlite reads the DSN from config (the
+            // old postgres the node used); sqlite→postgres needs the DSN.
+            let source = match cfg.memory_backend {
+                MemoryBackend::PostgresPgvector => {
+                    MemoryHandle::open(
+                        MemoryBackend::Sqlite,
+                        &NodeConfig::memory_db_path(),
+                        None,
+                        jerith_mesh_core::memory::EmbedConfig {
+                            dim: cfg.specialists.embedding_dim as usize,
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                }
+                MemoryBackend::Sqlite => {
+                    let dsn = cfg.effective_memory_dsn().context(
+                        "migrating FROM postgres needs the OLD memory_dsn in config.toml \
+                         (or JERITH_MEMORY_DSN) — set it to the postgres the node used before",
+                    )?;
+                    MemoryHandle::open(
+                        MemoryBackend::PostgresPgvector,
+                        &NodeConfig::memory_db_path(),
+                        Some(&dsn),
+                        jerith_mesh_core::memory::EmbedConfig {
+                            dim: cfg.specialists.embedding_dim as usize,
+                            ..Default::default()
+                        },
+                    )
+                    .await?
+                }
+            };
+            let src_count = source.count().await?;
+            if src_count == 0 {
+                println!(
+                    "source store is empty — nothing to migrate\n\
+                     (direction: FROM the store the config has LEFT; \
+                     target = the now-configured store)"
+                );
+                return Ok(());
+            }
+            println!(
+                "migrating {} source rows → {}",
+                src_count,
+                store.describe()
+            );
+            let report = store
+                .copy_rows_from(&source)
+                .await
+                .context("migration copy — the target store keeps whatever rows landed, rerun is idempotent")?;
+            let target_count = store.count().await?;
+            println!(
+                "copied: {} · already present (skipped): {} · target now holds {} entries",
+                report.copied, report.skipped_existing, target_count
+            );
+            if drop_source {
+                let wiped = source.wipe().await?;
+                println!("source emptied ({wiped} rows removed) — migration complete");
+            } else {
+                println!(
+                    "source left intact — verify the target, then rerun with \
+                     --drop-source to empty it"
+                );
             }
         }
     }
@@ -1378,46 +1444,27 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
 
     // Local memory: the backend the operator chose is the one opened.
     // A postgres choice without a usable store fails honest and loud —
-    // refused up front when no DSN is configured at all, degraded to
-    // "no memory" (warned, never swapped) when the chosen store itself
-    // cannot be reached. Embeddings stay local either way.
-    let memory = if cfg.specialists.embeddings_enabled {
-        let embed_cfg = jerith_mesh_core::memory::EmbedConfig {
-            ollama_url: cfg.specialists.ollama_url.clone(),
-            dim: cfg.specialists.embedding_dim as usize,
-            ..Default::default()
-        };
-        match jerith_mesh_core::memory::MemoryHandle::open(
-            cfg.memory_backend,
-            &NodeConfig::memory_db_path(),
-            cfg.effective_memory_dsn().as_deref(),
-            embed_cfg,
-        )
-        .await
-        {
+    // misconfiguration is a boot error (as with the resource ceilings);
+    // an unreachable store degrades to "no memory" (warned, never a
+    // silent swap). Embeddings stay local either way. The handle lives
+    // in MeshState so the config hot-reload can live-swap it later.
+    if cfg.specialists.embeddings_enabled {
+        match jerith_mesh_core::memory::MemoryHandle::open_for_config(&cfg).await {
             Ok(store) => {
                 println!("   memory      {}, local-only", store.describe());
-                Some(std::sync::Arc::new(store))
+                *state.memory.write().await = Some(std::sync::Arc::new(store));
             }
             Err(e) => {
                 if cfg.memory_backend == MemoryBackend::PostgresPgvector
-                    && cfg
-                        .memory_dsn
-                        .as_deref()
-                        .filter(|d| !d.trim().is_empty())
-                        .is_none()
-                    && std::env::var("JERITH_MEMORY_DSN").is_err()
+                    && cfg.effective_memory_dsn().is_none()
                 {
                     return Err(e);
                 }
                 tracing::warn!(error = %e, "memory store unavailable");
                 println!("   memory      unavailable ({e})");
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
     // Phase 2 tensor transport: open the local expert weight store. This
     // node answers peers' ExpertQuery requests with the expert's real
@@ -1593,7 +1640,6 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         runtime_api_key: cfg.runtime_api_key.clone(),
         runtime_num_predict: cfg.runtime_num_predict,
         miner,
-        memory: memory.clone(),
         mesh_fallback,
         guard,
         model_router: Some(std::sync::Arc::new(
@@ -1813,6 +1859,9 @@ async fn model_cmd(new_model: Option<String>) -> anyhow::Result<()> {
 
 async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
     let mut cfg = NodeConfig::load()?.context("no config — run setup first")?;
+    // Memory backend changes print store-migration guidance; capture
+    // the pre-change state for the diff.
+    let old = (cfg.memory_backend, cfg.memory_dsn.clone());
     if assignments.is_empty() {
         println!(
             "{}",
@@ -1848,10 +1897,45 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
             "runtime_url" => cfg.runtime_url = v.to_string(),
             "runtime_api_key" => cfg.runtime_api_key = Some(v.to_string()),
             "bootstrap_url" => cfg.bootstrap_url = v.to_string(),
+            "memory_backend" => {
+                cfg.memory_backend = parse_memory(v)?;
+            }
+            "memory_dsn" => {
+                cfg.memory_dsn = if v.trim().is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
+            }
             other => bail!("unknown config key {other:?}"),
         }
     }
+    // Final-state validation — assignments can fix each other up (e.g.
+    // `memory_backend=postgres memory_dsn=...` in one command), so this
+    // runs after the loop, never per-key: a postgres backend without a
+    // DSN anywhere is refused, not saved.
+    if cfg.memory_backend == MemoryBackend::PostgresPgvector
+        && cfg.effective_memory_dsn().is_none()
+    {
+        bail!(
+            "memory_backend = postgres but no DSN — add memory_dsn=postgres://user:pass@host:5432/db \
+             to the same command (or set JERITH_MEMORY_DSN); refusing a backend the node could never open"
+        );
+    }
+    let memory_changed = cfg.memory_backend != old.0 || cfg.memory_dsn != old.1;
     cfg.save()?;
     println!("saved {}", NodeConfig::config_path().display());
+    if memory_changed {
+        // A live node applies this within one ping tick (the mesh loop
+        // hot-reloads the config file); existing rows are not auto-moved
+        // — see the guidance, printed here.
+        println!(
+            "{}",
+            jerith_mesh_core::memory::migration_guidance(
+                old.0.label(),
+                cfg.memory_backend.label()
+            )
+        );
+    }
     Ok(())
 }

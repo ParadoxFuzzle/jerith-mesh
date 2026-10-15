@@ -102,6 +102,16 @@ pub struct MeshState {
     /// Persisted to `<data>/discovery-servers.json` when it grows.
     pub discovery:
         std::sync::Arc<tokio::sync::Mutex<crate::discovery::DiscoveryServers>>,
+    /// The live local memory store behind the memory.* skills — owned
+    /// HERE (not in the gateway) so the config hot-reload can live-swap
+    /// it without rebuilding the HTTP state. Boot swaps it in once the
+    /// configured store opens; None → skills answer the honest
+    /// "memory backend not configured".
+    pub memory: tokio::sync::RwLock<Option<crate::memory::SharedMemory>>,
+    /// Backoff for failed memory-store swaps during config reload: when
+    /// the newly-configured store won't open (postgres down), skip the
+    /// retry for this long so a dead neighbor doesn't spam every tick.
+    memory_swap_backoff_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// Where those counters persist (see
     /// [`set_expert_stats`](Self::set_expert_stats)).
     expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
@@ -150,6 +160,8 @@ impl MeshState {
                 crate::freerider::FreeriderDetector::default(),
             )),
             discovery: std::sync::Arc::new(tokio::sync::Mutex::new(discovery)),
+            memory: RwLock::new(None),
+            memory_swap_backoff_until: std::sync::Mutex::new(None),
         });
         Ok((state, rx))
     }
@@ -702,6 +714,198 @@ impl MeshFallbackChat {
 
 fn req_id_tracker() {}
 
+/// What a config-file re-read wants applied to a running node (Phase 0.5
+/// extension): hot fields land within the same tick, cold fields are
+/// restart-only and warned about, and identity fields are refused
+/// outright — a hot identity swap would be a forgery hazard on every
+/// signed wire surface.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigReloadPlan {
+    /// Changed fields that apply right away (hot-reloadable contract).
+    pub hot: Vec<&'static str>,
+    /// Changed fields that only a restart can apply.
+    pub cold: Vec<&'static str>,
+    /// The memory triple changed — the executor live-swaps the store
+    /// first and adopts the memory config fields only on success.
+    pub memory_changed: bool,
+    /// Identity changed — always refused with a loud ERROR.
+    pub identity_violations: Vec<&'static str>,
+}
+
+/// Diff the config file against the running config. Pure and
+/// unit-tested; [`reload_config_from_disk`] is the only side-effectful
+/// part. The hot set is exactly the fields every use site re-reads from
+/// `state.config` (contribution/ringer/verify/freerider gates, the
+/// per-peer block list, the memory triple) — so updating the live
+/// config here propagates on the next read.
+pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadPlan {
+    let mut plan = ConfigReloadPlan::default();
+
+    // Identity: never hot-applied, never quietly adopted.
+    if disk.node_id != live.node_id {
+        plan.identity_violations.push("node_id");
+    }
+    if disk.secret_key_hex != live.secret_key_hex {
+        plan.identity_violations.push("secret_key");
+    }
+
+    // Hot keys.
+    if disk.contribution_percent != live.contribution_percent {
+        plan.hot.push("contribution_percent");
+    }
+    if disk.ringer_percent != live.ringer_percent {
+        plan.hot.push("ringer_percent");
+    }
+    if disk.verify_percent != live.verify_percent {
+        plan.hot.push("verify_percent");
+    }
+    if disk.freerider_enabled != live.freerider_enabled {
+        plan.hot.push("freerider_enabled");
+    }
+    if disk.peers.blocked != live.peers.blocked {
+        plan.hot.push("peers.blocked");
+    }
+    let mem_key = |c: &NodeConfig| {
+        (
+            c.memory_backend,
+            c.memory_dsn.clone(),
+            c.specialists.embeddings_enabled,
+            c.specialists.embedding_dim,
+            c.specialists.ollama_url.clone(),
+        )
+    };
+    if mem_key(disk) != mem_key(live) {
+        plan.memory_changed = true;
+    }
+
+    // Cold keys: sockets and process-lifetime machinery.
+    if disk.model != live.model {
+        plan.cold.push("model");
+    }
+    if disk.role != live.role {
+        plan.cold.push("role");
+    }
+    if disk.gateway_port != live.gateway_port {
+        plan.cold.push("gateway_port");
+    }
+    if disk.rpc_port != live.rpc_port {
+        plan.cold.push("rpc_port");
+    }
+    if disk.gateway_bind != live.gateway_bind {
+        plan.cold.push("gateway_bind");
+    }
+    if disk.advertise_host != live.advertise_host {
+        plan.cold.push("advertise_host");
+    }
+    if disk.runtime_url != live.runtime_url {
+        plan.cold.push("runtime_url");
+    }
+    if disk.runtime_api_key != live.runtime_api_key {
+        plan.cold.push("runtime_api_key");
+    }
+    if disk.bootstrap_url != live.bootstrap_url {
+        plan.cold.push("bootstrap_url");
+    }
+    if format!("{:?}", disk.crypto) != format!("{:?}", live.crypto) {
+        plan.cold.push("crypto");
+    }
+    plan
+}
+
+/// Re-read `config.toml` and apply the reload plan: hot fields this
+/// tick, restart-required warnings for cold ones, and a live swap for
+/// the memory backend — failed swaps keep the previous store serving
+/// and never adopt the config fields, so `/status` never lies about the
+/// store that is actually live.
+async fn reload_config_from_disk(state: &Arc<MeshState>) {
+    let disk = match crate::config::NodeConfig::load() {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "config re-read failed — keeping the running config for this tick"
+            );
+            return;
+        }
+    };
+    let plan = {
+        let live = state.config.read().await;
+        plan_config_reload(&disk, &live)
+    };
+    if plan.identity_violations.is_empty()
+        && plan.hot.is_empty()
+        && plan.cold.is_empty()
+        && !plan.memory_changed
+    {
+        return;
+    }
+    if !plan.identity_violations.is_empty() {
+        tracing::error!(
+            fields = ?plan.identity_violations,
+            "identity change in config.toml refused — restart the node to re-identify (a hot identity swap would forge every signed wire surface)"
+        );
+    }
+    // Memory store swap first: adopt its config fields only when the new
+    // store actually opened.
+    let mut memory_adopted = true;
+    if plan.memory_changed {
+        let backoff_expired = match state.memory_swap_backoff_until.lock().unwrap().as_ref() {
+            Some(t) => std::time::Instant::now() >= *t,
+            None => true,
+        };
+        if !backoff_expired {
+            tracing::debug!("memory swap retry delayed (previous open failed — backoff)");
+            memory_adopted = false;
+        } else {
+            match crate::memory::MemoryHandle::open_for_config(&disk).await {
+                Ok(store) => {
+                    let to_desc = store.describe();
+                    let from_desc = state.memory.read().await.as_ref().map(|m| m.describe());
+                    *state.memory.write().await = Some(std::sync::Arc::new(store));
+                    *state.memory_swap_backoff_until.lock().unwrap() = None;
+                    tracing::info!(
+                        from = ?from_desc,
+                        to = %to_desc,
+                        "memory store live-swapped (config hot-reload)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "memory store swap failed — the previous store keeps serving; retrying with backoff"
+                    );
+                    *state.memory_swap_backoff_until.lock().unwrap() =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                    memory_adopted = false;
+                }
+            }
+        }
+    }
+    // Adopt the hot fields (memory fields only when the swap succeeded).
+    {
+        let mut live = state.config.write().await;
+        live.contribution_percent = disk.contribution_percent;
+        live.ringer_percent = disk.ringer_percent;
+        live.verify_percent = disk.verify_percent;
+        live.freerider_enabled = disk.freerider_enabled;
+        live.peers.blocked = disk.peers.blocked.clone();
+        if memory_adopted {
+            live.memory_backend = disk.memory_backend;
+            live.memory_dsn = disk.memory_dsn.clone();
+            live.specialists.embeddings_enabled = disk.specialists.embeddings_enabled;
+            live.specialists.embedding_dim = disk.specialists.embedding_dim;
+            live.specialists.ollama_url = disk.specialists.ollama_url.clone();
+        }
+    }
+    for field in plan.hot {
+        tracing::info!(field, "config hot-applied (took effect this tick)");
+    }
+    for field in plan.cold {
+        tracing::warn!(field, "config field changed — restart required to apply");
+    }
+}
+
 /// Background loop handle.
 pub struct MeshLoop {
     state: Arc<MeshState>,
@@ -787,6 +991,13 @@ async fn run_loop(
             let mut d = state.discovery.lock().await;
             d.configured = crate::discovery::sanitize(&cfg.discovery_seed_servers(), None);
         }
+
+        // Hot-reload the config FILE (Phase 0.5 extension): `jerith config
+        // set` (or a raw edit) is picked up here — hot fields land this
+        // tick, cold fields WARN about the restart, and a memory-backend
+        // change live-swaps the store (migration guidance rides `config
+        // set` and `jerith memory migrate` moves the rows safely).
+        reload_config_from_disk(&state).await;
 
         // Initialize the registry's model gate on first iteration (or after
         // a model switch event, which cleared it).
@@ -1411,6 +1622,34 @@ mod tests {
     use super::*;
     use crate::bootstrap::DEPRECATE_AFTER_FAILED_PINGS;
     use crate::config::*;
+
+    #[test]
+    fn config_reload_plan_classifies_fields() {
+        let live = NodeConfig::default();
+        let mut disk = NodeConfig::default();
+        disk.contribution_percent = live.contribution_percent + 5;
+        disk.bootstrap_url = "http://other-bootstrap/".to_string();
+        disk.node_id = "someone-else".to_string();
+        let plan = plan_config_reload(&disk, &live);
+        assert!(plan.hot.contains(&"contribution_percent"));
+        assert_eq!(plan.cold, vec!["bootstrap_url"]);
+        assert_eq!(plan.identity_violations, vec!["node_id"]);
+        assert!(!plan.memory_changed);
+    }
+
+    #[test]
+    fn config_reload_plan_detects_memory_triple_change() {
+        let live = NodeConfig::default();
+        let mut disk = NodeConfig::default();
+        disk.memory_backend = MemoryBackend::PostgresPgvector;
+        disk.memory_dsn = Some("postgres://u:p@127.0.0.1:5432/db?sslmode=disable".to_string());
+        let plan = plan_config_reload(&disk, &live);
+        assert!(plan.memory_changed);
+        assert!(plan.hot.is_empty(), "memory moves are not plain hot fields");
+        assert!(plan.cold.is_empty());
+        // Identical configs stay silent — the tick must not log noise.
+        assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
+    }
 
     #[test]
     fn meters_snapshot_resets() {

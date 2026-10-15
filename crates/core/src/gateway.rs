@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::economics::JerithMiner;
-use crate::memory::SharedMemory;
+
 use crate::ping::MeshState;
 
 /// How long the gateway waits for the local runtime's response headers
@@ -47,8 +47,6 @@ pub struct Gateway {
     pub runtime_num_predict: Option<u64>,
     /// Optional JER miner (present when crypto chain = JerithChain).
     pub miner: Option<JerithMiner>,
-    /// Local memory store backing the memory.* skills.
-    pub memory: Option<SharedMemory>,
     /// Optional mesh-fallback chat handle (QUIC client endpoint + peer
     /// address map). Present when the node runs a server endpoint.
     pub mesh_fallback: Option<Arc<crate::ping::MeshFallbackChat>>,
@@ -125,7 +123,7 @@ const MEMORY_EMBED_TEXT_CAP_CHARS: usize = 64_000;
 const CHAT_FORWARD_CAP_BYTES: usize = 1_000_000;
 
 async fn skill_memory_embed(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
-    let Some(memory) = &gw.memory else {
+    let Some(memory) = gw.state.memory.read().await.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "memory backend not configured"})),
@@ -170,7 +168,7 @@ async fn skill_memory_embed(State(gw): State<Arc<Gateway>>, Json(body): Json<Val
 
 /// skill: memory.search — local vector search over the local store.
 async fn skill_memory_search(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
-    let Some(memory) = &gw.memory else {
+    let Some(memory) = gw.state.memory.read().await.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "memory backend not configured"})),
@@ -220,7 +218,7 @@ async fn skill_memory_search(State(gw): State<Arc<Gateway>>, Json(body): Json<Va
 /// skill: memory.similar — semantic-memories port: rank stored entries by
 /// similarity to the entry with the given seed id. Body: {id, top_k?}.
 async fn skill_memory_similar(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
-    let Some(memory) = &gw.memory else {
+    let Some(memory) = gw.state.memory.read().await.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "memory backend not configured"})),
@@ -243,7 +241,7 @@ async fn skill_memory_similar(State(gw): State<Arc<Gateway>>, Json(body): Json<V
 
 /// skill: memory.stats — health-dashboard port: store size/dims/providers.
 async fn skill_memory_stats(State(gw): State<Arc<Gateway>>) -> Response {
-    let Some(memory) = &gw.memory else {
+    let Some(memory) = gw.state.memory.read().await.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "memory backend not configured"})),
@@ -820,6 +818,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     } else {
         Value::Null
     };
+    // The store actually serving memory.* right now — live truth, unlike
+    // config labels: the config hot-reload swaps it without a restart
+    // (or keeps serving the previous store when the new one won't open).
+    let memory_store_value = gw.state.memory.read().await.as_ref().map(|m| m.describe());
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -828,6 +830,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "contribution_percent": cfg.contribution_percent,
         // Real-time contribution (FEATURES §2): measured share + gate.
         "contribution": contribution_value,
+        // Local memory (FEATURES §6): the backend actually live-served.
+        "memory_store": memory_store_value,
         "peer_count": reg.len(),
         "peers_alive": alive,
         "meters": {
@@ -1342,7 +1346,6 @@ mod tests {
             runtime_api_key: None,
             runtime_num_predict: None,
             miner: None,
-            memory: None,
             mesh_fallback: if fallback {
                 Some(crate::ping::MeshFallbackChat::spawn().expect("test fallback"))
             } else {
@@ -1371,13 +1374,19 @@ mod tests {
         })
         .expect("test memory db");
         let memory = crate::memory::MemoryHandle::Sqlite(memory);
+        // MeshState owns the live store (hot-reloadable); boot swaps it in
+        // the same way. try_write is fine here: no readers exist yet.
+        state
+            .memory
+            .try_write()
+            .expect("no memory reader at test boot")
+            .replace(std::sync::Arc::new(memory));
         let gw = Gateway {
             state,
             runtime_url: "http://127.0.0.1:1".to_string(),
             runtime_api_key: None,
             runtime_num_predict: None,
             miner: None,
-            memory: Some(Arc::new(memory)),
             mesh_fallback: None,
             guard: None,
             model_router: None,
@@ -1404,7 +1413,6 @@ mod tests {
             runtime_api_key: None,
             runtime_num_predict: None,
             miner: None,
-            memory: None,
             mesh_fallback: None,
             guard: Some(std::sync::Arc::new(guard)),
             model_router: None,
@@ -1445,7 +1453,6 @@ mod tests {
             runtime_api_key: None,
             runtime_num_predict: None,
             miner: None,
-            memory: None,
             mesh_fallback: None,
             guard: None,
             model_router: None,
@@ -1567,7 +1574,6 @@ mod tests {
             runtime_api_key: None,
             runtime_num_predict: gw_cap,
             miner: None,
-            memory: None,
             mesh_fallback: None,
             guard: None,
             model_router: None,

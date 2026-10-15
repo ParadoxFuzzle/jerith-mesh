@@ -153,6 +153,38 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 #        JERITH_TEST_PG_URL (superuser, extension present) and
 #        JERITH_TEST_PG_URL_NOEXT (extension-less DB) with
 #        `cargo test -p jerith-mesh-core memory::tests::pg`.
+#
+# 5d. Memory-backend hot-swap + migration drill (Phase 0.5 completion,
+#     verified live 2026-10-15 against pgvector/pgvector:pg16 in Docker):
+#
+#     a. With the node RUNNING on sqlite: `jerith config set
+#        memory_backend=postgres memory_dsn=...` — prints the migration
+#        guidance (which store rows live in, the copy command, the
+#        verify step); config saves, nothing restarts.
+#     b. Within the next ping tick the mesh loop's config file re-read
+#        live-swaps the store: journal shows
+#        "memory store live-swapped (config hot-reload) from=…SQLite…
+#        to=PostgreSQL + pgvector (dim 256)" and /status memory_store
+#        tracks the store actually serving — verified in BOTH
+#        directions (sqlite→pg→sqlite→pg, two swap events, no restart).
+#        The pinned `vector(256)` column and the HNSW cosine index
+#        (idx_memories_embedding_hnsw) build at connect.
+#     c. Rows are NOT auto-moved. `jerith memory migrate` copies them
+#        into the now-configured store verbatim (no re-embedding),
+#        skipping duplicates by text: rerun reports copied: 0 · skipped
+#        N, so it is idempotent; `--drop-source` empties the SOURCE
+#        only after a verified copy (verified: copied 2 → rerun
+#        skipped 2 → --drop-source emptied 2 from the sqlite side,
+#        target still 2).
+#     d. Fail path: point memory_dsn at a dead postgres — one WARN
+#        "memory store swap failed — the previous store keeps serving"
+#        (60 s backoff, exactly one WARN across three ticks), /status
+#        stays honest on the working store, and the failed config is
+#        never adopted. Restore the DSN and the node heals quietly.
+#     e. Identity guardrail: config.toml node_id/secret changes are
+#        refused at the tick with an ERROR (hot identity swap would
+#        forge every signed wire surface); cold fields (model, ports,
+#        runtime…) WARN restart-required instead of hot-applying.
 # 6. Design checks that must always hold (fail-closed, not fail-open):
 #    - unsigned/replayed advertisements and pings get 401/403, never accepted
 #    - peers list only returns same-model nodes

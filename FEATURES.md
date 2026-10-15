@@ -82,7 +82,9 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 ## 2. Node Roles & Participation
 - ✅ Three roles: **Contributor**, **Requester**, **Hybrid**
 - ✅ Minimum **25 %** resource contribution required to be eligible to connect; user-configurable upward
-- ✅ Contribution changeable at any time (hot reload via `jerith config set contribution_percent N`)
+- ✅ Contribution changeable at any time (hot reload via `jerith config set contribution_percent N` —
+  the config file is re-read every ping tick: hot fields land within one tick, cold
+  ones WARN restart-required, identity fields are refused outright)
 - ✅ Model switching cleanly disconnects from all current peers, then joins the new mesh
 - ✅ Real-time contribution measurement and cryptographic verification
   (Phase 4): every ping tick diffs the cumulative serve/consume meters
@@ -134,12 +136,22 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   store); the DSN lives in `config.toml` `memory_dsn` (or `JERITH_MEMORY_DSN`),
   described with credentials redacted everywhere
 - ✅ PostgreSQL+pgvector backend (`core::memory::PgMemoryStore`): long-lived tokio-postgres
-  connection, `vector` columns + index-eligible `<=>` cosine ordering when the extension is
-  present; an honest bytea polyfill (packed-f32 blobs, cosine in Rust — the exact SQLite
-  semantics) when the extension is unavailable to the connection, always reported in the
-  banner/describe; a table written in the other layout is refused, never reshaped under the
-  user's data; retention cap (10 000 rows, newest survive) and mixed-dim scan degradation to
-  the shared prefix, both inherited from the SQLite store
+  connection, `vector(N)` columns pinned to the configured `embedding_dim` (server-side
+  uniformity; a dimension-mismatched or layout-mismatched table is refused loudly, never
+  reshaped or re-dimmed under the user's data) with an HNSW cosine index built best-effort
+  at connect (`vector_cosine_ops`; legacy dimension-free tables keep scrolling scan) and
+  index-eligible `<=>` cosine ordering when the extension is present; an honest bytea
+  polyfill (packed-f32 blobs, cosine in Rust — the exact SQLite semantics) when the
+  extension is unavailable to the connection, always reported in the banner/describe;
+  retention cap (10 000 rows, newest survive) inherited from the SQLite store
+- ✅ Backend hot-swap at runtime (Phase 0.5 completion): the mesh loop re-reads
+  `config.toml` every tick, so `jerith config set memory_backend/memory_dsn` live-swaps
+  the store without a restart (the previous store keeps serving until the new one opens;
+  a failed swap keeps serving the old one, warns once per 60 s backoff, and never adopts
+  the failed config — `/status.memory_store` always names the store actually serving);
+  `jerith memory migrate` copies rows across the two stores verbatim (no re-embedding,
+  idempotent by text dedupe, `--drop-source` empties the source only after a verified
+  copy), and `config set` prints the migration guidance at switch time
 - ✅ Local embedding pipeline integrated with the chosen vector store (Phase 0.5): local
   nomic nomic-embed-text-v2-moe via Ollama with Matryoshka truncation (768/512/256), offline
   hashing fallback always labeled in results (`provider` on every hit/skill response — raw

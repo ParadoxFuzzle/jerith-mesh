@@ -248,6 +248,79 @@ impl MemoryStore {
         Ok(n > 0)
     }
 
+    // --- migration primitives (used via MemoryHandle::copy_rows_from) ---
+
+    async fn all_rows(&self) -> anyhow::Result<Vec<MemoryRow>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, text, dim, embedding, provider, created_ms FROM memories \
+                 ORDER BY id",
+            )
+            .context("reading all memory rows")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let text: String = r.get(1)?;
+                let bytes: Vec<u8> = r.get(3)?;
+                let provider = provider_from_str(&r.get::<_, String>(4)?);
+                let created_ms: i64 = r.get(5)?;
+                Ok(MemoryRow {
+                    id,
+                    text,
+                    vector: unpack_vector(&bytes),
+                    provider,
+                    created_ms: created_ms.max(0) as u64,
+                })
+            })
+            .context("scanning memory rows")?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    async fn insert_raw(&self, row: &MemoryRow) -> anyhow::Result<i64> {
+        let id = {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "INSERT INTO memories (text, dim, embedding, provider, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    row.text,
+                    row.vector.len() as i64,
+                    pack_vector(&row.vector),
+                    provider_str(row.provider),
+                    row.created_ms as i64
+                ],
+            )
+            .context("inserting memory row (migration)")?;
+            conn.last_insert_rowid()
+        };
+        if id > MAX_MEMORY_ROWS {
+            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        }
+        Ok(id)
+    }
+
+    async fn contains_text(&self, text: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().await;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE text = ?1",
+                [text],
+                |r| r.get(0),
+            )
+            .context("checking duplicate text")?;
+        Ok(n > 0)
+    }
+
+    async fn wipe(&self) -> anyhow::Result<u64> {
+        let conn = self.conn.lock().await;
+        Ok(conn
+            .execute("DELETE FROM memories", [])
+            .context("wiping memories")? as u64)
+    }
+
     /// memory.similar — semantic-memories port: rank stored entries by
     /// cosine similarity to the entry with the given seed id ("find memories
     /// like this one"). The seed itself is excluded from the results.
@@ -580,11 +653,42 @@ impl PgMemoryStore {
                      migrate the table manually to preserve the data"
                 );
             }
+            if pgvector {
+                // Dimension pin: a table this backend creates is declared
+                // `vector(N)` (pgvector's HNSW index needs fixed-size
+                // vectors). An existing table either still carries the
+                // configured pin or was created dimension-free (the
+                // legacy layout, hnsw-less). A mismatched N is the
+                // operator changing embedding_dim under a live store —
+                // refused loudly, never a silent re-dim.
+                let stored: String = client
+                    .query_one(
+                        "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                         WHERE a.attrelid = to_regclass(current_schema() || '.memories') \
+                         AND a.attname = 'embedding'",
+                        &[],
+                    )
+                    .await
+                    .context("probing embedding column type")?
+                    .get::<_, String>(0);
+                let wanted = format!("vector({})", embed.dim);
+                if stored != "vector" && stored != wanted {
+                    anyhow::bail!(
+                        "existing memories table pins embeddings at {stored} but this run \
+                         uses embedding_dim {} — restore the configured dimension or migrate \
+                         manually; the store's dimension is pinned, never silently re-dimmed",
+                        embed.dim
+                    );
+                }
+            }
         }
-        let col = if pgvector {
-            "embedding vector NOT NULL"
+        let col: String = if pgvector {
+            // Pinned dimension: server-side uniformity is enforced from
+            // day one (mixed dims used to come from config changes over
+            // time; now they are typed errors at insert).
+            format!("embedding vector({}) NOT NULL", embed.dim)
         } else {
-            "embedding BYTEA NOT NULL"
+            "embedding BYTEA NOT NULL".to_string()
         };
         client
             .batch_execute(&format!(
@@ -599,6 +703,25 @@ impl PgMemoryStore {
             ))
             .await
             .context("creating memory schema")?;
+        if pgvector {
+            // Index over the cosine-distance operator class so `<=>`
+            // upgrades from an exact scan to approximate nearest-neighbor
+            // search as the store grows past the exact-scan sweet spot.
+            // Best-effort on purpose: pgvector < 0.5 has no hnsw support;
+            // a failed build logs and continues with exact scans (the
+            // retention cap keeps tables small enough for exact to win).
+            match client
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw \
+                     ON memories USING hnsw (embedding vector_cosine_ops)",
+                    &[],
+                )
+                .await
+            {
+                Ok(_) => tracing::info!("pgvector HNSW cosine index ready"),
+                Err(e) => tracing::debug!(error = %e, "HNSW index not created — exact scan path continues"),
+            }
+        }
         tracing::info!(schema = %schema, pgvector, "postgres memory store ready");
         Ok(Self {
             client,
@@ -877,6 +1000,86 @@ impl PgMemoryStore {
             },
         })
     }
+
+    // --- migration primitives (used via MemoryHandle::copy_rows_from) ---
+
+    async fn all_rows(&self) -> anyhow::Result<Vec<MemoryRow>> {
+        let select = if self.pgvector {
+            "SELECT id, text, embedding::text, provider, created_ms FROM memories ORDER BY id"
+        } else {
+            "SELECT id, text, embedding, provider, created_ms FROM memories ORDER BY id"
+        };
+        let rows = self
+            .client
+            .query(select, &[])
+            .await
+            .context("reading all memory rows")?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let vector = if self.pgvector {
+                vec_from_pg_text(&row.get::<_, String>(2))?
+            } else {
+                unpack_vector(&row.get::<_, Vec<u8>>(2))
+            };
+            out.push(MemoryRow {
+                id: row.get::<_, i64>(0),
+                text: row.get::<_, String>(1),
+                vector,
+                provider: provider_from_str(&row.get::<_, String>(3)),
+                created_ms: (row.get::<_, i64>(4).max(0)) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn insert_raw(&self, row: &MemoryRow) -> anyhow::Result<i64> {
+        let dim = row.vector.len() as i32;
+        let created = row.created_ms as i64;
+        let id: i64 = if self.pgvector {
+            let s = vec_to_pg_text(&row.vector);
+            self.client
+                .query_one(
+                    "INSERT INTO memories (text, dim, provider, created_ms, embedding)
+                     VALUES ($1, $2, $3, $4, $5::text::vector) RETURNING id",
+                    &[&row.text, &dim, &provider_str(row.provider), &created, &s],
+                )
+                .await
+                .context("inserting memory row (migration)")?
+                .get::<_, i64>(0)
+        } else {
+            let blob = pack_vector(&row.vector);
+            self.client
+                .query_one(
+                    "INSERT INTO memories (text, dim, provider, created_ms, embedding)
+                     VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    &[&row.text, &dim, &provider_str(row.provider), &created, &blob],
+                )
+                .await
+                .context("inserting memory row (migration)")?
+                .get::<_, i64>(0)
+        };
+        if id > MAX_MEMORY_ROWS {
+            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        }
+        Ok(id)
+    }
+
+    async fn contains_text(&self, text: &str) -> anyhow::Result<bool> {
+        let row = self
+            .client
+            .query_one("SELECT COUNT(*) FROM memories WHERE text = $1", &[&text])
+            .await
+            .context("checking duplicate text")?;
+        Ok(row.get::<_, i64>(0) > 0)
+    }
+
+    async fn wipe(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .client
+            .execute("DELETE FROM memories", &[])
+            .await
+            .context("wiping memories")? as u64)
+    }
 }
 
 /// Row projection shared by both ranking paths (columns 0–4).
@@ -1089,6 +1292,128 @@ impl MemoryHandle {
             }
         }
     }
+}
+
+// ============================================================================
+// Migration across stores (MemoryHandle): safe copy with text dedupe
+// ============================================================================
+
+/// One full row, read for migration (vector, provider and timestamps
+/// preserved verbatim — migration never re-embeds).
+#[derive(Debug, Clone)]
+pub struct MemoryRow {
+    pub id: i64,
+    pub text: String,
+    pub vector: Vec<f32>,
+    pub provider: EmbedProvider,
+    pub created_ms: u64,
+}
+
+/// Result of a migration run, for the operator's verify step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateReport {
+    /// Rows copied into the target store.
+    pub copied: u64,
+    /// Rows skipped because the target already had that exact text.
+    pub skipped_existing: u64,
+}
+
+impl MemoryHandle {
+    /// Every stored row, ready to be replayed into another store.
+    pub async fn all_rows(&self) -> anyhow::Result<Vec<MemoryRow>> {
+        match self {
+            Self::Sqlite(s) => s.all_rows().await,
+            Self::Pg(s) => s.all_rows().await,
+        }
+    }
+
+    /// Raw insert used by migration (skips the embed step; the vector is
+    /// copied verbatim). Retention rules still apply.
+    pub async fn insert_raw(&self, row: &MemoryRow) -> anyhow::Result<i64> {
+        match self {
+            Self::Sqlite(s) => s.insert_raw(row).await,
+            Self::Pg(s) => s.insert_raw(row).await,
+        }
+    }
+
+    pub async fn contains_text(&self, text: &str) -> anyhow::Result<bool> {
+        match self {
+            Self::Sqlite(s) => s.contains_text(text).await,
+            Self::Pg(s) => s.contains_text(text).await,
+        }
+    }
+
+    /// Remove every row (the `--drop-source` side of a verified
+    /// migration). Only call it after the copy verified — the data is
+    /// gone and there is no undo.
+    pub async fn wipe(&self) -> anyhow::Result<u64> {
+        match self {
+            Self::Sqlite(s) => s.wipe().await,
+            Self::Pg(s) => s.wipe().await,
+        }
+    }
+
+    /// Copy every row from `source` into `self`, verbatim (ids are
+    /// re-assigned by the target; text, vectors, providers and timestamps
+    /// survive as-is). Rows whose text already exists in the target are
+    /// skipped — re-running a migration is idempotent.
+    pub async fn copy_rows_from(&self, source: &MemoryHandle) -> anyhow::Result<MigrateReport> {
+        let rows = source.all_rows().await.context("reading source rows")?;
+        let mut copied = 0u64;
+        let mut skipped = 0u64;
+        for row in &rows {
+            if self
+                .contains_text(&row.text)
+                .await
+                .context("dedupe check during migration")?
+            {
+                skipped += 1;
+                continue;
+            }
+            self.insert_raw(row).await.with_context(|| {
+                format!("copying memory row {} into the new store", row.id)
+            })?;
+            copied += 1;
+        }
+        Ok(MigrateReport {
+            copied,
+            skipped_existing: skipped,
+        })
+    }
+
+    /// Open exactly what the operator's config calls for — the same
+    /// choose-and-open rules as the boot path (this is what the run
+    /// banner, the CLI and the config hot-reload all go through).
+    pub async fn open_for_config(cfg: &crate::config::NodeConfig) -> anyhow::Result<Self> {
+        let embed = EmbedConfig {
+            ollama_url: cfg.specialists.ollama_url.clone(),
+            dim: cfg.specialists.embedding_dim as usize,
+            ..Default::default()
+        };
+        Self::open(
+            cfg.memory_backend,
+            &crate::config::NodeConfig::memory_db_path(),
+            cfg.effective_memory_dsn().as_deref(),
+            embed,
+        )
+        .await
+    }
+}
+
+/// The migration guidance `config set` prints when the backend changes:
+/// the migration direction always follows the config (from the store the
+/// config has LEFT to the store it now names).
+pub fn migration_guidance(old_label: &str, new_label: &str) -> String {
+    format!(
+        "memory backend changed: {old_label} → {new_label}.\n\
+             The new store takes over on the next ping tick (live swap — the \
+             previous store keeps serving until the new one opens) or on the \
+             next restart if the node is down.\n\
+             Existing rows are NOT moved automatically — copy them with:\n\
+               jerith memory migrate            (into the now-configured store)\n\
+               jerith memory migrate --drop-source  (…and empty the old store)\n\
+             then verify: `jerith memory count` should match the source."
+    )
 }
 
 // ============================================================================
@@ -1352,6 +1677,115 @@ mod tests {
     // polyfill.
     // =========================================================================
 
+    #[tokio::test]
+    async fn migrate_copies_rows_and_is_idempotent() {
+        // Source: a real (file-backed) SQLite store; target: in-memory.
+        let dir = std::env::temp_dir().join(format!(
+            "jerith-migrate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_path = dir.join("mem.sqlite");
+        let source = MemoryHandle::Sqlite(
+            MemoryStore::open(&source_path, EmbedConfig {
+                dim: 64,
+                ..EmbedConfig::default()
+            })
+            .unwrap(),
+        );
+        for t in [
+            "sourdough baking guide",
+            "quantum computing notes",
+            "another sourdough entry",
+        ] {
+            source.embed_and_store(t).await.unwrap();
+        }
+        let target = MemoryHandle::Sqlite(
+            MemoryStore::open_in_memory(EmbedConfig {
+                dim: 64,
+                ..EmbedConfig::default()
+            })
+            .unwrap(),
+        );
+
+        // Copy: all 3 rows land, verbatim (no re-embedding — providers
+        // and created_ms survive exactly as stored).
+        let report = target.copy_rows_from(&source).await.unwrap();
+        assert_eq!(report.copied, 3);
+        assert_eq!(report.skipped_existing, 0);
+        assert_eq!(target.count().await.unwrap(), 3);
+
+        // Row payloads survive the move: retrieve one by search.
+        let hits = target.search("sourdough baking", 1).await.unwrap();
+        assert!(hits[0].text.contains("sourdough"));
+
+        // Idempotent re-run: dedupe by text, no duplicates created.
+        let report = target.copy_rows_from(&source).await.unwrap();
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.skipped_existing, 3);
+        assert_eq!(target.count().await.unwrap(), 3);
+
+        // --drop-source side: wipe empties the source, target is intact.
+        assert_eq!(source.wipe().await.unwrap(), 3);
+        assert_eq!(source.count().await.unwrap(), 0);
+        assert_eq!(target.count().await.unwrap(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pg_migrate_target_real_pgvector() {
+        let Some(dsn) = pg_url() else {
+            eprintln!("skip pg_migrate_* : set JERITH_TEST_PG_URL");
+            return;
+        };
+        // Source: file-backed SQLite (the default backend) with a few
+        // rows; target: a real pgvector store in a test schema.
+        let dir = std::env::temp_dir().join(format!(
+            "jerith-pg-migrate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source_path = dir.join("mem.sqlite");
+        let source = MemoryHandle::Sqlite(
+            MemoryStore::open(&source_path, EmbedConfig {
+                dim: 64,
+                ..EmbedConfig::default()
+            })
+            .unwrap(),
+        );
+        source.embed_and_store("how to bake sourdough bread at home").await.unwrap();
+        source.embed_and_store("quantum computing stock price forecast").await.unwrap();
+        let schema = format!("memtest_{}_migrate", std::process::id());
+        let target = MemoryHandle::Pg(
+            PgMemoryStore::connect(
+                &dsn,
+                EmbedConfig {
+                    dim: 64,
+                    ..EmbedConfig::default()
+                },
+                Some(&schema),
+            )
+            .await
+            .expect("connect target pgvector store"),
+        );
+
+        let report = target.copy_rows_from(&source).await.expect("migration copy");
+        assert_eq!(report.copied, 2);
+        assert_eq!(target.count().await.unwrap(), 2);
+        // Ranking must hold in the copied store (vectors verbatim).
+        let top = target.search("sourdough bread baking", 2).await.unwrap();
+        assert!(top[0].score > top[1].score, "strict ordering {top:?}");
+        assert!(top[0].text.contains("sourdough"));
+
+        // Idempotent re-run.
+        let report = target.copy_rows_from(&source).await.unwrap();
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.skipped_existing, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn pg_url() -> Option<String> {
         std::env::var("JERITH_TEST_PG_URL")
             .ok()
@@ -1519,9 +1953,32 @@ mod tests {
             return;
         };
         let schema = format!("memtest_{}_mixed", std::process::id());
-        // Two stores over ONE table (vectors are dimension-free here),
-        // with different truncation dims — the mixed-dim situation the
-        // scan path exists for.
+        // Pre-create the table DIMENSION-FREE (the legacy layout): a
+        // fresh store pins `vector(N)` now (the HNSW index requires
+        // fixed-size vectors), so mixed dims come only from tables made
+        // before pinning — the situation the scan path still exists for.
+        {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("raw probe connection");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c.batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS \"{schema}\";\
+                 SET search_path TO \"{schema}\", public;\
+                 CREATE TABLE memories (\
+                    id BIGSERIAL PRIMARY KEY, \
+                    text TEXT NOT NULL, dim INTEGER NOT NULL, \
+                    provider TEXT NOT NULL, created_ms BIGINT NOT NULL, \
+                    embedding vector NOT NULL);"
+            ))
+            .await
+            .expect("create legacy dimension-free memories table");
+        }
+        // Two stores over ONE dimension-free table, with different
+        // truncation dims — the mixed-dim situation the scan path
+        // exists for.
         let s64 = PgMemoryStore::connect(
             &dsn,
             EmbedConfig {
