@@ -110,6 +110,18 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 #     steps (b) become 'refreshed from bootstrap=<lan-url>' instead —
 #     that is the two-server leg working. Run scripts/
 #     setup-lan-bootstrap.sh ON the second node to arm it.
+#
+#     OBSERVED 2026-10-15 (both variants verified on main node):
+#     - all-dark: every tick WARNed with the full rotation named; node
+#       kept serving locally; recovery INFO landed on the first tick
+#       after `systemctl --user start jerith-bootstrap`.
+#     - two-server: with a working second bootstrap in the rotation,
+#       the FIRST tick after the primary went dark already refreshed
+#       `fetched=N bootstrap=http://127.0.0.1:8902` — zero degrades,
+#       zero warns; `last_good` followed the server that answered.
+#     - ops detail learned: raw config.toml edits do NOT hot-apply —
+#       a restart (or `jerith config set`) loads them; /status's
+#       discovery section is the truth of what the loop is using.
 
 # 6. Design checks that must always hold (fail-closed, not fail-open):
 #    - unsigned/replayed advertisements and pings get 401/403, never accepted
