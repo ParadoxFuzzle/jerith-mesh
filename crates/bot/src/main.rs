@@ -16,6 +16,7 @@ mod archiver;
 mod chat_fallback;
 mod commands;
 mod config;
+mod hooks;
 mod mailbox;
 mod monitor;
 mod owner;
@@ -104,6 +105,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut cfg = BotConfig::load()?;
+    // Webhook event hooks (FEATURES §8): installed once; every emit site
+    // goes through hooks::global() and is fire-and-forget.
+    hooks::init(cfg.hooks.clone());
+    if !cfg.hooks.urls.is_empty() {
+        tracing::info!(urls = cfg.hooks.urls.len(), "webhook event hooks enabled");
+    }
     // Persona: composed from the OpenClaw-style workspace canon docs
     // (~/.jerith-mesh/workspace/IDENTITY|SOUL|USER|USER_MODEL|AGENTS|MEMORY.md,
     // staged on first boot from the migrated OpenClaw workspace) when

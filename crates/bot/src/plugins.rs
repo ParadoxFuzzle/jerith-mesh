@@ -433,6 +433,7 @@ mod tests {
 
     fn test_cfg() -> crate::config::BotConfig {
         crate::config::BotConfig {
+            hooks: Default::default(),
             discord_token: "test".into(),
             gateway_url: "http://127.0.0.1:1".into(),
             chain_url: "http://127.0.0.1:1".into(),

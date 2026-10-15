@@ -179,7 +179,16 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ First-class skills `vision.describe` / `vision.analyze` — served by
   the gateway's `/v1/skills/vision/*` routes (multimodal forward with the
   model router's vision tier) and mirrored as bot plugins
-- 📋 Webhook / event hooks for plugin authors
+- ✅ Webhook / event hooks for plugin authors (FEATURES §8 port): the bot
+  POSTs signed JSON events fire-and-forget to operator URLs (`[hooks]` in
+  bot.toml: `urls`, `secret`, `timeout_secs`, `max_retries`) —
+  `skill_invoked` (skill name + ok/error, raw arguments never leave the
+  bot), `guard_violation` (public block reason only), `mine_won`
+  (`discord_id`, `amount_uj`). HMAC-SHA256 over `"{ts_ms}.{body}"` in
+  `x-jerith-signature` (+ `x-jerith-timestamp` for replay windows), linear
+  backoff, 1–5 attempts, global in-flight cap; empty `urls` = the whole
+  subsystem is a no-op. See hooks.rs (unit + live local-receiver tests:
+  signature recomputation, payload schema, retry bound, disabled no-op).
 
 ## 9. Incentives & Economics
 - 📋 Native JerithChain integration (default) — import/reuse `jerith_core` mining + RPC flow (Phase 4)

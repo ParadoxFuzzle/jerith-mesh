@@ -2970,7 +2970,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_frame_cap_never_emits_unbounded_buffer_growth() {
         let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
-        let (endpoint, mut conn) = raw_dial(&server_identity.node_id(), addr, &pins)
+        let (_endpoint, conn) = raw_dial(&server_identity.node_id(), addr, &pins)
             .await
             .unwrap();
 

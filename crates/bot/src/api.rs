@@ -372,10 +372,18 @@ pub async fn chat_with_usage_live(
             Ok(guard) => match guard.screen_messages(&messages) {
                 Ok(Some(patched)) => messages = patched,
                 Ok(None) => {}
-                Err(verdict) => anyhow::bail!(
+            Err(verdict) => {
+                // FEATURES §8: observers hear the block reason — never the
+                // blocked content itself.
+                crate::hooks::global().emit(crate::hooks::Event::new(
+                    crate::hooks::EV_GUARD_VIOLATION,
+                    json!({ "reason": verdict.block_reason() }),
+                ));
+                anyhow::bail!(
                     "🛡️ Jerith Guard blocked this request ({}). Edit the prompt and try again.",
                     verdict.block_reason()
-                ),
+                )
+            }
             },
             Err(e) => {
                 // A malformed [guard] in bot.toml must degrade to the
@@ -801,7 +809,17 @@ async fn run_tool(
     raw_args: &Value,
 ) -> String {
     let args = parse_tool_args(raw_args);
-    match registry.dispatch(cfg, name, &args).await {
+    let outcome = registry.dispatch(cfg, name, &args).await;
+    // FEATURES §8: receivers learn the skill name and whether it worked —
+    // raw arguments stay local (user text can flow through them).
+    crate::hooks::global().emit(crate::hooks::Event::new(
+        crate::hooks::EV_SKILL_INVOKED,
+        match &outcome {
+            Ok(_) => json!({ "skill": name, "ok": true }),
+            Err(e) => json!({ "skill": name, "ok": false, "error": e.to_string() }),
+        },
+    ));
+    match outcome {
         Ok(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
         Err(e) => json!({ "error": e.to_string() }).to_string(),
     }

@@ -79,7 +79,7 @@ pub fn recommended_meshes(fits: &[ModelFit], counts: &[(String, u64)]) -> Vec<Me
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ModelModality, ModelSource, ModelSpec};
+    use crate::models::{ModelModality, ModelSpec};
 
     fn spec(id: &str) -> ModelSpec {
         ModelSpec {

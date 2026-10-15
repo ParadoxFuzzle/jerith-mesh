@@ -215,6 +215,11 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
     if outcome.won {
         if let Some(uj) = outcome.reward_uj {
             ctx.data().state.record_mine_win(discord_id, uj);
+            // FEATURES §8: /mine win as a hookable event (fire-and-forget).
+            crate::hooks::global().emit(crate::hooks::Event::new(
+                crate::hooks::EV_MINE_WON,
+                serde_json::json!({ "discord_id": discord_id, "amount_uj": uj }),
+            ));
         }
     }
     // Optional: announce wins in a configured channel (fire-and-forget; a

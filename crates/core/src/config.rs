@@ -1145,7 +1145,6 @@ mod tests {
         assert!(back.resources.kill_switch, "kill switch defaults ARMED");
     }
 
-    #[test]
     /// Discovery seed: an empty `[discovery]` section must rotate the
     /// primary bootstrap (the pre-Phase-1 contract), not an empty list.
     #[test]

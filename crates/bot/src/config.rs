@@ -84,6 +84,10 @@ pub struct BotConfig {
     /// Ops monitor (OpenClaw ops-monitor family port): periodic checks
     /// with a single owner DM when something fails. Reports only.
     pub monitor: MonitorConfig,
+    /// Webhook / event hooks for plugin authors (FEATURES §8): fire-
+    /// and-forget signed JSON events POSTed to operator URLs. Empty
+    /// `urls` (the default) keeps it off; see hooks.rs.
+    pub hooks: crate::hooks::HooksConfig,
     /// Chat request timeout in seconds (`[chat] timeout_secs` in bot.toml,
     /// clamped 60–600). Default 240: the gateway bounds a non-stream local
     /// runtime at 180 s (header wait, then mesh fallback), so 240 s lets a
@@ -164,6 +168,11 @@ impl BotConfig {
             archiver: file.archiver.unwrap_or_default(),
             squeeze: file.squeeze.unwrap_or_default(),
             monitor: file.monitor.unwrap_or_default(),
+            hooks: {
+                let cfg = file.hooks.unwrap_or_default();
+                cfg.validate().map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
+                cfg
+            },
             chat_timeout_secs: file
                 .chat
                 .as_ref()
@@ -224,6 +233,7 @@ impl BotConfig {
             archiver: ArchiverConfig::default(),
             squeeze: SqueezeConfig::default(),
             monitor: MonitorConfig::default(),
+            hooks: crate::hooks::HooksConfig::default(),
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
             chat_stream: true,
         }
@@ -479,6 +489,9 @@ struct FileConfig {
     /// Optional `[monitor]` table — ops-monitor settings (checks +
     /// owner-DM reports; see monitor.rs).
     monitor: Option<MonitorConfig>,
+    /// Optional `[hooks]` table — webhook event hooks for plugin authors
+    /// (FEATURES §8, see hooks.rs). Empty = disabled.
+    hooks: Option<crate::hooks::HooksConfig>,
     /// Optional `[chat]` table — chat request timeout knob.
     chat: Option<ChatTable>,
     /// Optional `[plugins]` table — plugin/skill gating (see plugins.rs).
