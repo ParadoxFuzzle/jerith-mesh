@@ -87,11 +87,10 @@ pub fn squeeze_passive(history: &[Value], budget_chars: usize) -> Vec<Value> {
                 idx = Some(i);
             }
         }
-        if let Some(i) = idx {
-            if trim_message(&mut ring[i], PER_MSG_MAX) {
+        if let Some(i) = idx
+            && trim_message(&mut ring[i], PER_MSG_MAX) {
                 trimmed_any = true;
             }
-        }
     }
     ring
 }

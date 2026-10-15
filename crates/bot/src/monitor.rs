@@ -442,15 +442,14 @@ fn newest_file_age_ms(dir: &Path, now_ms: u64) -> u64 {
     };
     let mut newest: u64 = 0;
     for e in rd.flatten() {
-        if let Ok(meta) = e.metadata() {
-            if let Ok(mod_ms) = meta.modified().map(|t| {
+        if let Ok(meta) = e.metadata()
+            && let Ok(mod_ms) = meta.modified().map(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0)
             }) {
                 newest = newest.max(mod_ms);
             }
-        }
     }
     now_ms.saturating_sub(newest)
 }

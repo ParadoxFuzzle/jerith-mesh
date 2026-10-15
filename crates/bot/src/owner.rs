@@ -56,7 +56,7 @@ pub const USER_COMMANDS: [&str; 12] = [
 /// list stores).
 pub fn command_is_user_level(qualified_or_base: &str) -> bool {
     let name = qualified_or_base
-        .rsplit(|c| c == ':' || c == ' ')
+        .rsplit([':', ' '])
         .next()
         .unwrap_or(qualified_or_base);
     USER_COMMANDS.contains(&name)

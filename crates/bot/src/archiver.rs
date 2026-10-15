@@ -9,14 +9,13 @@
 //!   2. Extract decision/technical-note lines (case-insensitive markers:
 //!      "decision:", "decided to", "agreed", "action item", …), tagged
 //!      `author: line`, other bots' lines skipped.
-//!   3. Publish the summary three ways:
-//!        • **memory embed** via the gateway's
-//!          `POST /v1/skills/memory/embed` — the jerith-native addition:
-//!          `/recall` becomes thread-aware, which OpenClaw could never
-//!          offer (its archive only lived as a webhook post);
-//!        • optional upstream-parity POST to `notes_webhook` (204, same
-//!          body shape as the Python skill);
-//!        • a local markdown archive file, upstream `_summarize` format.
+//!   3. Publish the summary three ways: the memory embed via the
+//!      gateway's `POST /v1/skills/memory/embed` (the jerith-native
+//!      addition: `/recall` becomes thread-aware, which OpenClaw could
+//!      never offer — its archive only lived as a webhook post); the
+//!      optional upstream-parity POST to `notes_webhook` (204, same body
+//!      shape as the Python skill); and a local markdown archive file in
+//!      the upstream `_summarize` format.
 //!   4. Only after the embed succeeds is the ledger advanced — a failed
 //!      gateway call is retried on the next sweep and never loses notes.
 //!
@@ -71,14 +70,13 @@ pub fn effective_markers(arch: &ArchiverConfig, guild_id: Option<u64>) -> Vec<St
             .filter(|s| !s.is_empty())
             .collect()
     };
-    if let Some(gid) = guild_id {
-        if let Some(set) = arch.guild_markers.get(&gid) {
+    if let Some(gid) = guild_id
+        && let Some(set) = arch.guild_markers.get(&gid) {
             let over = clean(&set.markers);
             if !over.is_empty() {
                 return over;
             }
         }
-    }
     let global = clean(&arch.markers);
     if !global.is_empty() {
         return global;
@@ -279,10 +277,7 @@ pub(crate) async fn thread_info(
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(v) => Some(v),
-            Err(_) => None,
-        },
+        Ok(resp) => resp.json::<Value>().await.ok(),
         Err(_) => None,
     };
     match info {
@@ -451,11 +446,10 @@ async fn sweep_one(
     }
 
     // 2. webhook parity with the OpenClaw skill (optional).
-    if let Some(webhook) = arch.notes_webhook.as_deref().filter(|w| !w.is_empty()) {
-        if let Err(e) = post_webhook(client, webhook, &summary).await {
+    if let Some(webhook) = arch.notes_webhook.as_deref().filter(|w| !w.is_empty())
+        && let Err(e) = post_webhook(client, webhook, &summary).await {
             tracing::warn!(channel = cid, error = %e, "notes webhook post failed (memory already carries the summary)");
         }
-    }
 
     // 3. local markdown archive.
     let archive_dir = dir.join("archives");
@@ -497,7 +491,7 @@ pub fn archiver_dir() -> PathBuf {
 
 /// Loop body spawned once from main.rs.
 pub async fn run_loop(cfg: BotConfig) {
-    let interval = cfg.archiver.interval_minutes.max(1) as u64;
+    let interval = cfg.archiver.interval_minutes.max(1);
     tracing::info!(
         channels = cfg.archiver.channel_ids.len(),
         interval_minutes = interval,

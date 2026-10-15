@@ -212,8 +212,8 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
     let user = discord_id.to_string();
     let outcome = api::mine(&ctx.data().cfg, &user, &channel).await?;
     // Credit the bot-observed /leaderboard when the chain reports a reward.
-    if outcome.won {
-        if let Some(uj) = outcome.reward_uj {
+    if outcome.won
+        && let Some(uj) = outcome.reward_uj {
             ctx.data().state.record_mine_win(discord_id, uj);
             // FEATURES §8: /mine win as a hookable event (fire-and-forget).
             crate::hooks::global().emit(crate::hooks::Event::new(
@@ -221,11 +221,10 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
                 serde_json::json!({ "discord_id": discord_id, "amount_uj": uj }),
             ));
         }
-    }
     // Optional: announce wins in a configured channel (fire-and-forget; a
     // missing/incorrect channel id must not fail the user's command).
-    if let Some(announce_id) = ctx.data().cfg.announce_channel_id {
-        if let Some(text) = api::mine_announcement(&outcome, &user) {
+    if let Some(announce_id) = ctx.data().cfg.announce_channel_id
+        && let Some(text) = api::mine_announcement(&outcome, &user) {
             let http = ctx.serenity_context().http.clone();
             tokio::spawn(async move {
                 let ch = serenityall::ChannelId::new(announce_id);
@@ -234,7 +233,6 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
                 }
             });
         }
-    }
     persist_tally_after_win(ctx).await;
     ctx.say(outcome.message).await?;
     Ok(())

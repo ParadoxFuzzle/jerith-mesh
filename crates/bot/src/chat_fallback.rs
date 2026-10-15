@@ -288,24 +288,22 @@ impl LiveSink {
                 {
                     let shown = clip_tail(&s.text, 1990);
                     let msg_id = placeholder.id;
-                    match channel
+                    if channel
                         .edit_message(
                             &ticker_ctx,
                             msg_id,
                             poise::serenity_prelude::EditMessage::new().content(shown),
                         )
                         .await
+                        .is_ok()
                     {
-                        Ok(_) => {
-                            s.last_len = s.text.chars().count();
-                            s.last_edit = std::time::Instant::now();
-                            s.dirty = false;
-                        }
-                        // Stay dirty: the next tick or finish() retries. A
-                        // deleted message fails every later edit — harmless
-                        // noise, bounded by finish() aborting this task.
-                        Err(_) => {}
+                        s.last_len = s.text.chars().count();
+                        s.last_edit = std::time::Instant::now();
+                        s.dirty = false;
                     }
+                    // Stay dirty: the next tick or finish() retries. A
+                    // deleted message fails every later edit — harmless
+                    // noise, bounded by finish() aborting this task.
                 }
             }
         });

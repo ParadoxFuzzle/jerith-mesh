@@ -108,11 +108,10 @@ impl RoundAcc {
     /// source of truth regardless of transport.
     fn into_pseudo_body(self) -> Value {
         let mut content = self.content.clone();
-        if let Some(cut) = &self.cut {
-            if !content.trim().is_empty() {
+        if let Some(cut) = &self.cut
+            && !content.trim().is_empty() {
                 content.push_str(&format!("\n\n_(stream cut: {cut})_"));
             }
-        }
         let mut message = json!({"role": "assistant", "content": content});
         if !self.tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(self.tool_calls.clone());
@@ -412,8 +411,8 @@ pub async fn chat_with_usage_live(
     // root@127.0.0.1:5432, password via ~/.pgpass). The freshest row is
     // attached as a second system message; an unreachable database or an
     // unknown speaker just means the chat proceeds without it.
-    if let Some(pg) = cfg.postgres.as_ref().filter(|p| p.enabled) {
-        if let Some(discord_id) = crate::people::extract_speaker_id(&prompt) {
+    if let Some(pg) = cfg.postgres.as_ref().filter(|p| p.enabled)
+        && let Some(discord_id) = crate::people::extract_speaker_id(prompt) {
             match crate::people::lookup(pg, &discord_id).await {
                 Ok(Some(block)) => messages.insert(
                     if persona_first { 1 } else { 0 },
@@ -425,7 +424,6 @@ pub async fn chat_with_usage_live(
                 }
             }
         }
-    }
 
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
     let model = runtime_model(cfg)
@@ -508,18 +506,14 @@ pub async fn chat_with_usage_live(
         // tool intent as plain JSON content instead of native tool_calls.
         // Detect `{"function_name": …, "arguments": …}` there and subject
         // it to the same loop (same mock unit tests cover both shapes).
-        if tools_enabled && tool_calls.is_empty() && rounds < MAX_TOOL_ROUNDS {
-            match content_tool_intent(&body, &registry.enabled_skill_names()) {
-                Some((name, args)) => {
-                    tool_calls = vec![json!({
-                        "id": format!("iw{rounds}"),
-                        "type": "function",
-                        "function": {"name": name, "arguments": args.to_string()},
-                    })];
-                }
-                None => {}
+        if tools_enabled && tool_calls.is_empty() && rounds < MAX_TOOL_ROUNDS
+            && let Some((name, args)) = content_tool_intent(&body, &registry.enabled_skill_names()) {
+                tool_calls = vec![json!({
+                    "id": format!("iw{rounds}"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args.to_string()},
+                })];
             }
-        }
         // No tool use (or out of rounds): the plain chat answer — unless
         // it is degenerate ("{}", braces-only JSON, empty): one toolless
         // retry, then a graceful refusal, never braces rendered verbatim
@@ -735,15 +729,15 @@ pub fn answer_is_degenerate(content: &str) -> bool {
     if t.chars().all(|c| c == '{' || c == '}' || c.is_whitespace()) {
         return true;
     }
-    if t.starts_with('{') {
+    if let Some(rest) = t.strip_prefix('{') {
         // Brace-led serde intent: a chat answer opens with `{` + a quoted
         // field (the 05:57 render: `{ "` opening an object the stream never
-        // balanced, or `{…} trailing prose`). Renderable only by extracting
+        // balanced, or `{…} trailing prose'). Renderable only by extracting
         // a text field; everything else is degenerate — retry, then the
         // graceful refusal. Legit prose that merely MENTIONS braces (e.g.
         // `{} is an empty set`) has no quoted field right after the brace
         // and passes through untouched.
-        let opens_a_field = t[1..].trim_start().starts_with('"');
+        let opens_a_field = rest.trim_start().starts_with('"');
         if opens_a_field && json_text_field(t).is_none() {
             return true;
         }
@@ -751,8 +745,8 @@ pub fn answer_is_degenerate(content: &str) -> bool {
     // Parseable JSON object with no text payload inside (the original
     // incident: `{}` and `{"function_name": …}` intent slop that is not
     // text the user can read).
-    if t.starts_with('{') && t.ends_with('}') {
-        if let Ok(v) = serde_json::from_str::<Value>(t) {
+    if t.starts_with('{') && t.ends_with('}')
+        && let Ok(v) = serde_json::from_str::<Value>(t) {
             let has_text = ["content", "text", "answer", "message"]
                 .iter()
                 .find_map(|k| v.get(k).and_then(Value::as_str))
@@ -760,7 +754,6 @@ pub fn answer_is_degenerate(content: &str) -> bool {
                 .unwrap_or(false);
             return !has_text;
         }
-    }
     false
 }
 

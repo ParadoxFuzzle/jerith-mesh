@@ -598,9 +598,9 @@ fn load_chain_wallets(
         })?
         .collect::<Result<_, _>>()?;
     if by_balance {
-        rows.sort_by(|a, b| b.balance_uj.cmp(&a.balance_uj));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.balance_uj));
     } else {
-        rows.sort_by(|a, b| a.address.cmp(&b.address));
+        rows.sort_by_key(|row| row.address.clone());
     }
     rows.truncate((limit.max(1) as usize).min(500));
     Ok(rows)
@@ -731,8 +731,8 @@ async fn chain_cmd(cmd: ChainCmd) -> anyhow::Result<()> {
             .with_context(|| format!("opening chain ledger {db:?}"))?;
             let rows = load_chain_wallets(&conn, limit, by_balance)?;
             println!(
-                "{:<52} {:>14} {:>12} {:>12} {:>12} {}",
-                "address", "balance JER", "locked", "nonce", "mined", "discord"
+                "{:<52} {:>14} {:>12} {:>12} {:>12} discord",
+                "address", "balance JER", "locked", "nonce", "mined"
             );
             for r in rows {
                 println!(
@@ -1150,6 +1150,7 @@ fn parse_crypto(s: &str) -> anyhow::Result<jerith_mesh_core::config::CryptoConfi
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_flow(
     model: Option<String>,
     memory: Option<String>,
@@ -1262,8 +1263,8 @@ fn setup_flow(
     } else {
         let mid = parse_model_spec(&model_spec)?;
         // Leech guard: warn if the machine can't realistically run it.
-        if let Some(fit) = fits.iter().find(|f| f.model.id == mid.id) {
-            if !fit.fits && !std::env::var("JERITH_OK_BEYOND_CAPACITY").is_ok() {
+        if let Some(fit) = fits.iter().find(|f| f.model.id == mid.id)
+            && !fit.fits && std::env::var("JERITH_OK_BEYOND_CAPACITY").is_err() {
                 bail!(
                     "this machine cannot run {id} locally: {reason}\n\
                      Passing capacity checks is required to prevent mesh leeching. \
@@ -1272,7 +1273,6 @@ fn setup_flow(
                     reason = fit.reason
                 );
             }
-        }
         mid
     };
     println!("\n[2/5] Model: {} (quant {})", model.id, model.quant);
@@ -1868,8 +1868,8 @@ async fn peers_cmd() -> anyhow::Result<()> {
                 println!("No live peers for {} {}", model.id, model.quant);
             } else {
                 println!(
-                    "{:<22} {:<24} {:<8} {:>6}  {}",
-                    "node", "model", "quant", "contrib", "role"
+                    "{:<22} {:<24} {:<8} {:>6}  role",
+                    "node", "model", "quant", "contrib"
                 );
                 for p in same {
                     println!(
@@ -1892,7 +1892,7 @@ async fn model_cmd(new_model: Option<String>) -> anyhow::Result<()> {
     let mut cfg = NodeConfig::load()?.context("no config — run setup first")?;
     match new_model {
         None => match &cfg.model {
-            Some(m) => println!("{} ({}) — mesh: {} peers in model mesh", m.id, m.quant, ""),
+            Some(m) => println!("{} ({}) — mesh:  peers in model mesh", m.id, m.quant),
             None => println!("no model set"),
         },
         Some(spec) => {

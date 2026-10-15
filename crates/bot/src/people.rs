@@ -94,7 +94,7 @@ pub fn extract_speaker_id(prompt: &str) -> Option<String> {
     // find(']') slice keeps the ')' and fails the digit check).
     let id = raw
         .trim_end()
-        .trim_end_matches(|c| c == ')' || c == ']')
+        .trim_end_matches([')', ']'])
         .trim();
     let ok = !id.is_empty() && id.chars().all(|c| c.is_ascii_digit());
     ok.then(|| id.to_string())
