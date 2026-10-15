@@ -517,28 +517,35 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Independent SwiGLU reference (loops only, no shared helpers) — the
-/// arithmetic this test holds the wire result to.
+/// Independent SwiGLU reference (explicit loops over sliced rows, no
+/// shared helpers) — the arithmetic this test holds the wire result to.
 fn reference_swiglu(w: &jerith_mesh_core::expert_store::ExpertWeights, x: &[f32]) -> Vec<f32> {
-    let mut act = vec![0.0f32; w.intermediate];
-    for unit in 0..w.intermediate {
-        let mut g = 0.0f32;
-        let mut u = 0.0f32;
-        for k in 0..w.hidden {
-            g += w.gate[unit * w.hidden + k] * x[k];
-            u += w.up[unit * w.hidden + k] * x[k];
-        }
-        act[unit] = (g / (1.0 + (-g).exp())) * u;
-    }
-    let mut y = vec![0.0f32; w.hidden];
-    for out in 0..w.hidden {
-        let mut acc = 0.0f32;
-        for unit in 0..w.intermediate {
-            acc += w.down[out * w.intermediate + unit] * act[unit];
-        }
-        y[out] = acc;
-    }
-    y
+    let act: Vec<f32> = w
+        .gate
+        .chunks(w.hidden)
+        .zip(w.up.chunks(w.hidden))
+        .map(|(gate_row, up_row)| {
+            let mut g = 0.0f32;
+            let mut u = 0.0f32;
+            for (gr, k) in gate_row.iter().zip(x) {
+                g += gr * k;
+            }
+            for (ur, k) in up_row.iter().zip(x) {
+                u += ur * k;
+            }
+            (g / (1.0 + (-g).exp())) * u
+        })
+        .collect();
+    w.down
+        .chunks(w.intermediate)
+        .map(|down_row| {
+            down_row
+                .iter()
+                .zip(&act)
+                .map(|(d, a)| d * a)
+                .sum::<f32>()
+        })
+        .collect()
 }
 
 /// Phase 2 hot-expert replication, end to end over real QUIC: node B holds

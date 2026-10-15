@@ -1760,7 +1760,8 @@ mod tests {
         // apply_recovery would try to add 0 days → stays.
         apply_recovery(&mut e, now_ms());
         assert_eq!(e.score, -30);
-        assert!(HALT_SCORE_THRESHOLD > REPUTATION_FLOOR); // -20 > -100
+        // Compile-time sanity: the halt line never descends below the floor.
+        const _: () = assert!(HALT_SCORE_THRESHOLD > REPUTATION_FLOOR); // -20 > -100
     }
 
     #[test]
@@ -1809,7 +1810,7 @@ mod tests {
         // (the field was added after the legacy epoch).
         a.rpc_address = "z".into();
         let legacy2 = crate::signing::legacy_ad_excerpt(&a, stamp);
-        assert_eq!(legacy, legacy2.replace("", "")); // sanity: builder is deterministic
+        assert_eq!(legacy, legacy2, "sanity: builder is deterministic");
     }
 
     #[test]

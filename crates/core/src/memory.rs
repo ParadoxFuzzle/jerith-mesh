@@ -1653,7 +1653,7 @@ mod tests {
         assert!(text.starts_with('[') && text.ends_with(']'));
         assert_eq!(vec_from_pg_text(&text).unwrap(), v, "shortest-round-trip f32s");
         assert_eq!(vec_from_pg_text("[]").unwrap(), Vec::<f32>::new());
-        assert!(matches!(vec_from_pg_text("[1.0,oops]"), Err(_)), "malformed vector is a typed error, never silent zeros");
+        assert!(vec_from_pg_text("[1.0,oops]").is_err(), "malformed vector is a typed error, never silent zeros");
     }
 
     #[test]

@@ -1138,8 +1138,10 @@ mod tests {
             ..sample_choices()
         };
         assert!(choices.into_config(None).is_err());
-        let mut cfg = NodeConfig::default();
-        cfg.contribution_percent = 10;
+        let cfg = NodeConfig {
+            contribution_percent: 10,
+            ..NodeConfig::default()
+        };
         assert!(cfg.validate().is_err());
     }
 

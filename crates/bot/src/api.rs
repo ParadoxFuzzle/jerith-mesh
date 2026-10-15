@@ -1488,7 +1488,7 @@ mod tests {
                         seen_chat.lock().await.push(req.clone());
                         let has_tool_result = req["messages"]
                             .as_array()
-                            .map_or(false, |ms| {
+                            .is_some_and(|ms| {
                                 ms.iter()
                                     .any(|m| m["role"] == json!("tool"))
                             });
@@ -1575,7 +1575,7 @@ mod tests {
             .find(|r| {
                 r["messages"]
                     .as_array()
-                    .map_or(false, |ms| ms.iter().any(|m| m["role"] == json!("tool")))
+                    .is_some_and(|ms| ms.iter().any(|m| m["role"] == json!("tool")))
             })
             .expect("a round carrying tool results");
         let tool_msgs: Vec<&Value> = tool_round["messages"]
@@ -1611,7 +1611,7 @@ mod tests {
             .route(
                 "/v1/chat/completions",
                 axum::routing::post(move |axum::Json(req): axum::Json<Value>| async move {
-                    let has_tool_result = req["messages"].as_array().map_or(false, |ms| {
+                    let has_tool_result = req["messages"].as_array().is_some_and(|ms| {
                         ms.iter().any(|m| m["role"] == json!("tool"))
                     });
                     if has_tool_result {
@@ -1791,7 +1791,6 @@ mod tests {
                             + "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n"
                             + "data: [DONE]\n\n";
                         seen_live.lock().await.push(body.clone());
-                        (axum::http::header::CONTENT_TYPE, "text/event-stream");
                         (
                             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                             body,
@@ -1895,7 +1894,7 @@ mod tests {
                 axum::routing::post(|axum::Json(req): axum::Json<Value>| async move {
                     let has_tool_result = req["messages"]
                         .as_array()
-                        .map_or(false, |ms| ms.iter().any(|m| m["role"] == json!("tool")));
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == json!("tool")));
                     let body = if has_tool_result {
                         let a1 = json!({"choices":[{"delta":{"content":"answer "}}]});
                         let a2 = json!({"choices":[{"delta":{"content":"after web search."}}]});

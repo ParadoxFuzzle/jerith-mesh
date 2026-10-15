@@ -78,7 +78,7 @@ async fn dead_port() -> SocketAddr {
 
 #[tokio::test]
 async fn fetch_leg_fails_over_from_dead_to_alive_bootstrap() {
-    let live = spawn_mock(peers_json("peer-from-mock").into()).await;
+    let live = spawn_mock(peers_json("peer-from-mock")).await;
     let dead = dead_port().await;
     let order = vec![
         format!("http://{dead}"),
@@ -104,7 +104,7 @@ async fn fetch_leg_fails_over_from_dead_to_alive_bootstrap() {
 
 #[tokio::test]
 async fn last_good_stickiness_reorders_after_a_failover() {
-    let live = spawn_mock(peers_json("p").into()).await;
+    let live = spawn_mock(peers_json("p")).await;
     let dead = dead_port().await;
 
     let mut d = DiscoveryServers::default();

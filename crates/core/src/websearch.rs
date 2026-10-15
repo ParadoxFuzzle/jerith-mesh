@@ -587,8 +587,8 @@ mod tests {
         );
         // The real code path: spawning the resolver's shared logic via a
         // second pass to assert the is_private_host predicate used inline.
-        assert!(is_private_host(&"127.0.0.1".to_string()));
-        assert!(!is_private_host(&"93.184.216.34".to_string()));
+        assert!(is_private_host("127.0.0.1"));
+        assert!(!is_private_host("93.184.216.34"));
     }
 
     #[test]

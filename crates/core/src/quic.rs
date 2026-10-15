@@ -3973,9 +3973,8 @@ mod tests {
         let id = SigningIdentity::generate();
         let cert = identity_cert(&id);
         let key_hex = extract_ed25519_spki_hex(&cert).expect("extractor decodes");
-        assert_eq!(
+        assert!(
             key_hex.starts_with(&id.node_id()),
-            true,
             "extracted key {key_hex} must extend node_id {}",
             id.node_id()
         );

@@ -563,7 +563,7 @@ mod tests {
         // RAM under its soft line but VRAM still over: stay tripped.
         let c = cfg(Some(10 * GIB), Some(8 * GIB), true);
         let u = Usage {
-            rss_bytes: 1 * GIB,
+            rss_bytes: GIB,
             vram_used_bytes: Some(39 * GIB / 5),
             bandwidth_bytes_per_min: None,
         };
@@ -588,22 +588,24 @@ mod tests {
 
     #[test]
     fn usage_from_sample_sums_only_reporting_gpus() {
-        let mut sample = ResourceSample::default();
-        sample.gpus = vec![
-            crate::hw::GpuSample {
-                name: "A".into(),
-                vram_total_bytes: Some(8 * GIB),
-                vram_used_bytes: Some(2 * GIB),
-                vram_free_bytes: Some(6 * GIB),
-            },
-            crate::hw::GpuSample {
-                name: "B".into(),
-                vram_used_bytes: Some(3 * GIB),
-                ..Default::default()
-            },
-        ];
-        let u = usage_from_sample(1 * GIB, &Some(sample), Some(100 * 1024 * 1024));
-        assert_eq!(u.rss_bytes, 1 * GIB);
+        let sample = ResourceSample {
+            gpus: vec![
+                crate::hw::GpuSample {
+                    name: "A".into(),
+                    vram_total_bytes: Some(8 * GIB),
+                    vram_used_bytes: Some(2 * GIB),
+                    vram_free_bytes: Some(6 * GIB),
+                },
+                crate::hw::GpuSample {
+                    name: "B".into(),
+                    vram_used_bytes: Some(3 * GIB),
+                    ..Default::default()
+                },
+            ],
+            ..ResourceSample::default()
+        };
+        let u = usage_from_sample(GIB, &Some(sample), Some(100 * 1024 * 1024));
+        assert_eq!(u.rss_bytes, GIB);
         assert_eq!(u.vram_used_bytes, Some(5 * GIB));
         assert_eq!(u.bandwidth_bytes_per_min, Some(100 * 1024 * 1024));
         // Unknown VRAM stays None, never 0. Same for an unmeasured window.

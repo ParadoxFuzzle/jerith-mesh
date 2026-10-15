@@ -1336,8 +1336,10 @@ mod tests {
     use axum_test::TestServer;
 
     fn spawn_plain(runtime_url: &'static str, fallback: bool) -> TestServer {
-        let mut cfg = crate::config::NodeConfig::default();
-        cfg.runtime_url = runtime_url.to_string();
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.to_string(),
+            ..crate::config::NodeConfig::default()
+        };
         cfg.ensure_identity().expect("test identity");
         let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
         let gw = Gateway {
@@ -1364,8 +1366,10 @@ mod tests {
     /// Test server with the local memory backend armed (embed falls back
     /// to hashing when no ollama answers).
     fn spawn_with_memory() -> TestServer {
-        let mut cfg = crate::config::NodeConfig::default();
-        cfg.runtime_url = "http://127.0.0.1:1".to_string();
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
         cfg.ensure_identity().expect("test identity");
         let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
         let memory = crate::memory::MemoryStore::open_in_memory(crate::memory::EmbedConfig {
@@ -1401,8 +1405,10 @@ mod tests {
     /// Test server with the default-configured Jerith Guard armed.
     fn spawn_guarded(runtime_url: String) -> TestServer {
         let runtime_url: &'static str = Box::leak(runtime_url.into_boxed_str());
-        let mut cfg = crate::config::NodeConfig::default();
-        cfg.runtime_url = runtime_url.to_string();
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.to_string(),
+            ..crate::config::NodeConfig::default()
+        };
         cfg.ensure_identity().expect("test identity");
         let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
         let guard = crate::guard::Guard::build(&crate::guard::GuardConfig::default())
@@ -1442,8 +1448,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let mut cfg = crate::config::NodeConfig::default();
-        cfg.runtime_url = format!("http://{addr}");
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: format!("http://{addr}"),
+            ..crate::config::NodeConfig::default()
+        };
         cfg.ensure_identity().expect("test identity");
         let (state, _rx) = MeshState::new(cfg.clone()).expect("test mesh state");
         let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -1564,8 +1572,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, runtime).await.expect("runtime up") });
 
-        let mut cfg = crate::config::NodeConfig::default();
-        cfg.runtime_url = format!("http://{addr}");
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: format!("http://{addr}"),
+            ..crate::config::NodeConfig::default()
+        };
         cfg.ensure_identity().expect("test identity");
         let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
         let gw = Gateway {
@@ -1679,7 +1689,7 @@ mod tests {
             .await;
         assert_eq!(res.status_code(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         assert!(
-            crate::metrics::OVERSIZE_MEMORY_REJECTS.load(Ordering::Relaxed) >= mem_before + 1,
+            crate::metrics::OVERSIZE_MEMORY_REJECTS.load(Ordering::Relaxed) > mem_before,
             "memory oversize counter must reflect the 413"
         );
 

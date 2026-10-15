@@ -1627,10 +1627,12 @@ mod tests {
     #[test]
     fn config_reload_plan_classifies_fields() {
         let live = NodeConfig::default();
-        let mut disk = NodeConfig::default();
-        disk.contribution_percent = live.contribution_percent + 5;
-        disk.bootstrap_url = "http://other-bootstrap/".to_string();
-        disk.node_id = "someone-else".to_string();
+        let disk = NodeConfig {
+            contribution_percent: live.contribution_percent + 5,
+            bootstrap_url: "http://other-bootstrap/".to_string(),
+            node_id: "someone-else".to_string(),
+            ..NodeConfig::default()
+        };
         let plan = plan_config_reload(&disk, &live);
         assert!(plan.hot.contains(&"contribution_percent"));
         assert_eq!(plan.cold, vec!["bootstrap_url"]);
@@ -1641,9 +1643,11 @@ mod tests {
     #[test]
     fn config_reload_plan_detects_memory_triple_change() {
         let live = NodeConfig::default();
-        let mut disk = NodeConfig::default();
-        disk.memory_backend = MemoryBackend::PostgresPgvector;
-        disk.memory_dsn = Some("postgres://u:p@127.0.0.1:5432/db?sslmode=disable".to_string());
+        let disk = NodeConfig {
+            memory_backend: MemoryBackend::PostgresPgvector,
+            memory_dsn: Some("postgres://u:p@127.0.0.1:5432/db?sslmode=disable".to_string()),
+            ..NodeConfig::default()
+        };
         let plan = plan_config_reload(&disk, &live);
         assert!(plan.memory_changed);
         assert!(plan.hot.is_empty(), "memory moves are not plain hot fields");

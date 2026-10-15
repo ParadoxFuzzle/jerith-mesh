@@ -621,7 +621,7 @@ mod tests {
     fn penalty_math_no_zero_when_enabled() {
         // Pure math check via config: 25 % of 800 µJ = 200; of 1 µJ → min 1.
         assert_eq!(800 * 25 / 100, 200);
-        assert_eq!(1 * 25 / 100, 0); // why the .max(1) floor exists
+        assert_eq!(25 / 100, 0); // why the .max(1) floor exists
     }
 
     #[test]

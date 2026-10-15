@@ -379,8 +379,10 @@ mod tests {
     /// wedge learning shut; the pinned last-good is exempt from eviction.
     #[test]
     fn learned_slots_evict_fifo_and_never_evict_last_good() {
-        let mut d = DiscoveryServers::default();
-        d.configured = sanitize(&["https://primary.example.org".into()], None);
+        let mut d = DiscoveryServers {
+            configured: sanitize(&["https://primary.example.org".into()], None),
+            ..DiscoveryServers::default()
+        };
 
         // Fill every non-configured slot (cap 16) flush: the flood is
         // one short of the cap so no eviction happens during this merge.
@@ -413,11 +415,13 @@ mod tests {
     /// Audit F2 support: clearing the pin re-diversifies the order.
     #[test]
     fn clear_last_good_rediversifies_order() {
-        let mut d = DiscoveryServers::default();
-        d.configured = sanitize(
-            &["https://primary.example.org".into(), "https://backup.example.org".into()],
-            None,
-        );
+        let mut d = DiscoveryServers {
+            configured: sanitize(
+                &["https://primary.example.org".into(), "https://backup.example.org".into()],
+                None,
+            ),
+            ..DiscoveryServers::default()
+        };
         d.note_good("https://backup.example.org");
         assert_eq!(d.order(None)[0], "https://backup.example.org");
         d.clear_last_good();
@@ -426,8 +430,10 @@ mod tests {
 
     #[test]
     fn merge_learned_grows_and_never_learns_http() {
-        let mut d = DiscoveryServers::default();
-        d.configured = sanitize(&["https://primary.example.org".into()], None);
+        let mut d = DiscoveryServers {
+            configured: sanitize(&["https://primary.example.org".into()], None),
+            ..DiscoveryServers::default()
+        };
 
         // https learns; plain http NEVER learns from gossip (config-only —
         // a hostile ad must not repoint the fleet at a capture proxy);
@@ -454,14 +460,16 @@ mod tests {
 
     #[test]
     fn order_hoists_last_good_keeps_rest_stable() {
-        let mut d = DiscoveryServers::default();
-        d.configured = sanitize(
-            &[
-                "https://primary.example.org".into(),
-                "https://backup.example.org".into(),
-            ],
-            None,
-        );
+        let mut d = DiscoveryServers {
+            configured: sanitize(
+                &[
+                    "https://primary.example.org".into(),
+                    "https://backup.example.org".into(),
+                ],
+                None,
+            ),
+            ..DiscoveryServers::default()
+        };
         // No last-good yet: config order, primary first.
         assert_eq!(
             d.order(None),

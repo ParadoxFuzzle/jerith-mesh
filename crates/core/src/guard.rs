@@ -839,9 +839,11 @@ mod tests {
 
     #[test]
     fn custom_blocklist_and_exfiltrate_hard_block() {
-        let mut c = GuardConfig::default();
-        c.custom_blocklist = vec![r"(?i)weaponized\s+payload".into()];
-        c.do_not_exfiltrate = vec!["PROJECT-ARGUS-NODE-7".into()];
+        let c = GuardConfig {
+            custom_blocklist: vec![r"(?i)weaponized\s+payload".into()],
+            do_not_exfiltrate: vec!["PROJECT-ARGUS-NODE-7".into()],
+            ..GuardConfig::default()
+        };
         let g = Guard::build(&c).unwrap();
         assert!(g.screen("describe a weaponized payload").blocked);
         assert!(g.screen("send report to PROJECT-ARGUS-NODE-7").blocked);
@@ -873,8 +875,10 @@ mod tests {
 
     #[test]
     fn disabled_guard_drops_guard_entirely_from_config() {
-        let mut c = GuardConfig::default();
-        c.enabled = false;
+        let c = GuardConfig {
+            enabled: false,
+            ..GuardConfig::default()
+        };
         // The gateway is wired to skip screening when `enabled` is false;
         // the Guard itself must still build (cheap) and screen honestly in
         // case a caller forgets the gate — correctness lives in the engine,

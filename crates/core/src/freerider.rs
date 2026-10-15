@@ -481,10 +481,10 @@ mod tests {
     /// Medians behave on odd/even lengths and tolerate mixed values.
     #[test]
     fn median_helpers() {
-        assert_eq!(median(&vec![3, 1, 2]), Some(2.0));
+        assert_eq!(median(&[3, 1, 2]), Some(2.0));
         // Even length interpolates (true median).
-        assert_eq!(median(&vec![4, 1]), Some(2.5));
-        assert_eq!(median(&vec![]), None);
+        assert_eq!(median(&[4, 1]), Some(2.5));
+        assert_eq!(median(&[]), None);
         assert_eq!(median_f32(vec![]), None);
         assert_eq!(median_f32(vec![9.0, 7.0, 7.0]), Some(7.0));
     }

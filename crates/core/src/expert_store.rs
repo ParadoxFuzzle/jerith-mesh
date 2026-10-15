@@ -556,27 +556,28 @@ mod tests {
     }
 
     /// Reference SwiGLU written independently of the implementation:
-    /// explicit loops, no shared helpers.
+    /// explicit loops over sliced rows, no shared helpers.
     fn reference_forward(w: &ExpertWeights, x: &[f32]) -> Vec<f32> {
-        let mut act = vec![0.0f32; w.intermediate];
-        for unit in 0..w.intermediate {
+        let mut act: Vec<f32> = Vec::with_capacity(w.intermediate);
+        for (gate_row, up_row) in w.gate.chunks(w.hidden).zip(w.up.chunks(w.hidden)) {
             let mut g = 0.0f32;
             let mut u = 0.0f32;
-            for k in 0..w.hidden {
-                let xk = x[k];
-                g += w.gate[unit * w.hidden + k] * xk;
-                u += w.up[unit * w.hidden + k] * xk;
+            for (gr, xk) in gate_row.iter().zip(x) {
+                g += gr * xk;
+            }
+            for (ur, xk) in up_row.iter().zip(x) {
+                u += ur * xk;
             }
             let s = g / (1.0 + (-g).exp());
-            act[unit] = s * u;
+            act.push(s * u);
         }
-        let mut y = vec![0.0f32; w.hidden];
-        for out in 0..w.hidden {
+        let mut y: Vec<f32> = Vec::with_capacity(w.hidden);
+        for down_row in w.down.chunks(w.intermediate) {
             let mut acc = 0.0f32;
-            for unit in 0..w.intermediate {
-                acc += w.down[out * w.intermediate + unit] * act[unit];
+            for (d, a) in down_row.iter().zip(&act) {
+                acc += d * a;
             }
-            y[out] = acc;
+            y.push(acc);
         }
         y
     }

@@ -59,8 +59,10 @@ async fn mesh_chat_falls_back_over_quic_with_real_attribution() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // 2. Build the fallback handle + registry pointing at the peer.
-    let mut cfg = NodeConfig::default();
-    cfg.runtime_url = "http://127.0.0.1:1".to_string(); // deliberately dead
+    let mut cfg = NodeConfig {
+        runtime_url: "http://127.0.0.1:1".to_string(), // deliberately dead
+        ..NodeConfig::default()
+    };
     cfg.ensure_identity().unwrap();
     let (state, _rx2) = MeshState::new(cfg).unwrap();
     {

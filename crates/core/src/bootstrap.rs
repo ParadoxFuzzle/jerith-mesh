@@ -584,7 +584,7 @@ mod tests {
             "legacy peer stays a candidate"
         );
         // And a peer with no hosting fields serializes without them.
-        let out = serde_json::to_value(&ad("n", "m", "int4")).unwrap();
+        let out = serde_json::to_value(ad("n", "m", "int4")).unwrap();
         assert!(out.get("hosted_experts").is_none());
     }
 

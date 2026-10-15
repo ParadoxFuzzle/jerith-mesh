@@ -638,17 +638,15 @@ mod tests {
         ExpertWeights::synthetic(expert_id, 8, 16).forward(x)
     }
 
+    /// The remote-hop future shape the walker's adapters return.
+    type RemoteHopFut = std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
+    >;
+
     /// The same deterministic expert run a live peer would execute, wrapped
     /// like [`remote_run`]'s contract and returning a REAL Phase 4
     /// commitment over (req_id, per-hop expert id, node, in, out).
-    fn remote_ok(
-        req_id: &'static str,
-    ) -> impl Fn(
-        &str,
-        &str,
-        Vec<f32>,
-        Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>> {
+    fn remote_ok(req_id: &'static str) -> impl Fn(&str, &str, Vec<f32>, Duration) -> RemoteHopFut {
         move |expert_id, node, input, _timeout| {
             let expert_id = expert_id.to_owned();
             let node = node.to_owned();
@@ -955,7 +953,7 @@ mod tests {
         // skipped inside the chain deterministically, not silently dropped.
         let local0 = run_hop(
             &hop_expert_id(model, &PipelineHop { node: None, layers: vec![0] }),
-            &vec![0.5_f32; 8],
+            &[0.5_f32; 8],
         )
         .unwrap();
         let expect_b2 = run_hop(
@@ -1111,7 +1109,7 @@ mod tests {
             vec![0.0_f32; 4],
             |_a, _l| Ok(vec![0.0_f32; 4]),
             move |_e, node, _x, _t| {
-                let slow = node.to_owned() == "slow";
+                let slow = node == "slow";
                 Box::pin(async move {
                     if slow {
                         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1160,7 +1158,7 @@ mod tests {
             vec![0.0_f32; 4],
             |a, _l| Ok(a.to_vec()),
             move |_e, node, _x, _t| {
-                let dead = node.to_owned() == "gone";
+                let dead = node == "gone";
                 Box::pin(async move {
                     if dead {
                         anyhow::bail!("peer unreachable")

@@ -605,46 +605,6 @@ fn load_chain_wallets(
     rows.truncate((limit.max(1) as usize).min(500));
     Ok(rows)
 }
-
-/// `jerith chain …` — the read-only chain introspection commands.
-#[cfg(test)]
-mod chain_tests {
-    use super::*;
-    use rusqlite::Connection;
-
-    #[test]
-    fn chain_wallet_rows_join_and_sort() {
-        let dir = std::env::temp_dir().join(format!("chain-cl-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("jerith.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE balances (address TEXT PRIMARY KEY, balance INTEGER NOT NULL, nonce INTEGER NOT NULL, locked INTEGER NOT NULL);
-            CREATE TABLE users (discord_id TEXT, address TEXT UNIQUE, vk_hex TEXT, enc_sk TEXT, wrapped_sk TEXT, password_stored INTEGER, totp_enc TEXT, totp_confirmed INTEGER, auto_sign_limit INTEGER, daily_spent INTEGER);
-            CREATE TABLE mining_state (discord_id TEXT, last_success INTEGER, last_fail INTEGER, success_count INTEGER, fail_count INTEGER, total_mined INTEGER);
-            INSERT INTO balances VALUES ('jer1aaa', 2500000, 4, 1000000);
-            INSERT INTO balances VALUES ('jer1bbb', 12000000, 1, 0);
-            INSERT INTO users (discord_id, address) VALUES ('1001', 'jer1bbb');
-            INSERT INTO mining_state (discord_id, success_count, fail_count, total_mined) VALUES ('1001', 12, 1, 3000000);
-            "#,
-        )
-        .unwrap();
-        // Address-sort (default) LIMIT 1 keeps the lexicographically first.
-        let rows = load_chain_wallets(&conn, 10, false).unwrap();
-        assert_eq!(rows[0].address, "jer1aaa");
-        // Balance-sort brings the bigger wallet first, with the joined
-        // discord id + mined totals.
-        let rows = load_chain_wallets(&conn, 10, true).unwrap();
-        assert_eq!(rows[0].address, "jer1bbb");
-        assert_eq!(rows[0].discord_id, Some(1001));
-        assert_eq!(rows[0].total_mined_uj, 3_000_000);
-        assert_eq!(rows[1].discord_id, None);
-        // Limit applies.
-        assert_eq!(load_chain_wallets(&conn, 1, true).unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
 /// `jerith backup create|verify|restore` — the full node-state
 /// backup/restore/migrate story (Phase 2). The container format lives in
 /// `core::backup`; this is the human surface: one line per report field.
@@ -1992,4 +1952,44 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `jerith chain …` — the read-only chain introspection commands.
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn chain_wallet_rows_join_and_sort() {
+        let dir = std::env::temp_dir().join(format!("chain-cl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("jerith.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE balances (address TEXT PRIMARY KEY, balance INTEGER NOT NULL, nonce INTEGER NOT NULL, locked INTEGER NOT NULL);
+            CREATE TABLE users (discord_id TEXT, address TEXT UNIQUE, vk_hex TEXT, enc_sk TEXT, wrapped_sk TEXT, password_stored INTEGER, totp_enc TEXT, totp_confirmed INTEGER, auto_sign_limit INTEGER, daily_spent INTEGER);
+            CREATE TABLE mining_state (discord_id TEXT, last_success INTEGER, last_fail INTEGER, success_count INTEGER, fail_count INTEGER, total_mined INTEGER);
+            INSERT INTO balances VALUES ('jer1aaa', 2500000, 4, 1000000);
+            INSERT INTO balances VALUES ('jer1bbb', 12000000, 1, 0);
+            INSERT INTO users (discord_id, address) VALUES ('1001', 'jer1bbb');
+            INSERT INTO mining_state (discord_id, success_count, fail_count, total_mined) VALUES ('1001', 12, 1, 3000000);
+            "#,
+        )
+        .unwrap();
+        // Address-sort (default) LIMIT 1 keeps the lexicographically first.
+        let rows = load_chain_wallets(&conn, 10, false).unwrap();
+        assert_eq!(rows[0].address, "jer1aaa");
+        // Balance-sort brings the bigger wallet first, with the joined
+        // discord id + mined totals.
+        let rows = load_chain_wallets(&conn, 10, true).unwrap();
+        assert_eq!(rows[0].address, "jer1bbb");
+        assert_eq!(rows[0].discord_id, Some(1001));
+        assert_eq!(rows[0].total_mined_uj, 3_000_000);
+        assert_eq!(rows[1].discord_id, None);
+        // Limit applies.
+        assert_eq!(load_chain_wallets(&conn, 1, true).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
