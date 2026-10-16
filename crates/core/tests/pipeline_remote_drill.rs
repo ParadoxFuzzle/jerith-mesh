@@ -75,8 +75,8 @@ use jerith_mesh_core::pipeline::{
     plan_route_budget,
 };
 use jerith_mesh_core::quic::{
-    ExpertServing, NodeRpcReply, NodeRpcRequest, PinMap, SharedPinMap, call,
-    fetch_expert, pinned_client_endpoint_dyn, sign_request,
+    ExpertServing, NodeRpcReply, NodeRpcRequest, PinMap, SharedPinMap, call, fetch_expert,
+    pinned_client_endpoint_dyn, sign_request,
 };
 use jerith_mesh_core::signing::SigningIdentity;
 
@@ -199,10 +199,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     let walk_node_id = walker.node_id();
     let walk_req_id = "drill-route-1".to_string();
 
-    let addrs: HashMap<String, SocketAddr> = pin_map
-        .iter()
-        .map(|(n, a)| (n.clone(), *a))
-        .collect();
+    let addrs: HashMap<String, SocketAddr> = pin_map.iter().map(|(n, a)| (n.clone(), *a)).collect();
 
     // --- The transport adapter under test: signed ExpertQuery over the
     // pinned QUIC transport, the HOP DEADLINE APPLIED HERE (the closure
@@ -217,41 +214,42 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     type RemoteHopper = std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
     >;
-    let remote_run = move |expert_id: &str, node: &str, input: Vec<f32>, deadline: Duration| -> RemoteHopper {
-        let client = adapter_client.clone();
-        let walker = walker_for_adapter.clone();
-        let walk_req = req_id_for_adapter.clone();
-        let addr = addrs.get(node).copied();
-        let expert_id = expert_id.to_owned();
-        let node = node.to_owned();
-        Box::pin(async move {
-            let addr = addr.ok_or_else(|| anyhow::anyhow!("no pin for hop owner {node}"))?;
-            let mut req = NodeRpcRequest::ExpertQuery {
-                req_id: walk_req.clone(),
-                expert_id: expert_id.clone(),
-                input,
-                from_node_id: walker.node_id(),
-                stamp_ms: 0,
-                sig: String::new(),
-            };
-            sign_request(&mut req, &walker);
-            // The deadline the executor priced is applied at the wire.
-            // `call` gets a strictly LARGER internal budget (the margin
-            // keeps the two timers from racing): the priced deadline
-            // below must always be the one that fires, so the failure
-            // reason names the deadline on every platform — not which
-            // same-length timer happened to win the scheduling race.
-            let reply = tokio::time::timeout(
-                deadline,
-                call(
-                    &client,
-                    addr,
-                    &node,
-                    &req,
-                    &walker,
-                    deadline.saturating_add(Duration::from_secs(5)),
-                ),
-            )
+    let remote_run =
+        move |expert_id: &str, node: &str, input: Vec<f32>, deadline: Duration| -> RemoteHopper {
+            let client = adapter_client.clone();
+            let walker = walker_for_adapter.clone();
+            let walk_req = req_id_for_adapter.clone();
+            let addr = addrs.get(node).copied();
+            let expert_id = expert_id.to_owned();
+            let node = node.to_owned();
+            Box::pin(async move {
+                let addr = addr.ok_or_else(|| anyhow::anyhow!("no pin for hop owner {node}"))?;
+                let mut req = NodeRpcRequest::ExpertQuery {
+                    req_id: walk_req.clone(),
+                    expert_id: expert_id.clone(),
+                    input,
+                    from_node_id: walker.node_id(),
+                    stamp_ms: 0,
+                    sig: String::new(),
+                };
+                sign_request(&mut req, &walker);
+                // The deadline the executor priced is applied at the wire.
+                // `call` gets a strictly LARGER internal budget (the margin
+                // keeps the two timers from racing): the priced deadline
+                // below must always be the one that fires, so the failure
+                // reason names the deadline on every platform — not which
+                // same-length timer happened to win the scheduling race.
+                let reply = tokio::time::timeout(
+                    deadline,
+                    call(
+                        &client,
+                        addr,
+                        &node,
+                        &req,
+                        &walker,
+                        deadline.saturating_add(Duration::from_secs(5)),
+                    ),
+                )
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
@@ -259,22 +257,22 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
                         deadline
                     )
                 })??;
-            match reply {
-                NodeRpcReply::ExpertResult {
-                    req_id: _,
-                    output,
-                    node_id,
-                    commitment,
-                } => {
-                    if node_id != node {
-                        anyhow::bail!("attribution: hop served by {node_id}, pinned {node}");
+                match reply {
+                    NodeRpcReply::ExpertResult {
+                        req_id: _,
+                        output,
+                        node_id,
+                        commitment,
+                    } => {
+                        if node_id != node {
+                            anyhow::bail!("attribution: hop served by {node_id}, pinned {node}");
+                        }
+                        Ok((output, commitment))
                     }
-                    Ok((output, commitment))
+                    other => anyhow::bail!("unexpected rpc reply from hop {node}: {other:?}"),
                 }
-                other => anyhow::bail!("unexpected rpc reply from hop {node}: {other:?}"),
-            }
-        })
-    };
+            })
+        };
 
     // --- Criterion 0: RUNTIME WEIGHT PROVENANCE. The serving nodes
     // under test boot with empty stores: they first honestly REFUSE an
@@ -298,7 +296,14 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         sign_request(&mut req, &walker);
         let reply = tokio::time::timeout(
             Duration::from_secs(10),
-            call(&client, addr_b, &node_b, &req, &walker, Duration::from_secs(5)),
+            call(
+                &client,
+                addr_b,
+                &node_b,
+                &req,
+                &walker,
+                Duration::from_secs(5),
+            ),
         )
         .await
         .expect("refusal probe timeout")
@@ -331,10 +336,16 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         (&node_d, &store_d, &d_targets[..]),
     ] {
         for id in targets {
-            let bytes =
-                fetch_expert(&client, addr_s, &node_s, &walker, id, Duration::from_secs(15))
-                    .await
-                    .with_context(|| format!("harvesting {id} over QUIC"))?;
+            let bytes = fetch_expert(
+                &client,
+                addr_s,
+                &node_s,
+                &walker,
+                id,
+                Duration::from_secs(15),
+            )
+            .await
+            .with_context(|| format!("harvesting {id} over QUIC"))?;
             let ingested = owner_store
                 .put_bytes(&bytes)
                 .with_context(|| format!("ingesting harvested {id}"))?;
@@ -399,8 +410,14 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     assert_eq!(
         route,
         vec![
-            PipelineHop { node: Some(node_a.clone()), layers: vec![0, 1] },
-            PipelineHop { node: Some(node_b.clone()), layers: vec![2, 3] },
+            PipelineHop {
+                node: Some(node_a.clone()),
+                layers: vec![0, 1]
+            },
+            PipelineHop {
+                node: Some(node_b.clone()),
+                layers: vec![2, 3]
+            },
         ],
         "planner: two remote hops in walk order"
     );
@@ -408,8 +425,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     // Budgets priced from the measured-activation ordering (a drill node
     // has no measured history: even split, but the RTT floors are real).
     let rtt_of = |_: &str| 5_u64;
-    let priced =
-        plan_route_budget(&route, |_| 1, rtt_of, Duration::from_millis(250), 20_000);
+    let priced = plan_route_budget(&route, |_| 1, rtt_of, Duration::from_millis(250), 20_000);
     let budget_of = move |hop: &PipelineHop| {
         priced
             .iter()
@@ -466,8 +482,26 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
 
     // Serial reference on the containers now living on the hop owners
     // (chained hop by hop).
-    let r1 = run_hop(&hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![0, 1] }), &input)?;
-    let want = run_hop(&hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![2, 3] }), &r1)?;
+    let r1 = run_hop(
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![0, 1],
+            },
+        ),
+        &input,
+    )?;
+    let want = run_hop(
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![2, 3],
+            },
+        ),
+        &r1,
+    )?;
     assert_eq!(want.len(), result.activation.len());
     for (got, expected) in result.activation.iter().zip(&want) {
         assert!(
@@ -491,7 +525,14 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         sign_request(&mut req, &walker);
         let reply = tokio::time::timeout(
             Duration::from_secs(10),
-            call(&client, addr_b, &node_b, &req, &walker, Duration::from_secs(5)),
+            call(
+                &client,
+                addr_b,
+                &node_b,
+                &req,
+                &walker,
+                Duration::from_secs(5),
+            ),
         )
         .await
         .expect("manual hop timeout")
@@ -539,8 +580,13 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         vec![&[0, 1][..], &[2][..], &[3][..]],
         "planner: A, dead C, B"
     );
-    let priced_dead =
-        plan_route_budget(&dead_route, |_| 1, rtt_of, Duration::from_millis(250), 20_000);
+    let priced_dead = plan_route_budget(
+        &dead_route,
+        |_| 1,
+        rtt_of,
+        Duration::from_millis(250),
+        20_000,
+    );
     let budget_of_dead = move |hop: &PipelineHop| {
         priced_dead
             .iter()
@@ -579,10 +625,16 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         )
         .await
     };
-    assert!(result3.degraded.is_empty(), "re-hosted walk must not degrade");
+    assert!(
+        result3.degraded.is_empty(),
+        "re-hosted walk must not degrade"
+    );
     assert_eq!(result3.reassigned.len(), 1, "the dead hop was re-hosted");
     assert_eq!(result3.reassigned[0].layers, vec![2]);
-    assert_eq!(result3.reassigned[0].was_node.as_deref(), Some(node_c.as_str()));
+    assert_eq!(
+        result3.reassigned[0].was_node.as_deref(),
+        Some(node_c.as_str())
+    );
     assert!(
         result3.reassigned[0].reason.contains("deadline"),
         "the mute peer died at its priced deadline (reason: {})",
@@ -590,15 +642,33 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
     );
     assert_eq!(result3.hops_run, 3, "A, re-hosted 2–2 on B, 3–3 on B");
     let r1d = run_hop(
-        &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![0, 1] }),
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![0, 1],
+            },
+        ),
         &input,
     )?;
     let r2d = run_hop(
-        &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![2] }),
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![2],
+            },
+        ),
         &r1d,
     )?;
     let want3 = run_hop(
-        &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![3] }),
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![3],
+            },
+        ),
         &r2d,
     )?;
     for (got, expected) in result3.activation.iter().zip(&want3) {
@@ -636,11 +706,23 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         result4.degraded[0].reason
     );
     let skip_ref1 = run_hop(
-        &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![0, 1] }),
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![0, 1],
+            },
+        ),
         &input,
     )?;
     let want4 = run_hop(
-        &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![3] }),
+        &hop_expert_id(
+            MODEL,
+            &PipelineHop {
+                node: None,
+                layers: vec![3],
+            },
+        ),
         &skip_ref1,
     )?;
     for (got, expected) in result4.activation.iter().zip(&want4) {
@@ -684,8 +766,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             ],
             "planner: A, B, far D in walk order"
         );
-        let rtt_far =
-            |n: &str| if n == node_d.as_str() { 180_u64 } else { 5_u64 };
+        let rtt_far = |n: &str| if n == node_d.as_str() { 180_u64 } else { 5_u64 };
         let priced_far = plan_route_budget(
             &far_route,
             |_| 1,
@@ -710,16 +791,10 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             .find(|h| h.node.as_deref() == Some(node_a.as_str()))
             .expect("near hop present")
             .clone();
-        let far_floor = jerith_mesh_core::pipeline::hop_timeout(
-            Duration::from_millis(250),
-            180,
-        )
-        .as_millis() as u64;
-        let near_floor = jerith_mesh_core::pipeline::hop_timeout(
-            Duration::from_millis(250),
-            5,
-        )
-        .as_millis() as u64;
+        let far_floor = jerith_mesh_core::pipeline::hop_timeout(Duration::from_millis(250), 180)
+            .as_millis() as u64;
+        let near_floor = jerith_mesh_core::pipeline::hop_timeout(Duration::from_millis(250), 5)
+            .as_millis() as u64;
         assert!(
             budget_of_far(&far_hop) >= far_floor,
             "far hop budget floored on base + 3×RTT: {} < {far_floor}",
@@ -766,15 +841,33 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             "the far hop ran last"
         );
         let r1f = run_hop(
-            &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![0, 1] }),
+            &hop_expert_id(
+                MODEL,
+                &PipelineHop {
+                    node: None,
+                    layers: vec![0, 1],
+                },
+            ),
             &input,
         )?;
         let r2f = run_hop(
-            &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![2] }),
+            &hop_expert_id(
+                MODEL,
+                &PipelineHop {
+                    node: None,
+                    layers: vec![2],
+                },
+            ),
             &r1f,
         )?;
         let want6 = run_hop(
-            &hop_expert_id(MODEL, &PipelineHop { node: None, layers: vec![3] }),
+            &hop_expert_id(
+                MODEL,
+                &PipelineHop {
+                    node: None,
+                    layers: vec![3],
+                },
+            ),
             &r2f,
         )?;
         for (got, expected) in result6.activation.iter().zip(&want6) {

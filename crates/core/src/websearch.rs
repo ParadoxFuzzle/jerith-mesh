@@ -281,7 +281,8 @@ impl WebSearchService {
         timeout_secs: u64,
     ) -> Self {
         Self {
-            client: reqwest::Client::builder().use_rustls_tls()
+            client: reqwest::Client::builder()
+                .use_rustls_tls()
                 .timeout(Duration::from_secs(timeout_secs.max(5)))
                 .user_agent(USER_AGENT)
                 // SSRF hardening (round 1): never auto-follow redirects —

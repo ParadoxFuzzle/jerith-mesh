@@ -71,12 +71,13 @@ pub fn effective_markers(arch: &ArchiverConfig, guild_id: Option<u64>) -> Vec<St
             .collect()
     };
     if let Some(gid) = guild_id
-        && let Some(set) = arch.guild_markers.get(&gid) {
-            let over = clean(&set.markers);
-            if !over.is_empty() {
-                return over;
-            }
+        && let Some(set) = arch.guild_markers.get(&gid)
+    {
+        let over = clean(&set.markers);
+        if !over.is_empty() {
+            return over;
         }
+    }
     let global = clean(&arch.markers);
     if !global.is_empty() {
         return global;
@@ -257,7 +258,8 @@ impl Ledger {
 /// Discord REST client bits — a slim reqwest wrapper (the bot already
 /// speaks OpenAI-ish JSON everywhere; here it's Discord's API).
 pub(crate) fn discord_client() -> reqwest::Client {
-    reqwest::Client::builder().use_rustls_tls()
+    reqwest::Client::builder()
+        .use_rustls_tls()
         .user_agent("jerith-mesh-bot/0.1 (thread-archiver)")
         .build()
         .expect("static reqwest client config")
@@ -447,9 +449,10 @@ async fn sweep_one(
 
     // 2. webhook parity with the OpenClaw skill (optional).
     if let Some(webhook) = arch.notes_webhook.as_deref().filter(|w| !w.is_empty())
-        && let Err(e) = post_webhook(client, webhook, &summary).await {
-            tracing::warn!(channel = cid, error = %e, "notes webhook post failed (memory already carries the summary)");
-        }
+        && let Err(e) = post_webhook(client, webhook, &summary).await
+    {
+        tracing::warn!(channel = cid, error = %e, "notes webhook post failed (memory already carries the summary)");
+    }
 
     // 3. local markdown archive.
     let archive_dir = dir.join("archives");

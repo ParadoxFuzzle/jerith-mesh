@@ -322,15 +322,16 @@ mod tests {
         assert!(m.values().all(|o| o == "self"));
         // Departed-node reassignment: dropping a node re-pins only the
         // layers it owned (the whole point of a rendezvous ring).
-        let with_c = sm.layer_ownership("self", &[0, 1, 2, 3], &[
-            "self".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-        ]);
-        let without_c = sm.layer_ownership("self", &[0, 1, 2, 3], &[
-            "self".to_string(),
-            "b".to_string(),
-        ]);
+        let with_c = sm.layer_ownership(
+            "self",
+            &[0, 1, 2, 3],
+            &["self".to_string(), "b".to_string(), "c".to_string()],
+        );
+        let without_c = sm.layer_ownership(
+            "self",
+            &[0, 1, 2, 3],
+            &["self".to_string(), "b".to_string()],
+        );
         for (layer, owner_with) in &with_c {
             if owner_with != "c" {
                 assert_eq!(

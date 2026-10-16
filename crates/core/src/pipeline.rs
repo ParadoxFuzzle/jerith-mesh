@@ -223,7 +223,9 @@ async fn attempt_one_hop(
         &str,
         Vec<f32>,
         Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
+    >,
     rtt_of: &impl Fn(&str) -> u64,
     base_timeout: Duration,
 ) -> anyhow::Result<Vec<f32>> {
@@ -252,9 +254,9 @@ async fn attempt_one_hop(
                 {
                     Ok(out)
                 }
-                Some(_) => {
-                    Err(anyhow::anyhow!("commitment mismatch from hop {node}: body altered"))
-                }
+                Some(_) => Err(anyhow::anyhow!(
+                    "commitment mismatch from hop {node}: body altered"
+                )),
                 None => Ok(out),
             }
         }
@@ -291,13 +293,24 @@ pub async fn execute_route(
         &str,
         Vec<f32>,
         Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
+    >,
     rtt_of: impl Fn(&str) -> u64,
     base_timeout: Duration,
 ) -> Result<Vec<f32>, RouteError> {
     for (idx, hop) in route.iter().enumerate() {
-        match attempt_one_hop(model_id, req_id, hop, &activation, &local_run, &remote_run, &rtt_of, base_timeout)
-            .await
+        match attempt_one_hop(
+            model_id,
+            req_id,
+            hop,
+            &activation,
+            &local_run,
+            &remote_run,
+            &rtt_of,
+            base_timeout,
+        )
+        .await
         {
             Ok(out) => activation = out,
             Err(e) => {
@@ -445,13 +458,15 @@ pub async fn execute_route_resilient(
     req_id: &str,
     route: Vec<PipelineHop>,
     mut activation: Vec<f32>,
-    local_run: impl Fn(&[f32], &[usize]) -> anyhow::Result<Vec<f32>>, 
+    local_run: impl Fn(&[f32], &[usize]) -> anyhow::Result<Vec<f32>>,
     remote_run: impl Fn(
         &str,
         &str,
         Vec<f32>,
         Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
+    >,
     rtt_of: impl Fn(&str) -> u64,
     base_timeout: Duration,
     // M3: the caller-wired per-hop budget hook (ms). A hop that overruns
@@ -473,8 +488,17 @@ pub async fn execute_route_resilient(
 
     while let Some(hop) = pending.pop_front() {
         let started = std::time::Instant::now();
-        let outcome = attempt_one_hop(model_id, req_id, &hop, &activation, &local_run, &remote_run, &rtt_of, base_timeout)
-            .await;
+        let outcome = attempt_one_hop(
+            model_id,
+            req_id,
+            &hop,
+            &activation,
+            &local_run,
+            &remote_run,
+            &rtt_of,
+            base_timeout,
+        )
+        .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let hop_budget_ms = budget_of.as_ref().map(|f| f(&hop));
         match outcome {
@@ -540,7 +564,14 @@ pub async fn execute_route_resilient(
             }
         }
     }
-    RouteResult { activation, hops_run, degraded, reassigned, attempts, over_budget }
+    RouteResult {
+        activation,
+        hops_run,
+        degraded,
+        reassigned,
+        attempts,
+        over_budget,
+    }
 }
 
 #[cfg(test)]
@@ -553,10 +584,7 @@ mod tests {
     const BASE: Duration = Duration::from_millis(500);
 
     fn map(entries: &[(usize, &str)]) -> BTreeMap<usize, String> {
-        entries
-            .iter()
-            .map(|(l, o)| (*l, o.to_string()))
-            .collect()
+        entries.iter().map(|(l, o)| (*l, o.to_string())).collect()
     }
 
     #[test]
@@ -676,7 +704,16 @@ mod tests {
             input.clone(),
             |a, layers| {
                 // The local slice is one layer-run expert.
-                run_hop(&hop_expert_id(model, &PipelineHop { node: None, layers: layers.to_vec() }), a)
+                run_hop(
+                    &hop_expert_id(
+                        model,
+                        &PipelineHop {
+                            node: None,
+                            layers: layers.to_vec(),
+                        },
+                    ),
+                    a,
+                )
             },
             remote_ok(req),
             |_| 40, // 40 ms peer RTT
@@ -712,7 +749,13 @@ mod tests {
             input,
             |a, layers| {
                 run_hop(
-                    &hop_expert_id(model, &PipelineHop { node: None, layers: layers.to_vec() }),
+                    &hop_expert_id(
+                        model,
+                        &PipelineHop {
+                            node: None,
+                            layers: layers.to_vec(),
+                        },
+                    ),
                     a,
                 )
             },
@@ -737,11 +780,20 @@ mod tests {
         )
         .await
         .expect_err("tampered hop aborts the route");
-        let RouteError { hop_index, node, reason, hops_completed, .. } = &err;
+        let RouteError {
+            hop_index,
+            node,
+            reason,
+            hops_completed,
+            ..
+        } = &err;
         assert_eq!(*hop_index, 1, "the tampering middle hop faulted");
         assert_eq!(node.as_deref(), Some("peer-a"));
         assert_eq!(*hops_completed, 1, "local hop 0 completed first");
-        assert!(reason.contains("commitment mismatch"), "typed reason: {reason}");
+        assert!(
+            reason.contains("commitment mismatch"),
+            "typed reason: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -754,28 +806,60 @@ mod tests {
             layers: vec![7],
         }];
         // Honest case passes.
-        let ok = execute_route(model, req, &route, input.clone(),
+        let ok = execute_route(
+            model,
+            req,
+            &route,
+            input.clone(),
             |a, _| run_hop("fallback", a),
-            remote_ok(req), |_| 15, BASE)
-            .await.expect("honest commitment verifies");
-        assert_eq!(ok, run_hop(&hop_expert_id(model, &route[0]), &input).unwrap());
+            remote_ok(req),
+            |_| 15,
+            BASE,
+        )
+        .await
+        .expect("honest commitment verifies");
+        assert_eq!(
+            ok,
+            run_hop(&hop_expert_id(model, &route[0]), &input).unwrap()
+        );
 
         // Tampered output with commitment over the ORIGINAL body → mismatch.
         let variant: Vec<f32> = ok.iter().map(|v| v * 2.0).collect();
         let c = result_commitment(req, &hop_expert_id(model, &route[0]), "peer-a", &input, &ok);
-        assert!(!verify_commitment(req, &hop_expert_id(model, &route[0]), "peer-a", &input, &variant, &c),
-            "altered body must fail the per-hop commitment");
+        assert!(
+            !verify_commitment(
+                req,
+                &hop_expert_id(model, &route[0]),
+                "peer-a",
+                &input,
+                &variant,
+                &c
+            ),
+            "altered body must fail the per-hop commitment"
+        );
     }
 
     #[tokio::test]
     async fn remote_failure_aborts_with_typed_route_error() {
         let route = vec![
-            PipelineHop { node: Some("a".into()), layers: vec![0] },
-            PipelineHop { node: Some("b".into()), layers: vec![1] },
-            PipelineHop { node: Some("c".into()), layers: vec![2] },
+            PipelineHop {
+                node: Some("a".into()),
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("b".into()),
+                layers: vec![1],
+            },
+            PipelineHop {
+                node: Some("c".into()),
+                layers: vec![2],
+            },
         ];
         let err = execute_route(
-            "m", "req", &route, vec![0.0_f32; 4],
+            "m",
+            "req",
+            &route,
+            vec![0.0_f32; 4],
             |a, _| run_hop("m#local", a),
             |_e, node, _x, _t| {
                 let dead = node == "b";
@@ -786,36 +870,63 @@ mod tests {
                     Ok((vec![0.0_f32; 4], None))
                 })
             },
-            |_| 30, BASE,
+            |_| 30,
+            BASE,
         )
-        .await.expect_err("dead hop aborts");
-        let RouteError { hop_index, node, layers, reason, hops_completed } = &err;
+        .await
+        .expect_err("dead hop aborts");
+        let RouteError {
+            hop_index,
+            node,
+            layers,
+            reason,
+            hops_completed,
+        } = &err;
         assert_eq!(*hop_index, 1);
         assert_eq!(node.as_deref(), Some("b"));
         assert_eq!(layers.as_slice(), &[1_usize][..]);
         assert_eq!(*hops_completed, 1, "hop 0 completed before the failure");
         assert_eq!(reason, "peer unreachable");
-        assert!(err.to_string().contains("pipeline hop 1/b"), "typed display: {err}");
+        assert!(
+            err.to_string().contains("pipeline hop 1/b"),
+            "typed display: {err}"
+        );
     }
 
     #[test]
     fn hop_timeout_accounts_for_rtt() {
-        assert_eq!(hop_timeout(Duration::from_millis(100), 0), Duration::from_millis(100));
-        assert_eq!(hop_timeout(Duration::from_millis(100), 40), Duration::from_millis(220));
+        assert_eq!(
+            hop_timeout(Duration::from_millis(100), 0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            hop_timeout(Duration::from_millis(100), 40),
+            Duration::from_millis(220)
+        );
         // Monotonic in RTT, and the saturating path never panics.
         let huge = hop_timeout(Duration::from_millis(100), u64::MAX);
         assert!(huge > Duration::from_millis(100));
-        assert_eq!(huge, Duration::from_nanos(u64::MAX) + Duration::from_millis(100));
+        assert_eq!(
+            huge,
+            Duration::from_nanos(u64::MAX) + Duration::from_millis(100)
+        );
     }
 
     #[tokio::test]
     async fn empty_route_returns_input_unchanged() {
         assert_eq!(
-            execute_route("m", "r", &[], vec![1.0_f32; 4],
+            execute_route(
+                "m",
+                "r",
+                &[],
+                vec![1.0_f32; 4],
                 |_, _| unreachable!(),
                 |_, _, _, _| Box::pin(async { unreachable!() }),
-                |_| u64::MAX, BASE)
-                .await.unwrap(),
+                |_| u64::MAX,
+                BASE
+            )
+            .await
+            .unwrap(),
             vec![1.0_f32; 4]
         );
     }
@@ -827,7 +938,13 @@ mod tests {
     fn local_of(model: &'static str) -> impl Fn(&[f32], &[usize]) -> anyhow::Result<Vec<f32>> {
         move |a, layers| {
             run_hop(
-                &hop_expert_id(model, &PipelineHop { node: None, layers: layers.to_vec() }),
+                &hop_expert_id(
+                    model,
+                    &PipelineHop {
+                        node: None,
+                        layers: layers.to_vec(),
+                    },
+                ),
                 a,
             )
         }
@@ -838,9 +955,18 @@ mod tests {
         let model = "moe-v2";
         let req = "req-m2-1";
         let route = vec![
-            PipelineHop { node: None, layers: vec![0] },
-            PipelineHop { node: Some("peer-a".into()), layers: vec![1, 2] },
-            PipelineHop { node: Some("peer-b".into()), layers: vec![3] },
+            PipelineHop {
+                node: None,
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("peer-a".into()),
+                layers: vec![1, 2],
+            },
+            PipelineHop {
+                node: Some("peer-b".into()),
+                layers: vec![3],
+            },
         ];
 
         // The caller's reassign closure IS the ring's own rule: layers re-
@@ -848,7 +974,10 @@ mod tests {
         let reassign = |layers: &[usize], dead: Option<&str>| {
             assert_eq!(dead, Some("peer-a"), "only the dead owner is dropped");
             if layers == [1_usize, 2] {
-                Some(vec![PipelineHop { node: Some("peer-b".into()), layers: vec![1, 2] }])
+                Some(vec![PipelineHop {
+                    node: Some("peer-b".into()),
+                    layers: vec![1, 2],
+                }])
             } else {
                 None
             }
@@ -858,7 +987,10 @@ mod tests {
         let mut input = vec![0.5_f32; 8];
         input[3] = -0.25;
         let result = execute_route_resilient(
-            model, req, route, input,
+            model,
+            req,
+            route,
+            input,
             local_of(model),
             move |expert_id, node, activation, _t| {
                 let expert_id = expert_id.to_owned();
@@ -885,7 +1017,11 @@ mod tests {
         .await;
 
         // Complete walk: the failed hop was RE-HOSTED, not skipped.
-        assert!(result.degraded.is_empty(), "no honest losses: {:?}", result.degraded);
+        assert!(
+            result.degraded.is_empty(),
+            "no honest losses: {:?}",
+            result.degraded
+        );
         assert_eq!(result.reassigned.len(), 1, "the dead hop was re-hosted");
         assert_eq!(result.reassigned[0].layers, vec![1, 2]);
         assert_eq!(result.reassigned[0].was_node.as_deref(), Some("peer-a"));
@@ -894,16 +1030,28 @@ mod tests {
 
         // Serial reference: layer 1-2 ran under the replacement id.
         let serial = vec![
-            PipelineHop { node: None, layers: vec![0] },
-            PipelineHop { node: Some("peer-b".into()), layers: vec![1, 2] },
-            PipelineHop { node: Some("peer-b".into()), layers: vec![3] },
+            PipelineHop {
+                node: None,
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("peer-b".into()),
+                layers: vec![1, 2],
+            },
+            PipelineHop {
+                node: Some("peer-b".into()),
+                layers: vec![3],
+            },
         ];
         let mut expect = vec![0.5_f32; 8];
         expect[3] = -0.25;
         for hop in &serial {
             expect = run_hop(&hop_expert_id(model, hop), &expect).unwrap();
         }
-        assert_eq!(result.activation, expect, "reassigned walk must equal the re-planned serial walk");
+        assert_eq!(
+            result.activation, expect,
+            "reassigned walk must equal the re-planned serial walk"
+        );
     }
 
     #[tokio::test]
@@ -911,15 +1059,27 @@ mod tests {
         let model = "moe-v3";
         let req = "req-m2-2";
         let route = vec![
-            PipelineHop { node: None, layers: vec![0] },
-            PipelineHop { node: Some("gone".into()), layers: vec![1] },
-            PipelineHop { node: Some("peer-b".into()), layers: vec![2] },
+            PipelineHop {
+                node: None,
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("gone".into()),
+                layers: vec![1],
+            },
+            PipelineHop {
+                node: Some("peer-b".into()),
+                layers: vec![2],
+            },
         ];
         let mut stability = RouteStability::new();
 
         let input = vec![0.5_f32; 8];
         let result = execute_route_resilient(
-            model, req, route, input,
+            model,
+            req,
+            route,
+            input,
             local_of(model),
             move |expert_id, node, activation, _t| {
                 let expert_id = expert_id.to_owned();
@@ -952,12 +1112,24 @@ mod tests {
         // Honest hops-short: residual = local(0) then peer-b(2) — layer 1
         // skipped inside the chain deterministically, not silently dropped.
         let local0 = run_hop(
-            &hop_expert_id(model, &PipelineHop { node: None, layers: vec![0] }),
+            &hop_expert_id(
+                model,
+                &PipelineHop {
+                    node: None,
+                    layers: vec![0],
+                },
+            ),
             &[0.5_f32; 8],
         )
         .unwrap();
         let expect_b2 = run_hop(
-            &hop_expert_id(model, &PipelineHop { node: Some("peer-b".into()), layers: vec![2] }),
+            &hop_expert_id(
+                model,
+                &PipelineHop {
+                    node: Some("peer-b".into()),
+                    layers: vec![2],
+                },
+            ),
             &local0,
         )
         .unwrap();
@@ -971,13 +1143,22 @@ mod tests {
         stability.note_failure("flapper");
         stability.note_failure("flapper");
         stability.note_failure("flapper");
-        assert!(stability.is_excluded("flapper"), "raise at {HOP_EXCLUDE_SCORE}");
+        assert!(
+            stability.is_excluded("flapper"),
+            "raise at {HOP_EXCLUDE_SCORE}"
+        );
 
         // One success only decays — no instant re-inclusion mid-flap.
         stability.note_success("flapper");
-        assert!(stability.is_excluded("flapper"), "score 2 sits in the hysteresis band");
+        assert!(
+            stability.is_excluded("flapper"),
+            "score 2 sits in the hysteresis band"
+        );
         stability.note_success("flapper");
-        assert!(!stability.is_excluded("flapper"), "cleared below {HOP_CLEAR_SCORE}");
+        assert!(
+            !stability.is_excluded("flapper"),
+            "cleared below {HOP_CLEAR_SCORE}"
+        );
 
         // Unknown nodes are never excluded; healthy peers are untouched.
         assert!(!stability.is_excluded("stranger"));
@@ -998,7 +1179,11 @@ mod tests {
         for _ in 0..3 {
             stability.note_failure("b");
         }
-        assert_eq!(stability.filter_alive(&alive), alive, "never hand back an empty routing set");
+        assert_eq!(
+            stability.filter_alive(&alive),
+            alive,
+            "never hand back an empty routing set"
+        );
     }
 
     #[tokio::test]
@@ -1007,13 +1192,25 @@ mod tests {
         let req = "req-m2-3";
         // Three hops all owned by the same dead node — the walk notes each.
         let route = vec![
-            PipelineHop { node: Some("dead".into()), layers: vec![0] },
-            PipelineHop { node: Some("dead".into()), layers: vec![1] },
-            PipelineHop { node: Some("dead".into()), layers: vec![2] },
+            PipelineHop {
+                node: Some("dead".into()),
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("dead".into()),
+                layers: vec![1],
+            },
+            PipelineHop {
+                node: Some("dead".into()),
+                layers: vec![2],
+            },
         ];
         let mut stability = RouteStability::new();
         let result = execute_route_resilient(
-            model, req, route, vec![0.0_f32; 4],
+            model,
+            req,
+            route,
+            vec![0.0_f32; 4],
             local_of(model),
             |_e, node, _x, _t| {
                 let dead = node.to_owned();
@@ -1022,14 +1219,18 @@ mod tests {
                     Ok::<_, anyhow::Error>((vec![0.0_f32; 4], None))
                 })
             },
-            |_| 20, BASE,
+            |_| 20,
+            BASE,
             None::<fn(&PipelineHop) -> u64>,
             &mut stability,
             |_l, _d| None,
         )
         .await;
         assert_eq!(result.degraded.len(), 3);
-        assert!(stability.is_excluded("dead"), "3 walk failures must raise the flag");
+        assert!(
+            stability.is_excluded("dead"),
+            "3 walk failures must raise the flag"
+        );
     }
 
     // ---- M3: latency budgeting ----
@@ -1037,9 +1238,18 @@ mod tests {
     #[test]
     fn route_budget_orders_by_measured_demand_and_floors_at_rtt() {
         let route = vec![
-            PipelineHop { node: Some("peer-a".into()), layers: vec![0] },
-            PipelineHop { node: Some("peer-b".into()), layers: vec![1] },
-            PipelineHop { node: None, layers: vec![2] },
+            PipelineHop {
+                node: Some("peer-a".into()),
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("peer-b".into()),
+                layers: vec![1],
+            },
+            PipelineHop {
+                node: None,
+                layers: vec![2],
+            },
         ];
         let budgets = plan_route_budget(
             &route,
@@ -1056,7 +1266,10 @@ mod tests {
         // demanded hop first; the tie between the two zero-demand hops
         // keeps the route's original order (peer-a before the local hop).
         assert_eq!(
-            budgets.iter().map(|b| b.layers.as_slice()).collect::<Vec<_>>(),
+            budgets
+                .iter()
+                .map(|b| b.layers.as_slice())
+                .collect::<Vec<_>>(),
             vec![&[1_usize][..], &[0_usize][..], &[2_usize][..]]
         );
         // Exact arithmetic: floors a=1300 (100 + 3×400), b=160, local=100;
@@ -1076,9 +1289,18 @@ mod tests {
     #[test]
     fn equal_demand_splits_the_remaining_budget_evenly() {
         let route = vec![
-            PipelineHop { node: None, layers: vec![0] },
-            PipelineHop { node: Some("a".into()), layers: vec![1] },
-            PipelineHop { node: Some("b".into()), layers: vec![2] },
+            PipelineHop {
+                node: None,
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("a".into()),
+                layers: vec![1],
+            },
+            PipelineHop {
+                node: Some("b".into()),
+                layers: vec![2],
+            },
         ];
         let budgets = plan_route_budget(
             &route,
@@ -1098,8 +1320,14 @@ mod tests {
     #[tokio::test]
     async fn over_budget_hops_are_typed_into_the_result() {
         let route = vec![
-            PipelineHop { node: Some("slow".into()), layers: vec![0] },
-            PipelineHop { node: Some("fast".into()), layers: vec![1] },
+            PipelineHop {
+                node: Some("slow".into()),
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("fast".into()),
+                layers: vec![1],
+            },
         ];
         let mut stability = RouteStability::new();
         let result = execute_route_resilient(
@@ -1122,7 +1350,11 @@ mod tests {
             // Only the sleeper is priced against 1 ms; the unprioritized
             // fast hop gets u64::MAX so CI scheduling jitter can't flake it.
             Some(|hop: &PipelineHop| {
-                if hop.node.as_deref() == Some("slow") { 1 } else { u64::MAX }
+                if hop.node.as_deref() == Some("slow") {
+                    1
+                } else {
+                    u64::MAX
+                }
             }),
             &mut stability,
             |_l, _d| None,
@@ -1146,9 +1378,18 @@ mod tests {
     #[tokio::test]
     async fn attempts_are_timed_for_successes_and_failures_alike() {
         let route = vec![
-            PipelineHop { node: None, layers: vec![0] },
-            PipelineHop { node: Some("gone".into()), layers: vec![1] },
-            PipelineHop { node: Some("peer-b".into()), layers: vec![2] },
+            PipelineHop {
+                node: None,
+                layers: vec![0],
+            },
+            PipelineHop {
+                node: Some("gone".into()),
+                layers: vec![1],
+            },
+            PipelineHop {
+                node: Some("peer-b".into()),
+                layers: vec![2],
+            },
         ];
         let mut stability = RouteStability::new();
         let result = execute_route_resilient(

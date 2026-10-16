@@ -278,7 +278,10 @@ fn vision_describe_runner<'args>(
     args: &'args Value,
 ) -> BoxedSkillFut<'args> {
     Box::pin(async move {
-        let image = args.get("image").and_then(Value::as_str).unwrap_or_default();
+        let image = args
+            .get("image")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         anyhow::ensure!(!image.trim().is_empty(), "vision.describe: empty image");
         let prompt = args.get("prompt").and_then(Value::as_str);
         vision_call(cfg, image, prompt).await
@@ -290,7 +293,10 @@ fn vision_analyze_runner<'args>(
     args: &'args Value,
 ) -> BoxedSkillFut<'args> {
     Box::pin(async move {
-        let image = args.get("image").and_then(Value::as_str).unwrap_or_default();
+        let image = args
+            .get("image")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         anyhow::ensure!(!image.trim().is_empty(), "vision.analyze: empty image");
         let prompt = args.get("prompt").and_then(Value::as_str);
         let prompt = prompt.ok_or_else(|| anyhow::anyhow!("vision.analyze: prompt required"))?;
@@ -303,7 +309,8 @@ async fn vision_call(
     image: &str,
     prompt: Option<&str>,
 ) -> anyhow::Result<Value> {
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
     let url = format!("{}/v1/skills/vision/describe", cfg.gateway_url);
@@ -318,7 +325,10 @@ async fn vision_call(
         .await
         .context("calling gateway /v1/skills/vision/describe")?;
     let status = resp.status();
-    let body: Value = resp.json().await.context("reading gateway vision response")?;
+    let body: Value = resp
+        .json()
+        .await
+        .context("reading gateway vision response")?;
     if !status.is_success() {
         anyhow::bail!("vision failed: {}", status);
     }

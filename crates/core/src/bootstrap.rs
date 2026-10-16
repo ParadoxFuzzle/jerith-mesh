@@ -80,8 +80,7 @@ impl PeerAd {
                 if list.iter().any(|e| e == expert_id) {
                     return true;
                 }
-                self
-                    .hosted_expert_count
+                self.hosted_expert_count
                     .map(|c| c as usize > list.len())
                     .unwrap_or(false)
             }
@@ -290,7 +289,8 @@ impl BootstrapClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            inner: reqwest::Client::builder().use_rustls_tls()
+            inner: reqwest::Client::builder()
+                .use_rustls_tls()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),

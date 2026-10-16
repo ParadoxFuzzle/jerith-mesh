@@ -92,10 +92,7 @@ pub fn extract_speaker_id(prompt: &str) -> Option<String> {
     let raw = &rest[id_at + ", id ".len()..];
     // The tag always ends "id ...)]" — strip both closing chars (a bare
     // find(']') slice keeps the ')' and fails the digit check).
-    let id = raw
-        .trim_end()
-        .trim_end_matches([')', ']'])
-        .trim();
+    let id = raw.trim_end().trim_end_matches([')', ']']).trim();
     let ok = !id.is_empty() && id.chars().all(|c| c.is_ascii_digit());
     ok.then(|| id.to_string())
 }

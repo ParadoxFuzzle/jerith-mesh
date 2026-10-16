@@ -123,24 +123,16 @@ pub enum NodeRpcReply {
 pub fn sign_request(req: &mut NodeRpcRequest, identity: &SigningIdentity) {
     let stamp = crate::bootstrap::now_ms();
     match req {
-        NodeRpcRequest::Ping {
-            stamp_ms, ..
-        } => {
+        NodeRpcRequest::Ping { stamp_ms, .. } => {
             *stamp_ms = stamp;
         }
-        NodeRpcRequest::ExpertQuery {
-            stamp_ms, ..
-        } => {
+        NodeRpcRequest::ExpertQuery { stamp_ms, .. } => {
             *stamp_ms = stamp;
         }
-        NodeRpcRequest::ExpertFetch {
-            stamp_ms, ..
-        } => {
+        NodeRpcRequest::ExpertFetch { stamp_ms, .. } => {
             *stamp_ms = stamp;
         }
-        NodeRpcRequest::ChatQuery {
-            stamp_ms, ..
-        } => {
+        NodeRpcRequest::ChatQuery { stamp_ms, .. } => {
             *stamp_ms = stamp;
         }
     }
@@ -503,8 +495,8 @@ impl ExpertRouter {
         (u64::MAX - vram_free, u64::MAX - ram_free, rtt_ms)
     }
 
-/// QUIC-backed dispatch: same candidate plan, but remote candidates
-/// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
+    /// QUIC-backed dispatch: same candidate plan, but remote candidates
+    /// resolve over real QUIC NodeRPC (signed ExpertQuery → ExpertResult).
     /// `local_run` computes locally when the plan's first candidate is
     /// local. Feedback failures land in `completed` as usual; the caller
     /// receives the first successful result.
@@ -2013,7 +2005,8 @@ impl RuntimeExpert {
         api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
         let url = format!("{}/v1/models", runtime_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder().use_rustls_tls()
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
             .timeout(Duration::from_secs(10))
             .build()?;
         let mut req = client.get(&url);
@@ -2261,15 +2254,14 @@ impl RuntimeExpert {
         // tier disabled by config `""` never engages).
         let vision = self.vision_model.as_ref().filter(|s| !s.is_empty());
         let deep = self.deep_model.as_ref().filter(|s| !s.is_empty());
-        let model = if let Some(v) = vision
-            .filter(|_| crate::model_router::has_image_content(messages))
-        {
-            v.clone()
-        } else if let Some(d) = deep.filter(|_| crate::model_router::is_complex(messages)) {
-            d.clone()
-        } else {
-            self.model.clone()
-        };
+        let model =
+            if let Some(v) = vision.filter(|_| crate::model_router::has_image_content(messages)) {
+                v.clone()
+            } else if let Some(d) = deep.filter(|_| crate::model_router::is_complex(messages)) {
+                d.clone()
+            } else {
+                self.model.clone()
+            };
         let resp = req
             .json(&serde_json::json!({
                 "model": model,
@@ -2648,7 +2640,10 @@ mod tests {
                         .find(|(id, _, _, alive, _)| *id == node && *alive)
                         .map(|(_, rtt, _, _, _)| *rtt)
                         .unwrap_or(u64::MAX);
-                    expected.push(ExpertLocation::Remote { node_id: node, rtt_ms });
+                    expected.push(ExpertLocation::Remote {
+                        node_id: node,
+                        rtt_ms,
+                    });
                 }
             }
         }
@@ -2667,7 +2662,11 @@ mod tests {
         let plan = r
             .plan_dispatch_with_layer_ownership("self", &[0, 1, 2], &alive, "exp-1", &peers)
             .await;
-        assert_eq!(plan, vec![ExpertLocation::Local], "single node owns everything");
+        assert_eq!(
+            plan,
+            vec![ExpertLocation::Local],
+            "single node owns everything"
+        );
     }
 
     #[tokio::test]

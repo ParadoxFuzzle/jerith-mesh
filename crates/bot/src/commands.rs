@@ -213,26 +213,28 @@ pub async fn mine(ctx: Ctx<'_>) -> Result<(), Error> {
     let outcome = api::mine(&ctx.data().cfg, &user, &channel).await?;
     // Credit the bot-observed /leaderboard when the chain reports a reward.
     if outcome.won
-        && let Some(uj) = outcome.reward_uj {
-            ctx.data().state.record_mine_win(discord_id, uj);
-            // FEATURES §8: /mine win as a hookable event (fire-and-forget).
-            crate::hooks::global().emit(crate::hooks::Event::new(
-                crate::hooks::EV_MINE_WON,
-                serde_json::json!({ "discord_id": discord_id, "amount_uj": uj }),
-            ));
-        }
+        && let Some(uj) = outcome.reward_uj
+    {
+        ctx.data().state.record_mine_win(discord_id, uj);
+        // FEATURES §8: /mine win as a hookable event (fire-and-forget).
+        crate::hooks::global().emit(crate::hooks::Event::new(
+            crate::hooks::EV_MINE_WON,
+            serde_json::json!({ "discord_id": discord_id, "amount_uj": uj }),
+        ));
+    }
     // Optional: announce wins in a configured channel (fire-and-forget; a
     // missing/incorrect channel id must not fail the user's command).
     if let Some(announce_id) = ctx.data().cfg.announce_channel_id
-        && let Some(text) = api::mine_announcement(&outcome, &user) {
-            let http = ctx.serenity_context().http.clone();
-            tokio::spawn(async move {
-                let ch = serenityall::ChannelId::new(announce_id);
-                if let Err(e) = ch.say(&http, &text).await {
-                    tracing::warn!(error = %e, channel = announce_id, "mine announcement failed");
-                }
-            });
-        }
+        && let Some(text) = api::mine_announcement(&outcome, &user)
+    {
+        let http = ctx.serenity_context().http.clone();
+        tokio::spawn(async move {
+            let ch = serenityall::ChannelId::new(announce_id);
+            if let Err(e) = ch.say(&http, &text).await {
+                tracing::warn!(error = %e, channel = announce_id, "mine announcement failed");
+            }
+        });
+    }
     persist_tally_after_win(ctx).await;
     ctx.say(outcome.message).await?;
     Ok(())
@@ -899,8 +901,9 @@ mod tests {
             }
         });
         let out = format_status(&st);
-        assert!(out
-            .contains("discovery: 1 configured · 2 learned · last-good https://a.example.org"));
+        assert!(
+            out.contains("discovery: 1 configured · 2 learned · last-good https://a.example.org")
+        );
     }
 
     #[test]

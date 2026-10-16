@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 
 use jerith_mesh_core::bootstrap::{BootstrapClient, PeerAd};
-use jerith_mesh_core::discovery::{try_each, DiscoveryServers};
+use jerith_mesh_core::discovery::{DiscoveryServers, try_each};
 use jerith_mesh_core::signing::SigningIdentity;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -80,18 +80,13 @@ async fn dead_port() -> SocketAddr {
 async fn fetch_leg_fails_over_from_dead_to_alive_bootstrap() {
     let live = spawn_mock(peers_json("peer-from-mock")).await;
     let dead = dead_port().await;
-    let order = vec![
-        format!("http://{dead}"),
-        format!("http://{live}"),
-    ];
+    let order = vec![format!("http://{dead}"), format!("http://{live}")];
 
     let identity = SigningIdentity::generate();
     let outcome = try_each(&order, |url| {
         let client = BootstrapClient::new(url.to_string());
         let identity = &identity;
-        async move {
-            client.fetch_peers_signed(MODEL, identity).await
-        }
+        async move { client.fetch_peers_signed(MODEL, identity).await }
     })
     .await
     .expect("the second leg answers");

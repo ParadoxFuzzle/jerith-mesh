@@ -55,7 +55,8 @@ fn model_from_status(body: &Value) -> Option<String> {
 }
 
 pub(crate) fn client() -> reqwest::Client {
-    reqwest::Client::builder().use_rustls_tls()
+    reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(TIMEOUT)
         .build()
         .expect("static reqwest client config")
@@ -109,9 +110,10 @@ impl RoundAcc {
     fn into_pseudo_body(self) -> Value {
         let mut content = self.content.clone();
         if let Some(cut) = &self.cut
-            && !content.trim().is_empty() {
-                content.push_str(&format!("\n\n_(stream cut: {cut})_"));
-            }
+            && !content.trim().is_empty()
+        {
+            content.push_str(&format!("\n\n_(stream cut: {cut})_"));
+        }
         let mut message = json!({"role": "assistant", "content": content});
         if !self.tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(self.tool_calls.clone());
@@ -371,18 +373,18 @@ pub async fn chat_with_usage_live(
             Ok(guard) => match guard.screen_messages(&messages) {
                 Ok(Some(patched)) => messages = patched,
                 Ok(None) => {}
-            Err(verdict) => {
-                // FEATURES §8: observers hear the block reason — never the
-                // blocked content itself.
-                crate::hooks::global().emit(crate::hooks::Event::new(
-                    crate::hooks::EV_GUARD_VIOLATION,
-                    json!({ "reason": verdict.block_reason() }),
-                ));
-                anyhow::bail!(
-                    "🛡️ Jerith Guard blocked this request ({}). Edit the prompt and try again.",
-                    verdict.block_reason()
-                )
-            }
+                Err(verdict) => {
+                    // FEATURES §8: observers hear the block reason — never the
+                    // blocked content itself.
+                    crate::hooks::global().emit(crate::hooks::Event::new(
+                        crate::hooks::EV_GUARD_VIOLATION,
+                        json!({ "reason": verdict.block_reason() }),
+                    ));
+                    anyhow::bail!(
+                        "🛡️ Jerith Guard blocked this request ({}). Edit the prompt and try again.",
+                        verdict.block_reason()
+                    )
+                }
             },
             Err(e) => {
                 // A malformed [guard] in bot.toml must degrade to the
@@ -412,18 +414,19 @@ pub async fn chat_with_usage_live(
     // attached as a second system message; an unreachable database or an
     // unknown speaker just means the chat proceeds without it.
     if let Some(pg) = cfg.postgres.as_ref().filter(|p| p.enabled)
-        && let Some(discord_id) = crate::people::extract_speaker_id(prompt) {
-            match crate::people::lookup(pg, &discord_id).await {
-                Ok(Some(block)) => messages.insert(
-                    if persona_first { 1 } else { 0 },
-                    json!({"role": "system", "content": block}),
-                ),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(error = %e, "people-db lookup skipped — chatting without speaker context");
-                }
+        && let Some(discord_id) = crate::people::extract_speaker_id(prompt)
+    {
+        match crate::people::lookup(pg, &discord_id).await {
+            Ok(Some(block)) => messages.insert(
+                if persona_first { 1 } else { 0 },
+                json!({"role": "system", "content": block}),
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "people-db lookup skipped — chatting without speaker context");
             }
         }
+    }
 
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
     let model = runtime_model(cfg)
@@ -506,14 +509,17 @@ pub async fn chat_with_usage_live(
         // tool intent as plain JSON content instead of native tool_calls.
         // Detect `{"function_name": …, "arguments": …}` there and subject
         // it to the same loop (same mock unit tests cover both shapes).
-        if tools_enabled && tool_calls.is_empty() && rounds < MAX_TOOL_ROUNDS
-            && let Some((name, args)) = content_tool_intent(&body, &registry.enabled_skill_names()) {
-                tool_calls = vec![json!({
-                    "id": format!("iw{rounds}"),
-                    "type": "function",
-                    "function": {"name": name, "arguments": args.to_string()},
-                })];
-            }
+        if tools_enabled
+            && tool_calls.is_empty()
+            && rounds < MAX_TOOL_ROUNDS
+            && let Some((name, args)) = content_tool_intent(&body, &registry.enabled_skill_names())
+        {
+            tool_calls = vec![json!({
+                "id": format!("iw{rounds}"),
+                "type": "function",
+                "function": {"name": name, "arguments": args.to_string()},
+            })];
+        }
         // No tool use (or out of rounds): the plain chat answer — unless
         // it is degenerate ("{}", braces-only JSON, empty): one toolless
         // retry, then a graceful refusal, never braces rendered verbatim
@@ -745,15 +751,17 @@ pub fn answer_is_degenerate(content: &str) -> bool {
     // Parseable JSON object with no text payload inside (the original
     // incident: `{}` and `{"function_name": …}` intent slop that is not
     // text the user can read).
-    if t.starts_with('{') && t.ends_with('}')
-        && let Ok(v) = serde_json::from_str::<Value>(t) {
-            let has_text = ["content", "text", "answer", "message"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(Value::as_str))
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            return !has_text;
-        }
+    if t.starts_with('{')
+        && t.ends_with('}')
+        && let Ok(v) = serde_json::from_str::<Value>(t)
+    {
+        let has_text = ["content", "text", "answer", "message"]
+            .iter()
+            .find_map(|k| v.get(k).and_then(Value::as_str))
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        return !has_text;
+    }
     false
 }
 
@@ -1241,7 +1249,9 @@ mod tests {
         // the stream never balanced (or balanced with trailing prose).
         // Degenerate either way; a chat never leads with a field list.
         assert!(answer_is_degenerate("{ \"status\": \"done\", \"sum\""));
-        assert!(answer_is_degenerate("{ \"status\": \"ok\" } here is what happened"));
+        assert!(answer_is_degenerate(
+            "{ \"status\": \"ok\" } here is what happened"
+        ));
         assert!(answer_is_degenerate("{\n  \"note\": \"never closed\""));
         // Prose that merely MENTIONS braces stays legit — no quoted field
         // right after the opener.
@@ -1261,7 +1271,9 @@ mod tests {
         let raw = serde_json::to_string(&envelope).unwrap();
         assert_eq!(
             unwrap_json_text_envelope(&raw).as_deref(),
-            Some("No recent information about Glenn Lee's status was found in the node's memory. Would you like me to check other sources?"),
+            Some(
+                "No recent information about Glenn Lee's status was found in the node's memory. Would you like me to check other sources?"
+            ),
             "the prose reaches the chat, never the braces"
         );
 
@@ -1270,7 +1282,10 @@ mod tests {
         // JSON is the realistic shape (the paste showed the brace, then
         // indented fields, one per line).
         let padded = serde_json::to_string_pretty(&envelope).unwrap();
-        assert_eq!(unwrap_json_text_envelope(&padded), unwrap_json_text_envelope(&raw));
+        assert_eq!(
+            unwrap_json_text_envelope(&padded),
+            unwrap_json_text_envelope(&raw)
+        );
 
         // Other text keys serve too; first key wins.
         assert_eq!(
@@ -1288,7 +1303,10 @@ mod tests {
         assert_eq!(unwrap_json_text_envelope("{ \"status\": 42 }"), None);
         assert_eq!(unwrap_json_text_envelope("{ \"message\": \"\" }"), None);
         assert_eq!(unwrap_json_text_envelope("{"), None);
-        assert_eq!(unwrap_json_text_envelope("The kiln fires at 980 degrees."), None);
+        assert_eq!(
+            unwrap_json_text_envelope("The kiln fires at 980 degrees."),
+            None
+        );
         assert_eq!(unwrap_json_text_envelope(""), None);
         // Prose that MENTIONS braces is not an envelope.
         assert_eq!(

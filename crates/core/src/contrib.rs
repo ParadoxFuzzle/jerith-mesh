@@ -193,12 +193,7 @@ impl PeerContribLedger {
     /// A pinger verified the peer's signed numbers. Returns peers whose
     /// contradiction crossed the evidence line this round (flagged once
     /// per crossing; re-armed by recovery).
-    pub fn record_verified(
-        &mut self,
-        node_id: &str,
-        declared: u64,
-        measured: u64,
-    ) -> Vec<String> {
+    pub fn record_verified(&mut self, node_id: &str, declared: u64, measured: u64) -> Vec<String> {
         if node_id.is_empty() {
             return Vec::new();
         }
@@ -206,7 +201,9 @@ impl PeerContribLedger {
         let entry = self.peers.entry(node_id.to_string()).or_default();
         let shortfall = is_shortfall(declared, measured);
         entry.shortfalls = if shortfall { entry.shortfalls + 1 } else { 0 };
-        entry.samples.push_back(VerifiedSample { declared, measured });
+        entry
+            .samples
+            .push_back(VerifiedSample { declared, measured });
         if entry.samples.len() > SHORTFALL_MIN_SAMPLES * 3 {
             entry.samples.clear(); // bounded: keep the recent pattern only
         }
@@ -284,16 +281,31 @@ mod tests {
     #[test]
     fn share_percent_math() {
         assert_eq!(
-            IntervalStat { window_secs: 60, tokens_served: 40, tokens_consumed: 10 }.share_percent(),
+            IntervalStat {
+                window_secs: 60,
+                tokens_served: 40,
+                tokens_consumed: 10
+            }
+            .share_percent(),
             Some(80)
         );
         assert_eq!(
-            IntervalStat { window_secs: 60, tokens_served: 0, tokens_consumed: 25 }.share_percent(),
+            IntervalStat {
+                window_secs: 60,
+                tokens_served: 0,
+                tokens_consumed: 25
+            }
+            .share_percent(),
             Some(0)
         );
         // Idle is an absence, not a 0 %.
         assert_eq!(
-            IntervalStat { window_secs: 60, tokens_served: 0, tokens_consumed: 0 }.share_percent(),
+            IntervalStat {
+                window_secs: 60,
+                tokens_served: 0,
+                tokens_consumed: 0
+            }
+            .share_percent(),
             None
         );
     }
@@ -385,15 +397,8 @@ mod tests {
     #[test]
     fn measurement_payload_roundtrips_and_tamper_is_caught() {
         let id = crate::signing::SigningIdentity::generate();
-        let payload = crate::signing::measurement_payload(
-            &id.node_id(),
-            12345,
-            60,
-            400,
-            100,
-            25,
-            80,
-        );
+        let payload =
+            crate::signing::measurement_payload(&id.node_id(), 12345, 60, 400, 100, 25, 80);
         let sig = id.sign(payload.as_bytes());
         assert!(crate::signing::verify(
             &id.pubkey_hex(),
@@ -402,6 +407,10 @@ mod tests {
         ));
         // One byte different in ANY field (here measured 80→81) breaks it.
         let wrong = crate::signing::measurement_payload(&id.node_id(), 12345, 60, 400, 100, 25, 81);
-        assert!(!crate::signing::verify(&id.pubkey_hex(), wrong.as_bytes(), &sig));
+        assert!(!crate::signing::verify(
+            &id.pubkey_hex(),
+            wrong.as_bytes(),
+            &sig
+        ));
     }
 }

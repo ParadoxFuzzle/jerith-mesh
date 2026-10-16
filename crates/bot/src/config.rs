@@ -170,7 +170,8 @@ impl BotConfig {
             monitor: file.monitor.unwrap_or_default(),
             hooks: {
                 let cfg = file.hooks.unwrap_or_default();
-                cfg.validate().map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
+                cfg.validate()
+                    .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
                 cfg
             },
             chat_timeout_secs: file

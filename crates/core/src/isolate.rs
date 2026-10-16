@@ -21,11 +21,11 @@
 //! VRAM branch is skipped (unknown ≠ zero), and a governor with no
 //! ceilings configured is a no-op — the legacy behavior.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::ResourceIsolationConfig;
 use crate::hw::ResourceSample;
@@ -79,7 +79,10 @@ pub fn decide(usage: &Usage, cfg: &ResourceIsolationConfig, tripped: bool) -> Ve
             // No ceiling or no readings → that branch cannot hold a trip.
             _ => true,
         };
-        let bandwidth_ok = match (cfg.bandwidth_ceiling_bytes_per_min, usage.bandwidth_bytes_per_min) {
+        let bandwidth_ok = match (
+            cfg.bandwidth_ceiling_bytes_per_min,
+            usage.bandwidth_bytes_per_min,
+        ) {
             (Some(c), Some(rate)) => rate < soft_line(c),
             // No ceiling or a too-young measurement window → cannot hold a trip.
             _ => true,
@@ -124,7 +127,8 @@ pub fn decide(usage: &Usage, cfg: &ResourceIsolationConfig, tripped: bool) -> Ve
                 "GPU VRAM used {:.1}/{:.1} GiB reached the ceiling",
                 used as f64 / (1024.0 * 1024.0 * 1024.0),
                 vram as f64 / (1024.0 * 1024.0 * 1024.0)
-            ));        } else if soft.is_none() && used >= soft_line(vram) {
+            ));
+        } else if soft.is_none() && used >= soft_line(vram) {
             soft = Some(format!(
                 "GPU VRAM used {:.1}/{:.1} GiB crossed the soft line",
                 used as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -150,7 +154,7 @@ pub fn decide(usage: &Usage, cfg: &ResourceIsolationConfig, tripped: bool) -> Ve
             ));
         }
     }
-        if let Some(reason) = hard {
+    if let Some(reason) = hard {
         return if cfg.kill_switch {
             Verdict::Trip(reason)
         } else {
@@ -262,9 +266,7 @@ pub fn self_rss_bytes() -> u64 {
     let mut sys = System::new();
     let pid = Pid::from_u32(std::process::id());
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    sys.process(pid)
-        .map(|p| p.memory())
-        .unwrap_or_default()
+    sys.process(pid).map(|p| p.memory()).unwrap_or_default()
 }
 
 /// Best-effort CPU pinning: restrict this process to the first
@@ -314,14 +316,12 @@ fn usage_from_sample(
     sample: &Option<ResourceSample>,
     bandwidth_bytes_per_min: Option<u64>,
 ) -> Usage {
-    let vram = sample
-        .as_ref()
-        .and_then(|s| {
-            s.gpus
-                .iter()
-                .filter_map(|g| g.vram_used_bytes)
-                .reduce(|a, b| a + b)
-        });
+    let vram = sample.as_ref().and_then(|s| {
+        s.gpus
+            .iter()
+            .filter_map(|g| g.vram_used_bytes)
+            .reduce(|a, b| a + b)
+    });
     Usage {
         rss_bytes,
         vram_used_bytes: vram,
@@ -365,19 +365,17 @@ pub fn spawn_governor(
                 }
                 bw_window.push((now, now_counter));
             }
-            let bandwidth_rate = bw_window
-                .first()
-                .and_then(|(old_ts, old_counter)| {
-                    let secs = now - *old_ts;
-                    if secs.as_secs() >= 45 {
-                        Some(
-                            ((now_counter.saturating_sub(*old_counter) as f64)
-                                / (secs.as_secs_f64() / 60.0)) as u64,
-                        )
-                    } else {
-                        None
-                    }
-                });
+            let bandwidth_rate = bw_window.first().and_then(|(old_ts, old_counter)| {
+                let secs = now - *old_ts;
+                if secs.as_secs() >= 45 {
+                    Some(
+                        ((now_counter.saturating_sub(*old_counter) as f64)
+                            / (secs.as_secs_f64() / 60.0)) as u64,
+                    )
+                } else {
+                    None
+                }
+            });
             iso.record_bandwidth_rate(bandwidth_rate);
             let usage = {
                 let sample = state.resources.lock().await;
@@ -438,7 +436,11 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    fn cfg(ram_ceiling: Option<u64>, vram_ceiling: Option<u64>, kill: bool) -> ResourceIsolationConfig {
+    fn cfg(
+        ram_ceiling: Option<u64>,
+        vram_ceiling: Option<u64>,
+        kill: bool,
+    ) -> ResourceIsolationConfig {
         ResourceIsolationConfig {
             ram_ceiling_bytes: ram_ceiling,
             vram_ceiling_bytes: vram_ceiling,
@@ -554,7 +556,10 @@ mod tests {
             bandwidth_bytes_per_min: None,
         };
         assert!(matches!(decide(&hard, &c, true), Verdict::RemainTripped(_)));
-        assert!(matches!(decide(&between, &c, true), Verdict::RemainTripped(_)));
+        assert!(matches!(
+            decide(&between, &c, true),
+            Verdict::RemainTripped(_)
+        ));
         assert_eq!(decide(&under, &c, true), Verdict::Recover);
     }
 
@@ -575,7 +580,10 @@ mod tests {
         let iso = IsolateState::default();
         assert!(!iso.tripped());
         assert!(iso.record_trip("RSS over ceiling"));
-        assert!(!iso.record_trip("RSS over ceiling again"), "first reason wins");
+        assert!(
+            !iso.record_trip("RSS over ceiling again"),
+            "first reason wins"
+        );
         assert!(iso.tripped());
         assert_eq!(iso.tripped_reason().as_deref(), Some("RSS over ceiling"));
         assert!(iso.record_recover());
@@ -638,7 +646,10 @@ mod tests {
         };
         // Hard breach: 1 GiB/min reached.
         assert!(
-            matches!(decide(&bw_usage(Some(1024 * MIBMIN)), &c, false), Verdict::Trip(_)),
+            matches!(
+                decide(&bw_usage(Some(1024 * MIBMIN)), &c, false),
+                Verdict::Trip(_)
+            ),
             "hard bandwidth breach trips"
         );
         // Soft breach: 95 % of the ceiling.

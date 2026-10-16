@@ -7,6 +7,22 @@ on:
     branches: [main]
 
 jobs:
+  fmt-check:
+    # Formatting gate: `cargo fmt --check` fails on ANY drift, so a
+    # tree-wide reflow can never land silently again. Baseline: the
+    # whole workspace is rustfmt-clean as of 2026-10-16 (clippy is the
+    # semantic gate; this one is purely mechanical).
+    name: cargo fmt --check (formatting gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Verify the workspace is rustfmt-clean
+        run: cargo fmt --all --check
+
   tests-linux:
     name: cargo test --workspace (ubuntu-latest)
     runs-on: ubuntu-latest

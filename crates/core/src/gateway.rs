@@ -447,8 +447,15 @@ async fn skill_web_fetch(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>
 }
 
 /// skill: vision.describe — describe an image using the local vision model
-async fn skill_vision_describe(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
-    let Some(image) = body.get("image").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+async fn skill_vision_describe(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(image) = body
+        .get("image")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
         return bad_request("field 'image' is required");
     };
     let prompt = body
@@ -461,18 +468,30 @@ async fn skill_vision_describe(State(gw): State<Arc<Gateway>>, Json(body): Json<
 
 /// skill: vision.analyze — analyze an image with a custom prompt
 async fn skill_vision_analyze(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
-    let Some(image) = body.get("image").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+    let Some(image) = body
+        .get("image")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
         return bad_request("field 'image' is required");
     };
-    let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+    let Some(prompt) = body
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
         return bad_request("field 'prompt' is required");
     };
     vision_call(&gw, &prompt, &image).await
 }
 
 async fn vision_call(gw: &Arc<Gateway>, prompt: &str, image: &str) -> Response {
-    let url = format!("{}/v1/chat/completions", gw.runtime_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let url = format!(
+        "{}/v1/chat/completions",
+        gw.runtime_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
         .build()
@@ -491,7 +510,10 @@ async fn vision_call(gw: &Arc<Gateway>, prompt: &str, image: &str) -> Response {
         "messages": messages,
         "max_tokens": 512
     });
-    if let (Some(router), Some(msgs)) = (&gw.model_router, req_body.get("messages").and_then(|m| m.as_array())) {
+    if let (Some(router), Some(msgs)) = (
+        &gw.model_router,
+        req_body.get("messages").and_then(|m| m.as_array()),
+    ) {
         let requested = req_body.get("model").and_then(|m| m.as_str());
         if let Some(next) = crate::model_router::reroute_for_gateway(
             requested,
@@ -508,8 +530,12 @@ async fn vision_call(gw: &Arc<Gateway>, prompt: &str, image: &str) -> Response {
     }
     match req.send().await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body: Value = resp.json().await.unwrap_or_else(|e| json!({"error": e.to_string()}));
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body: Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| json!({"error": e.to_string()}));
             (status, Json(body)).into_response()
         }
         Err(e) => (
@@ -756,8 +782,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     // no-store cache header above matters here too).
     // Phase 2 cost estimation: bytes/min × 43 200 min/month → GB projection.
     let bw_rate = gw.state.isolate.bandwidth_rate_min();
-    let bw_gib_month = bw_rate
-        .map(|r| ((r as f64) * 60.0 * 24.0 * 30.0) / (1024.0 * 1024.0 * 1024.0));
+    let bw_gib_month =
+        bw_rate.map(|r| ((r as f64) * 60.0 * 24.0 * 30.0) / (1024.0 * 1024.0 * 1024.0));
     let resources_value = json!({
         "ram_ceiling_bytes": cfg.resources.ram_ceiling_bytes,
         "vram_ceiling_bytes": cfg.resources.vram_ceiling_bytes,
@@ -918,7 +944,8 @@ async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
         return Value::Null;
     }
     let url = format!("{base}/status");
-    let resp = reqwest::Client::builder().use_rustls_tls()
+    let resp = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(Duration::from_secs(3))
         .build()
         .ok()
@@ -1068,7 +1095,8 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body["max_tokens"] = serde_json::json!(cap);
         }
     }
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         // Distinguishes "host down" from "host up but wedged": a dead route
         // fails fast here, while a slow/hung runtime is caught by the
         // header-wait bound below instead.
@@ -1508,8 +1536,13 @@ mod tests {
     /// URL at it so the gateway treats the forward as true egress.
     fn nonloopback_ip_for_tests() -> String {
         let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp probe socket");
-        sock.connect("8.8.8.8:80").expect("a routable default route (the e2e requires one too)");
-        let ip = sock.local_addr().expect("probe local addr").ip().to_string();
+        sock.connect("8.8.8.8:80")
+            .expect("a routable default route (the e2e requires one too)");
+        let ip = sock
+            .local_addr()
+            .expect("probe local addr")
+            .ip()
+            .to_string();
         assert!(
             !ip.starts_with("127.") && ip != "::1",
             "detection must produce a non-loopback address, got {ip}"
@@ -1562,7 +1595,10 @@ mod tests {
         assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
         let body: Value = res.json();
         assert!(
-            body["error"].as_str().unwrap().contains("blocked by jerith-guard"),
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("blocked by jerith-guard"),
             "expected the fallback-edge guard block, got {body}"
         );
         assert!(!body.to_string().contains("078-05-1120"));

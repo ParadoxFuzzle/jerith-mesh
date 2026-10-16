@@ -447,9 +447,10 @@ fn newest_file_age_ms(dir: &Path, now_ms: u64) -> u64 {
                 t.duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0)
-            }) {
-                newest = newest.max(mod_ms);
-            }
+            })
+        {
+            newest = newest.max(mod_ms);
+        }
     }
     now_ms.saturating_sub(newest)
 }

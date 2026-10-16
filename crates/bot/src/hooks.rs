@@ -27,7 +27,7 @@
 //!   minimality is treated as a security property, not an optimization.
 
 use hmac::{Hmac, Mac};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Sha256;
 use std::sync::{Arc, OnceLock};
 
@@ -126,8 +126,8 @@ impl Event {
     /// receiver performs with the shared secret.
     pub fn signature(&self, secret: &str) -> String {
         let body = self.body().to_string();
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
         mac.update(format!("{}.{}", self.ts_ms, body).as_bytes());
         hex_encode(&mac.finalize().into_bytes())
     }
@@ -141,8 +141,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Used in tests to prove signatures recompute from (ts, body, secret).
 #[cfg(test)]
 pub fn verify_signature(ts_ms: u64, body: &str, secret: &str, sig_hex: &str) -> bool {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(format!("{ts_ms}.{body}").as_bytes());
     hex_encode(&mac.finalize().into_bytes()) == sig_hex
 }
@@ -170,7 +170,8 @@ impl Hooks {
         Self {
             cfg: Arc::new(cfg),
             http: enabled.then(|| {
-                reqwest::Client::builder().use_rustls_tls()
+                reqwest::Client::builder()
+                    .use_rustls_tls()
                     .timeout(timeout)
                     .build()
                     .expect("reqwest client for hooks")
@@ -205,11 +206,7 @@ impl Hooks {
         let sema = self.in_flight.clone();
         tokio::spawn(async move {
             for url in urls {
-                let permit_ok = sema
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .is_ok();
+                let permit_ok = sema.clone().acquire_owned().await.is_ok();
                 if !permit_ok {
                     return; // shutdown: not worth retrying here
                 }
@@ -230,7 +227,10 @@ async fn deliver(http: reqwest::Client, url: String, body: String, sig: String, 
             // Both headers ride per attempt: the ts lets receivers bound the
             // replay window, the signature binds (ts at signature time,
             // body). Receivers verify against the timestamp they accept.
-            .header("x-jerith-timestamp", jerith_mesh_core::bootstrap::now_ms().to_string())
+            .header(
+                "x-jerith-timestamp",
+                jerith_mesh_core::bootstrap::now_ms().to_string(),
+            )
             .header("x-jerith-signature", &sig)
             .body(body.clone());
         match req.send().await {
@@ -288,30 +288,36 @@ pub fn global() -> &'static Hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
     #[test]
     fn config_validation_rejects_bad_urls() {
         assert!(HooksConfig::default().validate().is_ok(), "empty = off");
-        assert!(HooksConfig {
-            urls: vec!["https://observer.example/hook".into()],
-            ..HooksConfig::default()
-        }
-        .validate()
-        .is_ok());
-        assert!(HooksConfig {
-            urls: vec!["ftp://nope".into()],
-            ..HooksConfig::default()
-        }
-        .validate()
-        .is_err());
-        assert!(HooksConfig {
-            urls: vec!["https://x y".into()],
-            ..HooksConfig::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            HooksConfig {
+                urls: vec!["https://observer.example/hook".into()],
+                ..HooksConfig::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            HooksConfig {
+                urls: vec!["ftp://nope".into()],
+                ..HooksConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HooksConfig {
+                urls: vec!["https://x y".into()],
+                ..HooksConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

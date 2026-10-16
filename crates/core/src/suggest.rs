@@ -64,11 +64,7 @@ pub fn recommended_meshes(fits: &[ModelFit], counts: &[(String, u64)]) -> Vec<Me
             },
         ));
     }
-    out.sort_by(|a, b| {
-        b.1.peers_online
-            .cmp(&a.1.peers_online)
-            .then(a.0.cmp(&b.0))
-    });
+    out.sort_by(|a, b| b.1.peers_online.cmp(&a.1.peers_online).then(a.0.cmp(&b.0)));
     out.into_iter().map(|(_, s)| s).collect()
 }
 
@@ -143,7 +139,10 @@ mod tests {
         let counts = vec![("too-big".to_string(), 99u64)];
         let sug = recommended_meshes(&fits, &counts);
         assert_eq!(sug.len(), 1);
-        assert_eq!(sug[0].model_id, "right-size", "a machine can't join a mesh its hardware can't run");
+        assert_eq!(
+            sug[0].model_id, "right-size",
+            "a machine can't join a mesh its hardware can't run"
+        );
     }
 
     #[test]

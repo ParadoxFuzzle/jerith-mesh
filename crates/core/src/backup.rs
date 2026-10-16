@@ -26,7 +26,7 @@
 //! `include_experts` opts them in.
 
 use anyhow::{Context as _, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -99,12 +99,7 @@ fn collect_candidates(home: &Path, include_experts: bool) -> Result<(Vec<Candida
         home.display()
     );
 
-    fn push(
-        abs: PathBuf,
-        rel: &str,
-        cands: &mut Vec<Candidate>,
-        skipped: &mut Vec<String>,
-    ) {
+    fn push(abs: PathBuf, rel: &str, cands: &mut Vec<Candidate>, skipped: &mut Vec<String>) {
         match std::fs::metadata(&abs) {
             Ok(m) if m.is_file() => cands.push(Candidate {
                 abs,
@@ -137,7 +132,9 @@ fn collect_candidates(home: &Path, include_experts: bool) -> Result<(Vec<Candida
         if include_experts {
             walk.push((experts, "experts".to_string()));
         } else {
-            skipped.push("experts/ (expert weights — omitted, rerun with --include-experts)".to_string());
+            skipped.push(
+                "experts/ (expert weights — omitted, rerun with --include-experts)".to_string(),
+            );
         }
     }
     while let Some((dir, prefix)) = walk.pop() {
@@ -218,7 +215,8 @@ pub fn create_into(home: &Path, out: Option<&Path>, opts: BackupOptions) -> Resu
     let mut metas: Vec<Value> = Vec::new();
     let mut total: u64 = 0;
     for c in &cands {
-        let bytes = std::fs::read(&c.abs).with_context(|| format!("reading {}", c.abs.display()))?;
+        let bytes =
+            std::fs::read(&c.abs).with_context(|| format!("reading {}", c.abs.display()))?;
         anyhow::ensure!(
             bytes.len() as u64 <= MAX_FILE_BYTES,
             "{} exceeds the per-file cap ({MAX_FILE_BYTES} bytes)",
@@ -314,7 +312,8 @@ pub fn verify(path: &Path) -> Result<VerifyReport> {
         "backup format version {version} is not readable by this build ({VERSION})"
     );
     let manifest_frame = read_frame(&mut r)?.context("missing manifest frame")?;
-    let manifest: Value = serde_json::from_slice(&manifest_frame).context("manifest is not JSON")?;
+    let manifest: Value =
+        serde_json::from_slice(&manifest_frame).context("manifest is not JSON")?;
     anyhow::ensure!(
         manifest.get("version").and_then(Value::as_u64) == Some(VERSION as u64),
         "manifest version disagrees with the container header"
@@ -525,8 +524,14 @@ mod tests {
     fn include_experts_rides_weights_along() {
         let home = seeded_home();
         let out = temp_home("out2").join("node.jbak");
-        let report =
-            create_into(&home, Some(&out), BackupOptions { include_experts: true }).unwrap();
+        let report = create_into(
+            &home,
+            Some(&out),
+            BackupOptions {
+                include_experts: true,
+            },
+        )
+        .unwrap();
         assert_eq!(report.entries, 5, "the weight store rides along");
         assert!(report.skipped.iter().all(|s| !s.contains("expert weights")));
         let v = verify(&out).unwrap();
@@ -628,4 +633,3 @@ mod tests {
         assert!(err.contains("run setup first"), "got: {err}");
     }
 }
-

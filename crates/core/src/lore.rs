@@ -327,10 +327,7 @@ fn excerpt_around(text: &str, terms: &[String], cap: usize) -> String {
     // Sentence boundaries: start after the previous terminator, end after
     // the next one following the match.
     let before = &text[..first];
-    let start = before
-        .rfind(['.', '!', '?'])
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let start = before.rfind(['.', '!', '?']).map(|i| i + 1).unwrap_or(0);
     let after = &text[first..];
     let end = after
         .find(['.', '!', '?'])

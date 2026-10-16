@@ -38,7 +38,7 @@
 //!
 //! Operators watch the running suspicion on `/status` (freerider section).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Served samples kept per peer (bounded ring: a stale window must fade).
@@ -81,8 +81,6 @@ pub const WINDOW_SAMPLES: usize = 12;
 
 /// Evaluation decay: suspicion fades when behavior stops feeding it.
 pub const DECAY: f32 = 0.93;
-
-
 
 /// Score at which Leeching evidence is queued.
 pub const FLAG_SCORE: f32 = 55.0;
@@ -372,7 +370,10 @@ mod tests {
             fed(&mut d, "e", &["peer-0", "peer-1"], "peer-1", 90);
         }
         let flagged = d.evaluate();
-        assert!(!flagged.contains(&"peer-1".to_string()), "no pool ⟹ no flag");
+        assert!(
+            !flagged.contains(&"peer-1".to_string()),
+            "no pool ⟹ no flag"
+        );
         assert!(d.scores.get("peer-1").copied().unwrap_or(0.0) < 1.0);
     }
 
@@ -394,10 +395,7 @@ mod tests {
             fed(&mut d, "e", &["peer-a", "peer-b"], "peer-a", 10);
             fed(&mut d, "e", &["peer-a", "peer-b"], "peer-b", 10);
             fed(&mut d, "e", &["peer-lazy", "peer-a"], "peer-a", 10);
-            if d.evaluate()
-                .iter()
-                .any(|x| x == "peer-lazy")
-            {
+            if d.evaluate().iter().any(|x| x == "peer-lazy") {
                 ever_flagged = true;
             }
         }

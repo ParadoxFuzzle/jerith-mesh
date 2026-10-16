@@ -181,19 +181,18 @@ impl VerificationTracker {
 
     /// Queue (with cooldown) the given nodes for a DishonestResults report.
     pub async fn flag_dishonest(&self, node_ids: &[&str]) {
-        self.flag_fraud(crate::bootstrap_server::FraudKind::DishonestResults, node_ids)
-            .await;
+        self.flag_fraud(
+            crate::bootstrap_server::FraudKind::DishonestResults,
+            node_ids,
+        )
+        .await;
     }
 
     /// Queue (with cooldown, per kind+target) the given nodes for the given
     /// fraud kind. Freerider detection (Phase 4) queues Leeching evidence
     /// here; statistical reports carry the same cooldown discipline as
     /// hard-evidence reports so neither channel can flood the bootstrap.
-    pub async fn flag_fraud(
-        &self,
-        kind: crate::bootstrap_server::FraudKind,
-        node_ids: &[&str],
-    ) {
+    pub async fn flag_fraud(&self, kind: crate::bootstrap_server::FraudKind, node_ids: &[&str]) {
         let mut last = self.last_flagged.lock().await;
         let mut queued = self.pending.lock().await;
         let now = crate::bootstrap::now_ms();
@@ -221,7 +220,10 @@ impl VerificationTracker {
             let mut q = self.pending.lock().await;
             q.drain(..).collect()
         };
-        to_report.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0))));
+        to_report.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
+        });
         to_report.dedup();
         if to_report.is_empty() {
             return Vec::new();

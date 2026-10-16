@@ -522,7 +522,8 @@ async fn submit_slash(
     auth: &crate::signing::WireAuth,
     body: &serde_json::Value,
 ) -> bool {
-    let client = match reqwest::Client::builder().use_rustls_tls()
+    let client = match reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(Duration::from_secs(5))
         .build()
     {
@@ -557,7 +558,8 @@ async fn stake_post(
     body: &serde_json::Value,
 ) -> anyhow::Result<(u16, serde_json::Value)> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(Duration::from_secs(5))
         .build()?;
     let resp = client
@@ -574,7 +576,8 @@ async fn stake_post(
 
 /// GET variant for the /stake read view.
 async fn stake_get(url: &str, token: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(Duration::from_secs(5))
         .build()?;
     let resp = client.get(url).bearer_auth(token).send().await?;

@@ -25,7 +25,7 @@
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -172,9 +172,7 @@ impl DiscoveryServers {
             if url == "http://" || url.starts_with("http://") {
                 continue; // plain-HTTP bootstraps: config-only, never learned
             }
-            if self.learned.iter().any(|s| s == &url)
-                || self.configured.iter().any(|s| s == &url)
-            {
+            if self.learned.iter().any(|s| s == &url) || self.configured.iter().any(|s| s == &url) {
                 continue;
             }
             if self.configured.len() + self.learned.len() >= ROTATION_CAP {
@@ -243,7 +241,9 @@ impl DiscoveryServers {
 
     /// Persist learned + last-good (a compact, human-inspectable file).
     pub fn save(&self) -> Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;
         }
@@ -265,10 +265,7 @@ impl DiscoveryServers {
     /// any http(s) we actually use (the ad is signed; a LAN http URL in
     /// it is the operator's own config speaking, not a hostile learn).
     pub fn ad_servers(&self, own: Option<&str>) -> Vec<String> {
-        self.order(own)
-            .into_iter()
-            .take(AD_MAX_SERVERS)
-            .collect()
+        self.order(own).into_iter().take(AD_MAX_SERVERS).collect()
     }
 }
 
@@ -400,14 +397,20 @@ mod tests {
         // A fresh legitimate bootstrap still lands (FIFO eviction).
         assert!(d.merge_learned(&["https://legit.example.org".into()]));
         assert_eq!(d.learned.last().unwrap(), "https://legit.example.org");
-        assert!(!d.learned.iter().any(|s| s == "https://hostile-0.example.org"));
+        assert!(
+            !d.learned
+                .iter()
+                .any(|s| s == "https://hostile-0.example.org")
+        );
         assert_eq!(d.learned.len(), ROTATION_CAP - d.configured.len());
 
         // Pinned last-good survives even as the rotation turns over.
         d.note_good("https://hostile-3.example.org");
         assert!(d.merge_learned(&["https://legit-2.example.org".into()]));
         assert!(
-            d.learned.iter().any(|s| s == "https://hostile-3.example.org"),
+            d.learned
+                .iter()
+                .any(|s| s == "https://hostile-3.example.org"),
             "pinned entry is never evicted"
         );
     }
@@ -417,7 +420,10 @@ mod tests {
     fn clear_last_good_rediversifies_order() {
         let mut d = DiscoveryServers {
             configured: sanitize(
-                &["https://primary.example.org".into(), "https://backup.example.org".into()],
+                &[
+                    "https://primary.example.org".into(),
+                    "https://backup.example.org".into(),
+                ],
                 None,
             ),
             ..DiscoveryServers::default()
@@ -438,14 +444,12 @@ mod tests {
         // https learns; plain http NEVER learns from gossip (config-only —
         // a hostile ad must not repoint the fleet at a capture proxy);
         // already-configured and duplicate entries leave the set alone.
-        assert!(
-            d.merge_learned(&[
-                "https://learned-1.example.org".into(),
-                "http://local-capture.example.org".into(),
-                "https://primary.example.org".into(),
-                "https://learned-2.example.org".into(),
-            ])
-        );
+        assert!(d.merge_learned(&[
+            "https://learned-1.example.org".into(),
+            "http://local-capture.example.org".into(),
+            "https://primary.example.org".into(),
+            "https://learned-2.example.org".into(),
+        ]));
         assert_eq!(
             d.learned,
             vec![
@@ -495,11 +499,7 @@ mod tests {
         let dir = temp_dir("persist");
         let path = dir.join("discovery-servers.json");
 
-        let mut d = DiscoveryServers::new(
-            vec!["https://primary.example.org".into()],
-            None,
-            &dir,
-        );
+        let mut d = DiscoveryServers::new(vec!["https://primary.example.org".into()], None, &dir);
         assert!(d.merge_learned(&["https://learned.example.org".into()]));
         d.note_good("https://primary.example.org");
         d.save().unwrap();
@@ -520,21 +520,27 @@ mod tests {
 
     #[test]
     fn discovery_config_validation_rejects_malformed_urls() {
-        assert!(DiscoveryConfig {
-            servers: vec!["https://b.example.org".into()],
-        }
-        .validate()
-        .is_ok());
-        assert!(DiscoveryConfig {
-            servers: vec!["   ".into()],
-        }
-        .validate()
-        .is_err());
-        assert!(DiscoveryConfig {
-            servers: vec!["not a url".into()],
-        }
-        .validate()
-        .is_err());
+        assert!(
+            DiscoveryConfig {
+                servers: vec!["https://b.example.org".into()],
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            DiscoveryConfig {
+                servers: vec!["   ".into()],
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DiscoveryConfig {
+                servers: vec!["not a url".into()],
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     /// Per-call failover: a dead first server is transparent to the

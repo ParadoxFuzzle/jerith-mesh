@@ -118,7 +118,9 @@ pub struct ModelStats {
 impl ModelStats {
     /// Mean latency in ms (0 when no requests).
     pub fn latency_ms_mean(&self) -> u64 {
-        self.latency_ms_total.checked_div(self.requests).unwrap_or(0)
+        self.latency_ms_total
+            .checked_div(self.requests)
+            .unwrap_or(0)
     }
     /// Success ratio in percent (0 when no requests).
     pub fn ok_percent(&self) -> u64 {

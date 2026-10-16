@@ -188,9 +188,10 @@ impl BotStateInner {
         let st = users.entry(user).or_default();
         let now = Instant::now();
         if let Some(t) = st.last_squeeze
-            && now.duration_since(t) < Duration::from_secs(min_interval_secs.max(1)) {
-                return false;
-            }
+            && now.duration_since(t) < Duration::from_secs(min_interval_secs.max(1))
+        {
+            return false;
+        }
         st.last_squeeze = Some(now);
         true
     }

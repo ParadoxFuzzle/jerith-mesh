@@ -205,7 +205,9 @@ fn probe_gpus() -> Vec<GpuInfo> {
         "--query-gpu=name,memory.total",
         "--format=csv,noheader,nounits",
     ]);
-    if let Ok(out) = smi.output() && out.status.success() {
+    if let Ok(out) = smi.output()
+        && out.status.success()
+    {
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
             if fields.len() == 2 {

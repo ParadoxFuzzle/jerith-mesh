@@ -1009,8 +1009,7 @@ mod tests {
         assert_eq!(back.specialists.embedding_model, "bge-m3");
         assert_eq!(
             NodeConfig::default().specialists.embedding_model,
-            crate::toolstack::default_small_model(crate::toolstack::ModelTier::Embedding)
-                .name
+            crate::toolstack::default_small_model(crate::toolstack::ModelTier::Embedding).name
         );
     }
 

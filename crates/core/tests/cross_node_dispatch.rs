@@ -439,14 +439,9 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
     {
         let node_id = node_id.clone();
         tokio::spawn(async move {
-            let _ = jerith_mesh_core::quic::serve_with_peer_block(
-                server,
-                serving,
-                node_id,
-                rx,
-                block,
-            )
-            .await;
+            let _ =
+                jerith_mesh_core::quic::serve_with_peer_block(server, serving, node_id, rx, block)
+                    .await;
         });
     }
     let mut pins: jerith_mesh_core::quic::PinMap = HashMap::new();
@@ -511,7 +506,10 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
     assert_eq!(served_by.as_deref(), Some(node_id.as_str()));
     let want = reference_swiglu(&weights, &input);
     for (got, expected) in out.iter().zip(&want) {
-        assert!((got - expected).abs() < 1e-6, "wrong result for allowed peer");
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "wrong result for allowed peer"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -538,13 +536,7 @@ fn reference_swiglu(w: &jerith_mesh_core::expert_store::ExpertWeights, x: &[f32]
         .collect();
     w.down
         .chunks(w.intermediate)
-        .map(|down_row| {
-            down_row
-                .iter()
-                .zip(&act)
-                .map(|(d, a)| d * a)
-                .sum::<f32>()
-        })
+        .map(|down_row| down_row.iter().zip(&act).map(|(d, a)| d * a).sum::<f32>())
         .collect()
 }
 
