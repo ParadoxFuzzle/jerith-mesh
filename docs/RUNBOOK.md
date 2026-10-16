@@ -518,6 +518,48 @@ remembering:
   benchmark showed truncating at 1200), config backup at
   `~/.jerith-mesh/config.toml.bak-pre-captop`.
 
+### Remote model endpoints + API keys (OpenRouter-free lane, 2026-10-16)
+
+A mesh bot's node can already pull chat lanes from ANY remote
+OpenAI-compatible endpoint — `runtime_url` + `runtime_api_key` in the
+node's config.toml (`bearer_auth` is wired; Jerith Guard screens the
+forward when the endpoint is not loopback). Nothing else is required to
+run against a relay/hosted provider; what was missing is the recipe.
+
+OpenRouter-free through the LiteLLM proxy (the recipe + today's gotchas):
+
+- **Model entries**: `model_list` rows with
+  `"model": "openrouter/<vendor>/<name>:free"` under an alias (the
+  proxy's list already carries ten of these). The node routes a lane at
+  the ALIAS — e.g. `runtime_deep_model = "ling-3.1-flash"` (armed
+  2026-10-16, config backup `config.toml.bak-openrouter-deep`).
+- **Provider key delivery — use an EnvironmentFile**: this LiteLLM build
+  does NOT resolve provider auth from the config file's
+  `environment_variables` section despite it holding the key (observed:
+  provider 401 until the key reached the process). Working wiring: the
+  key line in `~/.openclaw/litellm.env` (chmod 600) + a user-unit drop-in
+  `~/.config/systemd/user/litellm-proxy.service.d/openrouter-env.conf`
+  with `EnvironmentFile=` + `daemon-reload` + restart. Inside
+  `litellm_params`, either a literal api_key or LiteLLM's documented
+  "os.environ/OPENROUTER_API_KEY" reference now both resolve.
+- **Proxy key gate — send the Bearer**: when the proxy runs with key
+  management armed (its Postgres/user_api_key_auth), chat requests
+  without `Authorization: Bearer <proxy key>` die at the PROXY with
+  401 "No api key passed in" before any model call (masked as an
+  OpenRouter auth error — same message shape, wrong layer). The node's
+  `runtime_api_key` is the proxy key and the gateway sends it
+  automatically; probe scripts must include it too.
+- **Verified free lanes (PONG probes, 2026-10-16)**: `ling-3.1-flash` ✅,
+  `laguna-m` ✅ — both answer text through the proxy; `inkling` 403
+  (agentic-harness-only); `or-free` / `north-mini-code` /
+  `nemotron-3-super` return 200 with empty content at small
+  `max_tokens` caps (think-swallow — only usable with 300+ tokens);
+  local `qwen3:8b` stays the tool tier because free lanes are
+  rate-limited and a multi-round tool loop would hammer the cap.
+- **End-to-end proof**: a deep-tier-triggering prompt through the node
+  gateway rerouted `to=ling-3.1-flash` (node journal) and returned a
+  full prose answer (684 usage tokens) from OpenRouter.
+
 ## Security hardening log
 
 Round 3 (`9493165`): wire-auth verification for `/v1/report-dead` and
