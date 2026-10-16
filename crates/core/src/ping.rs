@@ -813,6 +813,9 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
     if disk.runtime_deep_model != live.runtime_deep_model {
         plan.cold.push("runtime_deep_model");
     }
+    if disk.runtime_primary_model != live.runtime_primary_model {
+        plan.cold.push("runtime_primary_model");
+    }
     if disk.bootstrap_url != live.bootstrap_url {
         plan.cold.push("bootstrap_url");
     }

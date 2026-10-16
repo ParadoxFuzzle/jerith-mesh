@@ -339,6 +339,16 @@ pub struct NodeConfig {
     /// long context, explicit `[deep]` tag). Default on; "" disables.
     #[serde(default = "default_deep_router_model")]
     pub runtime_deep_model: Option<String>,
+    /// Model router: PRIMARY chat lane — the everyday "plain chat" model
+    /// used whenever no other tier engages (tool shape → tool tier,
+    /// images → vision, complex prompts → deep regardless). Deliberately
+    /// distinct from the locally HOSTED base (`[model]`, which must remain
+    /// a servable local source for peer dispatch): pin an OpenRouter-free
+    /// alias (or any runtime-served model) here to make it the default
+    /// chatting model. "" / None = classic behavior: basic chat keeps the
+    /// caller's/base model.
+    #[serde(default)]
+    pub runtime_primary_model: Option<String>,
     /// Phase 4: probability (percent) of redundantly replaying a remote
     /// expert result on a second node before trusting it. Spec range:
     /// 5–15 %; 0 disables replay (commitments always checked).
@@ -671,6 +681,7 @@ impl Default for NodeConfig {
             runtime_tool_model: default_tool_router_model(),
             runtime_vision_model: Some(crate::model_router::DEFAULT_VISION_MODEL.to_string()),
             runtime_deep_model: Some(crate::model_router::DEFAULT_DEEP_MODEL.to_string()),
+            runtime_primary_model: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
             ringer_percent: default_ringer_percent(),

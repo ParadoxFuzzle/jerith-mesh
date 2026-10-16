@@ -55,6 +55,14 @@ pub struct RouterModels {
     pub tool: String,
     pub vision: String,
     pub deep: String,
+    /// The PRIMARY/basic chat lane: when pinned (non-empty), every plain
+    /// auto request that no other tier engages rides it — the operator's
+    /// everyday chatting model (e.g. an OpenRouter-free alias served by
+    /// the runtime). Deliberately distinct from the node's locally HOSTED
+    /// base model ([model]), which must stay a servable local source for
+    /// peer dispatch. Empty string = disabled: basic chat keeps the
+    /// caller's / advertised base model, the historical behavior.
+    pub primary: String,
 }
 
 /// Tool-tier model ids that demonstrably lost user traffic here: the
@@ -75,6 +83,7 @@ impl Default for RouterModels {
             tool: String::new(),
             vision: DEFAULT_VISION_MODEL.to_string(),
             deep: DEFAULT_DEEP_MODEL.to_string(),
+            primary: String::new(),
         }
     }
 }
@@ -97,6 +106,7 @@ impl RouterModels {
             tool,
             vision: cfg.runtime_vision_model.clone().unwrap_or_default(),
             deep: cfg.runtime_deep_model.clone().unwrap_or_default(),
+            primary: cfg.runtime_primary_model.clone().unwrap_or_default(),
         }
     }
 
@@ -220,7 +230,20 @@ pub fn reroute_for_gateway(
         Some("tool") => Some(tiers.tool.clone()),
         Some("vision") => Some(tiers.vision.clone()),
         Some("deep") => Some(tiers.deep.clone()),
-        _ => None,
+        // Basic chat, no tier engaged: ride the PRIMARY lane when one is
+        // pinned. This is how an everyday hosted-or-remote model (e.g. an
+        // OpenRouter-free alias served by the runtime) becomes the default
+        // chatting model WITHOUT repointing the node's locally HOSTED base
+        // ([model] must stay servable for peer dispatch). Tool-shape
+        // requests engaged the tool tier above; pinned caller models never
+        // reach the match at all (is_auto gate).
+        _ => {
+            if tiers.primary.is_empty() {
+                None
+            } else {
+                Some(tiers.primary.clone())
+            }
+        }
     };
     // A tier resolving to the model the caller already sent is a no-op —
     // suppress the rewrite (and the misleading reroute journal line).
@@ -382,6 +405,34 @@ mod tests {
                 false
             ),
             Some("qwen3-large-test".to_string())
+        );
+    }
+
+    #[test]
+    fn primary_lane_pinned_routes_basic_chat_without_touching_tool_or_pinned() {
+        let msgs = vec![json!({
+            "role": "user",
+            "content": "hey there, quick hello for the smoke run?"
+        })];
+        let pinned = RouterModels {
+            primary: "ling-3.1-flash".into(),
+            ..upgraded_tiers()
+        };
+        // Basic chat on the auto/base id rides the PRIMARY lane.
+        assert_eq!(
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &pinned, false),
+            Some("ling-3.1-flash".to_string())
+        );
+        // A caller pinning a foreign model still wins — primary is only
+        // consulted for auto/base requests.
+        assert_eq!(
+            reroute_for_gateway(Some("foreign:70b"), Some("qwen3:8b"), &msgs, &pinned, false),
+            None
+        );
+        // Empty primary = classic behavior: basic chat keeps the base.
+        assert_eq!(
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers(), false),
+            None
         );
     }
 
