@@ -30,7 +30,7 @@ jobs:
     # the last push that may be weeks older. The manual pre-release
     # audit reminder this replaces was the long tail of that gap.
     name: cargo audit (pre-release advisory gate)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             artifact: jerith-linux-x86_64
           - os: macos-latest
             artifact: jerith-macos-aarch64

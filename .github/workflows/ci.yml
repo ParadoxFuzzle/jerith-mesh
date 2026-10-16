@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# `ubuntu-latest` migrates to Ubuntu 26 beginning 2026-10-19
+# (actions/runner-images#14748). Pin the known-good 24.04 image so the
+# gates can't flip their environment underneath a push. Revisit to a
+# 26 image as an explicit change, not an accident.
 jobs:
   fmt-check:
     # Formatting gate: `cargo fmt --check` fails on ANY drift, so a
@@ -13,7 +17,7 @@ jobs:
     # whole workspace is rustfmt-clean as of 2026-10-16 (clippy is the
     # semantic gate; this one is purely mechanical).
     name: cargo fmt --check (formatting gate)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +28,8 @@ jobs:
         run: cargo fmt --all --check
 
   tests-linux:
-    name: cargo test --workspace (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: cargo test --workspace (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -40,8 +44,8 @@ jobs:
     # 2026-10-15 — keep it that way. One OS suffices: the lints this
     # workspace trips are platform-independent; OS-specific behavior is
     # what the test matrix above already covers on both runners.
-    name: cargo clippy --all-targets -- -D warnings (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: cargo clippy --all-targets -- -D warnings (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -61,8 +65,8 @@ jobs:
     # owner dying at its deadline and ring-rule re-hosted, honest
     # partials, and RTT-floored demand-priced budgets. Around a second
     # of runtime; keep it parallel with the suites (no needs).
-    name: pipeline live drill (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: pipeline live drill (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +91,7 @@ jobs:
 
   dev-e2e:
     name: two-node live E2E (scripts/dev-e2e.sh)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: tests-linux
     timeout-minutes: 30
     env:
@@ -112,7 +116,7 @@ jobs:
     # entries (and rerun this gate clean) when the serenity/poise
     # migration lands.
     name: cargo audit (dependency advisories gate)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
