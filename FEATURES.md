@@ -195,7 +195,7 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 
 ## 8. Plugin / Skill System
 - 🔄 OpenClaw-style modular plugin and skill architecture (Phase 3 core ✅;
-  see plugins.rs):
+  see plugins.rs — full reference now in [docs/PLUGINS.md](docs/PLUGINS.md)):
   - Capabilities are **plugins** owning dot-named **skills** (`web_search`,
     `memory.embed`, …): one `SkillSpec` table entry per skill derives the
     OpenAI tool declaration, the dispatch whitelist and the gating — the
