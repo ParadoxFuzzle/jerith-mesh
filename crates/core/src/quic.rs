@@ -3116,15 +3116,61 @@ mod tests {
             std::sync::Arc::new(tokio::sync::RwLock::new(pins))
         };
         let (endpoint1, _conn1) = raw_dial(&node_id, addr, &pins).await.unwrap();
-        // Let the serve loop pick up dial 1's handshake and acquire the
-        // permit. 150 ms was load-sensitive: under full-suite parallel
-        // pressure the permit could still be free when dial 2 fired,
-        // spuriously “served”. A second means dial 1 is definitely seated.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Wait until the serve loop has actually seated dial 1 and
+        // acquired the single permit — by PROVING it, not by sleeping.
+        // Fixed delays were load-sensitive: under full-suite parallel
+        // pressure the permit could still be free when the next dial
+        // fired, spuriously "served". A probe `call` that times out on
+        // its own short timeout proves the permit is held (the request
+        // can't reach the handler); a Pong means not seated yet — retry.
+        // Each probe dials a fresh connection and closes it, so a probe
+        // that lands before seating consumes nothing.
+        let identity = SigningIdentity::generate();
+        let mut seat_req = NodeRpcRequest::Ping {
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut seat_req, &identity);
+        let mut seat_probes = 0usize;
+        loop {
+            seat_probes += 1;
+            let probe = tokio::time::timeout(
+                Duration::from_millis(800),
+                call(
+                    &endpoint1,
+                    addr,
+                    &node_id,
+                    &seat_req,
+                    &identity,
+                    Duration::from_millis(400),
+                ),
+            )
+            .await;
+            if matches!(probe, Ok(Ok(_))) {
+                // Served ⇒ not seated yet. Probe after a beat, capped so
+                // a genuinely wedged serve loop fails loudly instead of
+                // hanging the suite.
+                assert!(
+                    seat_probes <= 60,
+                    "dial 1 never seated after {seat_probes} probes"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            if seat_probes == 1 {
+                // The very first probe can carry a connect-level hiccup
+                // under heavy load — that is not proof of seating.
+                // Re-probe before concluding anything.
+                continue;
+            }
+            // Any failure after the first probe proves the permit is
+            // held: the request was backpressured behind dial 1's seat.
+            break;
+        }
 
         // Dial 2 while the permit is held: backpressured — the request's
         // handler is never reached inside a short client timeout.
-        let identity = SigningIdentity::generate();
         let mut req = NodeRpcRequest::Ping {
             from_node_id: identity.node_id(),
             stamp_ms: 0,

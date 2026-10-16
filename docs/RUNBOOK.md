@@ -690,6 +690,29 @@ Known remaining limitations (accepted, bounded):
   (`meters`, `verify` fields); a spike in mismatches precedes scam/round
   slashing notices — check `GET /stake` on the chain node for who burned what.
 
+## CI runner image policy (ubuntu-24.04 pin)
+
+Effective `ebe542d` (2026-10-16): every Linux leg in `ci.yml` and
+`release.yml` pins `ubuntu-24.04` explicitly; macOS stays `macos-latest`.
+Rationale: GitHub migrates the `ubuntu-latest` label to Ubuntu 26.04
+over **2026-10-19 → 2026-11-19** (actions/runner-images#14748), and a
+silent environment flip mid-push is exactly the failure mode the gates
+exist to catch — so the environment changes only when we change it.
+
+Evaluation of moving to `ubuntu-26.04` (2026-10-16): *no dependency on
+the newer image exists* — Rust arrives via `dtolnay/rust-toolchain`
+(1.98.1 on both images per the announcement), `rusqlite` is bundled,
+`cargo-audit` builds from source, and the E2E uses stock `python3`/shell.
+The real deltas are base-image only (kernel 6.17 → 7.0, systemd
+255 → 259) — zero expected benefit for these suites, concrete risk in
+the first weeks of a fresh image (our three live-infra gates are the
+most environment-sensitive jobs in the fleet).
+
+Plan when the migration window closes (after 2026-11-19): open a branch
+that flips both pins to `ubuntu-26.04`, soak the full matrix on it for
+a week, then land explicitly. Until then `ubuntu-24.04` is deliberate,
+not inertia.
+
 ## Dependency security posture (cargo audit, 2026-10-15)
 
 ### Feature-unification audit (TLS/HTTP stack, 2026-10-15)
