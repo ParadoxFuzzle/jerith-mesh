@@ -532,6 +532,78 @@ mod tests {
         assert!(msg.contains(needle), "error `{msg}` lacks `{needle}`");
     }
 
+    /// The docs/PLUGINS.md worked example, registry half: the same spec
+    /// shape (stubbed upstream — no network in tests), wired through
+    /// `from_skills`, proves the author path end-to-end at the registry
+    /// layer. The transport half is proven bot-wide by the mock-gateway
+    /// tool-loop test in api.rs.
+    fn weather_example_spec() -> SkillSpec {
+        SkillSpec {
+            name: "weather.now",
+            plugin: "weather",
+            description: "Current temperature and conditions for a place. Use when asked about the weather.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "place": {"type": "string", "description": "The place to look up"}
+                },
+                "required": ["place"]
+            }),
+            run: |_cfg: &crate::config::BotConfig, args: &Value| {
+                // Stands in for the doc example's open-meteo fetch: same
+                // JSON-out shape (`provider` self-label included).
+                Box::pin(async move {
+                    let place = args
+                        .get("place")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    anyhow::ensure!(!place.trim().is_empty(), "weather.now: empty place");
+                    Ok(json!({ "provider": "open-meteo", "temperature_c": 21.5 }))
+                })
+            },
+        }
+    }
+
+    #[test]
+    fn worked_example_weather_skill_is_routable_and_gated() {
+        let args = json!({"place": "Praha"});
+
+        // Gated on: the derived OpenAI tool def is well-shaped, the
+        // whitelist admits the skill, dispatch routes it to the runner.
+        let on = SkillRegistry::from_skills(vec![weather_example_spec()], ["weather"]);
+        let defs = on.tool_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["type"], "function");
+        assert_eq!(defs[0]["function"]["name"], "weather.now");
+        assert_eq!(
+            defs[0]["function"]["parameters"]["required"],
+            json!(["place"])
+        );
+        assert_eq!(
+            on.enabled_skill_names(),
+            vec!["weather.now"],
+            "the whitelist is derived from the same table"
+        );
+        let served = rt().block_on(on.dispatch(&test_cfg(), "weather.now", &args));
+        assert_eq!(
+            served.unwrap(),
+            json!({"provider": "open-meteo", "temperature_c": 21.5})
+        );
+
+        // Gated off: no tool def reaches the model, and a dispatch
+        // attempt is refused in the model-recoverable shape — the
+        // refusal contract, applied to a third-party plugin id.
+        let off = SkillRegistry::from_skills(vec![weather_example_spec()], Vec::<String>::new());
+        assert!(off.tool_defs().is_empty());
+        let err = rt().block_on(off.dispatch(&test_cfg(), "weather.now", &args));
+        assert_err_mentions(&err, "unknown or disabled");
+
+        // Argument validation survives the example shape too: an empty
+        // required field is a typed runner error, not a panic.
+        let empty = rt().block_on(on.dispatch(&test_cfg(), "weather.now", &json!({"place": "  "})));
+        assert_err_mentions(&empty, "empty place");
+    }
+
     #[test]
     fn unknown_plugin_id_in_config_fails_loud() {
         assert!(

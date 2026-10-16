@@ -127,6 +127,126 @@ Third-party integrations (e.g. the LangChain integration's runtime
 tools loop under `integrations/langchain/`) consume the same registry
 shape, so a skill added here is usable from any client on the mesh.
 
+## Worked example (end-to-end): a `weather` skill
+
+Everything above, assembled: a keyless public API (open-meteo), one
+gating unit, one runner, three concrete edits in `plugins.rs`. Open-meteo
+is chosen because it needs no key or signup — **do not** apply the same
+logic to an upstream that receives user-derived text and *would*
+monetize it; the note under the runner is the general rule.
+
+**Step 1 — the runner (argument adapter, no LLM calls, ever):**
+
+```rust
+use serde_json::{json, Value};
+
+const GEOCODING_API_BASE: &str = "https://geocoding-api.open-meteo.com";
+const FORECAST_API_BASE: &str = "https://api.open-meteo.com";
+
+fn weather_now<'args>(
+    cfg: &'args BotConfig,
+    args: &'args Value,
+) -> BoxedSkillFut<'args> {
+    Box::pin(async move {
+        let place = args
+            .get("place")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        anyhow::ensure!(!place.trim().is_empty(), "weather.now: empty place");
+
+        // 1s reserve the bot's gateway-side skill call conventions: a
+        // bounded reqwest client, JSON in/out, typed errors.
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let q = urlencoding::encode(place.trim());
+        let geo: Value = client
+            .get(format!("{GEOCODING_API_BASE}/v1/search?name={q}&count=1"))
+            .send()
+            .await
+            .context("weather.now: geocoding request failed")?
+            .error_for_status()
+            .context("weather.now: geocoding upstream error")?
+            .json()
+            .await
+            .context("weather.now: geocoding returned non-JSON")?;
+        let hit = geo
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|r| r.first())
+            .ok_or_else(|| anyhow::anyhow!("weather.now: no place matched {q:?}"))?
+            .clone();
+        let lat = hit.get("latitude").and_then(Value::as_f64).unwrap_or_default();
+        let lon = hit.get("longitude").and_then(Value::as_f64).unwrap_or_default();
+
+        let forecast: Value = client
+            .get(format!(
+                "{FORECAST_API_BASE}/v1/forecast?latitude={lat}&longitude={lon}\
+                 &current=temperature_2m,weather_code"
+            ))
+            .send()
+            .await
+            .context("weather.now: forecast request failed")?
+            .error_for_status()
+            .context("weather.now: forecast upstream error")?
+            .json()
+            .await
+            .context("weather.now: forecast returned non-JSON")?;
+
+        // JSON out, not prose out — the model composes, the skill computes.
+        Ok(json!({
+            "provider": "open-meteo",
+            "place": hit.get("name").cloned().unwrap_or_else(|| json!(place)),
+            "temperature_c": forecast["current"]["temperature_2m"],
+            "weather_code": forecast["current"]["weather_code"],
+        }))
+    })
+}
+
+// The general rule under the code: anything a runner sends upstream is
+// user-derived. A bare place name to a keyless API is fine; never pipe
+// chat transcripts, message bodies, or accumulated memory to a third
+// party without a decisive reason.
+```
+
+**Step 2 — register the skill** in `standard_skills()`:
+
+```rust
+SkillSpec {
+    name: "weather.now",
+    plugin: "weather",
+    description: "Current temperature and conditions for a place. Use when asked about the weather.",
+    parameters: json!({
+        "type": "object",
+        "properties": {
+            "place": {"type": "string", "description": "The place to look up"}
+        },
+        "required": ["place"]
+    }),
+    run: weather_now,
+},
+```
+
+**Step 3 — name the gating unit:** add `"weather"` to
+`PREPACKAGED_PLUGINS`. That one line is what makes `[plugins] enabled =
+["weather", …]` valid in bot.toml (fail-loud validation works on the
+new id like every other), and — because the default `enabled` list *
+is* that constant — the skill is on unless the operator names it off.
+
+That's the whole surface: the spec's derived tool declaration enters
+every chat payload, the derived whitelist allows it (and nothing else)
+through both dispatch paths, and `[plugins]` in bot.toml governs it via
+the named id.
+
+The registry half of the example is proven by a compiling test —
+`worked_example_weather_skill_is_routable_and_gated` in
+`plugins.rs` (same spec shape, wired through `from_skills`: tool def
+present when gated on, absent and refusal-shaped when gated off). The
+transport half — a runner returning JSON into a live tool loop — is
+what `chat_tool_loop_executes_web_skills_and_finalizes` in `api.rs`
+proves with a mock gateway for the shipped skills.
+
 ## Node-side skill endpoints (HTTP, gateway :8900)
 
 The bot's runners are thin adapters over these routes; any client (curl,
