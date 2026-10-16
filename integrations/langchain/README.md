@@ -37,11 +37,21 @@ python integrations/langchain/langgraph_agent.py "what's on the mesh right now?"
 
 ## Model tiers (how the node picks models)
 
-The gateway routes each request: image content → the **vision** tier
-(default `minicpm-v4.6:1b`), complex/long prompts and explicit `[deep]`
-tags → the **thinking** tier (default `qwen3:8b`), everything else keeps
+The gateway routes each request: requests carrying function definitions
+(agent tool loops) → the **tool** tier — chosen for tool-call *parse
+reliability*, not depth (pin `runtime_tool_model=nemotron-3-nano:4b`, the
+measured-reliable default); image content → the **vision** tier
+(default `minicpm-v4.6:1b`); complex/long prompts and explicit `[deep]`
+tags → the **thinking** tier (default `qwen3:8b`); everything else keeps
 the caller's model. Pin a model per `JerithChat(...)` call to opt out of
 rerouting entirely.
+
+Measured on the live runtime (2026-10-16): qwen3:8b's thinking block
+(the raw `Calling the tool now…` text the model emits before the
+answer) trips Ollama's tool-call parser into a bare `{}`; but
+`think: false` passed through LiteLLM parses cleanly (17 tokens,
+`finish_reason: tool_calls`), and nemotron handles thinking + tools
+natively (3/3 clean parses) — hence the dedicated tool tier.
 
 Tier picks are installed/pulled with:
 

@@ -47,10 +47,12 @@ const COMPLEX_MARKERS: [&str; 14] = [
     "comprehensive",
 ];
 
-/// The routing tiers (`vision`/`deep`) — set once from node config; the
-/// base tier is whoever the caller asked for.
+/// The routing tiers (`tool`/`vision`/`deep`) — set once from node
+/// config; the base tier is whoever the caller asked for. An empty
+/// string disables a tier.
 #[derive(Debug, Clone)]
 pub struct RouterModels {
+    pub tool: String,
     pub vision: String,
     pub deep: String,
 }
@@ -58,8 +60,25 @@ pub struct RouterModels {
 impl Default for RouterModels {
     fn default() -> Self {
         Self {
+            // Tool tier starts DISABLED at the router level: operators
+            // pin it (setup default / config) once their runtime hosts
+            // the pick — an unpinned default would reroute tool requests
+            // to a model the runtime may not serve.
+            tool: String::new(),
             vision: DEFAULT_VISION_MODEL.to_string(),
             deep: DEFAULT_DEEP_MODEL.to_string(),
+        }
+    }
+}
+
+/// Build the router tiers from a node config (the run path; the gateway
+/// must honor what setup/config wrote, not fall back to the defaults).
+impl RouterModels {
+    pub fn from_config(cfg: &crate::config::NodeConfig) -> Self {
+        Self {
+            tool: cfg.runtime_tool_model.clone().unwrap_or_default(),
+            vision: cfg.runtime_vision_model.clone().unwrap_or_default(),
+            deep: cfg.runtime_deep_model.clone().unwrap_or_default(),
         }
     }
 }
@@ -113,16 +132,33 @@ pub fn is_complex(messages: &[serde_json::Value]) -> bool {
         || user_turns >= DEEP_MIN_USER_TURNS
 }
 
+/// True when a chat request payload carries function definitions (an
+/// agent tool loop). Such requests go to the `tool` tier: tool-calling
+/// reliability is a parse-format property, not a depth property.
+pub fn payload_has_tools(body: &serde_json::Value) -> bool {
+    body.get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|t| !t.is_empty())
+}
+
 /// Decide the model for a chat round-trip. `base` is the caller-requested
-/// model. Returns the override (`Some(vision|deep)`) or `None` = "keep the
+/// model, `has_tools` whether the payload carries function definitions.
+/// Returns the override (`Some(tool|vision|deep)`) or `None` = "keep the
 /// caller's model" (the overwhelmingly common basic-chat outcome).
-pub fn route(messages: &[serde_json::Value], base: Option<&str>) -> Option<&'static str> {
+pub fn route(
+    messages: &[serde_json::Value],
+    base: Option<&str>,
+    has_tools: bool,
+) -> Option<&'static str> {
     let base = base?;
     if base.is_empty() {
         return None;
     }
     if has_image_content(messages) {
         return Some("vision");
+    }
+    if has_tools {
+        return Some("tool");
     }
     if is_complex(messages) {
         return Some("deep");
@@ -133,12 +169,14 @@ pub fn route(messages: &[serde_json::Value], base: Option<&str>) -> Option<&'sta
 /// Gateway-level policy: reroute ONLY unpinned requests — the caller sent
 /// nothing, the bot's "jerith-mesh" placeholder, or the advertised base
 /// model resolved from /status. Every other id is a deliberate choice and
-/// passes through untouched.
+/// passes through untouched. `has_tools` marks agent tool-loop payloads
+/// (they want the `tool` tier ahead of the thinking rules).
 pub fn reroute_for_gateway(
     requested: Option<&str>,
     base_model: Option<&str>,
     messages: &[serde_json::Value],
     tiers: &RouterModels,
+    has_tools: bool,
 ) -> Option<String> {
     let requested = requested.unwrap_or_default().trim();
     let is_auto = requested.is_empty()
@@ -155,14 +193,15 @@ pub fn reroute_for_gateway(
     } else {
         requested
     };
-    let next = match route(messages, Some(anchor)) {
+    let next = match route(messages, Some(anchor), has_tools) {
+        Some("tool") => Some(tiers.tool.clone()),
         Some("vision") => Some(tiers.vision.clone()),
         Some("deep") => Some(tiers.deep.clone()),
         _ => None,
     };
     // A tier resolving to the model the caller already sent is a no-op —
     // suppress the rewrite (and the misleading reroute journal line).
-    next.filter(|n| *n != requested)
+    next.filter(|n| !n.is_empty() && *n != requested)
 }
 
 #[cfg(test)]
@@ -180,10 +219,10 @@ mod tests {
             json!({"role": "system", "content": "you are jerith"}),
             json!({"role": "user", "content": "what time is mine? /mine"}),
         ];
-        assert_eq!(route(&msgs, Some("qwen3:8b")), None);
+        assert_eq!(route(&msgs, Some("qwen3:8b"), false), None);
         // Gateway policy: base-model request stays as-is when no tier wants it.
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers(), false),
             None
         );
     }
@@ -198,9 +237,73 @@ mod tests {
             ]
         })];
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers(), false),
             Some("minicpm-v4.6:1b".to_string())
         );
+    }
+
+    #[test]
+    fn tool_payloads_route_to_the_tool_tier() {
+        let msgs = vec![json!({"role": "user", "content": "search memory for the drill notes"})];
+        let tiers = RouterModels {
+            tool: "nemotron-3-nano:4b".into(),
+            ..upgraded_tiers()
+        };
+        // A tool-loop request reads as "tool": the tool prompt is NOT his
+        // reasoning choice — the payload format is. Even a complex-looking
+        // prompt keeps tool-calling reliability first.
+        let complex = [json!(
+            {"role": "user", "content": format!("Refactor the module [deep] {}", "y".repeat(DEEP_MIN_CHARS))}
+        )];
+        assert_eq!(
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &complex, &tiers, true),
+            Some("nemotron-3-nano:4b".to_string())
+        );
+        // Vision still wins over tools: an image-bearing tool call goes to
+        // the vision model.
+        let image_tools = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "caption this"},
+                {"type": "image_url", "image_url": {"url": "https://x/img.png"}}
+            ]
+        })];
+        assert_eq!(
+            reroute_for_gateway(
+                Some("qwen3:8b"),
+                Some("qwen3:8b"),
+                &image_tools,
+                &tiers,
+                true
+            ),
+            Some("minicpm-v4.6:1b".to_string())
+        );
+        // Disabled (empty) tool tier: the same request falls through to the
+        // deep rules — a suppressed no-op when deep resolves to the base.
+        let tiers_no_tool = RouterModels {
+            tool: String::new(),
+            ..upgraded_tiers()
+        };
+        assert_eq!(
+            reroute_for_gateway(
+                Some("qwen3:8b"),
+                Some("qwen3:8b"),
+                &msgs,
+                &tiers_no_tool,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn payload_has_tools_needs_a_nonempty_function_list() {
+        assert!(!payload_has_tools(&json!({"a": 1})));
+        assert!(!payload_has_tools(&json!({"tools": []})));
+        assert!(!payload_has_tools(&json!({"tools": "not-a-list"})));
+        assert!(payload_has_tools(&json!({
+            "tools": [{"type": "function", "function": {"name": "f"}}]
+        })));
     }
 
     /// Tiers whose deep model differs from the base — the realistic
@@ -216,7 +319,13 @@ mod tests {
     fn long_conversation_routes_to_deep() {
         let msgs = vec![json!({"role": "user", "content": "x".repeat(DEEP_MIN_CHARS)})];
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            reroute_for_gateway(
+                Some("qwen3:8b"),
+                Some("qwen3:8b"),
+                &msgs,
+                &upgraded_tiers(),
+                false
+            ),
             Some("qwen3-large-test".to_string())
         );
     }
@@ -228,7 +337,7 @@ mod tests {
         // with NO rewrite (and no misleading journal line).
         let msgs = vec![json!({"role": "user", "content": "x".repeat(DEEP_MIN_CHARS)})];
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers(), false),
             None
         );
     }
@@ -240,7 +349,13 @@ mod tests {
         )];
         assert!(is_complex(&msgs));
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            reroute_for_gateway(
+                Some("qwen3:8b"),
+                Some("qwen3:8b"),
+                &msgs,
+                &upgraded_tiers(),
+                false
+            ),
             Some("qwen3-large-test".to_string())
         );
     }
@@ -251,7 +366,13 @@ mod tests {
             {"role": "user", "content": "compare mentors [DEEP]"}
         )];
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            reroute_for_gateway(
+                Some("qwen3:8b"),
+                Some("qwen3:8b"),
+                &msgs,
+                &upgraded_tiers(),
+                false
+            ),
             Some("qwen3-large-test".to_string())
         );
     }
@@ -262,7 +383,13 @@ mod tests {
             .map(|i| json!({"role": "user", "content": format!("question {i}")}))
             .collect();
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &upgraded_tiers()),
+            reroute_for_gateway(
+                Some("qwen3:8b"),
+                Some("qwen3:8b"),
+                &msgs,
+                &upgraded_tiers(),
+                false
+            ),
             Some("qwen3-large-test".to_string())
         );
     }
@@ -281,7 +408,7 @@ mod tests {
         })];
         for msgs in [deepish, image] {
             assert_eq!(
-                reroute_for_gateway(Some("or-free"), Some("qwen3:8b"), &msgs, &tiers()),
+                reroute_for_gateway(Some("or-free"), Some("qwen3:8b"), &msgs, &tiers(), false),
                 None,
                 "a caller who explicitly pinned a model is never overridden"
             );
@@ -298,12 +425,13 @@ mod tests {
                 Some("jerith-mesh"),
                 Some("qwen3:8b"),
                 &complex,
-                &upgraded_tiers()
+                &upgraded_tiers(),
+                false
             ),
             Some("qwen3-large-test".to_string())
         );
         assert_eq!(
-            reroute_for_gateway(None, Some("qwen3:8b"), &complex, &upgraded_tiers()),
+            reroute_for_gateway(None, Some("qwen3:8b"), &complex, &upgraded_tiers(), false),
             Some("qwen3-large-test".to_string())
         );
     }
@@ -311,8 +439,8 @@ mod tests {
     #[test]
     fn empty_base_string_disables_routing() {
         let msgs = vec![json!({"role": "user", "content": "anything"})];
-        assert_eq!(route(&msgs, None), None);
-        assert_eq!(route(&msgs, Some("")), None);
+        assert_eq!(route(&msgs, None, false), None);
+        assert_eq!(route(&msgs, Some(""), false), None);
     }
 
     #[test]
@@ -323,7 +451,7 @@ mod tests {
         )];
         assert!(!has_image_content(&msgs));
         assert_eq!(
-            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers()),
+            reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers(), false),
             None
         );
     }

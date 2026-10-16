@@ -24,9 +24,15 @@ use crate::hw::OsKind;
 // Small-model tier catalog
 // ============================================================================
 
-/// The three local routing tiers a pick applies to.
+/// The four local routing tiers a pick applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTier {
+    /// Tool-calling tier (mesh `tool` tier): any chat request that
+    /// carries function definitions. Deliberately separate from the
+    /// thinking tier: tool-calling is a *format-reliability* property,
+    /// not a depth property (qwen3:8b is a fine thinker whose tool
+    /// parsing chokes while thinking; nemotron-3-nano:4b is 3/3 clean).
+    Tool,
     /// Tools + reasoning tier (mesh `deep` tier; routed on complex prompts).
     Thinking,
     /// Image-content tier (mesh `vision` tier).
@@ -39,6 +45,7 @@ pub enum ModelTier {
 impl ModelTier {
     pub fn label(self) -> &'static str {
         match self {
+            ModelTier::Tool => "tool-calling",
             ModelTier::Thinking => "thinking / tools",
             ModelTier::Vision => "vision",
             ModelTier::Embedding => "embedding",
@@ -47,6 +54,7 @@ impl ModelTier {
 
     pub fn config_field(self) -> &'static str {
         match self {
+            ModelTier::Tool => "runtime_tool_model",
             ModelTier::Thinking => "runtime_deep_model",
             ModelTier::Vision => "runtime_vision_model",
             ModelTier::Embedding => "specialists.embedding_model",
@@ -91,12 +99,26 @@ const THINKING: &[SmallModel] = &[
         size_hint: "~5 GiB",
         note: "reasoning-first; sets runtime_num_predict to cap loops",
     },
+];
+
+/// Tool-calling tier: requests that carry function definitions. The
+/// nemotron family is the proven-reliable local tool caller (measured
+/// 3/3 clean tool_call parses on the live runtime, 2026-10-16, vs
+/// qwen3:8b's parse failures whenever it is also thinking).
+const TOOL: &[SmallModel] = &[
     SmallModel {
         name: "nemotron-3-nano:4b",
         display: "Nemotron-3-Nano 4B",
-        tier: ModelTier::Thinking,
+        tier: ModelTier::Tool,
         size_hint: "~2.6 GiB",
-        note: "tool-calling tuned, very light",
+        note: "tool-calling tuned, very light — the mesh tool-tier default",
+    },
+    SmallModel {
+        name: "qwen3:8b",
+        display: "Qwen3 8B",
+        tier: ModelTier::Tool,
+        size_hint: "~5 GiB",
+        note: "deeper tool reasoning — unreliable parses while thinking",
     },
 ];
 
@@ -156,6 +178,7 @@ const EMBEDDING: &[SmallModel] = &[
 /// All curated small models for a tier, in picker order.
 pub fn small_models(tier: ModelTier) -> &'static [SmallModel] {
     match tier {
+        ModelTier::Tool => TOOL,
         ModelTier::Thinking => THINKING,
         ModelTier::Vision => VISION,
         ModelTier::Embedding => EMBEDDING,
@@ -174,13 +197,18 @@ pub fn default_small_model(tier: ModelTier) -> &'static SmallModel {
 /// still accepted by setup — this is only for validation + display.
 pub fn find_small_model(name: &str) -> Option<&'static SmallModel> {
     let name = normalize(name);
-    [ModelTier::Thinking, ModelTier::Vision, ModelTier::Embedding]
-        .into_iter()
-        .find_map(|tier| {
-            small_models(tier)
-                .iter()
-                .find(|m| normalize(m.name) == name)
-        })
+    [
+        ModelTier::Tool,
+        ModelTier::Thinking,
+        ModelTier::Vision,
+        ModelTier::Embedding,
+    ]
+    .into_iter()
+    .find_map(|tier| {
+        small_models(tier)
+            .iter()
+            .find(|m| normalize(m.name) == name)
+    })
 }
 
 fn normalize(name: &str) -> String {
@@ -387,7 +415,12 @@ mod tests {
 
     #[test]
     fn tiers_have_nonempty_catalogs_with_unique_names() {
-        for tier in [ModelTier::Thinking, ModelTier::Vision, ModelTier::Embedding] {
+        for tier in [
+            ModelTier::Tool,
+            ModelTier::Thinking,
+            ModelTier::Vision,
+            ModelTier::Embedding,
+        ] {
             let models = small_models(tier);
             assert!(!models.is_empty(), "{tier:?} catalog empty");
             let mut seen = std::collections::HashSet::new();
@@ -401,6 +434,11 @@ mod tests {
 
     #[test]
     fn defaults_are_first_of_each_tier_and_match_mesh_defaults() {
+        // Tool tier default is the measured-reliable tool caller.
+        assert_eq!(
+            default_small_model(ModelTier::Tool).name,
+            "nemotron-3-nano:4b"
+        );
         assert_eq!(default_small_model(ModelTier::Thinking).name, "qwen3:8b");
         assert_eq!(
             default_small_model(ModelTier::Vision).name,

@@ -30,11 +30,12 @@ from jerith_langchain.skills import lore_search, memory_search, memory_store, we
 
 TOOLBOX = [memory_store, memory_search, lore_search, web_search]
 
-# Tool agents need a temperature near 0 — and, measured on the live
-# runtime (2026-10-16), qwen3:8b through the LiteLLM-proxied Ollama
-# returns a bare `{}` instead of a parsed tool call on most tool
-# requests. The tool-calling-tuned nemotron family is reliable (nano 4B:
-# 3/3, super: 2/2) — pin it while thinking/qwen remains the chat tier:
+# With the node's tool tier pinned (`jerith config set
+# runtime_tool_model=nemotron-3-nano:4b`), the gateway reroutes every
+# tool-bearing request (like these) to the reliable tool caller
+# automatically — no JERITH_MODEL pin needed. Without the pin, note the
+# measured live-runtime behavior (2026-10-16): qwen3:8b thinking chokes
+# tool-call parsing ({}`) — pin a reliable tool-calling model instead:
 #     JERITH_MODEL=nemotron-3-nano:4b python3 langgraph_agent.py …
 llm = JerithChat(temperature=0.1).bind_tools(TOOLBOX)
 
