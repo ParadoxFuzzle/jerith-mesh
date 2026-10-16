@@ -57,6 +57,14 @@ pub struct RouterModels {
     pub deep: String,
 }
 
+/// Tool-tier model ids that demonstrably lost user traffic here: the
+/// 2026-10-16 incidents — nemotron-3-nano:4b answered tool-shape rounds
+/// with empty/degenerate content again and again (think:false included),
+/// stranding users on the empty-answer refusal. `from_config` warns
+/// loudly at boot when one is pinned so an operator sees the shipping
+/// hazard, and the test suite fails if the defaults ever drift back.
+pub const KNOWN_STRANDED_TOOL_MODELS: &[&str] = &["nemotron-3-nano:4b"];
+
 impl Default for RouterModels {
     fn default() -> Self {
         Self {
@@ -75,11 +83,26 @@ impl Default for RouterModels {
 /// must honor what setup/config wrote, not fall back to the defaults).
 impl RouterModels {
     pub fn from_config(cfg: &crate::config::NodeConfig) -> Self {
+        let tool = cfg.runtime_tool_model.clone().unwrap_or_default();
+        if KNOWN_STRANDED_TOOL_MODELS.contains(&tool.as_str()) {
+            tracing::warn!(
+                tool_tier = %tool,
+                "tool tier pinned to a model in KNOWN_STRANDED_TOOL_MODELS — this tier '
+                 historically returned empty answers and lost user traffic '
+                 (2026-10-16 incidents); switch to qwen3:8b or another proven '
+                 parse-reliable model unless you have verified it"
+            );
+        }
         Self {
-            tool: cfg.runtime_tool_model.clone().unwrap_or_default(),
+            tool,
             vision: cfg.runtime_vision_model.clone().unwrap_or_default(),
             deep: cfg.runtime_deep_model.clone().unwrap_or_default(),
         }
+    }
+
+    /// Whether this router pins a known-stranded model as the tool tier.
+    pub fn tool_tier_known_stranded(&self) -> bool {
+        KNOWN_STRANDED_TOOL_MODELS.contains(&self.tool.as_str())
     }
 }
 
@@ -211,6 +234,38 @@ mod tests {
 
     fn tiers() -> RouterModels {
         RouterModels::default()
+    }
+
+    #[test]
+    fn tool_tier_defaults_disabled_and_never_to_a_stranded_model() {
+        // Default pins nothing: an unpinned tier reroutes nothing. It must
+        // never silently drift onto a model that demonstrably lost users —
+        // the failing shapes are enumerated in KNOWN_STRANDED_TOOL_MODELS
+        // (nemotron empty/degenerate answers, 2026-10-16 incidents).
+        let d = RouterModels::default();
+        assert!(d.tool.is_empty());
+        assert!(!d.tool_tier_known_stranded());
+    }
+
+    #[test]
+    fn config_slip_onto_a_stranded_tool_tier_is_flagged() {
+        // Someone re-pins the incident model in node config: from_config
+        // accepts it (operator override stays authoritative) but the
+        // stranded-hazard flag fires so tests/metrics can notice. A proven
+        // tool model stays clean.
+        let stranded = crate::config::NodeConfig {
+            runtime_tool_model: Some("nemotron-3-nano:4b".to_string()),
+            ..Default::default()
+        };
+        assert!(RouterModels::from_config(&stranded).tool_tier_known_stranded());
+
+        let proven = crate::config::NodeConfig {
+            runtime_tool_model: Some("qwen3:8b".to_string()),
+            ..Default::default()
+        };
+        let tiers = RouterModels::from_config(&proven);
+        assert_eq!(tiers.tool, "qwen3:8b");
+        assert!(!tiers.tool_tier_known_stranded());
     }
 
     #[test]

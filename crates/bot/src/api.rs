@@ -606,11 +606,7 @@ pub async fn chat_with_usage_live(
                     tools_enabled = false;
                     continue;
                 }
-                return Ok((
-                    "⚠️ the runtime returned an empty answer — try rephrasing, or ask a direct question.".to_string(),
-                    served_by,
-                    tokens_used,
-                ));
+                return Ok((EMPTY_ANSWER_REFUSAL.to_string(), served_by, tokens_used));
             }
             return Ok((content, served_by, tokens_used));
         }
@@ -750,6 +746,9 @@ fn truncate_degenerate_head(content: &str) -> String {
         })
         .collect()
 }
+
+pub const EMPTY_ANSWER_REFUSAL: &str =
+    "⚠️ the runtime returned an empty answer — try rephrasing, or ask a direct question.";
 
 pub fn answer_is_degenerate(content: &str) -> bool {
     let t = content.trim();
@@ -2168,5 +2167,51 @@ mod tests {
             .await
             .expect("post-tool degenerate retry");
         assert_eq!(reply, "Recovered.");
+    }
+
+    /// LIVE smoke: the real tool loop, degenerate gate, and retry landing
+    /// against the node's running gateway — the same path a Discord message
+    /// rides (runtime + runtime_tool_model reroute + web_search skill).
+    /// Never runs in CI (needs the live node + brave key): run manually
+    /// with `cargo test -p jerith-mesh-bot -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs the live gateway at 127.0.0.1:8900 — run with --ignored"]
+    async fn live_gateway_chats_never_refuse_with_an_empty_answer() {
+        use crate::api::EMPTY_ANSWER_REFUSAL;
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:8900", "http://127.0.0.1:8322");
+        cfg.web.enabled = true;
+        // Bound each request (thinking 4b deep-tier rounds run long); without
+        // a cap a single wedged round eats the whole test budget.
+        cfg.chat_timeout_secs = 120;
+        // Lane coverage: a plain question (deep-tier reroute), a web-search
+        // tool-loop prompt (the shape that kept stranding empty answers),
+        // and a second web question proving a fresh loop right after the
+        // first one. chat() is the line-identical Discord reply path.
+        for (i, prompt) in [
+            "Where was the isopress kiln built?",
+            "Search the web for the isopress kiln and tell me the town.",
+            "Where was the isopress kiln built?",
+        ]
+        .iter()
+        .enumerate()
+        {
+            eprintln!("[smoke] #{i} asking: {prompt}");
+            let (reply, _served_by) =
+                tokio::time::timeout(std::time::Duration::from_secs(170), chat(&cfg, prompt, &[]))
+                    .await
+                    .expect("live chat wall-clock bound per prompt")
+                    .unwrap_or_else(|e| panic!("live chat #{i} errored: {e} — prompt: {prompt}"));
+            eprintln!("[smoke] #{i} replied in-lane: {} chars", reply.len());
+            assert!(
+                !reply.contains(EMPTY_ANSWER_REFUSAL),
+                "live chat #{i} refused empty — prompt: {prompt} — reply: {reply}"
+            );
+            assert!(
+                !crate::api::answer_is_degenerate(&reply),
+                "live chat #{i} replied degenerate ({len} chars) — prompt: {prompt} — reply: {reply}",
+                len = reply.len()
+            );
+        }
     }
 }

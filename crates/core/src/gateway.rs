@@ -1244,6 +1244,7 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                         .await;
                     return match result {
                         Ok((content, served_by)) => {
+                            let content = sanitize_runtime_text(&content);
                             {
                                 let mut meters = gw.state.meters.lock().await;
                                 meters.tokens_served += 1;
@@ -1301,6 +1302,7 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                     .await;
                 return match result {
                     Ok((content, served_by)) => {
+                        let content = sanitize_runtime_text(&content);
                         {
                             let mut meters = gw.state.meters.lock().await;
                             meters.tokens_served += 1;
@@ -1401,6 +1403,24 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
         meters.bytes_relayed += bytes.len() as u64;
     }
     let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
+    // Display hygiene (buffered lane): some runtime models print HTML
+    // break tags and reasoning-trace markers straight into visible text
+    // (observed verbatim from deepseek-r1 via ollama: `<br>`, `</think>`).
+    // Strip the TAGS, keep the words — artifact removal, not censorship.
+    // The SSE passthrough above cannot do this reliably: a tag can straddle
+    // a chunk boundary (~"<br" + ">"), so streamed clients get the raw
+    // generation; the bot folds stream rounds before any final render and
+    // can sanitize there in a follow-up.
+    let bytes = match parsed {
+        Ok(mut body) => {
+            sanitize_choices(&mut body);
+            serde_json::to_vec(&body)
+                .map(Into::into)
+                .unwrap_or_else(|_| bytes)
+        }
+        Err(_) => bytes,
+    };
+    let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
     if let Ok(body) = &parsed {
         // Tokens metered when usage is present.
         if let Some(usage) = body.get("usage") {
@@ -1436,6 +1456,81 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
         }
     }
     (status, [("content-type", "application/json")], bytes).into_response()
+}
+
+/// Visual noise some runtime models print into otherwise-good text: HTML
+/// break tags (which render as literal debris in chat UIs — what the model
+/// meant was a line break) and reasoning-trace markers leaked outside the
+/// dedicated field (observed verbatim: deepseek-r1 inlining `</think>` in
+/// content). Tags go, words stay.
+/// Visual noise some runtime models print into otherwise-good text: HTML
+/// break tags (which render as literal debris in chat UIs — what the model
+/// meant was a line break) and reasoning-trace markers leaked into content
+/// (observed verbatim: deepseek-r1 inlining a close marker after prose).
+/// Tags go, words stay. The scanner works token-wise rather than matching
+/// whole tag literals: the markers arrive with stray whitespace variants
+/// and the marker glyphs are risky to transcribe into source — the scanner
+/// is robust to both.
+fn sanitize_runtime_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        match after_open.find('>') {
+            Some(close) => {
+                let inner = &after_open[..close];
+                let word: String = inner
+                    .chars()
+                    .filter(|c| !matches!(c, ' ' | '/' | '\t'))
+                    .collect::<String>()
+                    .to_lowercase();
+                match word.as_str() {
+                    "think" => {} // reasoning-trace marker: gone, words kept
+                    "br" => out.push('\n'),
+                    // Unknown tag: not our display-hygiene business — keep it.
+                    _ => {
+                        out.push('<');
+                        out.push_str(inner);
+                        out.push('>');
+                    }
+                }
+                rest = &after_open[close + 1..];
+            }
+            None => {
+                // Unterminated '<': not a tag, emit the tail as-is.
+                out.push_str(&rest[open..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Sanitize every choice's assistant text content of a chat-completion
+/// body, in place. Non-string content (null tool-call rounds, multimodal
+/// arrays) is left untouched.
+fn sanitize_choices(body: &mut Value) {
+    let Some(choices) = body.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices {
+        let Some(message) = choice.get_mut("message") else {
+            continue;
+        };
+        let Some(content) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let cleaned = sanitize_runtime_text(&content);
+        if cleaned != content {
+            message["content"] = Value::String(cleaned);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2133,5 +2228,60 @@ mod tests {
         assert!(res.status_code().is_success());
         let forwarded: Value = serde_json::from_str(&received.lock().await).expect("runtime body");
         assert_eq!(forwarded["model"], json!("base:7b"));
+    }
+
+    #[tokio::test]
+    async fn buffered_runtime_answers_are_sanitized_of_html_and_trace_tags() {
+        // The runtime laces visible text with `<br>` debris and a leaked
+        // `</think>` marker (observed verbatim from deepseek-r1 via ollama,
+        // 2026-10-16): the gateway relays the words, not the artifacts.
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": "A<br>B\u{3C}think\u{3E}C</br>D<br />E"
+                    }}],
+                    "usage": {"total_tokens": 9}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+        let runtime_url = format!("http://{addr}");
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.clone(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url,
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("m".to_string()),
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+            .await;
+        assert!(res.status_code().is_success());
+        let body: Value = res.json();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            json!("A\nBC\nD\nE")
+        );
     }
 }
