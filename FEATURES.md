@@ -191,7 +191,10 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   each win and restored on startup
   `/mine` wins optionally post to a channel via
   `JERITH_ANNOUNCE_CHANNEL_ID` (or `announce_channel_id` in bot.toml)
-- 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+)
+- 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+) — the
+  how is now pre-registered: [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md)
+  (manifest-registered external skills, the dialogue-core seam for
+  channel transports, phasing, falsification tests)
 
 ## 8. Plugin / Skill System
 - 🔄 OpenClaw-style modular plugin and skill architecture (Phase 3 core ✅;

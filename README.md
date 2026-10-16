@@ -165,6 +165,7 @@ on the node except the model calls you route through the mesh.
 | [FEATURES.md](FEATURES.md) | Full feature list distilled from the spec |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Phases, wire protocol, MoE routing, anti-fraud, economics |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | Plugin/skill system: registry, gating, authoring a skill, hooks |
+| [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md) | Design (Phase 3+): external-process plugins, Telegram/WhatsApp transports |
 | docs/SETUP.md | Setup walkthrough (planned) |
 
 ## Repo layout
