@@ -773,4 +773,74 @@ mod tests {
             assert!(f["parameters"]["properties"].is_object());
         }
     }
+
+    /// Phase 3a registry-level proof: an external skill joined via
+    /// `with_external` dispatches through `registry.dispatch` (the tool
+    /// loop's actual call path) to a real local HTTP stub — tool schema
+    /// shape, namespaced gating, the HTTP hop, and the refusal contract
+    /// all in one pass. invoke()'s own tests cover the wire details;
+    /// this one covers the JOIN.
+    #[tokio::test]
+    async fn external_skill_dispatches_through_the_registry() {
+        let outcome = serde_json::json!({"provider": "open-meteo", "temperature_c": 21.5});
+        // The stub lives on THIS test's runtime — spawning it into a
+        // throwaway block_on runtime dies with that runtime and every
+        // later dispatch hits "connection refused".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve_outcome = outcome.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/rpc",
+                axum::routing::post(move || {
+                    let body = serve_outcome.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let make_plugin = |endpoint: String| crate::external::ExternalPlugin {
+            id: "weather".into(),
+            endpoint,
+            secret: None,
+            timeout_secs: 5,
+            skills: vec![crate::external::ExternalSkill {
+                name: "weather.now".into(),
+                description: "current conditions".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"place": {"type": "string"}},
+                    "required": ["place"]
+                }),
+            }],
+        };
+
+        // Gated ON through the namespaced id — the way bot.toml says it.
+        let reg = SkillRegistry::standard(["external:weather"])
+            .with_external(vec![make_plugin(format!("http://{addr}/rpc"))])
+            .expect("drop joins cleanly");
+        let names = reg.enabled_skill_names();
+        assert!(
+            names.iter().any(|n| n == "weather.now"),
+            "whitelist: {names:?}"
+        );
+        // The tool def reaches the chat payload shaped right.
+        let defs = reg.tool_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["function"]["name"], "weather.now");
+        // Dispatch — the registry → HTTP hop the tool loop exercises.
+        let hit = reg
+            .dispatch(&test_cfg(), "weather.now", &json!({"place": "Praha"}))
+            .await;
+        assert_eq!(hit.unwrap(), outcome);
+
+        // The plugin NOT in [plugins] enabled → refusal, no HTTP call.
+        let off = SkillRegistry::standard(Vec::<String>::new())
+            .with_external(vec![make_plugin(format!("http://{addr}/rpc"))])
+            .unwrap();
+        let refused = off
+            .dispatch(&test_cfg(), "weather.now", &json!({"place": "Praha"}))
+            .await;
+        assert_err_mentions(&refused, "unknown or disabled");
+    }
 }

@@ -454,6 +454,14 @@ pub async fn chat_with_usage_live(
     let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt);
 
     let mut rounds = 0usize;
+    // One retry against a degenerate answer, whichever lane produced it.
+    // The old `rounds == 0` gate skipped the retry whenever a tool round
+    // had already run (live 2026-10-16: the model answered round 1 with
+    // 289 chars of ●-glyph placeholders right after a web_search round —
+    // caught as degenerate, retried zero times, straight to the refusal).
+    // A toolless retry over the accumulated exchange usually lands real
+    // text; a second degenerate answer still falls to the refusal.
+    let mut degenerate_retried = false;
     // Per-request bound ([chat] timeout_secs, default 240 s): slow thinking
     // answers are legit — the gateway bounds the local runtime's header wait
     // at 180 s and hands off to mesh fallback, so the bot's bound only needs
@@ -461,6 +469,25 @@ pub async fn chat_with_usage_live(
     // old shared client constant imposed.
     let chat_timeout = std::time::Duration::from_secs(cfg.chat_timeout_secs);
     loop {
+        // Round budget exhausted mid-tool-loop: land the answer BEFORE
+        // sending another request (no wasted round). The model that just
+        // spent three rounds calling tools replies to round four with
+        // ANOTHER tool_call shaped body (observed live on the tool tier,
+        // 2026-10-16 — think:false + fed-back results): taking that
+        // round's `content` verbatim means null text and the
+        // graceful-refusal error the user sees. One final TOOLLESS round
+        // over the accumulated exchange forces the model to answer from
+        // what it gathered; only a degenerate answer from THERE falls
+        // back to the plain-refusal path below.
+        if rounds >= MAX_TOOL_ROUNDS && tools_enabled {
+            tracing::info!(
+                target: "bot",
+                rounds,
+                "tool round budget exhausted — one toolless landing round"
+            );
+            tools_enabled = false;
+            continue;
+        }
         // Round boundary for live taps: whatever the previous round typed
         // (tool-intent slop, nothing for native tool_call rounds) clears
         // here, before this round's fragments arrive.
@@ -522,11 +549,11 @@ pub async fn chat_with_usage_live(
                 "function": {"name": name, "arguments": args.to_string()},
             })];
         }
-        // No tool use (or out of rounds): the plain chat answer — unless
-        // it is degenerate ("{}", braces-only JSON, empty): one toolless
-        // retry, then a graceful refusal, never braces rendered verbatim
-        // into the chat (observed live, see the share incident above).
-        if !tools_enabled || tool_calls.is_empty() || rounds >= MAX_TOOL_ROUNDS {
+        // No tool use: the plain chat answer — unless it is degenerate
+        // ("{}", braces-only JSON, empty): one toolless retry, then a
+        // graceful refusal, never braces rendered verbatim into the chat
+        // (observed live, see the share incident above).
+        if !tools_enabled || tool_calls.is_empty() {
             let content = body
                 .pointer("/choices/0/message/content")
                 .and_then(value_to_string)
@@ -574,7 +601,8 @@ pub async fn chat_with_usage_live(
                 // case above comes from the plain lane). When tools WERE on,
                 // the retry runs toolless: a `{` opener usually means the
                 // model was fumbling a tool intent it cannot really make.
-                if rounds == 0 {
+                if !degenerate_retried {
+                    degenerate_retried = true;
                     tools_enabled = false;
                     continue;
                 }
@@ -1993,5 +2021,152 @@ mod tests {
                 "after web search.".to_string()
             ]
         );
+    }
+
+    /// Budget-exhausted tool loop (observed live 2026-10-16 with the tool
+    /// tier feeding results back, think:false): nemotron re-issues tool
+    /// calls every round, so the round after the cap would strand the user
+    /// with null content → the graceful refusal. The loop must spend one
+    /// final TOOLLESS round over the gathered exchange and land its text.
+    #[tokio::test]
+    async fn chat_tool_loop_budget_exhaustion_lands_toolless_answer() {
+        use std::sync::Arc;
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let calls_seen = calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| async move {
+                    let has_tools = req.get("tools").is_some();
+                    calls_seen.lock().expect("test calls").push(has_tools);
+                    let has_tool_result = req["messages"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|m| m["role"] == json!("tool")));
+                    // Every round WITH tools: another tool call, no text —
+                    // the live shape that used to strand empty content.
+                    if has_tools {
+                        axum::Json(json!({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "tool_calls": [{"id": "c", "type": "function", "function": {
+                                    "name": "web_search", "arguments": "{\"query\":\"kiln\"}"
+                                }}]
+                            }}],
+                            "usage": {"total_tokens": 5}
+                        }))
+                    } else if has_tool_result {
+                        // The toolless landing round: answers from what it
+                        // gathered instead of calling another tool.
+                        axum::Json(json!({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "content": "Landed after the tool budget."
+                            }}],
+                            "usage": {"total_tokens": 4}
+                        }))
+                    } else {
+                        // Toolless first round never answered with a tool
+                        // call here (budget only exhausts after tool rounds).
+                        axum::Json(json!({
+                            "choices": [{"message": {"role": "assistant", "content": "plain"}}]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/skills/web/search",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"results": [{"title": "K", "url": "https://k"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+        let (reply, served_by) = chat(&cfg, "find the kiln", &[])
+            .await
+            .expect("budget-exhausted loop chat");
+        assert_eq!(reply, "Landed after the tool budget.");
+        assert!(served_by.is_none());
+        // Rounds: three tool calls, then the toolless landing — never a
+        // fourth tool round.
+        assert_eq!(
+            calls.lock().expect("test calls").as_slice(),
+            &[true, true, true, false]
+        );
+    }
+
+    /// A degenerate answer AFTER a tool round still gets its one retry
+    /// (observed live 2026-10-16: 289 chars of ●-glyph placeholders arrived
+    /// right after a web_search round; the old rounds==0 gate skipped the
+    /// retry and the user ate the refusal).
+    #[tokio::test]
+    async fn chat_degenerate_after_tool_round_is_retried_toolless() {
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|axum::Json(req): axum::Json<Value>| async move {
+                    let ms = req["messages"].as_array().unwrap();
+                    // The toolless RETRY round still carries the round-0
+                    // tool messages — branch on it FIRST.
+                    let plain_retried = !req.get("tools").is_some();
+                    let has_tool_result = ms.iter().any(|m| m["role"] == json!("tool"));
+                    if !plain_retried && !has_tool_result {
+                        // Round 0: the model makes a tool call (one round of
+                        // tool work, then the degenerate answer follows).
+                        axum::Json(json!({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "tool_calls": [{"id": "c", "type": "function", "function": {
+                                    "name": "web_search", "arguments": "{\"query\":\"kiln\"}"
+                                }}]
+                            }}]
+                        }))
+                    } else if !plain_retried && has_tool_result {
+                        // Round 1: a JSON-envelope degenerate (the live
+                        // 2026-10-16 shape; the journal's ●-dots are the
+                        // gate's redaction mask over this kind of body).
+                        axum::Json(json!({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "content": "{\"status\": \"generating\", \"message\": \"\"}"
+                            }}]
+                        }))
+                    } else {
+                        // Toolless retry over the gathered exchange
+                        axum::Json(json!({
+                            "choices": [{"message": {"role": "assistant", "content": "Recovered."}}]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/skills/web/search",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"results": [{"title": "K", "url": "https://k"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+        let (reply, _) = chat(&cfg, "find the kiln", &[])
+            .await
+            .expect("post-tool degenerate retry");
+        assert_eq!(reply, "Recovered.");
     }
 }
