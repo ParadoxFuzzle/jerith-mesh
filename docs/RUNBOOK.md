@@ -325,6 +325,16 @@ loops ran on the base model — qwen3:8b returns `{}` on tool payloads
 while thinking; see the LangChain integration README for the byte-level
 finding).
 
+The tool tier's forwarded payloads also carry **`think: false`**
+(2026-10-16): nemotron put its whole response inside the reasoning
+channel and ollama answered `content: ""` at exactly the cap
+(`finish_reason: stop`, zero content) — the "⚠️ the runtime returned an
+empty answer" family the bot showed its users. Merged at the gateway on
+tool-tier reroutes ONLY (deep-tier/pinned requests keep their thinking;
+LiteLLM drops the unknown field, so the merge is inert elsewhere).
+Live-proven: the previously-empty probe now lands `finish_reason:
+tool_calls` in-budget.
+
 **Single-model trap:** every tier key serde-defaults *enabled* (a fresh
 config without the key gets the tool pick `nemotron-3-nano:4b` and the
 vision pick `minicpm-v4.6:1b`). On a node that deliberately serves one

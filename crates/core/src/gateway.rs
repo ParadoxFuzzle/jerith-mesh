@@ -1068,7 +1068,16 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
     // image content → vision tier; complex prompt → deep tier; basic
     // chat → caller's model untouched. Only *unpinned* requests
     // (placeholder / advertised base model) are reroutable, so
-    // explicit model choices always win.
+    // explicit model choices always win. On a tool-tier reroute the
+    // payload also gets `think: false`: thinking models burn the whole
+    // generation budget inside their reasoning channel before emitting
+    // any tool call or text, and ollama then reports `content: ""` with
+    // finish_reason stop at exactly the cap — the "runtime returned an
+    // empty answer" family. Disabling thinking on the parse-reliability
+    // tier (only) keeps the budget for actual calls; deep-tier and
+    // pinned requests keep their thinking untouched. ollama honors the
+    // field on /v1; LiteLLM drops unknown params (drop_params), so the
+    // merge is inert everywhere else.
     if let (Some(router), Some(messages)) = (
         &gw.model_router,
         body.get("messages").and_then(|m| m.as_array()),
@@ -1087,6 +1096,9 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                 to = %next,
                 "model router: rerouted chat request"
             );
+            if !router.tool.is_empty() && next == router.tool {
+                body["think"] = serde_json::Value::Bool(false);
+            }
             body["model"] = serde_json::Value::String(next);
         }
     }
@@ -1795,6 +1807,104 @@ mod tests {
         )
         .await;
         assert_eq!(forwarded.get("max_tokens"), None);
+    }
+
+    /// Tool/Deep tier reroutes: the tool tier's forwarded body must carry
+    /// `think: false` (budget goes to calls/text, not the reasoning
+    /// channel — the "empty answer at exactly the cap" degenerate), while
+    /// the deep tier keeps thinking and basic chats keep the caller's
+    /// model untouched with no think key at all.
+    #[tokio::test]
+    async fn tier_reroutes_forward_think_false_only_for_the_tool_tier() {
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new("".to_string()));
+        let recv = received.clone();
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let recv = recv.clone();
+                async move {
+                    *recv.lock().await = body;
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.expect("runtime up") });
+        let runtime_url = format!("http://{addr}");
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.clone(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        cfg.runtime_tool_model = Some("tier-tool:9b".to_string());
+        cfg.runtime_deep_model = Some("tier-deep:9b".to_string());
+        let (state, _rx) = MeshState::new(cfg.clone()).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: runtime_url.clone(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: Some(std::sync::Arc::new(
+                crate::model_router::RouterModels::from_config(&cfg),
+            )),
+            base_model: None,
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+
+        let tool_request = json!({
+            "model": "jerith-mesh",
+            "messages": [{"role": "user", "content": "search the notes"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "search",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+        server
+            .post("/v1/chat/completions")
+            .json(&tool_request)
+            .await;
+        let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
+        assert_eq!(forwarded["model"], json!("tier-tool:9b"), "tool reroute");
+        assert_eq!(
+            forwarded["think"],
+            json!(false),
+            "tool tier disables thinking"
+        );
+
+        let deep_request = json!({
+            "model": "jerith-mesh",
+            "messages": [{"role": "user", "content": "x".repeat(5000)}]
+        });
+        server
+            .post("/v1/chat/completions")
+            .json(&deep_request)
+            .await;
+        let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
+        assert_eq!(forwarded["model"], json!("tier-deep:9b"), "deep reroute");
+        assert_eq!(forwarded.get("think"), None, "deep tier keeps thinking");
+
+        let basic = json!({
+            "model": "jerith-mesh",
+            "messages": [{"role": "user", "content": "hey"}]
+        });
+        server.post("/v1/chat/completions").json(&basic).await;
+        let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
+        assert_eq!(forwarded["model"], json!("jerith-mesh"), "basic untouched");
+        assert_eq!(forwarded.get("think"), None);
     }
 
     #[tokio::test]
