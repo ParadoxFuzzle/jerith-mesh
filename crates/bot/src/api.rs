@@ -439,9 +439,11 @@ pub async fn chat_with_usage_live(
     // registry decides what's summonable; see plugins.rs). Unsupported
     // model/runtimes get exactly one toolless retry below — tools degrade,
     // never fail the chat.
-    let registry = std::sync::Arc::new(crate::plugins::SkillRegistry::standard(
-        cfg.plugins.enabled.clone(),
-    ));
+    let registry = std::sync::Arc::new(
+        crate::plugins::SkillRegistry::standard(cfg.plugins.enabled.clone())
+            .with_external(cfg.external_plugins.clone())
+            .expect("external drops validated at config load"),
+    );
     const MAX_TOOL_ROUNDS: usize = 3;
     // Tokens accumulated across rounds (session-cost-tracker port input).
     let mut tokens_used: u64 = 0;
@@ -771,7 +773,7 @@ pub fn answer_is_degenerate(content: &str) -> bool {
 /// Returns the function name and parsed arguments. `allowed` is exactly
 /// the registry's enabled skill names (`plugins.rs`) — a model can never
 /// summon a disabled or unknown tool through here.
-fn content_tool_intent(body: &Value, allowed: &[&str]) -> Option<(String, Value)> {
+fn content_tool_intent(body: &Value, allowed: &[String]) -> Option<(String, Value)> {
     let content = body
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)?;
@@ -788,7 +790,7 @@ fn content_tool_intent(body: &Value, allowed: &[&str]) -> Option<(String, Value)
         .or_else(|| v.get("name"))
         .or_else(|| v.get("tool"))
         .and_then(Value::as_str)?;
-    if !allowed.contains(&name) {
+    if !allowed.iter().any(|a| a == name) {
         return None;
     }
     let args = v

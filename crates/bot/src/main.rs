@@ -16,6 +16,7 @@ mod archiver;
 mod chat_fallback;
 mod commands;
 mod config;
+mod external;
 mod hooks;
 mod mailbox;
 mod monitor;

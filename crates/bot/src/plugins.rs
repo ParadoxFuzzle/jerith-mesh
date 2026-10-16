@@ -25,6 +25,10 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
 
+/// Pre-packaged plugin ids (`[plugins] enabled = [...]` in bot.toml).
+/// Bare ids gate in-tree plugins; external drops gate as `external:<id>`.
+pub const PREPACKAGED_PLUGINS: [&str; 5] = ["websearch", "memory", "lore", "squeeze", "vision"];
+
 /// Boxed executor future for one model-requested skill call.
 type BoxedSkillFut<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send + 'a>>;
 
@@ -62,9 +66,6 @@ impl SkillSpec {
         })
     }
 }
-
-/// Pre-packaged plugin ids (`[plugins] enabled = [...]` in bot.toml).
-pub const PREPACKAGED_PLUGINS: [&str; 5] = ["websearch", "memory", "lore", "squeeze", "vision"];
 
 /// All pre-packaged model-facing skills. The bot-side `squeeze` plugin
 /// intentionally has no entries (it registers no skills).
@@ -335,12 +336,33 @@ async fn vision_call(
     Ok(body)
 }
 
+/// One manifest-declared skill joined into the registry (Phase 3a,
+/// `docs/PLUGIN-SDK.md`): same public shape as an in-tree `SkillSpec`
+/// (tool def, whitelist, refusal contract) but its executor is the
+/// out-of-process HTTP dispatcher in `external.rs`, keyed by the drop
+/// itself.
+#[derive(Debug, Clone)]
+pub struct ExternalSkillEntry {
+    /// Qualified model-visible name (`weather.now`).
+    pub name: String,
+    /// Gating id in `[plugins] enabled` (`external:weather`).
+    pub gate: String,
+    pub description: String,
+    pub parameters: Value,
+    /// Endpoint + secret + timeout for the dispatcher.
+    pub plugin: crate::external::ExternalPlugin,
+}
+
 /// The registry: every skill the bot could have, plus the enabled-plugin
 /// gate from `[plugins]` in bot.toml. All model-facing callables flow
 /// through here — tool declarations, the tool whitelist, and dispatch.
+/// In-tree skills live in `skills`; manifest-declared external plugins
+/// join into `external` (gated by `external:<id>` ids) without touching
+/// the in-tree table.
 #[derive(Debug, Clone)]
 pub struct SkillRegistry {
     skills: Vec<SkillSpec>,
+    external: Vec<ExternalSkillEntry>,
     /// Enabled plugin ids; also the dispatch whitelist.
     enabled_plugins: std::collections::BTreeSet<String>,
 }
@@ -359,6 +381,7 @@ impl SkillRegistry {
     ) -> Self {
         Self {
             skills,
+            external: Vec::new(),
             enabled_plugins: enabled_plugins
                 .into_iter()
                 .map(|p| p.as_ref().to_string())
@@ -366,15 +389,100 @@ impl SkillRegistry {
         }
     }
 
-    /// Validate a `[plugins] enabled` list against the pre-packaged ids.
-    /// Unknown names return an error naming the culprit — mistyped feature
-    /// flags should fail loud, not sit silently off.
-    pub fn check_config_enabled(entries: &[String]) -> anyhow::Result<()> {
+    /// Join parsed external-plugin drops (Phase 3a): each manifest skill
+    /// becomes a registry entry gated by its `external:<id>` id. Name
+    /// collisions with in-tree skills fail loud here too — a drop that
+    /// shadows a built-in must be fixed, not silently ranked.
+    pub fn with_external(
+        mut self,
+        plugins: Vec<crate::external::ExternalPlugin>,
+    ) -> anyhow::Result<Self> {
+        for plugin in plugins {
+            let gate = plugin.gate_id();
+            for skill in &plugin.skills {
+                anyhow::ensure!(
+                    !skill.name.is_empty(),
+                    "external:{}: empty skill name",
+                    plugin.id
+                );
+                anyhow::ensure!(
+                    !self.skills.iter().any(|s| s.name == skill.name),
+                    "external skill {name:?} collides with a built-in skill",
+                    name = skill.name
+                );
+                anyhow::ensure!(
+                    !gate.is_empty(),
+                    "external:{}: missing plugin id",
+                    plugin.id
+                );
+                self.external.push(ExternalSkillEntry {
+                    name: skill.name.clone(),
+                    gate: gate.clone(),
+                    description: skill.description.clone(),
+                    parameters: skill.parameters.clone(),
+                    plugin: plugin.clone(),
+                });
+            }
+        }
+        Ok(self)
+    }
+
+    fn external_enabled(&self, e: &ExternalSkillEntry) -> bool {
+        self.enabled_plugins.contains(&e.gate)
+    }
+
+    /// Validate a `[plugins] enabled` list against the pre-packaged ids
+    /// and the parsed external drops (`external:<id>` entries must have a
+    /// matching drop). Unknown names return an error naming the culprit —
+    /// mistyped feature flags (either kind) should fail loud, not sit
+    /// silently off. Drops scanned from a missing `plugins.d` make any
+    /// `external:*` entry unknown → fail loud.
+    pub fn check_config_enabled(
+        entries: &[String],
+        external: &[crate::external::ExternalPlugin],
+    ) -> anyhow::Result<()> {
         for e in entries {
-            if !PREPACKAGED_PLUGINS.contains(&e.as_str()) {
+            if let Some(drop_id) = e.strip_prefix("external:") {
+                let known = if external.is_empty() {
+                    "none".to_string()
+                } else {
+                    external
+                        .iter()
+                        .map(|p| p.id.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                anyhow::ensure!(
+                    external.iter().any(|p| p.id == drop_id),
+                    "unknown plugin `{e}` in [plugins] enabled — no drop with id \
+                     {drop_id:?} in plugins.d (known external: {known})",
+                );
+            } else if !PREPACKAGED_PLUGINS.contains(&e.as_str()) {
                 anyhow::bail!(
-                    "unknown plugin `{e}` in [plugins] enabled — known: {}",
+                    "unknown plugin `{e}` in [plugins] enabled — known: {} (external drops \
+                     must be gated as `external:<id>`)",
                     PREPACKAGED_PLUGINS.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// In-tree name-collision gate for external drops (checked at config
+    /// load, before any registry is built): a manifest skill must not
+    /// shadow a built-in — the drop author fixes their name, the bot
+    /// doesn't play ranking games with its own skills.
+    pub fn check_external_collisions(
+        external: &[crate::external::ExternalPlugin],
+    ) -> anyhow::Result<()> {
+        for plugin in external {
+            for skill in &plugin.skills {
+                anyhow::ensure!(
+                    !standard_skills().iter().any(|s| s.name == skill.name),
+                    "external skill {name:?} collides with a built-in skill — \
+                     rename it in the manifest (names are plugin-qualified unless \
+                     they shadow a built-in)",
+                    name = skill.name
                 );
             }
         }
@@ -386,40 +494,75 @@ impl SkillRegistry {
     }
 
     /// OpenAI tool declarations for every enabled skill — what the chat
-    /// payload's `tools` array gets.
+    /// payload's `tools` array gets. Joined-in external skills shape
+    /// identically (same function-declaration JSON) so the model can't
+    /// tell the difference.
     pub fn tool_defs(&self) -> Vec<Value> {
         self.skills
             .iter()
             .filter(|s| self.enabled(s))
             .map(SkillSpec::tool_def)
+            .chain(
+                self.external
+                    .iter()
+                    .filter(|e| self.external_enabled(e))
+                    .map(|e| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": e.name,
+                                "description": e.description,
+                                "parameters": e.parameters,
+                            }
+                        })
+                    }),
+            )
             .collect()
     }
 
     /// Names of enabled skills — the dispatch whitelist (the model can
-    /// never summon a disabled or unknown tool).
-    pub fn enabled_skill_names(&self) -> Vec<&'static str> {
+    /// never summon a disabled or unknown tool). In-tree names come back
+    /// first, then the enabled external ones.
+    pub fn enabled_skill_names(&self) -> Vec<String> {
         self.skills
             .iter()
             .filter(|s| self.enabled(s))
-            .map(|s| s.name)
+            .map(|s| s.name.to_string())
+            .chain(
+                self.external
+                    .iter()
+                    .filter(|e| self.external_enabled(e))
+                    .map(|e| e.name.clone()),
+            )
             .collect()
     }
 
     /// Execute a model-requested skill by name. Unknown or disabled
     /// skills are refused (the tool loop surfaces the error to the model,
-    /// which can recover; the chat itself never fails on it).
+    /// which can recover; the chat itself never fails on it). External
+    /// entries dispatch over HTTP with their own gating, refusals and
+    /// typed errors identical to the in-tree contract.
     pub async fn dispatch(
         &self,
         cfg: &crate::config::BotConfig,
         name: &str,
         args: &Value,
     ) -> anyhow::Result<Value> {
-        let spec = self
+        if let Some(spec) = self
             .skills
             .iter()
             .find(|s| s.name == name && self.enabled(s))
-            .ok_or_else(|| anyhow::anyhow!("skill {name:?} unknown or disabled"))?;
-        (spec.run)(cfg, args).await
+        {
+            return (spec.run)(cfg, args).await;
+        }
+        if let Some(entry) = self
+            .external
+            .iter()
+            .find(|e| e.name == name && self.external_enabled(e))
+        {
+            return crate::external::invoke(&entry.plugin, &entry.name, args).await;
+        }
+        anyhow::bail!("skill {name:?} unknown or disabled")
     }
 }
 
@@ -457,6 +600,7 @@ mod tests {
             archiver: Default::default(),
             squeeze: Default::default(),
             monitor: Default::default(),
+            external_plugins: Vec::new(),
             chat_timeout_secs: 240,
             chat_stream: false,
         }
@@ -482,7 +626,7 @@ mod tests {
             "vision.describe",
             "vision.analyze",
         ] {
-            assert!(names.contains(&expect), "missing {expect}");
+            assert!(names.iter().any(|n| n == expect), "missing {expect}");
         }
         // 7 model-facing skills; squeeze is bot-side (no tool def anywhere).
         assert_eq!(names.len(), 7);
@@ -607,9 +751,10 @@ mod tests {
     #[test]
     fn unknown_plugin_id_in_config_fails_loud() {
         assert!(
-            SkillRegistry::check_config_enabled(&["websearch".into(), "squeeze".into()]).is_ok()
+            SkillRegistry::check_config_enabled(&["websearch".into(), "squeeze".into()], &[],)
+                .is_ok()
         );
-        let err = SkillRegistry::check_config_enabled(&["websearch_typo".into()])
+        let err = SkillRegistry::check_config_enabled(&["websearch_typo".into()], &[])
             .expect_err("unknown plugin must fail loud");
         let msg = err.to_string();
         assert!(msg.contains("websearch_typo"));

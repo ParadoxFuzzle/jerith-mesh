@@ -70,6 +70,10 @@ pub struct BotConfig {
     /// names the pre-packaged plugins that are switched on; everything the
     /// model can summon derives from it (web loop tools, memory.*, lore).
     pub plugins: PluginsConfig,
+    /// Parsed external plugin drops (Phase 3a, docs/PLUGIN-SDK.md) from
+    /// `plugins.d` — validated at load, joined into the chat-time registry,
+    /// gated by `external:<id>` entries in `[plugins] enabled`.
+    pub external_plugins: Vec<crate::external::ExternalPlugin>,
     /// The bot owner's Discord id (default-deny gate for system-level
     /// commands; see owner.rs). Resolved from `$JERITH_BOT_OWNER_ID`, then
     /// bot.toml `[owner] discord_id`, then the OpenClaw config's
@@ -143,6 +147,15 @@ impl BotConfig {
             .or(file.announce_channel_id.map(|v| v.to_string()))
             .and_then(|v| v.trim().parse::<u64>().ok());
 
+        // External plugin drops (Phase 3a, docs/PLUGIN-SDK.md): scanned
+        // once at load, fail-closed — a malformed drop aborts the start
+        // (same discipline as [hooks] URL validation), never a silently
+        // ignored skill. Missing dir = none (opt-in by existence).
+        let external_plugins = crate::external::ExternalPlugin::scan_drops(&plugins_dir_path())
+            .map_err(|e| anyhow::anyhow!("{} (scanning {})", e, plugins_dir_path().display()))?;
+        crate::plugins::SkillRegistry::check_external_collisions(&external_plugins)
+            .map_err(|e| anyhow::anyhow!("{} (scanning {})", e, plugins_dir_path().display()))?;
+
         let system_prompt = std::env::var(PERSONA_ENV)
             .ok()
             .map(|s| s.trim().to_string())
@@ -160,8 +173,11 @@ impl BotConfig {
             web: file.web.unwrap_or_default(),
             plugins: {
                 let cfg = file.plugins.unwrap_or_default();
-                crate::plugins::SkillRegistry::check_config_enabled(&cfg.enabled)
-                    .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
+                crate::plugins::SkillRegistry::check_config_enabled(
+                    &cfg.enabled,
+                    &external_plugins,
+                )
+                .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
                 cfg
             },
             owner_discord_id,
@@ -181,6 +197,7 @@ impl BotConfig {
                 .unwrap_or(DEFAULT_CHAT_TIMEOUT_SECS)
                 .clamp(60, 600),
             chat_stream: file.chat.as_ref().and_then(|c| c.stream).unwrap_or(true),
+            external_plugins,
         })
     }
 
@@ -235,6 +252,7 @@ impl BotConfig {
             squeeze: SqueezeConfig::default(),
             monitor: MonitorConfig::default(),
             hooks: crate::hooks::HooksConfig::default(),
+            external_plugins: Vec::new(),
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
             chat_stream: true,
         }
@@ -431,6 +449,15 @@ pub fn token_file_path() -> PathBuf {
 pub fn persona_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".jerith-mesh").join("persona.md")
+}
+
+/// `~/.jerith-mesh/plugins.d/` — external plugin manifest drops
+/// (Phase 3a, docs/PLUGIN-SDK.md). Missing dir = no external plugins
+/// (opt-in by directory existence); everything inside is validated
+/// fail-closed at bot start.
+pub fn plugins_dir_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".jerith-mesh").join("plugins.d")
 }
 
 /// `~/.jerith-mesh/known-users.md` — live export of the `jerith_people`

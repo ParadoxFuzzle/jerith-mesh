@@ -1,11 +1,17 @@
-# Plugin SDK design (Phase 3+)
+# Plugin SDK (Phase 3+)
 
-A **design document, deliberately not code**: it pre-registers how
-plugins leave the compiled-in model (`crates/bot/src/plugins.rs`,
-in-tree Rust) so the skills/channels ecosystem can extend without
-forking the bot. If an entry here conflicts with `features.md §8`, the
-code wins and this doc gets corrected — that ordering is the point of
-shipping the design before the implementation.
+**Status: Phase 3a is implemented** — external skills ship in the bot:
+manifest drops in `~/.jerith-mesh/plugins.d/` parse fail-closed at boot
+(`crates/bot/src/external.rs`), join the skill registry
+(`SkillRegistry::with_external`), gate via `external:<id>` in
+`[plugins] enabled`, and dispatch over the signed HTTP contract below.
+Everything else (transports, packaging) remains design.
+
+This document pre-registers how plugins leave the compiled-in model
+(`crates/bot/src/plugins.rs`, in-tree Rust) so the skills/channels
+cosystem can extend without forking the bot. If an entry here conflicts
+with `features.md §8`, the code wins and this doc gets corrected — that
+ordering is the point of shipping the design before the implementation.
 
 ## Why in-tree plugins hit a wall
 

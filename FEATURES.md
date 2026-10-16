@@ -191,10 +191,13 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   each win and restored on startup
   `/mine` wins optionally post to a channel via
   `JERITH_ANNOUNCE_CHANNEL_ID` (or `announce_channel_id` in bot.toml)
-- 📋 Plugin SDK surfaces for Telegram, WhatsApp, others (Phase 3+) — the
-  how is now pre-registered: [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md)
-  (manifest-registered external skills, the dialogue-core seam for
-  channel transports, phasing, falsification tests)
+- 🔄 Manifest-registered **external skills** (Phase 3a ✅;
+  `crates/bot/src/external.rs`): TOML drops in `~/.jerith-mesh/plugins.d/`
+  parse fail-closed at bot start, join the skill registry, gate via
+  `external:<id>` in `[plugins] enabled`, and dispatch over signed HTTP
+  (HMAC recipe shared with the hooks events; bounded responses; typed
+  errors keep the refusal contract). [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md)
+  carries the full design (transports for Telegram/WhatsApp remain 📋 Phase 3+)
 
 ## 8. Plugin / Skill System
 - 🔄 OpenClaw-style modular plugin and skill architecture (Phase 3 core ✅;
