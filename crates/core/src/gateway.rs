@@ -515,11 +515,13 @@ async fn vision_call(gw: &Arc<Gateway>, prompt: &str, image: &str) -> Response {
         req_body.get("messages").and_then(|m| m.as_array()),
     ) {
         let requested = req_body.get("model").and_then(|m| m.as_str());
+        // The vision skill never carries function definitions — no tool tier.
         if let Some(next) = crate::model_router::reroute_for_gateway(
             requested,
             gw.base_model.as_deref(),
             msgs,
             router,
+            false,
         ) {
             req_body["model"] = serde_json::Value::String(next);
         }
@@ -1062,20 +1064,23 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    // Model routing: image content → vision tier, complex prompt → deep
-    // tier, basic chat → caller's model untouched. Only *unpinned*
-    // requests (placeholder / advertised base model) are reroutable, so
+    // Model routing: tool loops → tool tier (parse-reliable caller);
+    // image content → vision tier; complex prompt → deep tier; basic
+    // chat → caller's model untouched. Only *unpinned* requests
+    // (placeholder / advertised base model) are reroutable, so
     // explicit model choices always win.
     if let (Some(router), Some(messages)) = (
         &gw.model_router,
         body.get("messages").and_then(|m| m.as_array()),
     ) {
         let requested = body.get("model").and_then(|m| m.as_str());
+        let has_tools = crate::model_router::payload_has_tools(&body);
         if let Some(next) = crate::model_router::reroute_for_gateway(
             requested,
             gw.base_model.as_deref(),
             messages,
             router,
+            has_tools,
         ) {
             tracing::info!(
                 from = requested.unwrap_or("(none)"),

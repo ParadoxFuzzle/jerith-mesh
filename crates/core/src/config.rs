@@ -325,6 +325,12 @@ pub struct NodeConfig {
     /// models that loop unbounded (deepseek-r1:8b live 2026-10-14).
     #[serde(default)]
     pub runtime_num_predict: Option<u64>,
+    /// Model router: tool-calling tier for any chat request that carries
+    /// function definitions (agent tool loops). Chosen for parse
+    /// RELIABILITY, not depth — default is the measured-reliable
+    /// nemotron-3-nano:4b. "" / None disables the tier.
+    #[serde(default = "default_tool_router_model")]
+    pub runtime_tool_model: Option<String>,
     /// Model router: vision tier for image-content chats (see
     /// `model_router`). Default on; an empty string disables the tier.
     #[serde(default = "default_vision_router_model")]
@@ -627,6 +633,14 @@ fn default_ringer_percent() -> u32 {
     10
 }
 
+fn default_tool_router_model() -> Option<String> {
+    Some(
+        crate::toolstack::default_small_model(crate::toolstack::ModelTier::Tool)
+            .name
+            .to_string(),
+    )
+}
+
 fn default_vision_router_model() -> Option<String> {
     Some(crate::model_router::DEFAULT_VISION_MODEL.to_string())
 }
@@ -654,6 +668,7 @@ impl Default for NodeConfig {
             gateway_bind: None,
             runtime_api_key: None,
             runtime_num_predict: None,
+            runtime_tool_model: default_tool_router_model(),
             runtime_vision_model: Some(crate::model_router::DEFAULT_VISION_MODEL.to_string()),
             runtime_deep_model: Some(crate::model_router::DEFAULT_DEEP_MODEL.to_string()),
             runtime_url: "http://127.0.0.1:8000".to_string(),

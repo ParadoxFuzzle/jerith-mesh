@@ -77,6 +77,11 @@ struct SetupArgs {
     /// enabled by default — the interactive prompt's default as well).
     #[arg(long, default_value_t = false)]
     no_embeddings: bool,
+    /// Ollama tag for the tool-calling tier (agent tool loops — chosen
+    /// for parse RELIABILITY, not depth). Default: nemotron-3-nano:4b.
+    /// "" disables the tier.
+    #[arg(long = "tool-model")]
+    tool_model: Option<String>,
     /// Ollama tag for the thinking/tools tier (deep tier on complex
     /// prompts). Default: qwen3:8b. "" disables the tier.
     #[arg(long = "deep-model")]
@@ -1165,6 +1170,7 @@ fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
         no_wait,
         no_vision,
         no_embeddings,
+        tool_model,
         deep_model,
         vision_model,
         embedding_model,
@@ -1382,6 +1388,9 @@ fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
         validate_tier_pick(tier, &pick)
     };
     let deep_pick = pick_tier(ModelTier::Thinking, &deep_model)?;
+    // The tool tier is chosen for parse reliability, not depth — agent
+    // tool loops reroute here ahead of the thinking rules.
+    let tool_pick = pick_tier(ModelTier::Tool, &tool_model)?;
     // Vision tier is only kept when the vision specialist is enabled.
     let vision_pick = if vision_enabled {
         pick_tier(ModelTier::Vision, &vision_model)?
@@ -1395,9 +1404,14 @@ fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
         String::new()
     };
     println!(
-        "[3/5b] Local skills: vision {}, embeddings {} | tiers: thinking {}, vision {}, embedding {} (excluded from the contribution accounting)",
+        "[3/5b] Local skills: vision {}, embeddings {} | tiers: tools {}, thinking {}, vision {}, embedding {} (excluded from the contribution accounting)",
         on_off(vision_enabled),
         on_off(embeddings_enabled),
+        if tool_pick.is_empty() {
+            "(off)"
+        } else {
+            tool_pick.as_str()
+        },
         if deep_pick.is_empty() {
             "(off)"
         } else {
@@ -1560,6 +1574,11 @@ fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
     } else {
         Some(vision_pick.clone())
     };
+    cfg.runtime_tool_model = if tool_pick.is_empty() {
+        None
+    } else {
+        Some(tool_pick.clone())
+    };
     if print_mode {
         println!(
             "   print-mode: config untouched — would write {} with the tier picks above",
@@ -1604,13 +1623,14 @@ fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
     // (already or just now) present and the pick is an ollama tag.
     let ollama_ready = detect_tool(StackTool::Ollama);
     if print_mode && !ollama_ready {
-        for pick in [&deep_pick, &vision_pick, &embedding_pick] {
+        for pick in [&tool_pick, &deep_pick, &vision_pick, &embedding_pick] {
             if !pick.is_empty() {
                 println!("   $ ollama pull {pick}");
             }
         }
     } else if ollama_ready {
         for (tier, pick) in [
+            (ModelTier::Tool, &tool_pick),
             (ModelTier::Thinking, &deep_pick),
             (ModelTier::Vision, &vision_pick),
             (ModelTier::Embedding, &embedding_pick),
@@ -2136,8 +2156,11 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         miner,
         mesh_fallback,
         guard,
+        // The gateway must honor what setup/config wrote for the tier
+        // routing (previously it silently used the router defaults and
+        // ignored `runtime_vision_model` / `runtime_deep_model`).
         model_router: Some(std::sync::Arc::new(
-            jerith_mesh_core::model_router::RouterModels::default(),
+            jerith_mesh_core::model_router::RouterModels::from_config(&cfg),
         )),
         base_model: cfg.model.as_ref().map(|m| m.id.clone()),
         web,
@@ -2353,6 +2376,10 @@ async fn model_cmd(new_model: Option<String>) -> anyhow::Result<()> {
 
 async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
     let mut cfg = NodeConfig::load()?.context("no config — run setup first")?;
+    // Documented shorthand: `jerith config set key=value …` is accepted
+    // alongside the raw `jerith config key=value` form (the `set` token
+    // is a no-op filter), so guides that say "config set" are true.
+    let assignments: Vec<String> = assignments.into_iter().filter(|a| a != "set").collect();
     // Memory backend changes print store-migration guidance; capture
     // the pre-change state for the diff.
     let old = (cfg.memory_backend, cfg.memory_dsn.clone());
@@ -2390,16 +2417,16 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
             }
             "runtime_url" => cfg.runtime_url = v.to_string(),
             "runtime_api_key" => cfg.runtime_api_key = Some(v.to_string()),
-            "runtime_deep_model" | "runtime_vision_model" => {
+            "runtime_deep_model" | "runtime_vision_model" | "runtime_tool_model" => {
                 let val = if v.eq_ignore_ascii_case("none") {
                     None
                 } else {
                     Some(v.to_string())
                 };
-                if k == "runtime_deep_model" {
-                    cfg.runtime_deep_model = val;
-                } else {
-                    cfg.runtime_vision_model = val;
+                match k {
+                    "runtime_deep_model" => cfg.runtime_deep_model = val,
+                    "runtime_vision_model" => cfg.runtime_vision_model = val,
+                    _ => cfg.runtime_tool_model = val,
                 }
             }
             "runtime_num_predict" => {

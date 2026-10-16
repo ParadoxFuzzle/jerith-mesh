@@ -803,6 +803,16 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
     if disk.runtime_api_key != live.runtime_api_key {
         plan.cold.push("runtime_api_key");
     }
+    // The gateway binds the model-router tiers at boot — all cold.
+    if disk.runtime_tool_model != live.runtime_tool_model {
+        plan.cold.push("runtime_tool_model");
+    }
+    if disk.runtime_vision_model != live.runtime_vision_model {
+        plan.cold.push("runtime_vision_model");
+    }
+    if disk.runtime_deep_model != live.runtime_deep_model {
+        plan.cold.push("runtime_deep_model");
+    }
     if disk.bootstrap_url != live.bootstrap_url {
         plan.cold.push("bootstrap_url");
     }
