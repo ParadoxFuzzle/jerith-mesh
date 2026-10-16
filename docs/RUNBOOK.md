@@ -311,9 +311,33 @@ curl -s -H "Authorization: Bot $(grep '^discord_token' ~/.jerith-mesh/bot.toml \
   | grep -o '"name":"timeout"'
 ```
 
+### Model router tiers (tool / vision / deep) — pinning
+
+The gateway router re-classifies each *auto* chat request (placeholder /
+advertised base model callers only — explicit model ids always win):
+tool-bearing requests → the **tool** tier (`runtime_tool_model`, parse
+reliability first), image content → **vision** (`runtime_vision_model`),
+complex prompts → **deep** (`runtime_deep_model`), else the caller's
+model untouched. All three are cold-reload keys (restart required); set
+them with `jerith config set <key>=<model>` (or `""` / `none` to disable
+the tier). The tool tier dates from 2026-10-16 (before that, agent tool
+loops ran on the base model — qwen3:8b returns `{}` on tool payloads
+while thinking; see the LangChain integration README for the byte-level
+finding).
+
+**Single-model trap:** every tier key serde-defaults *enabled* (a fresh
+config without the key gets the tool pick `nemotron-3-nano:4b` and the
+vision pick `minicpm-v4.6:1b`). On a node that deliberately serves one
+model, a missing key means the *next* binary update silently reroutes
+tier traffic at models not pulled there. The Jetson node is pinned
+ahead of time (`runtime_deep_model` / `runtime_tool_model` /
+`runtime_vision_model` all `""`, set 2026-10-16 with the update-pending
+old binary — unknown keys parse as no-ops, so pre-pinning is safe);
+pin the same way before updating any other single-model node.
+
 ## Nodes
 
-Jetson node (added 2026-10-14): Orin Nano `noodlypanda@192.168.1.150`, aarch64 Ubuntu 22.04 — binary built natively from a fresh clone, `~/.jerith-mesh/config.toml` with fresh Ed25519 identity (`node_id 4353ea12d8100f45`), runtime at local ollama (`127.0.0.1:11434`, JetPack6 NVIDIA build). **Single-model node: `qwen3:8b 500a1f06…` only** (same digest as the main node) — 8b+4b in 7.4 GB RAM thrashes with thinking models, so the 4b and the embedding model were removed (2026-10-14); its `runtime_deep_model` is therefore `""` (tier disabled) and `embeddings_enabled = false`. Deep-tier and embedding lanes stay on the main node (`qwen3:8b` + `qwen3:4b` + `qwen3-embedding:0.6b` there). Runs as a systemd **user** unit (`~/.config/systemd/user/jerith-node.service`) with linger enabled, so it survives reboot without sudo. Verified: `/status` green, `POST /v1/chat/completions` round-trip (139 tokens served),`GET /v1/peers?model=qwen3:8b` lists both nodes (Jetson + main).
+Jetson node (added 2026-10-14): Orin Nano `noodlypanda@192.168.1.150`, aarch64 Ubuntu 22.04 — binary built natively from a fresh clone, `~/.jerith-mesh/config.toml` with fresh Ed25519 identity (`node_id 4353ea12d8100f45`), runtime at local ollama (`127.0.0.1:11434`, JetPack6 NVIDIA build). **Single-model node: `qwen3:8b 500a1f06…` only** (same digest as the main node) — 8b+4b in 7.4 GB RAM thrashes with thinking models, so the 4b and the embedding model were removed (2026-10-14); its `runtime_deep_model` is therefore `""` (tier disabled) and `embeddings_enabled = false`. Tool-tier (2026-10-16) and vision-tier (2026-10-16) reroute pins (`""`) were added to its config ahead of its next binary update for the same reason (see "Model router tiers" above) — without them the update would default-enable reroutes to models that node doesn't pull. Deep-tier, tool-tier and embedding lanes stay on the main node (`qwen3:8b` + tool pick `nemotron-3-nano:4b` pinned 2026-10-16 + `qwen3:4b` + `qwen3-embedding:0.6b` there). Runs as a systemd **user** unit (`~/.config/systemd/user/jerith-node.service`) with linger enabled, so it survives reboot without sudo. Verified: `/status` green, `POST /v1/chat/completions` round-trip (139 tokens served),`GET /v1/peers?model=qwen3:8b` lists both nodes (Jetson + main).
 
 Direct cross-host meshing (same day, commits `7924408` + `c79eca3`):
 
