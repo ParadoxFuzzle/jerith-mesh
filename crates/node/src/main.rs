@@ -38,46 +38,74 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// All `jerith setup` arguments — a boxed struct variant keeps `Cmd`
+/// small (the documented clippy pattern for large argument sets).
+#[derive(clap::Args)]
+struct SetupArgs {
+    /// Model id (curated) e.g. glm-5.3, or "huggingface:<repo>",
+    /// "ollama:<name>", "path:<file>".
+    #[arg(long)]
+    model: Option<String>,
+    /// "sqlite" or "postgres"
+    #[arg(long)]
+    memory: Option<String>,
+    /// Postgres DSN (memory_backend postgres only):
+    /// "postgres://user:pass@127.0.0.1:5432/db" — also readable from
+    /// JERITH_MEMORY_DSN.
+    #[arg(long = "memory-dsn")]
+    memory_dsn: Option<String>,
+    /// Contribution percent (>= 25).
+    #[arg(long)]
+    contribution: Option<u64>,
+    /// contributor | requester | hybrid
+    #[arg(long)]
+    role: Option<String>,
+    /// jerithchain | bitcoin | ethereum | dogecoin | monero | none
+    #[arg(long)]
+    crypto: Option<String>,
+    /// Override the bootstrap node URL.
+    #[arg(long)]
+    bootstrap: Option<String>,
+    /// Skip the live peer-count fetch during model listing.
+    #[arg(long, default_value_t = false)]
+    no_wait: bool,
+    /// Disable the local vision specialist (MiniCPM-V; enabled by
+    /// default — the interactive prompt's default as well).
+    #[arg(long, default_value_t = false)]
+    no_vision: bool,
+    /// Disable the local embedding specialist (nomic text vectors;
+    /// enabled by default — the interactive prompt's default as well).
+    #[arg(long, default_value_t = false)]
+    no_embeddings: bool,
+    /// Ollama tag for the thinking/tools tier (deep tier on complex
+    /// prompts). Default: qwen3:8b. "" disables the tier.
+    #[arg(long = "deep-model")]
+    deep_model: Option<String>,
+    /// Ollama tag for the vision tier (image content). Default:
+    /// minicpm-v4.6:1b. "" disables the tier.
+    #[arg(long = "vision-model")]
+    vision_model: Option<String>,
+    /// Ollama tag memory embeds with. Default: nomic-embed-text-v2-moe.
+    #[arg(long = "embedding-model")]
+    embedding_model: Option<String>,
+    /// OpenAI-compatible runtime base URL (scheme://host:port — the
+    /// gateway appends /v1/…). Default: ollama when present, else the
+    /// curated engine on :8000.
+    #[arg(long = "runtime-url")]
+    runtime_url: Option<String>,
+    /// Install stack tools non-interactively (comma names, or "all").
+    #[arg(long = "with")]
+    with_stack: Option<String>,
+    /// Print every step the stack install would run instead of doing
+    /// anything (installs, model pulls). Nothing is executed.
+    #[arg(long, default_value_t = false)]
+    print_mode: bool,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Guided setup flow (interactive when on a TTY, flags otherwise).
-    Setup {
-        /// Model id (curated) e.g. glm-5.3, or "huggingface:<repo>",
-        /// "ollama:<name>", "path:<file>".
-        #[arg(long)]
-        model: Option<String>,
-        /// "sqlite" or "postgres"
-        #[arg(long)]
-        memory: Option<String>,
-        /// Postgres DSN (memory_backend postgres only): 
-        /// "postgres://user:pass@127.0.0.1:5432/db" — also readable from
-        /// JERITH_MEMORY_DSN.
-        #[arg(long = "memory-dsn")]
-        memory_dsn: Option<String>,
-        /// Contribution percent (>= 25).
-        #[arg(long)]
-        contribution: Option<u64>,
-        /// contributor | requester | hybrid
-        #[arg(long)]
-        role: Option<String>,
-        /// jerithchain | bitcoin | ethereum | dogecoin | monero | none
-        #[arg(long)]
-        crypto: Option<String>,
-        /// Override the bootstrap node URL.
-        #[arg(long)]
-        bootstrap: Option<String>,
-        /// Skip the live peer-count fetch during model listing.
-        #[arg(long, default_value_t = false)]
-        no_wait: bool,
-        /// Disable the local vision specialist (MiniCPM-V; enabled by
-        /// default — the interactive prompt's default as well).
-        #[arg(long, default_value_t = false)]
-        no_vision: bool,
-        /// Disable the local embedding specialist (nomic text vectors;
-        /// enabled by default — the interactive prompt's default as well).
-        #[arg(long, default_value_t = false)]
-        no_embeddings: bool,
-    },
+    Setup(#[command(flatten)] Box<SetupArgs>),
     /// Run the node until Ctrl+C.
     Run {
         /// Override the config's model for this session (switches mesh).
@@ -137,6 +165,12 @@ enum Cmd {
     Backup {
         #[command(subcommand)]
         cmd: BackupCmd,
+    },
+    /// Optional AI tool stack (ollama, litellm, langchain, langgraph,
+    /// langsmith, postgres) + the small-model tier catalog.
+    Stack {
+        #[command(subcommand)]
+        cmd: StackCmd,
     },
 }
 
@@ -279,6 +313,26 @@ enum StakeCmd {
     },
 }
 
+/// `jerith stack …` subcommands.
+#[derive(Subcommand)]
+enum StackCmd {
+    /// List the stack tools and the small-model tier catalog.
+    List {
+        /// Show only the model catalog (not the tools).
+        #[arg(long, default_value_t = false)]
+        models: bool,
+    },
+    /// Check which stack tools are already available on this machine.
+    Status,
+    /// Install one tool with its official installer (each step is echoed
+    /// before it runs — running the command IS the consent).
+    Install { tool: String },
+    /// Print an install plan instead of running it.
+    InstallPlan { tool: String },
+    /// Pull a small model into local ollama (tier tags accepted).
+    Pull { model: String },
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -295,29 +349,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
-        Cmd::Setup {
-            model,
-            memory,
-            memory_dsn,
-            contribution,
-            role,
-            crypto,
-            bootstrap,
-            no_wait,
-            no_vision,
-            no_embeddings,
-        } => setup_flow(
-            model,
-            memory,
-            memory_dsn,
-            contribution,
-            role,
-            crypto,
-            bootstrap,
-            no_wait,
-            no_vision,
-            no_embeddings,
-        ),
+        Cmd::Setup(args) => setup_flow(*args),
         Cmd::Run { model } => run_node(model).await,
         Cmd::Bootstrap { port, ttl_ms } => {
             jerith_mesh_core::bootstrap_server::serve(
@@ -338,6 +370,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Lore { query, top_k } => lore_cmd(&query, top_k).await,
         Cmd::Experts { cmd } => experts_cmd(cmd).await,
         Cmd::Backup { cmd } => backup_cmd(cmd).await,
+        Cmd::Stack { cmd } => stack_cmd(cmd),
     }
 }
 
@@ -523,7 +556,8 @@ async fn chain_get(
         "no chain api token — stage ~/.jerith-mesh/keys/api.token (see docs/RUNBOOK.md) \\
          or set $JERITH_TOKEN",
     )?;
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(Duration::from_secs(15))
         .build()?;
     let mut url = format!("{base}{path}");
@@ -617,9 +651,8 @@ async fn backup_cmd(cmd: BackupCmd) -> anyhow::Result<()> {
             out,
             include_experts,
         } => {
-            let report = backup::create_into(&home, out.as_deref(), BackupOptions {
-                include_experts,
-            })?;
+            let report =
+                backup::create_into(&home, out.as_deref(), BackupOptions { include_experts })?;
             println!(
                 "backup written: {} ({} files, {:.2} MiB)",
                 report.path.display(),
@@ -632,9 +665,7 @@ async fn backup_cmd(cmd: BackupCmd) -> anyhow::Result<()> {
                     println!("  - {s}");
                 }
             }
-            println!(
-                "note: config.toml carries the node identity key — keep the backup private"
-            );
+            println!("note: config.toml carries the node identity key — keep the backup private");
         }
         BackupCmd::Verify { path } => {
             let report = backup::verify(&path)?;
@@ -652,7 +683,11 @@ async fn backup_cmd(cmd: BackupCmd) -> anyhow::Result<()> {
         }
         BackupCmd::Restore { path, force } => {
             let report = backup::restore_into(&home, &path, force)?;
-            println!("restored {} files under {}", report.written.len(), home.display());
+            println!(
+                "restored {} files under {}",
+                report.written.len(),
+                home.display()
+            );
             if !report.skipped_existing.is_empty() {
                 println!(
                     "skipped {} existing file(s) (rerun with --force to overwrite)",
@@ -862,15 +897,10 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            println!(
-                "migrating {} source rows → {}",
-                src_count,
-                store.describe()
-            );
-            let report = store
-                .copy_rows_from(&source)
-                .await
-                .context("migration copy — the target store keeps whatever rows landed, rerun is idempotent")?;
+            println!("migrating {} source rows → {}", src_count, store.describe());
+            let report = store.copy_rows_from(&source).await.context(
+                "migration copy — the target store keeps whatever rows landed, rerun is idempotent",
+            )?;
             let target_count = store.count().await?;
             println!(
                 "copied: {} · already present (skipped): {} · target now holds {} entries",
@@ -1069,10 +1099,22 @@ fn parse_model_spec(spec: &str) -> anyhow::Result<ModelId> {
     if curated.iter().any(|m| m.id == spec) {
         return Ok(default_model(spec));
     }
+    // Small-model tier tags (setup's picker catalog; qwen3:8b etc.) are
+    // ollama names served by the ollama/litellm runtime.
+    if let Some(sm) = jerith_mesh_core::toolstack::find_small_model(spec) {
+        return Ok(ModelId {
+            id: sm.name.to_string(),
+            quant: "int4".into(),
+            source: ModelSource::Ollama {
+                name: sm.name.to_string(),
+            },
+        });
+    }
     bail!(
         "unknown model {spec:?}. Use a curated id (glm-5.2, glm-5.3, glm-5.3-flash, \
          deepseek-v4-flash, deepseek-v4.1-flash, kimi-k3, qwen3.8-flash-next, \
-         qwen-image-2.1) or prefix: huggingface:<repo>, ollama:<name>, path:<file>"
+         qwen-image-2.1), a small-model tier tag (see `jerith stack list --models`), \
+         or prefix: huggingface:<repo>, ollama:<name>, path:<file>"
     );
 }
 
@@ -1111,18 +1153,25 @@ fn parse_crypto(s: &str) -> anyhow::Result<jerith_mesh_core::config::CryptoConfi
 }
 
 #[allow(clippy::too_many_arguments)]
-fn setup_flow(
-    model: Option<String>,
-    memory: Option<String>,
-    memory_dsn: Option<String>,
-    contribution: Option<u64>,
-    role: Option<String>,
-    crypto: Option<String>,
-    bootstrap: Option<String>,
-    no_wait: bool,
-    no_vision: bool,
-    no_embeddings: bool,
-) -> anyhow::Result<()> {
+fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
+    let SetupArgs {
+        model,
+        memory,
+        memory_dsn,
+        contribution,
+        role,
+        crypto,
+        bootstrap,
+        no_wait,
+        no_vision,
+        no_embeddings,
+        deep_model,
+        vision_model,
+        embedding_model,
+        runtime_url,
+        with_stack,
+        print_mode,
+    } = a;
     println!("🦜 jerith-mesh setup");
     println!("───────────────────");
 
@@ -1224,15 +1273,17 @@ fn setup_flow(
         let mid = parse_model_spec(&model_spec)?;
         // Leech guard: warn if the machine can't realistically run it.
         if let Some(fit) = fits.iter().find(|f| f.model.id == mid.id)
-            && !fit.fits && std::env::var("JERITH_OK_BEYOND_CAPACITY").is_err() {
-                bail!(
-                    "this machine cannot run {id} locally: {reason}\n\
+            && !fit.fits
+            && std::env::var("JERITH_OK_BEYOND_CAPACITY").is_err()
+        {
+            bail!(
+                "this machine cannot run {id} locally: {reason}\n\
                      Passing capacity checks is required to prevent mesh leeching. \
                      Set JERITH_OK_BEYOND_CAPACITY=1 to override.",
-                    id = mid.id,
-                    reason = fit.reason
-                );
-            }
+                id = mid.id,
+                reason = fit.reason
+            );
+        }
         mid
     };
     println!("\n[2/5] Model: {} (quant {})", model.id, model.quant);
@@ -1279,12 +1330,9 @@ fn setup_flow(
         false
     } else if interactive {
         matches!(
-            prompt(
-                "\nEnable the local vision specialist? (y/n)",
-                "y"
-            )?
-            .to_lowercase()
-            .as_str(),
+            prompt("\nEnable the local vision specialist? (y/n)", "y")?
+                .to_lowercase()
+                .as_str(),
             "y" | "yes"
         )
     } else {
@@ -1302,10 +1350,69 @@ fn setup_flow(
     } else {
         true
     };
+    // Tier model picks — the small-model catalog (toolstack). Thinking
+    // routes complex prompts (runtime_deep_model), vision routes image
+    // content (runtime_vision_model), embedding feeds local memory
+    // (specialists.embedding_model). Curated tags or free-form
+    // ollama:<name>; an empty pick ("") disables a tier. Flags win over
+    // the prompt; defaults are the mesh's own routing defaults.
+    use jerith_mesh_core::toolstack::{self, ModelTier, StackTool};
+    let pick_tier = |tier: ModelTier, flag: &Option<String>| -> anyhow::Result<String> {
+        if let Some(p) = flag {
+            return validate_tier_pick(tier, p);
+        }
+        if !interactive {
+            return Ok(toolstack::default_small_model(tier).name.to_string());
+        }
+        println!(
+            "\n{} tier options (number, ollama tag, ollama:<name>, or \"\" to disable):",
+            tier.label()
+        );
+        for (i, m) in toolstack::small_models(tier).iter().enumerate() {
+            println!("  {}. {:<26} {:<10} {}", i + 1, m.name, m.size_hint, m.note);
+        }
+        let def = toolstack::default_small_model(tier).name;
+        let answer = prompt(&format!("\nModel for the {} tier?", tier.label()), def)?;
+        let pick = match answer.trim().parse::<usize>() {
+            Ok(n) if (1..=toolstack::small_models(tier).len()).contains(&n) => {
+                toolstack::small_models(tier)[n - 1].name.to_string()
+            }
+            _ => answer,
+        };
+        validate_tier_pick(tier, &pick)
+    };
+    let deep_pick = pick_tier(ModelTier::Thinking, &deep_model)?;
+    // Vision tier is only kept when the vision specialist is enabled.
+    let vision_pick = if vision_enabled {
+        pick_tier(ModelTier::Vision, &vision_model)?
+    } else {
+        String::new()
+    };
+    // The embedding tag only matters when memory is actually on.
+    let embedding_pick = if embeddings_enabled {
+        pick_tier(ModelTier::Embedding, &embedding_model)?
+    } else {
+        String::new()
+    };
     println!(
-        "[3/5b] Local skills: vision {}, embeddings {} (excluded from the contribution accounting)",
+        "[3/5b] Local skills: vision {}, embeddings {} | tiers: thinking {}, vision {}, embedding {} (excluded from the contribution accounting)",
         on_off(vision_enabled),
-        on_off(embeddings_enabled)
+        on_off(embeddings_enabled),
+        if deep_pick.is_empty() {
+            "(off)"
+        } else {
+            deep_pick.as_str()
+        },
+        if vision_pick.is_empty() {
+            "(off)"
+        } else {
+            vision_pick.as_str()
+        },
+        if embedding_pick.is_empty() {
+            "(off)"
+        } else {
+            embedding_pick.as_str()
+        }
     );
 
     // 4. Contribution % — min 25 hard-coded by spec.
@@ -1345,7 +1452,85 @@ fn setup_flow(
         None => jerith_mesh_core::config::CryptoConfig::default(),
     };
 
-    let choices = SetupChoices {
+    // Runtime backstop: which OpenAI-compatible base URL serves the chat
+    // lane. Ollama, once installed (stack tool), serves /v1/… itself — so
+    // it becomes the default; otherwise the curated engine on :8000 (or a
+    // LiteLLM proxy the operator names). The gateway appends /v1/… to
+    // whatever lands here.
+    let runtime_url = match runtime_url {
+        Some(u) => Some(u),
+        None if interactive => {
+            let default = if detect_tool(StackTool::Ollama) {
+                "http://127.0.0.1:11434 (ollama)"
+            } else {
+                "http://127.0.0.1:8000 (colibri/litellm)"
+            };
+            Some(prompt(
+                "\nOpenAI-compatible runtime base URL? (scheme://host:port)",
+                default,
+            )?)
+        }
+        None => None,
+    };
+    // Accept a bare URL or an annotated answer like "url (ollama)".
+    let runtime_url = runtime_url.map(|s| {
+        s.split_whitespace()
+            .next()
+            .unwrap_or("http://127.0.0.1:8000")
+            .to_string()
+    });
+
+    // Stack tools (--with all | tool,tool / --no-tools; interactive prompt
+    // otherwise). Ollama is the host for the tier models; litellm + the
+    // langchain family install into the node-managed tools venv; postgres
+    // sets up the pgvector memory backend. Detection runs first so
+    // already-present tools install as a harmless no-op.
+    let with: Vec<StackTool> = if with_stack == Some("all".into()) {
+        StackTool::ALL.to_vec()
+    } else if with_stack.is_some() {
+        let mut out = Vec::new();
+        for n in with_stack.unwrap_or_default().split(',') {
+            let t = StackTool::from_name(n)
+                .with_context(|| format!("unknown stack tool {n:?} — see `jerith stack list`"))?;
+            out.push(t);
+        }
+        out.sort();
+        out.dedup();
+        out
+    } else if interactive {
+        println!(
+            "\nOptional AI tool stack (space/comma-separated numbers or names, empty = none):"
+        );
+        println!("  1. ollama     — hosts the tier models above locally");
+        println!("  2. litellm    — OpenAI-compatible proxy over any backend");
+        println!("  3. langchain  — agent framework using this node's gateway");
+        println!("  4. langgraph  — LangChain's graph agent runtime");
+        println!("  5. langsmith  — tracing + evals for LangChain/LangGraph");
+        println!("  6. postgres   — PostgreSQL + pgvector (memory backend)");
+        let answer = prompt("\nInstall which tools?", "")?;
+        let mut out = Vec::new();
+        for tok_str in answer.split([',', ' ']) {
+            let tok_str = tok_str.trim();
+            if tok_str.is_empty() {
+                continue;
+            }
+            let tool = match tok_str.parse::<usize>() {
+                Ok(n) if (1..=StackTool::ALL.len()).contains(&n) => StackTool::ALL[n - 1],
+                _ => StackTool::from_name(tok_str).with_context(|| {
+                    format!("unknown stack tool {tok_str:?} — see `jerith stack list`")
+                })?,
+            };
+            out.push(tool);
+        }
+        out.sort();
+        out.dedup();
+        out
+    } else {
+        Vec::new()
+    };
+
+    let existing = NodeConfig::load()?;
+    let mut cfg = SetupChoices {
         model,
         memory_backend,
         memory_dsn,
@@ -1355,25 +1540,310 @@ fn setup_flow(
         specialists: jerith_mesh_core::config::SpecialistConfig {
             vision_enabled,
             embeddings_enabled,
+            embedding_model: embedding_pick.clone(),
             ..Default::default()
         },
         bootstrap_url: bootstrap,
         gateway_port: NodeConfig::default().gateway_port,
-        runtime_url: None,
+        runtime_url,
+    }
+    .into_config(existing)?;
+    // Tier picks land on the routing fields setup doesn't model — an
+    // empty pick disables the tier (the gateway honors "" as "off").
+    cfg.runtime_deep_model = if deep_pick.is_empty() {
+        None
+    } else {
+        Some(deep_pick.clone())
     };
+    cfg.runtime_vision_model = if vision_pick.is_empty() {
+        None
+    } else {
+        Some(vision_pick.clone())
+    };
+    if print_mode {
+        println!(
+            "   print-mode: config untouched — would write {} with the tier picks above",
+            NodeConfig::config_path().display()
+        );
+    } else {
+        cfg.save()?;
+        // Touch the memory DB path so data dir exists.
+        std::fs::create_dir_all(NodeConfig::data_dir())?;
+    }
 
-    let existing = NodeConfig::load()?;
-    let cfg = choices.into_config(existing)?;
-    cfg.save()?;
-    // Touch the memory DB path so data dir exists.
-    std::fs::create_dir_all(NodeConfig::data_dir())?;
+    // Materialize the chosen stack. --print-mode shows the exact plan and
+    // touches nothing; otherwise every step is echoed before it runs
+    // (running the command IS the consent) and failures stop setup with
+    // the step's own error output.
+    if !with.is_empty()
+        || !deep_pick.is_empty()
+        || !vision_pick.is_empty()
+        || !embedding_pick.is_empty()
+    {
+        println!("\n[5/5] AI stack:");
+    }
+    let os = report.os;
+    if !with.is_empty() {
+        // Shared pip tools venv first — one plan, before any pip tool.
+        if with.iter().any(|t| t.uses_tools_venv()) {
+            for step in StackTool::venv_plan(os) {
+                run_or_print(&step, print_mode, "tools-venv")?;
+            }
+        }
+        for tool in &with {
+            if detect_tool(*tool) {
+                println!("   {:<10} already installed — skipping", tool.name());
+                continue;
+            }
+            for step in tool.install_plan(os) {
+                run_or_print(&step, print_mode, tool.name())?;
+            }
+        }
+    }
+    // Pull the tier models the operator just picked — only when ollama is
+    // (already or just now) present and the pick is an ollama tag.
+    let ollama_ready = detect_tool(StackTool::Ollama);
+    if print_mode && !ollama_ready {
+        for pick in [&deep_pick, &vision_pick, &embedding_pick] {
+            if !pick.is_empty() {
+                println!("   $ ollama pull {pick}");
+            }
+        }
+    } else if ollama_ready {
+        for (tier, pick) in [
+            (ModelTier::Thinking, &deep_pick),
+            (ModelTier::Vision, &vision_pick),
+            (ModelTier::Embedding, &embedding_pick),
+        ] {
+            if pick.is_empty() {
+                continue;
+            }
+            if print_mode {
+                println!("   $ ollama pull {pick}");
+            } else {
+                println!("   ollama     pulling {} ({})…", pick, tier.label());
+                let pull = format!("ollama pull {pick}");
+                run_or_print(&pull, false, "ollama")?;
+            }
+        }
+    } else if !with.is_empty() {
+        println!(
+            "   note: ollama not available — pull the tier picks with `jerith stack pull <model>` after installing it"
+        );
+    }
 
-    println!(
-        "\n[5/5] Done. Config: {}",
-        NodeConfig::config_path().display()
-    );
+    println!("\nDone. Config: {}", NodeConfig::config_path().display());
     println!("\nNext: ./jerith run   (or set up wallets with `jerith config`)");
 
+    Ok(())
+}
+
+/// Validate a setup-flow tier pick: curated small-model tag, free-form
+/// `ollama:<name>`, or `""` (disable the tier).
+fn validate_tier_pick(
+    tier: jerith_mesh_core::toolstack::ModelTier,
+    pick: &str,
+) -> anyhow::Result<String> {
+    let pick = pick.trim();
+    if pick.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(name) = pick.strip_prefix("ollama:") {
+        anyhow::ensure!(!name.trim().is_empty(), "empty ollama tag");
+        return Ok(name.trim().to_string());
+    }
+    if let Some(m) = jerith_mesh_core::toolstack::find_small_model(pick) {
+        if m.tier != tier {
+            anyhow::bail!(
+                "{} belongs to the {} tier, not {}",
+                m.name,
+                m.tier.label(),
+                tier.label()
+            );
+        }
+        return Ok(m.name.to_string());
+    }
+    anyhow::bail!(
+        "unknown model {pick:?} for the {} tier — use a listed tag, ollama:<name>, or \"\" to disable",
+        tier.label()
+    )
+}
+
+/// Fast detect used inside setup (one version probe; failure = absent).
+fn detect_tool(tool: jerith_mesh_core::toolstack::StackTool) -> bool {
+    let (cmd, args) = tool.detect_cmd();
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Echo then run one install step (bash on unix, cmd on Windows); the
+/// child inherits stdout/stderr so installers stay interactive. Failure
+/// aborts setup immediately with the step's own output as the diagnosis.
+fn run_or_print(step: &str, print_mode: bool, label: &str) -> anyhow::Result<()> {
+    if print_mode {
+        println!("   $ {step}");
+        return Ok(());
+    }
+    println!("   [{label}] $ {step}");
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/C", step])
+    } else {
+        ("sh", vec!["-c", step])
+    };
+    let status = std::process::Command::new(program)
+        .args(&args)
+        .status()
+        .with_context(|| format!("spawning {program} for [{label}]"))?;
+    anyhow::ensure!(status.success(), "[{label}] step failed ({status}): {step}");
+    Ok(())
+}
+
+/// `jerith stack …` — the optional AI companion stack + small-model
+/// catalog. Install steps run each tool's own official installer, echoed
+/// before execution; the CLI invocation itself is the consent.
+fn stack_cmd(cmd: StackCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::toolstack::{ModelTier, StackTool, small_models};
+    let os = jerith_mesh_core::hw::probe().os;
+    match cmd {
+        StackCmd::List { models } => {
+            if !models {
+                println!("stack tools (`jerith stack install <name>`):");
+                for t in StackTool::ALL {
+                    let state = if detect_tool(*t) {
+                        "present   "
+                    } else {
+                        "not found "
+                    };
+                    println!("  {:<10} {} {}", t.name(), state, t.description());
+                }
+            }
+            let _ = small_models(ModelTier::Thinking).len();
+            println!("\nsmall-model tiers (ollama tags — `jerith stack pull <tag>`):",);
+            for tier in [ModelTier::Thinking, ModelTier::Vision, ModelTier::Embedding] {
+                println!("  {} (config: {}):", tier.label(), tier.config_field());
+                let def = jerith_mesh_core::toolstack::default_small_model(tier).name;
+                for m in small_models(tier) {
+                    let marker = if m.name == def {
+                        " · mesh default"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {:<26} {:<10} {}{}",
+                        m.name, m.size_hint, m.note, marker
+                    );
+                }
+            }
+            Ok(())
+        }
+        StackCmd::Status => {
+            for t in StackTool::ALL {
+                let (cmd, args) = t.detect_cmd();
+                println!(
+                    "{:<10} {:<10} ({} {})",
+                    t.name(),
+                    if detect_tool(*t) {
+                        "present"
+                    } else {
+                        "missing"
+                    },
+                    cmd,
+                    args.join(" ")
+                );
+            }
+            Ok(())
+        }
+        StackCmd::Install { ref tool } | StackCmd::InstallPlan { ref tool } => {
+            let t = StackTool::from_name(tool).with_context(|| {
+                format!(
+                    "unknown stack tool {tool:?} — options: {}",
+                    StackTool::ALL
+                        .iter()
+                        .map(|x| x.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            let steps = t.install_plan(os);
+            anyhow::ensure!(
+                !steps.is_empty(),
+                "{}: no automated install for this OS — install it manually",
+                t.name()
+            );
+            if let StackCmd::InstallPlan { .. } = cmd {
+                println!(
+                    "install plan for {} ({} step(s), not run):",
+                    t.name(),
+                    steps.len()
+                );
+                for s in &steps {
+                    println!("  $ {s}");
+                }
+                return Ok(());
+            }
+            // pip tools share the node-managed venv — create it once.
+            if t.uses_tools_venv() {
+                let python = if cfg!(windows) {
+                    r"Scripts\python.exe"
+                } else {
+                    "bin/python"
+                };
+                let venv_py = NodeConfig::home().join("tools-venv").join(python);
+                if !venv_py.exists() {
+                    for step in StackTool::venv_plan(os) {
+                        shell_run(&step, "tools-venv")?;
+                    }
+                }
+            }
+            for step in &steps {
+                shell_run(step, t.name())?;
+            }
+            println!("✓ {} installed", t.name());
+            match t {
+                StackTool::Ollama => println!(
+                    "  point the node at it: jerith config set \n  runtime_url=http://127.0.0.1:11434"
+                ),
+                StackTool::LiteLLM => println!(
+                    "  point the node at it: jerith config set runtime_url=http://127.0.0.1:4000"
+                ),
+                StackTool::LangChain | StackTool::LangGraph | StackTool::LangSmith => println!(
+                    "  see integrations/langchain/ in the repo — the examples use this node's \n  gateway as an OpenAI-compatible endpoint (LangSmith: set LANGSMITH_TRACING=true \n  and note the LANGSMITH_API_KEY env vars; never commit them)"
+                ),
+                StackTool::Postgres => println!(
+                    "  then: jerith config set memory_backend=postgres \\\n                     memory_dsn=postgres://postgres@127.0.0.1:5432/jerith\\?sslmode=disable"
+                ),
+            }
+            Ok(())
+        }
+        StackCmd::Pull { model } => {
+            let tag = model.trim().trim_start_matches("ollama:").to_string();
+            anyhow::ensure!(!tag.is_empty(), "empty ollama tag");
+            // Confirm the tag is servable before pulling (free-form names
+            // are fine — ollama itself validates against its registry).
+            shell_run(&format!("ollama pull {tag}"), "ollama")
+        }
+    }
+}
+
+/// Run one stack shell step (sh -c | cmd /C), output inherited, failure
+/// loud. `label` is just the echoed context tag.
+fn shell_run(step: &str, label: &str) -> anyhow::Result<()> {
+    println!("  [{label}] $ {step}");
+    let (program, args) = if cfg!(windows) {
+        ("cmd", vec!["/C", step])
+    } else {
+        ("sh", vec!["-c", step])
+    };
+    let status = std::process::Command::new(program)
+        .args(&args)
+        .status()
+        .with_context(|| format!("spawning {program} for [{label}]"))?;
+    anyhow::ensure!(status.success(), "[{label}] failed: {step}");
     Ok(())
 }
 
@@ -1564,13 +2034,23 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
                 "   resources   {}{}kill switch {} — governs mesh work only",
                 cfg.resources
                     .ram_ceiling_bytes
-                    .map(|b| format!("RAM ceiling {:.1} GiB ", b as f64 / (1024.0 * 1024.0 * 1024.0)))
+                    .map(|b| format!(
+                        "RAM ceiling {:.1} GiB ",
+                        b as f64 / (1024.0 * 1024.0 * 1024.0)
+                    ))
                     .unwrap_or_default(),
                 cfg.resources
                     .vram_ceiling_bytes
-                    .map(|b| format!("VRAM ceiling {:.1} GiB ", b as f64 / (1024.0 * 1024.0 * 1024.0)))
+                    .map(|b| format!(
+                        "VRAM ceiling {:.1} GiB ",
+                        b as f64 / (1024.0 * 1024.0 * 1024.0)
+                    ))
                     .unwrap_or_default(),
-                if cfg.resources.kill_switch { "ARMED" } else { "off" }
+                if cfg.resources.kill_switch {
+                    "ARMED"
+                } else {
+                    "off"
+                }
             );
             Some(jerith_mesh_core::isolate::spawn_governor(
                 state.clone(),
@@ -1910,6 +2390,26 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
             }
             "runtime_url" => cfg.runtime_url = v.to_string(),
             "runtime_api_key" => cfg.runtime_api_key = Some(v.to_string()),
+            "runtime_deep_model" | "runtime_vision_model" => {
+                let val = if v.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
+                if k == "runtime_deep_model" {
+                    cfg.runtime_deep_model = val;
+                } else {
+                    cfg.runtime_vision_model = val;
+                }
+            }
+            "runtime_num_predict" => {
+                cfg.runtime_num_predict = if v.eq_ignore_ascii_case("none") || v == "0" {
+                    None
+                } else {
+                    Some(v.parse().context("runtime_num_predict must be a number")?)
+                }
+            }
+            "embedding_model" => cfg.specialists.embedding_model = v.to_string(),
             "bootstrap_url" => cfg.bootstrap_url = v.to_string(),
             "memory_backend" => {
                 cfg.memory_backend = parse_memory(v)?;
@@ -1928,8 +2428,7 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
     // `memory_backend=postgres memory_dsn=...` in one command), so this
     // runs after the loop, never per-key: a postgres backend without a
     // DSN anywhere is refused, not saved.
-    if cfg.memory_backend == MemoryBackend::PostgresPgvector
-        && cfg.effective_memory_dsn().is_none()
+    if cfg.memory_backend == MemoryBackend::PostgresPgvector && cfg.effective_memory_dsn().is_none()
     {
         bail!(
             "memory_backend = postgres but no DSN — add memory_dsn=postgres://user:pass@host:5432/db \
@@ -1945,10 +2444,7 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
         // — see the guidance, printed here.
         println!(
             "{}",
-            jerith_mesh_core::memory::migration_guidance(
-                old.0.label(),
-                cfg.memory_backend.label()
-            )
+            jerith_mesh_core::memory::migration_guidance(old.0.label(), cfg.memory_backend.label())
         );
     }
     Ok(())

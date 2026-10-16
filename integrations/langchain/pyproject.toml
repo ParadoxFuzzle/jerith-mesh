@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jerith-langchain"
+version = "0.1.0"
+description = "Run LangChain and LangGraph agents against a local jerith-mesh node (OpenAI-compatible gateway + strictly-local skill tools)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langgraph>=0.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["jerith_langchain"]

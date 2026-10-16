@@ -8,3 +8,5 @@ Cargo.lock.orig
 *.key
 *.token
 config.toml
+__pycache__/
+*.pyc

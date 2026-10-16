@@ -423,7 +423,8 @@ impl MemoryStore {
 
 async fn ollama_embed(cfg: &EmbedConfig, text: &str) -> anyhow::Result<Vec<f32>> {
     let url = format!("{}/api/embeddings", cfg.ollama_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
     #[derive(serde::Deserialize)]
@@ -534,7 +535,10 @@ fn provider_from_str(s: &str) -> EmbedProvider {
 /// Produce an embedding, store-independent: Ollama nomic when reachable,
 /// hashing fallback otherwise. The provider is always reported to the
 /// caller, matching the SQLite store's semantics exactly.
-pub async fn embed_with(cfg: &EmbedConfig, text: &str) -> anyhow::Result<(Vec<f32>, EmbedProvider)> {
+pub async fn embed_with(
+    cfg: &EmbedConfig,
+    text: &str,
+) -> anyhow::Result<(Vec<f32>, EmbedProvider)> {
     match ollama_embed(cfg, text).await {
         Ok(mut v) => {
             truncate_matryoshka(&mut v, cfg.dim);
@@ -606,7 +610,10 @@ impl PgMemoryStore {
         // The pgvector extension is normally installed by the operator
         // beforehand; a non-superuser connection may fail to create it and
         // still legitimately find it present. Polyfill is never an error.
-        if let Err(e) = client.execute("CREATE EXTENSION IF NOT EXISTS vector", &[]).await {
+        if let Err(e) = client
+            .execute("CREATE EXTENSION IF NOT EXISTS vector", &[])
+            .await
+        {
             tracing::debug!(
                 error = %e,
                 "pgvector extension create failed — needs a superuser or a preinstalled extension"
@@ -721,7 +728,9 @@ impl PgMemoryStore {
                 .await
             {
                 Ok(_) => tracing::info!("pgvector HNSW cosine index ready"),
-                Err(e) => tracing::debug!(error = %e, "HNSW index not created — exact scan path continues"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "HNSW index not created — exact scan path continues")
+                }
             }
         }
         tracing::info!(schema = %schema, pgvector, "postgres memory store ready");
@@ -800,10 +809,7 @@ impl PgMemoryStore {
         } else {
             let row = self
                 .client
-                .query_opt(
-                    "SELECT embedding FROM memories WHERE id = $1",
-                    &[&seed_id],
-                )
+                .query_opt("SELECT embedding FROM memories WHERE id = $1", &[&seed_id])
                 .await
                 .context("loading seed memory")?
                 .context(format!("no memory entry with id {seed_id}"))?;
@@ -970,9 +976,7 @@ impl PgMemoryStore {
         let rows = self
             .client
             .query(
-                &format!(
-                    "SELECT dim, provider, {emb_len}, created_ms FROM memories"
-                ),
+                &format!("SELECT dim, provider, {emb_len}, created_ms FROM memories"),
                 &[],
             )
             .await
@@ -1054,7 +1058,13 @@ impl PgMemoryStore {
                 .query_one(
                     "INSERT INTO memories (text, dim, provider, created_ms, embedding)
                      VALUES ($1, $2, $3, $4, $5) RETURNING id",
-                    &[&row.text, &dim, &provider_str(row.provider), &created, &blob],
+                    &[
+                        &row.text,
+                        &dim,
+                        &provider_str(row.provider),
+                        &created,
+                        &blob,
+                    ],
                 )
                 .await
                 .context("inserting memory row (migration)")?
@@ -1196,13 +1206,11 @@ impl MemoryHandle {
                 Ok(Self::Sqlite(MemoryStore::open(sqlite_path, embed)?))
             }
             crate::config::MemoryBackend::PostgresPgvector => {
-                let dsn = pg_dsn
-                    .filter(|s| !s.trim().is_empty())
-                    .context(
-                        "memory_backend = postgres but no DSN — set memory_dsn in config.toml \
+                let dsn = pg_dsn.filter(|s| !s.trim().is_empty()).context(
+                    "memory_backend = postgres but no DSN — set memory_dsn in config.toml \
                          (or the JERITH_MEMORY_DSN environment variable); refusing to run memory \
                          against a different store",
-                    )?;
+                )?;
                 Ok(Self::Pg(PgMemoryStore::connect(dsn, embed, None).await?))
             }
         }
@@ -1372,9 +1380,9 @@ impl MemoryHandle {
                 skipped += 1;
                 continue;
             }
-            self.insert_raw(row).await.with_context(|| {
-                format!("copying memory row {} into the new store", row.id)
-            })?;
+            self.insert_raw(row)
+                .await
+                .with_context(|| format!("copying memory row {} into the new store", row.id))?;
             copied += 1;
         }
         Ok(MigrateReport {
@@ -1389,8 +1397,11 @@ impl MemoryHandle {
     pub async fn open_for_config(cfg: &crate::config::NodeConfig) -> anyhow::Result<Self> {
         let embed = EmbedConfig {
             ollama_url: cfg.specialists.ollama_url.clone(),
+            // All EmbedConfig fields are set explicitly here — including
+            // the setup-chosen embedding model (the mesh default is
+            // nomic-embed-text-v2-moe).
+            model: cfg.specialists.embedding_model.clone(),
             dim: cfg.specialists.embedding_dim as usize,
-            ..Default::default()
         };
         Self::open(
             cfg.memory_backend,
@@ -1653,9 +1664,16 @@ mod tests {
         let v = vec![0.25f32, -1.5, 3.0, 0.0, 1.0 / 3.0];
         let text = vec_to_pg_text(&v);
         assert!(text.starts_with('[') && text.ends_with(']'));
-        assert_eq!(vec_from_pg_text(&text).unwrap(), v, "shortest-round-trip f32s");
+        assert_eq!(
+            vec_from_pg_text(&text).unwrap(),
+            v,
+            "shortest-round-trip f32s"
+        );
         assert_eq!(vec_from_pg_text("[]").unwrap(), Vec::<f32>::new());
-        assert!(vec_from_pg_text("[1.0,oops]").is_err(), "malformed vector is a typed error, never silent zeros");
+        assert!(
+            vec_from_pg_text("[1.0,oops]").is_err(),
+            "malformed vector is a typed error, never silent zeros"
+        );
     }
 
     #[test]
@@ -1664,7 +1682,8 @@ mod tests {
         assert_eq!(full, "10.0.0.7:5433/memdb");
         assert!(!full.contains("s3cret"));
         assert!(!describe_dsn("postgres://jerith:s3cret@10.0.0.7:5433/memdb").contains("s3cret"));
-        let kv = describe_dsn("host=db.internal port=5432 dbname=jerith user=postgres password=hunter2");
+        let kv =
+            describe_dsn("host=db.internal port=5432 dbname=jerith user=postgres password=hunter2");
         assert_eq!(kv, "db.internal/jerith");
         assert!(!kv.contains("hunter2"));
         // No scheme, no recognizable pairs: an honest generic line.
@@ -1682,17 +1701,17 @@ mod tests {
     #[tokio::test]
     async fn migrate_copies_rows_and_is_idempotent() {
         // Source: a real (file-backed) SQLite store; target: in-memory.
-        let dir = std::env::temp_dir().join(format!(
-            "jerith-migrate-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("jerith-migrate-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let source_path = dir.join("mem.sqlite");
         let source = MemoryHandle::Sqlite(
-            MemoryStore::open(&source_path, EmbedConfig {
-                dim: 64,
-                ..EmbedConfig::default()
-            })
+            MemoryStore::open(
+                &source_path,
+                EmbedConfig {
+                    dim: 64,
+                    ..EmbedConfig::default()
+                },
+            )
             .unwrap(),
         );
         for t in [
@@ -1743,21 +1762,28 @@ mod tests {
         };
         // Source: file-backed SQLite (the default backend) with a few
         // rows; target: a real pgvector store in a test schema.
-        let dir = std::env::temp_dir().join(format!(
-            "jerith-pg-migrate-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("jerith-pg-migrate-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let source_path = dir.join("mem.sqlite");
         let source = MemoryHandle::Sqlite(
-            MemoryStore::open(&source_path, EmbedConfig {
-                dim: 64,
-                ..EmbedConfig::default()
-            })
+            MemoryStore::open(
+                &source_path,
+                EmbedConfig {
+                    dim: 64,
+                    ..EmbedConfig::default()
+                },
+            )
             .unwrap(),
         );
-        source.embed_and_store("how to bake sourdough bread at home").await.unwrap();
-        source.embed_and_store("quantum computing stock price forecast").await.unwrap();
+        source
+            .embed_and_store("how to bake sourdough bread at home")
+            .await
+            .unwrap();
+        source
+            .embed_and_store("quantum computing stock price forecast")
+            .await
+            .unwrap();
         let schema = format!("memtest_{}_migrate", std::process::id());
         let target = MemoryHandle::Pg(
             PgMemoryStore::connect(
@@ -1772,7 +1798,10 @@ mod tests {
             .expect("connect target pgvector store"),
         );
 
-        let report = target.copy_rows_from(&source).await.expect("migration copy");
+        let report = target
+            .copy_rows_from(&source)
+            .await
+            .expect("migration copy");
         assert_eq!(report.copied, 2);
         assert_eq!(target.count().await.unwrap(), 2);
         // Ranking must hold in the copied store (vectors verbatim).
@@ -1848,7 +1877,10 @@ mod tests {
             .take(2)
             .filter(|t| t.contains("sourdough"))
             .count();
-        assert!(per >= 1, "sourdough sibling in top ranks, order was {texts:?}");
+        assert!(
+            per >= 1,
+            "sourdough sibling in top ranks, order was {texts:?}"
+        );
 
         // Empty top_k and forget and count.
         assert!(s.search("anything", 0).await.unwrap().is_empty());
@@ -1865,7 +1897,9 @@ mod tests {
 
         // Retention cap: oldest rows pruned, newest survive.
         for i in 0..5 {
-            s.embed_and_store(&format!("retention row {i}")).await.unwrap();
+            s.embed_and_store(&format!("retention row {i}"))
+                .await
+                .unwrap();
         }
         let removed = s.prune_beyond(5).await.expect("prune");
         assert_eq!(removed, 2, "7 rows → 5 most recent kept");
@@ -1875,7 +1909,10 @@ mod tests {
         // The forgotten (quantum) row is gone: at top_k = 3 across all
         // surviving rows — originals and retention rows — no hit is ever
         // the deleted entry.
-        let hits = s.search("quantum computing stock price forecast", 3).await.unwrap();
+        let hits = s
+            .search("quantum computing stock price forecast", 3)
+            .await
+            .unwrap();
         assert!(
             hits.iter().all(|h| !h.text.contains("quantum")),
             "the forgotten row must never be returned: {:?}",
@@ -1898,7 +1935,9 @@ mod tests {
             let s = PgMemoryStore::connect(&dsn, embed.clone(), Some(&schema))
                 .await
                 .expect("connect 1");
-            s.embed_and_store("persistent pg memory entry").await.expect("insert")
+            s.embed_and_store("persistent pg memory entry")
+                .await
+                .expect("insert")
         };
         let s = PgMemoryStore::connect(&dsn, embed, Some(&schema))
             .await
@@ -1929,16 +1968,25 @@ mod tests {
         .await
         .expect("connect polyfill store");
         assert!(!s.pgvector, "this DSN must lack the extension");
-        s.embed_and_store("how to bake sourdough bread at home").await.unwrap();
-        s.embed_and_store("quantum computing stock price forecast").await.unwrap();
-        s.embed_and_store("sourdough starter feeding schedule").await.unwrap();
+        s.embed_and_store("how to bake sourdough bread at home")
+            .await
+            .unwrap();
+        s.embed_and_store("quantum computing stock price forecast")
+            .await
+            .unwrap();
+        s.embed_and_store("sourdough starter feeding schedule")
+            .await
+            .unwrap();
         let top = s.search("sourdough bread baking", 3).await.expect("search");
         assert_eq!(top.len(), 3);
         // Polyfill ranks by true cosine against packed vectors.
         assert!(top[0].score > top[2].score, "strict ordering: {top:?}");
         let texts: Vec<&str> = top.iter().map(|h| h.text.as_str()).collect();
         assert!(
-            texts.first().map(|t| t.contains("sourdough")).unwrap_or(false)
+            texts
+                .first()
+                .map(|t| t.contains("sourdough"))
+                .unwrap_or(false)
                 || texts.last().map(|t| t.contains("quantum")).unwrap_or(false),
             "similar docs rank above dissimilar: {texts:?}"
         );
@@ -1991,7 +2039,9 @@ mod tests {
         )
         .await
         .expect("connect 64");
-        s64.embed_and_store("how to bake sourdough bread at home").await.unwrap();
+        s64.embed_and_store("how to bake sourdough bread at home")
+            .await
+            .unwrap();
         let s32 = PgMemoryStore::connect(
             &dsn,
             EmbedConfig {
@@ -2002,11 +2052,16 @@ mod tests {
         )
         .await
         .expect("connect 32");
-        s32.embed_and_store("quantum computing stock price forecast").await.unwrap();
+        s32.embed_and_store("quantum computing stock price forecast")
+            .await
+            .unwrap();
         // No uniform dim → the native `<=>` path must NOT be used; the
         // scan path still ranks, degrading to the shared prefix like the
         // SQLite store.
-        let (h64, _) = s64.embed_and_store("sourdough starter feeding schedule").await.unwrap();
+        let (h64, _) = s64
+            .embed_and_store("sourdough starter feeding schedule")
+            .await
+            .unwrap();
         let hits = s64.similar_to(h64, 2).await.expect("mixed search");
         assert_eq!(hits.len(), 2, "all rows located despite mixed dims");
         assert!(hits.iter().all(|h| h.id != h64));

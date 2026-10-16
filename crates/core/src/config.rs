@@ -114,16 +114,28 @@ pub struct SpecialistConfig {
     pub vision_enabled: bool,
     #[serde(default = "default_true")]
     pub embeddings_enabled: bool,
-    /// Matryoshka truncation for nomic-embed-text-v2-moe.
+    /// Matryoshka truncation for nomic-family embedding models.
     #[serde(default = "default_embedding_dim")]
     pub embedding_dim: u32,
     /// Local Ollama base URL (serves the nomic embedding model).
     #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    /// Ollama tag of the embedding model memory uses (chosen at setup;
+    /// the curated small-model picker lists the options). Matryoshka
+    /// models (the nomic family) honor `embedding_dim` truncation;
+    /// others embed at full width.
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
 }
 
 fn default_ollama_url() -> String {
     "http://127.0.0.1:11434".to_string()
+}
+
+fn default_embedding_model() -> String {
+    crate::toolstack::default_small_model(crate::toolstack::ModelTier::Embedding)
+        .name
+        .to_string()
 }
 
 fn default_true() -> bool {
@@ -139,6 +151,7 @@ impl Default for SpecialistConfig {
             vision_enabled: true,
             embeddings_enabled: true,
             embedding_dim: default_embedding_dim(),
+            embedding_model: default_embedding_model(),
             ollama_url: default_ollama_url(),
         }
     }
@@ -982,6 +995,23 @@ mod tests {
         let cfg = choices.into_config(None).unwrap();
         assert!(!cfg.specialists.vision_enabled);
         assert!(!cfg.specialists.embeddings_enabled);
+    }
+
+    #[test]
+    fn embedding_model_config_roundtrips_with_toml() {
+        // The setup pick lands in the [specialists] table and survives a
+        // toml round-trip verbatim (older configs without the key default
+        // to the mesh's nomic embedding model).
+        let mut cfg = NodeConfig::default();
+        cfg.specialists.embedding_model = "bge-m3".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: NodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.specialists.embedding_model, "bge-m3");
+        assert_eq!(
+            NodeConfig::default().specialists.embedding_model,
+            crate::toolstack::default_small_model(crate::toolstack::ModelTier::Embedding)
+                .name
+        );
     }
 
     #[test]

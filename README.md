@@ -122,8 +122,39 @@ scripts/dev-e2e.sh
    against a different store than the configured one).
 4. **Contribution %** — minimum **25 %** required to be eligible; configurable
    upward.
-5. **Optional crypto wallets** — JerithChain by default; you provide BTC/ETH/
+5. **Small-model tiers** — pick from the curated small-model catalog per tier:
+   *thinking/tools* (`qwen3:8b`, `qwen3:4b`, `deepseek-r1:8b`, `nemotron-3-nano:4b`),
+   *vision* (`minicpm-v4.6:1b`, `qwen3-vl:4b`, `moondream2`), *embedding*
+   (`nomic-embed-text-v2-moe`, …) — or any `ollama:<tag>`.
+6. **Optional AI tool stack** — install any of the companions below (each
+   confirmed step by step; `jerith stack install <tool>` works standalone too).
+   Tier models are `ollama pull`-ed as part of setup.
+7. **Optional crypto wallets** — JerithChain by default; you provide BTC/ETH/
    DOGE/XMR endpoints yourself.
+
+---
+
+## AI tool stack & integrations
+
+```bash
+./target/release/jerith stack list            # tools + the small-model catalog
+./target/release/jerith stack install ollama  # …also: litellm, langchain,
+                                              # langgraph, langsmith, postgres
+./target/release/jerith stack pull qwen3:8b   # pull small models into ollama
+```
+
+| Tool | What it gives the mesh |
+|---|---|
+| **Ollama** | hosts the tier models locally (setup's default runtime URL: `http://127.0.0.1:11434`) |
+| **LiteLLM** | OpenAI-compatible proxy over any backend — `runtime_url=http://127.0.0.1:4000` |
+| **LangChain / LangGraph** | agents that consume the node's OpenAI-compatible gateway (`integrations/langchain/` — pinned `JerithChat` + skill tools) |
+| **LangSmith** | optional tracing for LangChain runs (env vars only, nothing phones home otherwise) |
+| **PostgreSQL + pgvector** | the node's scalable memory backend (`memory_backend=postgres`) |
+
+The LangChain integration lives at
+[`integrations/langchain/`](integrations/langchain/README.md) — the node's
+memory/lore/web-search skills are exposed as LangChain tools, everything stays
+on the node except the model calls you route through the mesh.
 
 ---
 
@@ -139,9 +170,11 @@ scripts/dev-e2e.sh
 
 ```
 crates/
-  node/       the `jerith` CLI binary (setup, run, status, peers)
+  node/       the `jerith` CLI binary (setup, run, status, peers, stack)
   bot/        the `jerith-bot` Discord bot (slash commands → gateway + JerithChain)
   core/       hardware probe, config, peer registry, ping loop, model gateway
+integrations/
+  langchain/  LangChain/LangGraph integration package (uses the local gateway)
 proto/        wire protocol (planned Phase 1)
 docs/         design documents
 ```

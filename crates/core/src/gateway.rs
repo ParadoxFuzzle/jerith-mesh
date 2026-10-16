@@ -969,12 +969,51 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
     }
 }
 
+/// A guard block response (400) carrying the whole-detector report.
+fn guard_block_response(verdict: crate::guard::GuardVerdict) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": verdict.block_reason(),
+            "guard": {
+                "blocked": true,
+                "detections": verdict.detections,
+            },
+            "mesh_fallback": Value::Null,
+        })),
+    )
+        .into_response()
+}
+
+/// True when the chat runtime is this very machine (loopback/localhost):
+/// forwarding there is not egress, so Jerith Guard's leave-the-node
+/// screening is pointless there — agent tool-loop payloads carry
+/// timestamps, scores and scores-as-floats that PII heuristics
+/// false-positive on. The mesh-fallback edge screens instead (see
+/// chat_completions), so peer dispatch is never unscreened.
+fn runtime_is_loopback(runtime_url: &str) -> bool {
+    let host = reqwest::Url::parse(runtime_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default()
+        .trim_matches(['[', ']'])
+        .to_string();
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
 /// Forward chat completions to the local runtime, metering the request.
 /// Streaming responses are passed through byte-for-byte.
 async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<Value>) -> Response {
-    // Jerith Guard: screen everything about to leave the node — this gate
-    // covers both the local runtime forward and mesh fallback below.
-    if let Some(guard) = &gw.guard
+    // Jerith Guard screens at EGRESS, not at intake: content only needs
+    // screening when something actually leaves the node. A loopback
+    // runtime forward is not egress (the payload never leaves the
+    // machine — and agent tool-loop payloads are full of numbers and
+    // scores that false-positive the PII heuristics), so the screen
+    // happens later, at the mesh-fallback edge, if peer dispatch ever
+    // engages. Non-loopback runtimes keep the pre-forward screen.
+    let loopback_runtime = runtime_is_loopback(&gw.runtime_url);
+    if !loopback_runtime
+        && let Some(guard) = &gw.guard
         && let Some(messages) = body.get("messages").and_then(|m| m.as_array())
     {
         match guard.screen_messages(messages) {
@@ -983,20 +1022,7 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                 tracing::debug!(target: "guard", "outbound payload redacted before forwarding");
             }
             Ok(None) => {} // clean payload, pass touch-free
-            Err(verdict) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": verdict.block_reason(),
-                        "guard": {
-                            "blocked": true,
-                            "detections": verdict.detections,
-                        },
-                        "mesh_fallback": Value::Null,
-                    })),
-                )
-                    .into_response();
-            }
+            Err(verdict) => return guard_block_response(verdict),
         }
     }
     let url = format!(
@@ -1108,6 +1134,24 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                         })),
                     )
                         .into_response();
+                }
+                // Egress edge — loopback-runtime lane: the pre-forward
+                // screen was skipped at the top because a loopback forward
+                // never leaves the node. Peer dispatch DOES leave it, so
+                // screen here; fallback can never bypass Jerith Guard.
+                // (Runs before the messages extraction: a redaction patch
+                // must be on the array the dispatch actually sends.)
+                if loopback_runtime
+                    && let Some(guard) = &gw.guard
+                    && let Some(msgs_to_screen) = body.get("messages").and_then(|m| m.as_array())
+                {
+                    match guard.screen_messages(msgs_to_screen) {
+                        Ok(Some(patched)) => {
+                            body["messages"] = Value::Array(patched);
+                        }
+                        Ok(None) => {} // clean payload
+                        Err(verdict) => return guard_block_response(verdict),
+                    }
                 }
                 let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
                     return (
@@ -1335,6 +1379,30 @@ mod tests {
     use super::*;
     use axum_test::TestServer;
 
+    #[test]
+    fn loopback_detection_covers_localhost_forms_and_refuses_remote() {
+        for url in [
+            "http://127.0.0.1:11434",
+            "http://localhost:8900",
+            "http://[::1]:8900",
+            "http://127.0.0.1:4000/v1",
+            "https://localhost/v1/chat/completions",
+        ] {
+            assert!(runtime_is_loopback(url), "{url} should count as loopback");
+        }
+        for url in [
+            "https://api.openai.com/v1",
+            "http://10.0.0.5:11434",
+            "http://172.127.0.1:4000", // starts with 172, NOT the loopback /8
+            "jerith-mesh",
+        ] {
+            assert!(
+                !runtime_is_loopback(url),
+                "{url} must NOT count as loopback"
+            );
+        }
+    }
+
     fn spawn_plain(runtime_url: &'static str, fallback: bool) -> TestServer {
         let mut cfg = crate::config::NodeConfig {
             runtime_url: runtime_url.to_string(),
@@ -1402,8 +1470,9 @@ mod tests {
         TestServer::new(gw.router().into_make_service()).expect("test server")
     }
 
-    /// Test server with the default-configured Jerith Guard armed.
-    fn spawn_guarded(runtime_url: String) -> TestServer {
+    /// Test server with the default-configured Jerith Guard armed;
+    /// `fallback` arms the mesh-fallback lane (the egress-edge tests).
+    fn spawn_guarded(runtime_url: String, fallback: bool) -> TestServer {
         let runtime_url: &'static str = Box::leak(runtime_url.into_boxed_str());
         let mut cfg = crate::config::NodeConfig {
             runtime_url: runtime_url.to_string(),
@@ -1419,7 +1488,11 @@ mod tests {
             runtime_api_key: None,
             runtime_num_predict: None,
             miner: None,
-            mesh_fallback: None,
+            mesh_fallback: if fallback {
+                Some(crate::ping::MeshFallbackChat::spawn().expect("test fallback"))
+            } else {
+                None
+            },
             guard: Some(std::sync::Arc::new(guard)),
             model_router: None,
             base_model: None,
@@ -1428,6 +1501,85 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("guarded test server")
+    }
+
+    /// This machine's NON-loopback address (the UDP connect-trick the
+    /// config uses for advertise) — remote-egress tests point the runtime
+    /// URL at it so the gateway treats the forward as true egress.
+    fn nonloopback_ip_for_tests() -> String {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("udp probe socket");
+        sock.connect("8.8.8.8:80").expect("a routable default route (the e2e requires one too)");
+        let ip = sock.local_addr().expect("probe local addr").ip().to_string();
+        assert!(
+            !ip.starts_with("127.") && ip != "::1",
+            "detection must produce a non-loopback address, got {ip}"
+        );
+        ip
+    }
+
+    fn blocked_ssn_request() -> Value {
+        json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "my SSN is 078-05-1120"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn guard_blocks_nonloopback_runtime_requests_before_forwarding() {
+        // REMOTE runtime (non-loopback): the payload leaves the node, so
+        // the guard answers BEFORE any forward is attempted — a 400, not
+        // the dead address's connection error.
+        let server = spawn_guarded("http://10.255.255.1:9".into(), false);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&blocked_ssn_request())
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let body: Value = res.json();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("blocked by jerith-guard"),
+            "error must name the guard, got {body}"
+        );
+        // Detection report present, raw value never echoed back.
+        assert_eq!(body["guard"]["blocked"], Value::Bool(true));
+        assert!(!body.to_string().contains("078-05-1120"));
+    }
+
+    #[tokio::test]
+    async fn guard_blocks_at_mesh_fallback_edge_when_runtime_is_loopback() {
+        // Loopback runtime (screen correctly skipped at intake) + mesh
+        // fallback armed: the local forward fails, and the FALLBACK edge
+        // screens before any peer dispatch — blocked content still 400s
+        // with the guard's report, never reaching a peer.
+        let server = spawn_guarded("http://127.0.0.1:1".into(), true);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&blocked_ssn_request())
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let body: Value = res.json();
+        assert!(
+            body["error"].as_str().unwrap().contains("blocked by jerith-guard"),
+            "expected the fallback-edge guard block, got {body}"
+        );
+        assert!(!body.to_string().contains("078-05-1120"));
+    }
+
+    #[tokio::test]
+    async fn loopback_runtime_intake_is_not_screened_when_nothing_can_leave() {
+        // Loopback runtime, NO fallback: nothing can ever leave the node,
+        // so the guard is deliberately not consulted — the dead runtime's
+        // failure surfaces as the familiar 502 (intake stays touch-free;
+        // agent tool-loop payloads must not trip the PII heuristics).
+        let server = spawn_guarded("http://127.0.0.1:1".into(), false);
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&blocked_ssn_request())
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -1491,33 +1643,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guard_blocks_sensitive_request_at_the_gate() {
-        // Local runtime would 502 — a 400 means the Guard answered first.
-        let server = spawn_guarded("http://127.0.0.1:1".into());
-        let res = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "m",
-                "messages": [{"role": "user", "content": "my SSN is 078-05-1120"}]
-            }))
-            .await;
-        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
-        let body: Value = res.json();
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("blocked by jerith-guard"),
-            "error must name the guard, got {body}"
-        );
-        // Detection report present, raw value never echoed back.
-        assert_eq!(body["guard"]["blocked"], Value::Bool(true));
-        assert!(!body.to_string().contains("078-05-1120"));
-    }
-
-    #[tokio::test]
-    async fn guard_redacts_payload_before_it_reaches_the_runtime() {
-        // Minimal downstream runtime that records exactly what it received.
+    async fn guard_redacts_payload_before_it_reaches_a_remote_runtime() {
+        // Recording runtime bound to this machine's NON-loopback address:
+        // the gateway must treat the forward as egress and redact first.
         let received = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let recv = received.clone();
         let runtime = axum::Router::new().route(
@@ -1532,11 +1660,14 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ip = nonloopback_ip_for_tests();
+        let listener = tokio::net::TcpListener::bind(format!("{ip}:0"))
+            .await
+            .expect("bind on the non-loopback address");
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, runtime).await.expect("runtime up") });
 
-        let server = spawn_guarded(format!("http://{addr}"));
+        let server = spawn_guarded(format!("http://{addr}"), false);
         let res = server
             .post("/v1/chat/completions")
             .json(&json!({

@@ -64,8 +64,7 @@ pub struct MeshState {
     /// Per-peer verdicts over peers' SIGNED measurement blocks (the
     /// verification half): tampered blocks and demonstrated declared-vs-
     /// measured shortfalls queue Leeching evidence on the tick cadence.
-    pub contrib_ledger:
-        std::sync::Arc<tokio::sync::Mutex<crate::contrib::PeerContribLedger>>,
+    pub contrib_ledger: std::sync::Arc<tokio::sync::Mutex<crate::contrib::PeerContribLedger>>,
     pub started_at: std::time::Instant,
     /// What THIS node can offer right now — refreshed at ping cadence
     /// (see hw::sample) and shipped inside our advertise (resource
@@ -77,8 +76,7 @@ pub struct MeshState {
     /// Statistical freerider detection (Phase 4): coordinator-side evidence
     /// only — the ledger rides the dispatch loop (feed_dispatch) and the
     /// evaluator runs on the ping tick, off the inference hot path.
-    pub freerider:
-        std::sync::Arc<tokio::sync::Mutex<crate::freerider::FreeriderDetector>>,
+    pub freerider: std::sync::Arc<tokio::sync::Mutex<crate::freerider::FreeriderDetector>>,
     /// Phase 5 stake + slashing handle (ledger persists across restarts).
     pub stake: Arc<crate::stake::StakeManager>,
     /// Phase 2 tensor transport: local expert weights (set by the node
@@ -100,8 +98,7 @@ pub struct MeshState {
     /// Bootstrap rotation (Phase 1 discovery redundancy): configured
     /// servers + peer-gossiped learned URLs + last-good bookkeeping.
     /// Persisted to `<data>/discovery-servers.json` when it grows.
-    pub discovery:
-        std::sync::Arc<tokio::sync::Mutex<crate::discovery::DiscoveryServers>>,
+    pub discovery: std::sync::Arc<tokio::sync::Mutex<crate::discovery::DiscoveryServers>>,
     /// The live local memory store behind the memory.* skills — owned
     /// HERE (not in the gateway) so the config hot-reload can live-swap
     /// it without rebuilding the HTTP state. Boot swaps it in once the
@@ -547,11 +544,12 @@ impl MeshFallbackChat {
                     .filter(|(id, ..)| *id != own_id)
                     .map(|(id, ..)| id.clone())
                     .collect();
-                state
-                    .freerider
-                    .lock()
-                    .await
-                    .feed_dispatch(expert_id, &candidates, served, dispatch_ms);
+                state.freerider.lock().await.feed_dispatch(
+                    expert_id,
+                    &candidates,
+                    served,
+                    dispatch_ms,
+                );
             }
         }
         Ok((out, served_by))
@@ -772,6 +770,7 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
             c.memory_dsn.clone(),
             c.specialists.embeddings_enabled,
             c.specialists.embedding_dim,
+            c.specialists.embedding_model.clone(),
             c.specialists.ollama_url.clone(),
         )
     };
@@ -896,6 +895,7 @@ async fn reload_config_from_disk(state: &Arc<MeshState>) {
             live.memory_dsn = disk.memory_dsn.clone();
             live.specialists.embeddings_enabled = disk.specialists.embeddings_enabled;
             live.specialists.embedding_dim = disk.specialists.embedding_dim;
+            live.specialists.embedding_model = disk.specialists.embedding_model.clone();
             live.specialists.ollama_url = disk.specialists.ollama_url.clone();
         }
     }
@@ -1031,11 +1031,7 @@ async fn run_loop(
             let identity_ref = &state.identity;
             let fetched_leg = crate::discovery::try_each(&order, |url| {
                 let client = BootstrapClient::new(url.to_string());
-                async move {
-                    client
-                        .fetch_peers_signed(model_id, identity_ref)
-                        .await
-                }
+                async move { client.fetch_peers_signed(model_id, identity_ref).await }
             })
             .await;
             match fetched_leg {
@@ -1276,7 +1272,8 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
         return;
     }
 
-    let client = reqwest::Client::builder().use_rustls_tls()
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .timeout(Duration::from_secs(4))
         .build()
         .expect("reqwest client");
@@ -1315,21 +1312,18 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
                     // other fraud layer (verified here locally, signed by
                     // the peer's own key, so the bootstrap can weigh it).
                     let targets = match meas {
-                        Some(Ok((declared, measured))) => {
-                            state
-                                .contrib_ledger
-                                .lock()
-                                .await
-                                .record_verified(&node_id, declared, measured)
-                        }
+                        Some(Ok((declared, measured))) => state
+                            .contrib_ledger
+                            .lock()
+                            .await
+                            .record_verified(&node_id, declared, measured),
                         Some(Err(())) => {
                             state.contrib_ledger.lock().await.record_tampered(&node_id)
                         }
                         None => Vec::new(),
                     };
                     if !targets.is_empty() {
-                        let refs: Vec<&str> =
-                            targets.iter().map(|s| s.as_str()).collect();
+                        let refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
                         state
                             .verify
                             .flag_fraud(crate::bootstrap_server::FraudKind::Leeching, &refs)
