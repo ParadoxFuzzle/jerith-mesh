@@ -40,52 +40,50 @@ pub async fn ask(
     }
     ctx.defer().await?;
 
-    let history = ctx.data().state.history(user);
     let cfg = ctx.data().cfg.clone();
-    // Context squeeze stage 3 (deep collapse) before the chat when the
-    // passive pass still leaves the ring over the configured budget.
-    let history = crate::squeeze::squeeze_deep(&ctx.data().state, &cfg, user, &history).await;
     // Individual-user recognition (same convention as the DM/@mention path):
     // every turn keeps its speaker so the model can tell owner from guests
-    // and address people by name across the conversation.    let prompt = format!("{}{}", crate::chat_fallback::speaker_tag(ctx.author()), prompt);
+    // and address people by name across the conversation. The tag is this
+    // transport's `speaker_prefix`; the pipeline applies it host-side.
+    let speaker_prefix = crate::chat_fallback::speaker_tag(ctx.author());
     // Streaming ([chat] stream, default on): /ask live-types the answer the
     // same way the @mention/DM fallback does — placeholder message, throttled
     // edits while tokens land, one final formatted replacement. The
     // placeholder lives in the command's channel (slash replies would
     // otherwise need the deferred-response edit path); `stream = false`
     // restores the buffered single-shot `say_long`.
-    let sink = if cfg.chat_stream {
+    let mut sink: Option<std::sync::Arc<dyn crate::converse::ConversationSink>> = if cfg.chat_stream
+    {
         crate::chat_fallback::LiveSink::start(&ctx.serenity_context().clone(), ctx.channel_id())
             .await
+            .map(|s| std::sync::Arc::new(s) as _)
     } else {
         None
     };
-    // The tap owns a state Arc (no borrow of the sink), but shares its move
-    // scope — wait for the chat inside a scope that drops the tap before
-    // the result arms consume the sink.
-    let chat = {
-        let tap: Option<Box<crate::api::LiveTap>> =
-            sink.as_ref().map(|s| -> Box<crate::api::LiveTap> {
-                Box::new(crate::chat_fallback::LiveSink::tap_for(s.state.clone()))
-            });
-        let live: Option<&crate::api::LiveTap> = tap.as_deref();
-        api::chat_with_usage_live(&cfg, &prompt, &history, live).await
-    };
+    // The whole pipeline (squeeze → speaker tag → chat → usage/history
+    // bookkeeping → reply formatting → streamed delivery) has one
+    // definition now (converse::run_session); /ask's remaining
+    // transport-specific bits: tally persistence on chat success, the
+    // buffered `say_long`, and poise error propagation when no sink exists.
+    let chat = crate::converse::run_session(
+        &cfg,
+        &ctx.data().state,
+        crate::converse::Session { user, prompt },
+        &speaker_prefix,
+        &mut sink,
+    )
+    .await;
     match chat {
-        Ok((reply, served_by, tokens)) => {
-            // Session-cost-tracker port input: cumulative per-user tokens.
-            ctx.data().state.record_usage(user, tokens);
+        Ok((text, _served_by)) => {
             // Persist after chats too (not just /mine wins) so token spend and
             // history survive restarts on chat-active bots.
             persist_tally_after_win(ctx).await;
-            ctx.data().state.push_turn(user, &prompt, &reply);
-            let text = format_reply(&reply, served_by.as_deref());
-            match sink {
-                Some(sink) => sink.finish(text).await,
-                None => say_long(ctx, &text).await?,
+            if sink.is_none() {
+                say_long(ctx, &text).await?;
             }
+            // Sink-delivered: the pipeline already streamed + finished.
         }
-        Err(e) => match sink {
+        Err(e) => match sink.take() {
             Some(sink) => sink.finish(format!("⚠️ chat failed just now — {e}")).await,
             None => return Err(e),
         },

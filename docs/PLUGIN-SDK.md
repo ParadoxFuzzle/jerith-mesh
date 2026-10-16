@@ -126,15 +126,20 @@ reactions and message chunking differ per transport).
 
 ## Phasing (what lands in what order)
 
-1. **Phase 3a — registry joins manifests.** `with_external(drops)` +
-   manifest validation + HTTP dispatcher + the `[plugins]` namespaced
-   ids + tests (manifest parse, gating, timeout refusal). No channel
-   surfaces change. Already steers by the hooks signing code (`hooks.rs`),
-   the dispatcher test pattern (`api.rs`), and works with the worked
-   example in `docs/PLUGINS.md` as the reference third-party skill.
-2. **Phase 3b — dialogue-core extraction.** The `ConversationSink`
-   boundary with an in-memory impl, Discord confirmed unchanged (CI runs
-   bot suites before and after; the E2E stays the live gate).
+1. **Phase 3a — registry joins manifests. ✅ implemented** (`c7d6f3d`,
+   2026-10-16): `with_external(drops)` + manifest validation + HTTP
+   dispatcher + the `[plugins]` namespaced ids + tests. External skills
+   ship in `crates/bot/src/external.rs`; see the status header above.
+2. **Phase 3b — dialogue-core extraction. ✅ implemented** (2026-10-16):
+   `crates/bot/src/converse.rs` — the `ConversationSink` seam (sync
+   best-effort `on_event`, Arc-consuming `finish`), `run_session` as
+   the single definition of the squeeze→tag→chat→bookkeeping→format
+   pipeline, and the shipped sinks: Discord's `LiveSink` impl plus the
+   in-memory test transport (streaming + buffered end-to-end proofs
+   against a real gateway stub, no serenity). `/ask` and the
+   @mention/DM path now consume the core; the cooldown gate and error
+   display stay transport-side by design (different wordings, and the
+   gate must fire exactly once per request).
 3. **Phase 3c — Telegram adapter.** The first external-channel
    consumer, shipping as a separate binary (`jerith-bot-telegram`)
    configured via `bot.toml [telegram]`, reusing everything else.

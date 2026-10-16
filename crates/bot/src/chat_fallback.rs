@@ -18,7 +18,6 @@
 
 use poise::serenity_prelude as serenityall;
 
-use crate::api;
 use crate::commands::Data;
 
 type Error = anyhow::Error;
@@ -96,44 +95,44 @@ pub async fn handle(
     let cfg = data.cfg.clone();
     // Individual-user recognition: every turn keeps its speaker, so the
     // model (whose persona encodes the owner's id) can tell owner from
-    // guests and address people by name across the conversation.
-    let tagged = format!("{}{}", speaker_tag(&msg.author), prompt);
+    // guests and address people by name across the conversation. The
+    // tag is the transport's `speaker_prefix` contribution — the
+    // pipeline itself applies it.
+    let speaker_prefix = speaker_tag(&msg.author);
     tokio::spawn(async move {
         show_typing(&http_ctx, channel).await;
-        // Context squeeze stage 3 before the chat (same as /ask).
-        let history = crate::squeeze::squeeze_deep(&state, &cfg, user, &state.history(user)).await;
         // Live typing ([chat] stream, default on): the answer streams
         // through the gateway's SSE passthrough and edits into Discord
         // while tokens land. The sink degrades on its own — a failed
         // placeholder POST or a failed edit just silences it — so the
         // chat result path below is identically correct either way.
         // Buffered configs (stream = false) keep the plain one-shot send.
-        let sink = if cfg.chat_stream {
-            LiveSink::start(&http_ctx, channel).await
-        } else {
-            None
-        };
-        // The tap borrows nothing from `sink` (it owns a state Arc), but it
-        // still shares `sink`'s move scope — scope both so the result match
-        // below can consume the sink.
-        let chat = {
-            let tap: Option<Box<crate::api::LiveTap>> =
-                sink.as_ref().map(|s| -> Box<crate::api::LiveTap> {
-                    Box::new(crate::chat_fallback::LiveSink::tap_for(s.state.clone()))
-                });
-            let live: Option<&crate::api::LiveTap> = tap.as_deref();
-            api::chat_with_usage_live(&cfg, &tagged, &history, live).await
-        };
-        match chat {
-            Ok((reply, served_by, tokens)) => {
-                state.record_usage(user, tokens);
-                state.push_turn(user, &tagged, &reply);
-                let text = crate::commands::format_reply(&reply, served_by.as_deref());
-                match sink {
-                    Some(sink) => sink.finish(text).await,
-                    None => {
-                        send_long(&http_ctx, channel, &text).await;
-                    }
+        let mut sink: Option<std::sync::Arc<dyn crate::converse::ConversationSink>> =
+            if cfg.chat_stream {
+                LiveSink::start(&http_ctx, channel)
+                    .await
+                    .map(|s| std::sync::Arc::new(s) as _)
+            } else {
+                None
+            };
+        // The whole pipeline (squeeze → speaker tag → chat → usage/history
+        // bookkeeping → reply formatting → streamed delivery) has one
+        // definition now (converse::run_session); this front-end only
+        // chooses the sink and the error display.
+        match crate::converse::run_session(
+            &cfg,
+            &state,
+            crate::converse::Session { user, prompt },
+            &speaker_prefix,
+            &mut sink,
+        )
+        .await
+        {
+            Ok((text, _served_by)) => {
+                // A live sink was already finished inside the pipeline;
+                // buffered configs deliver here, as before.
+                if sink.is_none() {
+                    send_long(&http_ctx, channel, &text).await;
                 }
             }
             Err(e) => {
@@ -157,11 +156,10 @@ pub async fn handle(
                 let text = format!(
                     "⚠️ the mesh didn't answer just now — {reason}\ntry `@bot ask <question>` again in a moment."
                 );
-                match sink {
-                    Some(sink) => sink.finish(text).await,
-                    None => {
-                        send_long(&http_ctx, channel, &text).await;
-                    }
+                if let Some(sink) = sink.take() {
+                    sink.finish(text).await;
+                } else {
+                    send_long(&http_ctx, channel, &text).await;
                 }
             }
         }
@@ -315,51 +313,52 @@ impl LiveSink {
             ticker,
         })
     }
+}
 
-    /// The api layer's per-fragment tap: appends into the shared state,
-    /// marks dirty; the ticker does the (throttled) Discord part.
-    /// The api layer's event tap: `RoundStart` clears whatever the previous
-    /// round typed (tool-exchange slop — native web-search tool rounds type
-    /// nothing), `Text` appends; the ticker does the (throttled) Discord part.
-    /// Free fn over the state Arc so the opaque return never captures `&self`
-    /// (the sink is moved into `finish` while the tap can still be alive).
-    pub(crate) fn tap_for(
-        state: std::sync::Arc<tokio::sync::Mutex<SinkState>>,
-    ) -> impl Fn(crate::api::LiveEvent) + Send + Sync {
-        move |ev: crate::api::LiveEvent| {
-            if let Ok(mut s) = state.try_lock() {
-                match ev {
-                    crate::api::LiveEvent::RoundStart => {
-                        s.text.clear();
+/// The live-typing sink as the pipeline's seam (Phase 3b): fragments
+/// flow through `on_event` (the same try-lock discipline the old
+/// `tap_for` bridge used), the final formatted reply through `finish`
+/// (which also aborts the edit ticker). The `Arc` keying exists because
+/// the pipeline finishes the sink while its own per-request tap holds a
+/// clone.
+impl crate::converse::ConversationSink for LiveSink {
+    fn on_event(&self, event: crate::api::LiveEvent<'_>) {
+        if let Ok(mut s) = self.state.try_lock() {
+            match event {
+                crate::api::LiveEvent::RoundStart => {
+                    s.text.clear();
+                    s.dirty = true;
+                }
+                crate::api::LiveEvent::Text(frag) => {
+                    if !frag.is_empty() {
+                        s.text.push_str(frag);
                         s.dirty = true;
-                    }
-                    crate::api::LiveEvent::Text(frag) => {
-                        if !frag.is_empty() {
-                            s.text.push_str(frag);
-                            s.dirty = true;
-                        }
                     }
                 }
             }
         }
     }
 
-    /// Final replacement: the full formatted reply, then the ticker stops.
-    pub(crate) async fn finish(self, text: String) {
-        self.ticker.abort();
-        let clipped = clip_tail(&text, 1990);
-        if let Err(e) = self
-            .channel
-            .edit_message(
-                &self.http_ctx,
-                self.msg_id,
-                poise::serenity_prelude::EditMessage::new().content(clipped),
-            )
-            .await
-        {
-            tracing::debug!(error = %e, "live sink final edit failed — resending");
-            send_long(&self.http_ctx, self.channel, &text).await;
-        }
+    fn finish(
+        self: std::sync::Arc<Self>,
+        text: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            self.ticker.abort();
+            let clipped = clip_tail(&text, 1990);
+            if let Err(e) = self
+                .channel
+                .edit_message(
+                    &self.http_ctx,
+                    self.msg_id,
+                    poise::serenity_prelude::EditMessage::new().content(clipped),
+                )
+                .await
+            {
+                tracing::debug!(error = %e, "live sink final edit failed — resending");
+                send_long(&self.http_ctx, self.channel, &text).await;
+            }
+        })
     }
 }
 
