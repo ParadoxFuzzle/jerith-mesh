@@ -1102,6 +1102,25 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body["model"] = serde_json::Value::String(next);
         }
     }
+    // A model-less BASIC chat (no tier engaged) would forward `model: null`
+    // to the runtime — LiteLLM rejects that with 400 "Invalid model name
+    // passed in model=None" (observed 2026-10-16 via a plain probe without
+    // the field). Default to the advertised base model — the same id
+    // /status serves — so any OpenAI-compatible client can omit `model`.
+    if body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::is_empty)
+        .unwrap_or(true)
+        && let Some(base) = gw
+            .base_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        body["model"] = serde_json::Value::String(base.to_string());
+    }
     // Runaway cap: bound generation for the runtime lane when configured
     // and the caller didn't express their own cap (see field docs).
     if let Some(cap) = gw.runtime_num_predict {
@@ -2059,5 +2078,60 @@ mod tests {
             "body: {body}"
         );
         assert_eq!(body.get("mesh_fallback"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn model_less_basic_chat_defaults_to_the_advertised_base_model() {
+        // A client that omits `model` on a basic (tool-less) chat must get
+        // the advertised base model substituted — not a forwarded null that
+        // the runtime 400s on ("Invalid model name … model=None",
+        // observed live 2026-10-16).
+        let received = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let recv = received.clone();
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let recv = recv.clone();
+                async move {
+                    *recv.lock().await = body;
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+        let runtime_url = format!("http://{addr}");
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.clone(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url,
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("base:7b".to_string()),
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+            .await;
+        assert!(res.status_code().is_success());
+        let forwarded: Value = serde_json::from_str(&received.lock().await).expect("runtime body");
+        assert_eq!(forwarded["model"], json!("base:7b"));
     }
 }
