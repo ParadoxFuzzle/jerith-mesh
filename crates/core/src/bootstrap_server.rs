@@ -705,13 +705,38 @@ async fn report_fraud(
 
 async fn model_counts(State((registry, ttl_ms)): State<Shared>) -> Response {
     let live = sweep_live(&registry, ttl_ms).await;
+    // Per-model count plus the per-quant breakdown — the mesh-compat
+    // check (FEATURES §12) reads this to tell an operator "same model,
+    // wrong quant — N nodes run quants [...]".
     let mut counts: HashMap<String, u64> = HashMap::new();
+    let mut quants: HashMap<String, HashMap<String, u64>> = HashMap::new();
     for e in live {
         *counts.entry(e.ad.model_id.clone()).or_default() += 1;
+        *quants
+            .entry(e.ad.model_id.clone())
+            .or_default()
+            .entry(e.ad.quant.clone())
+            .or_default() += 1;
     }
     let mut out: Vec<serde_json::Value> = counts
         .into_iter()
-        .map(|(model_id, count)| serde_json::json!({"model_id": model_id, "count": count}))
+        .map(|(model_id, count)| {
+            let mut qs: Vec<(String, u64)> = quants
+                .remove(&model_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            qs.sort();
+            let quant_rows: Vec<serde_json::Value> = qs
+                .into_iter()
+                .map(|(q, c)| serde_json::json!({"quant": q, "count": c}))
+                .collect();
+            serde_json::json!({
+                "model_id": model_id,
+                "count": count,
+                "quants": quant_rows,
+            })
+        })
         .collect();
     out.sort_by_key(|v| {
         v.get("model_id")
@@ -868,6 +893,48 @@ mod tests {
         assert_eq!(counts.len(), 2);
         let glm = counts.iter().find(|c| c["model_id"] == "glm-5.3").unwrap();
         assert_eq!(glm["count"], 2);
+        assert_eq!(glm["quants"][0]["quant"], "int4");
+        assert_eq!(glm["quants"][0]["count"], 2);
+    }
+
+    /// The compat census the mesh-compat check consumes: quant counts MIX
+    /// (two nodes int4, one bogus-default quant "fp8") and the row shape
+    /// `BootstrapClient::fetch_model_census` parses.
+    #[tokio::test]
+    async fn model_counts_split_by_quant() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = crate::http::mesh_http();
+        for (model, quant) in [
+            ("glm-5.3", "int4"),
+            ("glm-5.3", "int4"),
+            ("glm-5.3", "fp8"),
+        ] {
+            let (mut id, mut a) = make_peer(model);
+            a.quant = quant.into();
+            let r = client
+                .put(format!("{base}/v1/advertise"))
+                .headers(signed_headers(&id, &a))
+                .json(&a)
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+            let _ = &mut id;
+        }
+        // Client-side parse: the typed census row carries both quants.
+        let rows = crate::bootstrap::BootstrapClient::new(base)
+            .fetch_model_census()
+            .await
+            .unwrap();
+        let glm = rows.iter().find(|r| r.model_id == "glm-5.3").unwrap();
+        assert_eq!(glm.count, 3);
+        assert_eq!(glm.quants.get("int4"), Some(&2));
+        assert_eq!(glm.quants.get("fp8"), Some(&1));
     }
 
     #[tokio::test]

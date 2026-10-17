@@ -444,7 +444,19 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
     the roundtrip, weight opt-in, checksum/truncation failures, overwrite
     semantics, path-traversal refusal and the no-config refusal
 - 📋 Privacy levels: local-only / trusted-peers / full-mesh (Phase 3)
-- 📋 Compatibility check for quantization, context length, tokenizer version (Phase 2)
+- ✅ Compatibility check for model id + quantization (Phase 2, landed
+  2026-10-17): the bootstrap's `/v1/models/counts` census now splits per
+  quant, and every node runs a ONE-TIME pre-join compat probe on its first
+  successful bootstrap leg (when nothing was admitted yet): the typed
+  verdict lands in /status `compat` and logs warn —
+  - `wrong_quant`: "same model, wrong quant — the mesh runs <model> on
+    quant(s) [...]; you run '<quant>', which no peer admits (peers match
+    id+quant exactly) `jerith config set model.quant <theirs>` is the fix"
+  - `no_peers_on_model`: "you ARE the mesh" for a brand-new network, or
+    the models live right now when the fleet runs something else
+  - `healthy` when nodes on the exact id+quant are live
+  Context length + tokenizer: not carried on ModelId yet (the mesh peering
+  gate is id+quant), so that half stays 📋 until the identity gains them
 - ✅ Rate limiting, per-peer blocking, content filters (Phase 3):
   - Rate limiting: fixed-window limiter on the public HTTP surfaces (node
     gateway + bootstrap), per-IP anonymous floor + per-Ed25519-identity

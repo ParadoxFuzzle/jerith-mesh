@@ -19,6 +19,7 @@ use tokio::time::{MissedTickBehavior, interval};
 
 use crate::bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState, now_ms};
 use crate::config::NodeConfig;
+use serde::Serialize;
 
 /// Shared Phase 4 verification tracker: counters + pending fraud evidence.
 pub type SharedVerifyTracker = std::sync::Arc<crate::verify::VerificationTracker>;
@@ -112,6 +113,121 @@ pub struct MeshState {
     /// Where those counters persist (see
     /// [`set_expert_stats`](Self::set_expert_stats)).
     expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
+    /// Pre-join mesh-compat verdict (FEATURES §12): the typed, readable
+    /// result of comparing OUR model identity against the bootstrap's
+    /// per-model/per-quant census, taken once on the loop's first
+    /// successful bootstrap leg. "Healthy" nodes replace it with nothing
+    /// interesting; the mismatch cases explain WHY the mesh looks empty
+    /// (same model, wrong quant — N nodes could still take you).
+    pub compat: tokio::sync::RwLock<Option<CompatVerdict>>,
+}
+
+/// One pre-join compat verdict over a local model identity + the live
+/// bootstrap census (pure fn below drives it; see `compat_verdict`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CompatVerdict {
+    /// "healthy" | "wrong_quant" | "no_peers_on_model" | "bootstrap_unreachable"
+    pub verdict: String,
+    pub message: String,
+    pub checked_at_ms: u64,
+    /// Live peers running OUR exact model id (any quant).
+    pub peers_on_model: u64,
+    /// Of those, our exact quant (0 under wrong_quant).
+    pub peers_same_quant: u64,
+    /// Mismatch quant → count rows for our model (readable operator hint).
+    pub other_quants: Vec<(String, u64)>,
+    /// Live models we could join instead, when our model has no peers at
+    /// all ("{model_id} ({count} nodes)" rows) — the honest answer to a
+    ///"brand-new mesh?" suspicion.
+    pub other_models: Vec<(String, u64)>,
+}
+
+/// Compare OUR identity against the census: determine if the same model, wrong quant
+/// case, the live-alternatives case, or healthy — in that priority.
+pub fn compat_verdict(
+    local: &crate::models::ModelId,
+    census: &[crate::bootstrap::ModelCensusRow],
+) -> CompatVerdict {
+    let mine = census
+        .iter()
+        .find(|row| row.model_id == local.id)
+        .cloned()
+        .unwrap_or_default();
+    let peers_same_quant = mine
+        .quants
+        .get(&local.quant)
+        .copied()
+        .unwrap_or(0);
+    let other_quants: Vec<(String, u64)> = mine
+        .quants
+        .iter()
+        .filter(|(q, _)| q.as_str() != local.quant)
+        .map(|(q, c)| (q.clone(), *c))
+        .collect();
+    let other_models: Vec<(String, u64)> = census
+        .iter()
+        .filter(|row| row.model_id != local.id && row.count > 0)
+        .map(|row| (row.model_id.clone(), row.count))
+        .collect();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut v = CompatVerdict {
+        verdict: "healthy".into(),
+        message: format!(
+            "mesh compatible — {} peer(s) on {} quant {}",
+            peers_same_quant, local.id, local.quant
+        ),
+        checked_at_ms: now_ms,
+        peers_on_model: mine.count,
+        peers_same_quant,
+        other_quants,
+        other_models,
+    };
+    if peers_same_quant > 0 {
+        return v;
+    }
+    if mine.count > 0 {
+        // The model runs live on the mesh but NOT with our quant: peers
+        // admit exact quant matches only, so this node would join an
+        // empty registry. Say both halves readably.
+        let list = v
+            .other_quants
+            .iter()
+            .map(|(q, c)| format!("{q} ({c} node{})", if *c == 1 { "" } else { "s" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        v.verdict = "wrong_quant".into();
+        v.message = format!(
+            "same model, wrong quant — the mesh runs {} on quant(s) [{list}]; you run '{}', which no peer admits (peers match id+quant exactly). `jerith config set model.quant <theirs>` is the fix",
+            local.id,
+            local.quant,
+        );
+        return v;
+    }
+    // No live peers on our model at all: either this mesh is brand-new,
+    // or the model spelling drifts from the fleet. Surface what IS live
+    // so the operator can pick a lane.
+    v.verdict = "no_peers_on_model".into();
+    if v.other_models.is_empty() {
+        v.message = format!(
+            "no live peers on {} yet — you ARE the mesh (brand-new network? check the bootstrap server if peers were expected)",
+            local.id
+        );
+    } else {
+        let alts = v
+            .other_models
+            .iter()
+            .map(|(m, c)| format!("{m} ({c})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        v.message = format!(
+            "no live peers on {} — models live on this mesh right now: {alts}",
+            local.id
+        );
+    }
+    v
 }
 
 impl MeshState {
@@ -151,6 +267,7 @@ impl MeshState {
                 crate::expert_stats::ExpertStats::load(&crate::expert_stats::default_stats_path()),
             )),
             expert_stats_path: std::sync::Mutex::new(crate::expert_stats::default_stats_path()),
+            compat: tokio::sync::RwLock::new(None),
             isolate: std::sync::Arc::new(crate::isolate::IsolateState::default()),
             peer_block,
             freerider: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -1073,6 +1190,50 @@ async fn run_loop(
                         bootstrap = %used,
                         "peer list refreshed from bootstrap"
                     );
+                    // Pre-join mesh compat (FEATURES §12), once per
+                    // process: if the registry admitted NOTHING so far,
+                    // compare OUR identity against the bootstrap census
+                    // so "mesh looks empty" always has a typed answer —
+                    // especially "same model, wrong quant, N nodes
+                    // could still take you". A healthy node overwrites
+                    // nothing interesting; verdicts surface in /status.
+                    // NOTE: the `reg` guard is held in this scope — use it
+                    // instead of re-locking (a second registry lock on the
+                    // same task deadlocks the loop AND /status's mutex).
+                    if reg.is_empty() && state.compat.read().await.is_none()
+                    {
+                        match BootstrapClient::new(used.clone())
+                            .fetch_model_census()
+                            .await
+                        {
+                            Ok(census) => {
+                                let verdict = compat_verdict(m, &census);
+                                if verdict.verdict != "healthy" {
+                                    tracing::warn!(
+                                        target: "mesh",
+                                        verdict = %verdict.verdict,
+                                        "{}",
+                                        verdict.message
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        target: "mesh",
+                                        verdict = %verdict.verdict,
+                                        "{}",
+                                        verdict.message
+                                    );
+                                }
+                                *state.compat.write().await = Some(verdict);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "mesh",
+                                    error = %e,
+                                    "mesh compat census probe failed (retry next tick)"
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     // Bootstrap turned this node away (signature/expiry) or
@@ -1628,8 +1789,79 @@ pub struct PingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::DEPRECATE_AFTER_FAILED_PINGS;
+    use crate::bootstrap::{DEPRECATE_AFTER_FAILED_PINGS, ModelCensusRow};
     use crate::config::*;
+
+    fn census(rows: &[(&str, &str, u64)]) -> Vec<ModelCensusRow> {
+        rows.iter()
+            .map(|(m, q, c)| ModelCensusRow {
+                model_id: m.to_string(),
+                count: *c,
+                quants: std::collections::BTreeMap::from([(q.to_string(), *c)]),
+            })
+            .fold(Vec::new(), |mut acc, row| {
+                if let Some(existing) = acc.iter_mut().find(|r| r.model_id == row.model_id) {
+                    existing.count += row.count;
+                    for (k, v) in row.quants {
+                        *existing.quants.entry(k).or_default() += v;
+                    }
+                } else {
+                    acc.push(row);
+                }
+                acc
+            })
+    }
+
+    fn local(id: &str, quant: &str) -> crate::models::ModelId {
+        crate::models::ModelId {
+            id: id.into(),
+            quant: quant.into(),
+            source: crate::models::ModelSource::Ollama { name: id.into() },
+        }
+    }
+
+    #[test]
+    fn compat_verdict_healthy_when_our_exact_quant_is_live() {
+        let v = compat_verdict(&local("glm-5.3", "int4"), &census(&[
+            ("glm-5.3", "int4", 3),
+            ("glm-5.3", "fp8", 1),
+            ("qwen3:8b", "default", 2),
+        ]));
+        assert_eq!(v.verdict, "healthy", "{}", v.message);
+        assert_eq!(v.peers_on_model, 4);
+        assert_eq!(v.peers_same_quant, 3);
+    }
+
+    #[test]
+    fn compat_verdict_wrong_quant_names_the_live_quants() {
+        let v = compat_verdict(&local("glm-5.3", "default"), &census(&[
+            ("glm-5.3", "int4", 2),
+            ("glm-5.3", "fp8", 1),
+        ]));
+        assert_eq!(v.verdict, "wrong_quant");
+        assert!(v.message.contains("same model, wrong quant"), "{}", v.message);
+        assert!(v.message.contains("int4 (2 nodes)"), "{}", v.message);
+        assert!(v.message.contains("fp8 (1 node"), "{}", v.message);
+        assert!(v.message.contains("'default'"), "{}", v.message);
+        assert!(v.other_quants.iter().any(|(q, c)| q == "int4" && *c == 2));
+    }
+
+    #[test]
+    fn compat_verdict_no_peers_names_live_alternatives() {
+        let v = compat_verdict(&local("made-up", "default"), &census(&[
+            ("glm-5.3", "int4", 2),
+        ]));
+        assert_eq!(v.verdict, "no_peers_on_model");
+        assert!(v.message.contains("models live on this mesh"), "{}", v.message);
+        assert!(v.message.contains("glm-5.3 (2)"), "{}", v.message);
+    }
+
+    #[test]
+    fn compat_verdict_brand_new_mesh_says_so() {
+        let v = compat_verdict(&local("glm-5.3", "int4"), &census(&[]));
+        assert_eq!(v.verdict, "no_peers_on_model");
+        assert!(v.message.contains("you ARE the mesh"), "{}", v.message);
+    }
 
     #[test]
     fn config_reload_plan_classifies_fields() {

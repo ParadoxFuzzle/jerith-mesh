@@ -892,6 +892,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "peer_block": peer_block_value,
         // Discovery rotation (Phase 1): configured + learned + last-good.
         "discovery": discovery_value,
+        // Pre-join mesh compat (FEATURES §12): the typed verdict over OUR
+        // model identity vs the bootstrap census (quants mismatch,
+        // brand-new mesh). Null until the first probe answered.
+        "compat": gw.state.compat.read().await.clone().map(|v| serde_json::to_value(v).expect("compat verdict serializes")).unwrap_or(Value::Null),
         // Statistical freerider detection (Phase 4): running suspicion.
         "freerider": freerider_value,
         // Tensor transport (Phase 2): expert store state + cache counters.

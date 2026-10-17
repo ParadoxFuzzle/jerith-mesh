@@ -65,6 +65,17 @@ pub struct PeerAd {
 /// `hosted_expert_count` instead of bloating every advertise.
 pub const HOSTED_EXPERTS_AD_MAX: usize = 256;
 
+/// One row of the bootstrap's per-model peer census (`GET
+/// /v1/models/counts`): how many live nodes run the model, and how that
+/// count splits over quants — the pre-join compat check's data source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelCensusRow {
+    pub model_id: String,
+    pub count: u64,
+    /// quant → peer count. BTree for stable, readable verdicts.
+    pub quants: std::collections::BTreeMap<String, u64>,
+}
+
 impl PeerAd {
     /// Does this peer claim to host `expert_id`?
     ///
@@ -317,6 +328,49 @@ impl BootstrapClient {
             .await
             .context("bootstrap returned unparseable peer list")?;
         Ok(parsed.peers)
+    }
+
+    /// GET /v1/models/counts — the live per-model peer census, with the
+    /// per-quant breakdown that makes the pre-join compat check readable
+    /// ("same model, wrong quant — N nodes could still take you").
+    pub async fn fetch_model_census(&self) -> anyhow::Result<Vec<ModelCensusRow>> {
+        let url = format!("{}/v1/models/counts", self.base_url.trim_end_matches('/'));
+        let parsed: Vec<serde_json::Value> = self
+            .inner
+            .get(&url)
+            .send()
+            .await
+            .context("bootstrap census fetch failed")?
+            .error_for_status()
+            .context("bootstrap census returned an error")?
+            .json()
+            .await
+            .context("bootstrap census returned unparseable JSON")?;
+        Ok(parsed
+            .into_iter()
+            .map(|row| ModelCensusRow {
+                model_id: row
+                    .get("model_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                count: row.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                quants: row
+                    .get("quants")
+                    .and_then(|v| v.as_array())
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| {
+                                Some((
+                                    r.get("quant")?.as_str()?.to_string(),
+                                    r.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect())
     }
 
     /// Signed variant of `fetch_peers`: the wire-auth headers put the hit
