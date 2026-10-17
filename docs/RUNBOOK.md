@@ -195,6 +195,81 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 If every step above passes, the deploy is live and consistent with the
 pushed code. Record the deployed commit (`git log -1`) for rollback.
 
+## Optional-chain wallet adapters (§9, per-chain examples)
+
+The default chain is JerithChain. Setting `[crypto] chain` to a PoW chain
+switches the node to the **wallet-card half only**: `/status` probes the
+endpoint you supply for a live, chain-truthful balance (`crypto.
+optional_wallet`); mining stays refused by the honest note — PoW chains
+don't mesh-mine. Config keys (config.toml):
+
+```toml
+[crypto]
+chain = "bitcoin"            # bitcoin | ethereum | dogecoin | monero
+wallet_endpoint = "..."      # ALWAYS user-supplied; see per-chain below
+wallet_address = "..."       # required for ethereum; optional (recommended) for Core chains; unused by monero
+```
+
+A wrong endpoint never becomes a fake zero — the card degrades to
+`{ok:false, error:"..."}` in /status and `wallet(oc) … (<error>)` in the
+banner. Verify each shape after edit (no restart needed for a
+config-reload drill; the card probes per /status request):
+
+```bash
+curl -s :8900/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["crypto"]["optional_wallet"])'
+```
+
+```toml
+# — Bitcoin Core (bitcoind-defaults node; Dogecoin Core is the same shape) —
+# RPC auth rides the URL: http://<rpcuser>:<rpcpass>@127.0.0.1:8332
+[crypto]
+chain = "bitcoin"
+wallet_endpoint = "http://__rpcuser__:__rpcpass__@127.0.0.1:8332"
+# watch exactly one address (RPC getreceivedbyaddress, 1-confirmation):  
+wallet_address = "bc1qyy74txkqpa6y4mpanh5y5phqqktghwx30nyn8y"
+# omit wallet_address to show the node wallet's own getbalance instead
+
+# — Dogecoin Core — same as Bitcoin, default port 22555 —
+[crypto]
+chain = "dogecoin"
+wallet_endpoint = "http://__rpcuser__:__rpcpass__@127.0.0.1:22555"
+wallet_address = "D8aX7z1KL4bYQKQ1znyEbEhhhkYXPf1Qps"
+
+# — Ethereum (any node with the standard JSON-RPC; plain HTTP okay for LAN) —
+[crypto]
+chain = "ethereum"
+wallet_endpoint = "http://127.0.0.1:8545"
+# REQUIRED + exactly 0x + 40 hex (eth_getBalance is address-keyed):
+wallet_address = "0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5"
+
+# — Monero (monero-wallet-rpc serving ONE wallet file; no address needed) —
+# Point it at wallet-rpc's json_rpc surface; the doc-default port is 18083:
+[crypto]
+chain = "monero"
+wallet_endpoint = "http://127.0.0.1:18083/json_rpc"
+# wallet_address unused (the probe is whichever wallet file you started with)
+```
+
+Pre-wire check per chain, outside the mesh — run the exact call
+the adapter makes (these must succeed before blaming the node):
+
+```bash
+# bitcoin/dogecoin Core (the probe asks getreceivedbyaddress when an
+# address is set, else getbalance):
+curl -su u:p -H 'content-type: application/json' \
+  -d '{"jsonrpc":"1.0","id":"probe","method":"getreceivedbyaddress","params":["<addr>",1]}' \
+  http://127.0.0.1:8332
+# ethereum:
+curl -s -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x…","latest"]}' http://127.0.0.1:8545
+# monero-wallet-rpc:
+curl -s -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"0","method":"get_balance","params":{}}' \
+  http://127.0.0.1:18083/json_rpc
+```
+
+Rolling back a chain switch is a config edit away (chain back to
+`jerithchain`); the JER wallet card and the miner come straight back.
+
 ## Rollback
 
 ```bash
