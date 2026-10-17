@@ -17,7 +17,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState, now_ms};
+use crate::bootstrap::{
+    BootstrapClient, FetchedPeers, PeerAd, PeerRegistry, PeerState, now_ms,
+};
 use crate::config::{NodeConfig, PrivacyLevel};
 use serde::Serialize;
 
@@ -119,6 +121,11 @@ pub struct MeshState {
     /// Why the latch fired (typed journal: config model id we would serve
     /// after a restart), surfaced beside the latch in /status.
     pub pending_model: tokio::sync::RwLock<Option<String>>,
+    /// §10 reputation gossip: bootstrap-verified score stamps we may carry
+    /// inside ads. Newest-subject-per-stamp, capped; every stamp in here
+    /// verified against an ORIGIN pin WE made from a configured/learned
+    /// bootstrap's own published key — nothing unverified rides out.
+    pub reputation_cache: std::sync::Arc<tokio::sync::Mutex<Vec<crate::signing::ReputationStamp>>>,
     /// Where those counters persist (see
     /// [`set_expert_stats`](Self::set_expert_stats)).
     expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
@@ -287,6 +294,7 @@ impl MeshState {
             memory_swap_backoff_until: std::sync::Mutex::new(None),
             left_mesh_latch: std::sync::atomic::AtomicBool::new(false),
             pending_model: tokio::sync::RwLock::new(None),
+            reputation_cache: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         });
         Ok((state, rx))
     }
@@ -1278,11 +1286,20 @@ async fn run_loop(
             let identity_ref = &state.identity;
             let fetched_leg = crate::discovery::try_each(&order, |url| {
                 let client = BootstrapClient::new(url.to_string());
-                async move { client.fetch_peers_signed(model_id, identity_ref).await }
+                async move { client.fetch_peers_signed_full(model_id, identity_ref).await }
             })
             .await;
             match fetched_leg {
-                Ok((peers, used)) => {
+                Ok((fetched, used)) => {
+                    let FetchedPeers {
+                        peers,
+                        served_by: _,
+                        bootstrap_key,
+                        reputations,
+                    } = fetched;
+                    // §10 reputation trust surface: PIN the answering
+                    // bootstrap's key and ingest its direct stamps.
+                    pin_and_ingest(&state, &used, bootstrap_key.as_ref(), reputations).await;
                     {
                         let mut d = state.discovery.lock().await;
                         // Hostile-ad audit (F2): "answered" alone does not
@@ -1299,6 +1316,12 @@ async fn run_loop(
                     let mut reg = state.registry.lock().await;
                     let fetched = peers.len();
                     for ad in peers {
+                        // §10 gossip ingest: stamps carried INSIDE ads re-
+                        // verify against OUR OWN pins (origin-bound); unknown
+                        // origins, stale stamps, and forged sigs drop here,
+                        // never into the cache. Self-stamps from the ad's
+                        // own node are refused (no self-serving broadcast).
+                        let _ = ingest_ad_gossip(&state, &ad).await;
                         reg.upsert(ad);
                     }
                     tracing::info!(
@@ -1444,6 +1467,16 @@ async fn run_loop(
                 discovery_servers: {
                     let d = state.discovery.lock().await;
                     d.ad_servers(None)
+                },
+                // §10 reputation gossip: bootstrap-verified score stamps
+                // (verified against OUR pins) ride inside the ad so peers
+                // can learn configured-bootstrap scores without trusting
+                // the advertiser. Newest first, capped like discovery.
+                gossip_reputations: {
+                    let cache = state.reputation_cache.lock().await;
+                    (!cache.is_empty()).then(|| {
+                        cache.iter().take(crate::bootstrap::REPUTATION_GOSSIP_AD_MAX).cloned().collect()
+                    })
                 },
             };
             let identity_ref = &state.identity;
@@ -1981,6 +2014,146 @@ async fn verify_health_reply(
     (alive, measurement)
 }
 
+/// §10 quotient — how old a reputation stamp may be and still ride
+/// (direct fetches re-sign every response; gossip hops add minutes).
+/// Old verdicts from a dead origin stop propagating here, not by policy
+/// layers elsewhere.
+pub const REPUTATION_STAMP_MAX_AGE_MS: u64 = 3_600_000;
+
+/// Cap on the gossip cache carried inside ads (bounded like discovery).
+pub const REPUTATION_CACHE_MAX: usize = crate::bootstrap::REPUTATION_GOSSIP_AD_MAX;
+
+/// Verify one bootstrap-published stamp against THE origin's own key and
+/// freshness. Returns the full wire stamp on success (origin fingerprint
+/// comes from the key itself, never from the caller's word).
+fn stamp_verified(
+    origin: &crate::bootstrap::BootstrapKeyInfo,
+    subject: &str,
+    body: &crate::bootstrap::StampBody,
+) -> Option<crate::signing::ReputationStamp> {
+    // Score sanity: the floor lives server-side (REPUTATION_FLOOR); a
+    // grossly out-of-range number is a broken/malicious origin — refuse.
+    if !(-10_000..=100).contains(&body.score) {
+        return None;
+    }
+    let stamp = crate::signing::ReputationStamp {
+        origin: origin.node_id.clone(),
+        subject: subject.to_string(),
+        score: body.score,
+        stamp_ms: body.stamp_ms,
+        sig: body.sig.clone(),
+    };
+    if now_ms().saturating_sub(stamp.stamp_ms) > REPUTATION_STAMP_MAX_AGE_MS {
+        return None;
+    }
+    if !stamp.verifies(&origin.pubkey) {
+        return None;
+    }
+    Some(stamp)
+}
+
+/// Ingest verified stamps into the gossip cache: newest-per-subject wins,
+/// whole set capped (`REPUTATION_CACHE_MAX`). Every stamp in here passed a
+/// pin-or-direct verification upstream — the ad publisher sends nothing
+/// unverifiable.
+/// §10 pin + direct-ingest for ONE answered bootstrap: pin the key first
+/// (trust-on-first-use on the configured/learned URL; a rotation replaces
+/// the pin with a journal note), then ingest the response's direct stamps
+/// (they verify against the key that published itself). Returns the
+/// ingested count. Unit-testable against stub bootstraps.
+async fn pin_and_ingest(
+    state: &Arc<MeshState>,
+    served_by: &str,
+    bootstrap_key: Option<&crate::bootstrap::BootstrapKeyInfo>,
+    reputations: std::collections::HashMap<String, crate::bootstrap::StampBody>,
+) -> usize {
+    let Some(key) = bootstrap_key else {
+        return 0;
+    };
+    let rotated = {
+        let mut d = state.discovery.lock().await;
+        d.pin_key(served_by, &key.pubkey)
+    };
+    if rotated {
+        // First sight or an actual rotation — either way an operator
+        // should see it in the journal once per change.
+        tracing::info!(
+            target: "mesh",
+            bootstrap = %served_by,
+            pubkey = %key.pubkey,
+            "bootstrap signing key pinned (reputation stamps verifiable from here)"
+        );
+    }
+    let direct: Vec<crate::signing::ReputationStamp> = reputations
+        .into_iter()
+        .filter_map(|(subject, body)| stamp_verified(key, &subject, &body))
+        .collect();
+    let n = direct.len();
+    ingest_verified_stamps(state, direct).await;
+    n
+}
+
+/// §10 gossip ingest for ONE peer advertisement: every carried stamp must
+/// (a) not be the ad owner's own subject (no self-serving broadcast),
+/// (b) name an origin WE pinned, (c) verify against that pinned key, and
+/// (d) be fresh. Returns the ingested count (journal-debug on refusal).
+async fn ingest_ad_gossip(state: &Arc<MeshState>, ad: &PeerAd) -> usize {
+    let Some(carried) = &ad.gossip_reputations else {
+        return 0;
+    };
+    if carried.is_empty() {
+        return 0;
+    }
+    let mut verified = Vec::new();
+    {
+        let d = state.discovery.lock().await;
+        for stamp in carried {
+            let pinned_ok = stamp.subject != ad.node_id
+                && !stamp.subject.is_empty()
+                && d.pubkey_for_fingerprint(&stamp.origin)
+                    .is_some_and(|k| stamp.verifies(&k))
+                && now_ms().saturating_sub(stamp.stamp_ms) <= REPUTATION_STAMP_MAX_AGE_MS;
+            if pinned_ok {
+                verified.push(stamp.clone());
+            }
+        }
+    }
+    if verified.len() < carried.len() {
+        tracing::debug!(
+            target: "mesh",
+            from = %ad.node_id,
+            dropped = carried.len() - verified.len(),
+            "unverifiable reputation gossip dropped at the pin wall"
+        );
+    }
+    let n = verified.len();
+    ingest_verified_stamps(state, verified).await;
+    n
+}
+
+async fn ingest_verified_stamps(
+    state: &Arc<MeshState>,
+    stamps: Vec<crate::signing::ReputationStamp>,
+) {
+    if stamps.is_empty() {
+        return;
+    }
+    let mut cache = state.reputation_cache.lock().await;
+    for stamp in stamps {
+        cache.retain(|s| s.subject != stamp.subject || s.stamp_ms < stamp.stamp_ms);
+        if !cache
+            .iter()
+            .any(|s| s.subject == stamp.subject && s.stamp_ms >= stamp.stamp_ms)
+        {
+            cache.push(stamp);
+        }
+    }
+    cache.sort_by_key(|s| std::cmp::Reverse(s.stamp_ms));
+    while cache.len() > REPUTATION_CACHE_MAX {
+        cache.pop();
+    }
+}
+
 /// Statistics about the most recent ping cycle, surfaced to the web UI.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PingStats {
@@ -2068,6 +2241,123 @@ mod tests {
         let v = compat_verdict(&local("glm-5.3", "int4"), &census(&[]));
         assert_eq!(v.verdict, "no_peers_on_model");
         assert!(v.message.contains("you ARE the mesh"), "{}", v.message);
+    }
+
+    /// §10 reputation gossip never crosses the pin wall: one ad whose
+    /// carried stamps exercise every rejection leg, then the acceptance
+    /// leg. (a) a NOT-pinned origin's properly-signed stamp drops (the
+    /// fingerprint is unknown at the receiver's pin table); (b) a
+    /// self-stamp (subject = the ad owner praising itself) drops even
+    /// fully signed and fresh; (c) a forged signature under a PINNED
+    /// origin's fingerprint drops; (d) only the honestly-signed stamp
+    /// about someone else under the pinned origin key lands in the
+    /// gossip cache — the advertiser's word is never the reason.
+    #[tokio::test]
+    async fn reputation_gossip_drops_unpinned_forged_and_self_stamps() {
+        let origin = crate::signing::SigningIdentity::generate();
+        let forger = crate::signing::SigningIdentity::generate();
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let subject = "subject-node";
+        let now = now_ms();
+
+        // A stamp's wires are: `origin` = the 16-hex fingerprint (what the
+        // pin table indexes), `sig` = over a payload built from the FULL
+        // origin pubkey (what verifies() rebuilds). Both conventions matter
+        // — a fingerprint-signed payload MUST fail.
+        let stamp_of = |signer: &crate::signing::SigningIdentity,
+                        origin_pubkey: &str,
+                        subj: &str,
+                        score: i32,
+                        stamp_ms: u64|
+         -> crate::signing::ReputationStamp {
+            let payload = crate::signing::reputation_payload(origin_pubkey, subj, score, stamp_ms);
+            crate::signing::ReputationStamp {
+                origin: origin_pubkey[..16].to_string(),
+                subject: subj.to_string(),
+                score,
+                stamp_ms,
+                sig: signer.sign(payload.as_bytes()),
+            }
+        };
+
+        // Leg (a): origin not pinned yet — even a perfectly signed stamp
+        // from the REAL origin must drop (fingerprint unknowable).
+        let ad_owner = "advertiser-node";
+        let mut ad = crate::bootstrap::PeerAd {
+            node_id: ad_owner.into(),
+            address: "127.0.0.1:9001".into(),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 30,
+            rpc_address: String::new(),
+            last_seen_ms: now,
+            role: crate::config::NodeRole::Hybrid,
+            resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
+            discovery_servers: Vec::new(),
+            gossip_reputations: Some(vec![stamp_of(
+                &origin,
+                &origin.pubkey_hex(),
+                subject,
+                42,
+                now,
+            )]),
+        };
+        assert_eq!(ingest_ad_gossip(&state, &ad).await, 0, "unpinned origin");
+        assert!(state.reputation_cache.lock().await.is_empty());
+
+        // Pin the origin (the operator's configured URL's bootstrap key).
+        {
+            let mut d = state.discovery.lock().await;
+            d.pin_key("http://anchor.invalid", &origin.pubkey_hex());
+        }
+
+        // Leg (b): self-stamp — the ad owner certifying itself. Fully
+        // signed and fresh, but it must never ride.
+        let self_stamp = stamp_of(&origin, &origin.pubkey_hex(), ad_owner, 99, now);
+        // Leg (c): forged — signed by the forger's KEY but wearing the
+        // pinned origin's fingerprint (what a lazy attacker sends).
+        let forged = stamp_of(&forger, &origin.pubkey_hex(), subject, 100, now);
+        ad.gossip_reputations = Some(vec![self_stamp, forged.clone()]);
+        assert_eq!(ingest_ad_gossip(&state, &ad).await, 0, "self + forged");
+        assert!(state.reputation_cache.lock().await.is_empty());
+
+        // Leg (d): the honest one — a real origin signature about a third
+        // party. Both legs had better land now.
+        let honest = stamp_of(&origin, &origin.pubkey_hex(), subject, 42, now);
+        ad.gossip_reputations = Some(vec![honest.clone()]);
+        assert_eq!(ingest_ad_gossip(&state, &ad).await, 1, "honest stamp lands");
+        let cache = state.reputation_cache.lock().await;
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0], honest);
+        assert_eq!(cache[0].score, 42);
+
+        // The direct-fetch wall agrees: stamp_verified accepts the real
+        // origin's key and rejects the forged body under the same subject.
+        let key_info = crate::bootstrap::BootstrapKeyInfo {
+            node_id: origin.node_id(),
+            pubkey: origin.pubkey_hex(),
+        };
+        let body = crate::bootstrap::StampBody {
+            score: 42,
+            stamp_ms: now,
+            sig: honest.sig.clone(),
+        };
+        assert!(stamp_verified(&key_info, subject, &body).is_some());
+        // Fingerprint-only payload signing (a plausible mistake) must fail:
+        let fp_signed = crate::signing::ReputationStamp {
+            origin: origin.node_id(),
+            subject: subject.to_string(),
+            score: 42,
+            stamp_ms: now,
+            sig: origin.sign(
+                crate::signing::reputation_payload(&origin.node_id(), subject, 42, now).as_bytes(),
+            ),
+        };
+        assert!(!fp_signed.verifies(&origin.pubkey_hex()));
     }
 
     /// §12 privacy tiers are policy: changing them is a HOT reload

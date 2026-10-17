@@ -554,6 +554,7 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                gossip_reputations: None,
             },
             PeerAd {
                 node_id: "peer".into(),
@@ -568,6 +569,7 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                gossip_reputations: None,
             },
         ];
         let ring = ShardMap::from_ads("me", &ads);

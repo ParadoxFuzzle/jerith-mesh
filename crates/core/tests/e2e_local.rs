@@ -84,6 +84,7 @@ async fn mesh_chat_falls_back_over_quic_with_real_attribution() {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         });
         reg.record_ping_ok(&peer_id_for_registry, 5);
         *state.registry.lock().await = reg;

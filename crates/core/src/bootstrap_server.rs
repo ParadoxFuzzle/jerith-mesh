@@ -27,7 +27,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::bootstrap::{PeerAd, PeerListResponse, now_ms};
+use crate::bootstrap::{BootstrapKeyInfo, PeerAd, PeerListResponse, now_ms};
+use std::sync::OnceLock;
 
 /// How long an advertisement stays live without refresh.
 pub const DEFAULT_ADVERTISE_TTL_MS: u64 = 90_000;
@@ -497,6 +498,32 @@ async fn sweep_live(registry: &Registry, ttl_ms: u64) -> Vec<Entry> {
     entries.values().cloned().collect()
 }
 
+/// §10: the bootstrap's signing identity. Persisted hex secret in the
+/// shared data dir (0600) so the key — and with it every receiver's pin —
+/// survives restarts; generated on first boot. Used to sign the additive
+/// `/v1/peers` reputation stamps; unloaded until `serve()` runs, so
+/// library use of the registry (tests, in-process spawns) carries no key
+/// obligations and degrades to a stampless list.
+static REPUTATION_ID: OnceLock<crate::signing::SigningIdentity> = OnceLock::new();
+
+fn init_reputation_identity() -> Option<crate::signing::SigningIdentity> {
+    let dir = crate::config::NodeConfig::data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("bootstrap-reputation.hex");
+    let existing = std::fs::read_to_string(&path).ok();
+    if let Some(hexstr) = existing {
+        let bytes = hex::decode(hexstr.trim()).ok()?;
+        crate::signing::SigningIdentity::from_secret_bytes(&bytes).ok()
+    } else {
+        let id = crate::signing::SigningIdentity::generate();
+        let wrote = std::fs::write(&path, hex::encode(id.secret_bytes()));
+        if wrote.is_ok() {
+            crate::config::NodeConfig::restrict_file_permissions(&path);
+        }
+        Some(id)
+    }
+}
+
 async fn peers(
     Query(params): Query<HashMap<String, String>>,
     State((registry, ttl_ms)): State<Shared>,
@@ -506,17 +533,65 @@ async fn peers(
     // Halt-filtered: bins below HALT_SCORE_THRESHOLD are withheld — a
     // persistent non-contributor stops receiving mesh traffic but can come
     // back via adverts once its behavior corrects.
-    let peers: Vec<PeerAd> = live
-        .into_iter()
+    // Restructured once (§10 + §2 additive fields build together): the
+    // filtered live entries are materialized BEFORE the owning iterator
+    // runs so both the ad list and the reputation stamps come from one
+    // consistent snapshot.
+    let filtered: Vec<&Entry> = live
+        .iter()
         .filter(|e| want_model.is_empty() || e.ad.model_id == want_model)
         .filter(|e| score_of(e) > HALT_SCORE_THRESHOLD)
-        .map(|e| e.ad)
         .collect();
+    let peers: Vec<PeerAd> = filtered.iter().map(|e| e.ad.clone()).collect();
     // §2 contribution quorum (additive wire field): the aggregate per peer
     // (distinct corroborating reporters / spread / consistency) — statistics
     // for operators and bots, never a verdict.
     let measurements = registry.measures.read().await.shared_json();
-    (StatusCode::OK, Json(PeerListResponse { peers, measurements })).into_response()
+    // §10 signed reputation stamps (additive wire field): the bootstrap
+    // signs each returned peer's CURRENT score so the figures can travel
+    // node-to-node inside ads (receivers verify against the pin they made
+    // from `bootstrap` here). Score range [REPUTATION_FLOOR, 0]:
+    // fraud-decremented, time-recovered; 0 = neutral.
+    let bootstrap = REPUTATION_ID
+        .get()
+        .map(|id| BootstrapKeyInfo {
+            node_id: id.node_id(),
+            pubkey: id.pubkey_hex(),
+        });
+    let reputations = match REPUTATION_ID.get() {
+        Some(id) => {
+            let mut m = std::collections::HashMap::new();
+            for e in &filtered {
+                let stamp = now_ms();
+                let payload = crate::signing::reputation_payload(
+                    &id.node_id(),
+                    &e.ad.node_id,
+                    e.score,
+                    stamp,
+                );
+                m.insert(
+                    e.ad.node_id.clone(),
+                    crate::bootstrap::StampBody {
+                        score: e.score,
+                        stamp_ms: stamp,
+                        sig: id.sign(payload.as_bytes()),
+                    },
+                );
+            }
+            m
+        }
+        None => Default::default(),
+    };
+    (
+        StatusCode::OK,
+        Json(PeerListResponse {
+            peers,
+            measurements,
+            bootstrap,
+            reputations,
+        }),
+    )
+        .into_response()
 }
 
 async fn advertise(
@@ -1056,6 +1131,17 @@ async fn model_counts(State((registry, ttl_ms)): State<Shared>) -> Response {
 pub async fn serve(options: BootstrapOptions) -> anyhow::Result<()> {
     let registry = Arc::new(Registry::default());
     let app = router(registry.clone(), options.advertise_ttl_ms);
+    // §10: load-or-generate the reputation signing identity FIRST — a
+    // failure downgrades to stamps-off (registry still runs) rather than
+    // taking the discovery node down.
+    match init_reputation_identity() {
+        Some(id) => {
+            let _ = REPUTATION_ID.set(id);
+        }
+        None => tracing::warn!(
+            "reputation signing identity unavailable — /v1/peers runs without score stamps"
+        ),
+    }
     // Background TTL sweeper: expiry otherwise only happens while a read
     // endpoint is polled, so an idle bootstrap would retain every stale
     // advertisement forever. Half-TTL cadence, floored at 15s.
@@ -1127,6 +1213,7 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         };
         (id, a)
     }
@@ -1375,6 +1462,7 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                gossip_reputations: None,
             };
             let r = client
                 .put(format!("{base}/v1/advertise"))
@@ -2166,6 +2254,7 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         };
         let r = client
             .put(format!("{base}/v1/advertise"))
@@ -2337,6 +2426,7 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         };
         // Re-sign with the accused's identity (same key, same node_id).
         let r = client
@@ -2384,6 +2474,7 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                gossip_reputations: None,
             },
             last_refresh_ms: 0,
             dead_votes: 0,
@@ -2439,6 +2530,7 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         };
         // Two stamps: a fixed one for shape determinism, a fresh one for
         // the wire-auth freshness checks.

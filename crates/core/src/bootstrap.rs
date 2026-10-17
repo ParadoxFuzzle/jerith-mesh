@@ -59,9 +59,20 @@ pub struct PeerAd {
     /// pre-discovery ads — wire-compatible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovery_servers: Vec<String>,
+    /// §10 reputation gossip: bootstrap-signed score stamps the sender has
+    /// recently verified against a pin, carried so a receiving node learns
+    /// configured-bootstrap scores WITHOUT trusting the advertiser — stamps
+    /// re-verify against the receiver's own pins (origin-bound signature;
+    /// fabricated origins fail at the receiver's pin table). Capped like
+    /// the discovery rotation (`REPUTATION_GOSSIP_AD_MAX`); the ad payload
+    /// signature deliberately does NOT cover this field (see
+    /// `advertise_payload` — rolling upgrades stay wire-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gossip_reputations: Option<Vec<crate::signing::ReputationStamp>>,
 }
 
-/// Cap on the advertised expert-id list: a long tail is represented by
+/// Cap on stamps carried per ad — bounded like every gossip payload.
+pub const REPUTATION_GOSSIP_AD_MAX: usize = 16;
 /// `hosted_expert_count` instead of bloating every advertise.
 pub const HOSTED_EXPERTS_AD_MAX: usize = 256;
 
@@ -126,11 +137,44 @@ impl PeerAd {
 /// old servers and new clients compatible during rolling upgrades.
 type QuorumJson = serde_json::Map<String, serde_json::Value>;
 
+/// The bootstrap's own signing identity as published in /v1/peers (§10):
+/// receivers pin `pubkey` per configured URL on first sight (TOFU) and
+/// later verify reputation stamps against the pin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapKeyInfo {
+    pub node_id: String,
+    pub pubkey: String,
+}
+
+/// One reputation stamp as published in /v1/peers (subject = map key).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StampBody {
+    pub score: i32,
+    pub stamp_ms: u64,
+    pub sig: String,
+}
+
+/// Everything one signed peers-fetch returns: the ads themselves plus the
+/// reputation surfaces (§10) and the bootstrap's key.
+#[derive(Debug)]
+pub struct FetchedPeers {
+    pub peers: Vec<PeerAd>,
+    pub served_by: String,
+    pub bootstrap_key: Option<BootstrapKeyInfo>,
+    pub reputations: std::collections::HashMap<String, StampBody>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerListResponse {
     pub peers: Vec<PeerAd>,
     #[serde(default)]
     pub measurements: QuorumJson,
+    /// §10: the bootstrap's own signing identity (for key pinning).
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapKeyInfo>,
+    /// §10: bootstrap-signed score stamps per live subject.
+    #[serde(default)]
+    pub reputations: std::collections::HashMap<String, StampBody>,
 }
 
 /// Running state for a peer in the local registry.
@@ -393,6 +437,18 @@ impl BootstrapClient {
         model: &str,
         identity: &crate::signing::SigningIdentity,
     ) -> anyhow::Result<Vec<PeerAd>> {
+        Ok(self.fetch_peers_signed_full(model, identity).await?.peers)
+    }
+
+
+    /// Peer peers + reputation surfaces: the signed stamps (§10) and the
+    /// bootstrap's own key (for pinning) travel with the list, so callers
+    /// can verify without a second round trip.
+    pub async fn fetch_peers_signed_full(
+        &self,
+        model: &str,
+        identity: &crate::signing::SigningIdentity,
+    ) -> anyhow::Result<FetchedPeers> {
         let url = format!(
             "{}/v1/peers?model={}",
             self.base_url.trim_end_matches('/'),
@@ -416,7 +472,13 @@ impl BootstrapClient {
             .json()
             .await
             .context("bootstrap returned unparseable peer list")?;
-        Ok(parsed.peers)
+        let served_by = self.base_url.trim_end_matches('/').to_string();
+        Ok(FetchedPeers {
+            peers: parsed.peers,
+            served_by,
+            bootstrap_key: parsed.bootstrap,
+            reputations: parsed.reputations,
+        })
     }
 
     /// Advertise ourselves with the bootstrap node (heartbeat).
@@ -651,6 +713,7 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         }
     }
 

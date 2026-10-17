@@ -32,6 +32,49 @@ pub const LEAVE_PREFIX: &str = "jerith-leave1";
 /// it can never alter the numbers it reports.
 pub const MEASURE_ATTEST_PREFIX: &str = "measure-rept1";
 
+/// Canonical signed-reputation stamp (§10 gossip): the bootstrap signs its
+/// current score over a peer so that score can travel node-to-node
+/// verifiably — carried inside ads (capped like the discovery rotation),
+/// re-verified by receivers against the ORIGIN bootstrap's pinned pubkey.
+/// A receiving node thus learns "the bootstrap I configured says this peer
+/// scores X" without trusting the advertiser at all.
+pub const REPUTATION_PREFIX: &str = "jerith-rept1";
+
+pub fn reputation_payload(
+    origin_node_id: &str,
+    subject: &str,
+    score: i32,
+    stamp_ms: u64,
+) -> String {
+    format!(
+        "{REPUTATION_PREFIX}|{stamp_ms}|{origin_node_id}|{subject}|{score}"
+    )
+}
+
+/// One bootstrap-signed score stamp: `origin` names the signing bootstrap
+/// by its pubkey fingerprint so a receiver can pick the right pinned key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReputationStamp {
+    pub origin: String,
+    pub subject: String,
+    pub score: i32,
+    pub stamp_ms: u64,
+    pub sig: String,
+}
+
+impl ReputationStamp {
+    /// Verify against an ORIGIN pubkey the receiver pinned itself.
+    /// Older than the gossip bound → stale (rejected by the caller's age
+    /// check, the payload binding does the rest).
+    pub fn verifies(&self, origin_pubkey: &str) -> bool {
+        if self.origin != origin_pubkey[..16.min(origin_pubkey.len())] {
+            return false;
+        }
+        let payload = reputation_payload(origin_pubkey, &self.subject, self.score, self.stamp_ms);
+        verify(origin_pubkey, payload.as_bytes(), &self.sig)
+    }
+}
+
 /// Max acceptable age for a stamp (advertisement TTL is 90 s; the stamp
 /// window is tighter to block replays).
 pub const STAMP_MAX_AGE_MS: u64 = 120_000;
@@ -319,6 +362,7 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            gossip_reputations: None,
         }
     }
 

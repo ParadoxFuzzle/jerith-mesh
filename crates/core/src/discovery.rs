@@ -108,6 +108,12 @@ pub struct DiscoveryServers {
     pub learned: Vec<String>,
     /// The last server that answered us this process (persisted too).
     pub last_good: Option<String>,
+    /// §10 reputation-gossip trust pins: bootstrap URL → its published
+    /// signing pubkey, pinned on FIRST SIGHT (the operator's config URL
+    /// is the trust anchor — trust-on-first-use, rotation warned once).
+    /// Gossip stamps re-verify ONLY against these pins, so an advertiser
+    /// cannot inject scores from an origin we never configured or learned.
+    pub pinned: std::collections::HashMap<String, String>,
     path: Option<PathBuf>,
 }
 
@@ -120,7 +126,37 @@ impl DiscoveryServers {
             last_good,
             path: Some(data_dir.join("discovery-servers.json")),
             learned: Vec::new(),
+            pinned: Default::default(),
         }
+    }
+
+    /// Pin a bootstrap's signing key (first sight = trust). Returns whether
+    /// the pin CHANGED — a rotation at an already-pinned URL is worth a
+    /// warning (older carried stamps from the origin fail verification),
+    /// never a silent swap. Persists through the same file as learned/last_good.
+    pub fn pin_key(&mut self, url: &str, pubkey: &str) -> bool {
+        let url = url.trim_end_matches('/');
+        let changed = match self.pinned.get(url) {
+            Some(k) => k != pubkey,
+            None => true,
+        };
+        if changed {
+            self.pinned.insert(url.to_string(), pubkey.to_string());
+            // Persist best-effort: a failed save only costs a re-pin on the
+            // next boot (fresh TOFU at the same configured URL).
+            let _ = self.save();
+        }
+        changed
+    }
+
+    /// §10 gossip lookup: which pinned bootstrap owns this fingerprint?
+    /// Gossip stamps name their origin by fingerprint; verification uses
+    /// the pinned key — unknown origin ⇒ rejected, never applied.
+    pub fn pubkey_for_fingerprint(&self, fingerprint: &str) -> Option<String> {
+        self.pinned
+            .values()
+            .find(|k| k.starts_with(fingerprint))
+            .cloned()
     }
 
     /// Total rotation list: configured first (config order), then learned
@@ -228,6 +264,21 @@ impl DiscoveryServers {
             .and_then(Value::as_str)
             .filter(|s| valid_server_url(s))
             .map(str::to_string);
+        let pinned: std::collections::HashMap<String, String> = v
+            .get("pinned")
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(url, k)| {
+                        let key = k.as_str()?;
+                        // Trust lives in the pinned KEY, not the URL scheme:
+                        // a LAN http bootstrap's pin persists like anybody's.
+                        (key.len() == 64 && valid_server_url(url))
+                            .then(|| (url.to_string(), key.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             configured: Vec::new(),
             learned: sanitize(&learned, None)
@@ -235,6 +286,7 @@ impl DiscoveryServers {
                 .filter(|s| !s.starts_with("http://"))
                 .collect(),
             last_good,
+            pinned,
             path: Some(path.to_path_buf()),
         }
     }
@@ -250,6 +302,7 @@ impl DiscoveryServers {
         let json = json!({
             "learned": self.learned,
             "last_good": self.last_good,
+            "pinned": self.pinned,
         });
         serde_json::to_writer_pretty(
             &mut std::io::BufWriter::new(
