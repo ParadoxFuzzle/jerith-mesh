@@ -173,6 +173,26 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   Chat replies carry `mesh_fallback` (node id when a mesh peer served it,
   explicit `null` otherwise — including 502s when neither the local runtime
   nor mesh peers are reachable: never a bare 500).
+- ✅ Model router tiers on the gateway (`core::model_router` + the forward path),
+  every *auto* chat classified — an explicit caller model id always wins, the
+  auto gate covers the placeholder `jerith-mesh`, an absent model, and the
+  advertised base resolved from `/status`:
+  - tool-bearing requests → the **tool** tier (`runtime_tool_model`, parse
+    reliability first); its forwarded body carries `think: false` so a
+    thinking tool model cannot burn the generation budget inside its
+    reasoning channel and land empty (`content: ""` at the cap — the
+    empty-answer family). The merge rides the tier's *engagement*, not the
+    model rewrite: the pinned same-as-base shape (tool pick == base model)
+    suppresses the rewrite as a no-op but still gets the merge
+    (`auto_tool_tier_merge`).
+  - image content → the **vision** tier; complex prompts → the **deep** tier;
+    plain chat rides the **PRIMARY chat lane** (`runtime_primary_model`) —
+    pin a served model (e.g. a relay-hosted alias) as the everyday chatting
+    model without repointing the locally hosted `[model]`, which must stay
+    servable for peer dispatch
+  - tier keys are cold-reload config (`""` disables a tier); a tier pick
+    that equals the caller's model suppresses the rewrite (and the journal
+    line) but not the tool tier's think:false merge
 - ✅ Discord bot (`crates/bot`, poise/serenity): `/ask` (mesh-peer fallback included,
   screened outbound by Jerith Guard before the gateway call — optional
   `[guard]` in bot.toml),
@@ -191,6 +211,26 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   each win and restored on startup
   `/mine` wins optionally post to a channel via
   `JERITH_ANNOUNCE_CHANNEL_ID` (or `announce_channel_id` in bot.toml)
+  - ✅ Streamed delivery with an honesty contract (`crates/bot/src/api.rs` +
+    `chat_fallback.rs`; `[chat] stream`, default on; `[chat] timeout_secs`
+    bounds the whole chat): the answer live-types into Discord through the
+    gateway's SSE passthrough — and nothing a round yields becomes visible
+    before it is real. Tool-bearing rounds fire **no** live events at all:
+    streamed tool-intent JSON and echoed tool results (web rows, private
+    embedded-memory recall hits) can no longer surface in the chat before a
+    reply exists (the recall-slop incident). Toolless rounds are JSON-gated:
+    fragments are held while the streamed content still opens `{ "…` (a
+    degenerate brace-led intent stub — 193 chars live-typed, then
+    RoundStart-cleared when the retry types — read as a double response),
+    released the moment the content proves to be prose, and a held round
+    that ends degenerate never surfaces; the final formatted reply always
+    replaces the streamed surface in one message. Tests:
+    `chat_tool_round_fragments_never_reach_the_live_surface`,
+    `chat_json_shaped_stream_rounds_never_type_live` (bot),
+    `tool_tier_no_op_rewrite_still_merges_think_false` (gateway),
+    `auto_tool_tier_merge_follows_the_same_gate_as_the_rewrite` — plus the
+    live gateway smoke (plain chat, web tool-loop, follow-up; zero empty
+    refusals)
 - 🔄 Manifest-registered **external skills** (Phase 3a ✅;
   `crates/bot/src/external.rs`): TOML drops in `~/.jerith-mesh/plugins.d/`
   parse fail-closed at bot start, join the skill registry, gate via
