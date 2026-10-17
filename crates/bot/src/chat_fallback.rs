@@ -265,6 +265,11 @@ impl LiveSink {
         channel: serenityall::ChannelId,
     ) -> Option<LiveSink> {
         let placeholder = channel.say(http_ctx, "…").await.ok()?;
+        tracing::info!(
+            channel = %channel,
+            message_id = %placeholder.id,
+            "live sink: placeholder posted (one message per chat; the final edit below is the only other touch)"
+        );
         let state = std::sync::Arc::new(tokio::sync::Mutex::new(SinkState {
             text: String::new(),
             last_len: 0,
@@ -355,8 +360,14 @@ impl crate::converse::ConversationSink for LiveSink {
                 )
                 .await
             {
-                tracing::debug!(error = %e, "live sink final edit failed — resending");
+                tracing::warn!(error = %e, "live sink final edit failed — resending (a second message appears when this fires)");
                 send_long(&self.http_ctx, self.channel, &text).await;
+            } else {
+                tracing::info!(
+                    channel = %self.channel,
+                    message_id = %self.msg_id,
+                    "live sink: final edit applied in place (no resend)"
+                );
             }
         })
     }
