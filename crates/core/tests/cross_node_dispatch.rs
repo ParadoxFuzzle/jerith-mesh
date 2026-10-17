@@ -187,7 +187,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
     peer_addrs.insert(node_id.clone(), addr);
     // B advertises holding this expert, is alive, and is unreported (RTT
     // order, no resource sample — the pre-pooling path).
-    let peers = vec![(node_id.clone(), 5u64, true, true, None)];
+    let peers = vec![(node_id.clone(), 5u64, true, true, None, None)];
     let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
 
     // Node A holds no local weights: `local_run` always fails, so the
@@ -332,7 +332,7 @@ async fn kill_switch_tripped_refuses_serving_honestly_over_quic() {
     let requester = SigningIdentity::generate();
     let mut peer_addrs: HashMap<String, SocketAddr> = HashMap::new();
     peer_addrs.insert(node_id.clone(), addr);
-    let peers = vec![(node_id.clone(), 5u64, true, true, None)];
+    let peers = vec![(node_id.clone(), 5u64, true, true, None, None)];
     let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
     let local_run = |_: &[f32]| -> anyhow::Result<Vec<f32>> {
         anyhow::bail!("node A holds no local expert weights")
@@ -456,7 +456,7 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
     });
     let mut peer_addrs: HashMap<String, SocketAddr> = HashMap::new();
     peer_addrs.insert(node_id.clone(), addr);
-    let peers = vec![(node_id.clone(), 5u64, true, true, None)];
+    let peers = vec![(node_id.clone(), 5u64, true, true, None, None)];
     let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
 
     // --- The BLOCKED requester: prefix-listed, refused by identity -------

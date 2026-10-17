@@ -899,6 +899,22 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             "allowlist_size": trusted,
         })
     };
+    // Phase 5 reputation-weighted placement surface (live): every VERIFIED
+    // score stamp the router currently carries, with its dispatch tier.
+    // Only pin-wall-verified stamps exist here — unverified word never
+    // reaches placement, and the section makes that legible.
+    let reputation_value = {
+        let cache = gw.state.reputation_cache.lock().await;
+        json!({
+            "verified_subjects": cache.iter().map(|s| json!({
+                "subject": s.subject,
+                "score": s.score,
+                "stamp_ms": s.stamp_ms,
+                "origin": s.origin,
+                "penalized": crate::quic::reputation_tier(Some(s.score)) == 1,
+            })).collect::<Vec<_>>(),
+        })
+    };
     // §2 model-switch machinery: whether this node has gracefully LEFT the
     // mesh (signed leave + advertise latch) ahead of a config-model
     // restart, and which model it would serve when it rejoins.
@@ -943,6 +959,12 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "crypto": crypto_value,
         // Privacy tiers (§12): live level + trusted-node allowlist size.
         "privacy": privacy_value,
+        // Phase 5 reputation-weighted placement surface: which subjects the
+        // router sees as VERIFIED (only pin-verified stamps live in the
+        // cache) and who currently sits in the penalized dispatch tier
+        // (negative verified score — placement preference, never refusal;
+        // refusals are the stake tier's job).
+        "reputation": reputation_value,
         // Model-switch (§2): graceful-exit latch + pending restart model.
         "mesh_exit": mesh_exit_value,
         // Runaway-generation cap state (armed via config `runtime_num_predict`;
@@ -1938,6 +1960,53 @@ mod tests {
             "typed transport error: {ow:?}"
         );
         assert!(ow.get("amount").is_none(), "no fake balance on error");
+    }
+
+    /// Phase 5: the /status reputation section renders the router's VERIFIED
+    /// score knowledge (pin-wall stamps only), tiered — the operator sees
+    /// who sits penalized and why, without trusting anyone's word.
+    #[tokio::test]
+    async fn status_reputation_section_reports_verified_subjects() {
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        state.reputation_cache.lock().await.push(
+            crate::signing::ReputationStamp {
+                origin: "47bb0d50e3de1009".to_string(),
+                subject: "scored-node".to_string(),
+                score: -25,
+                stamp_ms: 1_234,
+                sig: "sig".to_string(),
+            },
+        );
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let body: Value = server.get("/status").await.json();
+        let rep = body["reputation"]["verified_subjects"]
+            .as_array()
+            .expect("verified subjects listed");
+        assert_eq!(rep.len(), 1);
+        assert_eq!(rep[0]["subject"], json!("scored-node"));
+        assert_eq!(rep[0]["score"], json!(-25));
+        assert_eq!(rep[0]["penalized"], json!(true), "negative ⇒ penalized tier");
     }
 
     /// §12 privacy tiers ride /status: the live level + allowlist size

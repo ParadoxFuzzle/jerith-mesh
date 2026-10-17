@@ -346,22 +346,33 @@ impl ExpertRouter {
     pub async fn plan_dispatch(
         &self,
         expert_id: &str,
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
     ) -> Vec<ExpertLocation> {
         let mut plan = Vec::new();
         if self.hosts_locally(expert_id).await {
             plan.push(ExpertLocation::Local);
         }
         // Reported-with-capacity peers first, then unreported by RTT.
-        let mut remotes: Vec<(String, u64, Option<crate::hw::ResourceSample>)> = peers
+        let mut remotes: Vec<(
+            String,
+            u64,
+            Option<crate::hw::ResourceSample>,
+            Option<i32>,
+        )> = peers
             .iter()
-            .filter(|(_, _, has, alive, _)| *has && *alive)
-            .map(|(id, rtt, _, _, res)| (id.clone(), *rtt, res.clone()))
+            .filter(|(_, _, has, alive, _, _)| *has && *alive)
+            .map(|(id, rtt, _, _, res, rep)| {
+                (id.clone(), *rtt, res.clone(), *rep)
+            })
             .collect();
-        remotes.sort_by_key(|(id, rtt, res)| {
-            (Self::placement_sort_key(*rtt, res.as_ref()), id.clone())
+        remotes.sort_by_key(|(id, rtt, res, rep)| {
+            (
+                reputation_tier(*rep),
+                Self::placement_sort_key(*rtt, res.as_ref()),
+                id.clone(),
+            )
         });
-        for (id, rtt, _) in remotes {
+        for (id, rtt, _, _) in remotes {
             plan.push(ExpertLocation::Remote {
                 node_id: id,
                 rtt_ms: rtt,
@@ -393,7 +404,7 @@ impl ExpertRouter {
         layers: &[usize],
         alive: &[String],
         _expert_id: &str,
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
     ) -> Vec<ExpertLocation> {
         // The FULL ownership map (every layer's owner — see
         // ShardMap::layer_ownership; the pre-M0 self-only map left this
@@ -422,8 +433,8 @@ impl ExpertRouter {
                     // owner legitimately fails).
                     let rtt_ms = peers
                         .iter()
-                        .find(|(id, _, _, alive, _)| *id == node_id && *alive)
-                        .map(|(_, rtt, _, _, _)| *rtt)
+                        .find(|(id, _, _, alive, _, _)| *id == node_id && *alive)
+                        .map(|(_, rtt, _, _, _, _)| *rtt)
                         .unwrap_or(u64::MAX);
                     plan.push(ExpertLocation::Remote { node_id, rtt_ms });
                 }
@@ -441,7 +452,7 @@ impl ExpertRouter {
         req_id: &str,
         expert_id: &str,
         _input: &[f32],
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
         completed: &mut HashMap<String, Vec<f32>>,
         mut dispatch: impl FnMut(ExpertLocation, Duration) -> anyhow::Result<Vec<f32>>,
     ) -> anyhow::Result<Vec<f32>> {
@@ -482,10 +493,12 @@ impl ExpertRouter {
         out
     }
 
-    /// Order key for mesh-chat remotes (resource pooling, Phase 1). Pure
-    /// helper — unit-tested: reported peers beat unreported, biggest free
+    /// Order key for mesh-chat remotes (resource pooling, Phase 1) — pure
+    /// helper, unit-tested: reported peers beat unreported, biggest free
     /// VRAM first, then free RAM, RTT as the tiebreak; all-unreported meshes
-    /// degenerate to pure-RTT order.
+    /// degenerate to pure-RTT order. Verified reputation is NOT part of
+    /// this key: it is a coarser, separate tier applied by the caller
+    /// (`reputation_tier`) so the two concerns stay testably disjoint.
     fn placement_sort_key(rtt_ms: u64, res: Option<&crate::hw::ResourceSample>) -> (u64, u64, u64) {
         let (vram_free, ram_free) = match res {
             Some(r) => (r.vram_free_total().unwrap_or(0), r.ram_available_bytes),
@@ -511,7 +524,7 @@ impl ExpertRouter {
         peer_addrs: &HashMap<String, SocketAddr>,
         req_id: &str,
         messages: &[serde_json::Value],
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
         local_chat: impl FnOnce() -> anyhow::Result<String>,
     ) -> anyhow::Result<(String, String)> {
         // Returns (content, answering_node_id). Local answers attribute to the
@@ -532,17 +545,28 @@ impl ExpertRouter {
         // most free RAM, RTT as tiebreak; peers without a report sink behind
         // reported ones and order by RTT among themselves (an all-unreported
         // mesh — pre-pooling peers — keeps the pure-RTT behaviour).
-        let mut remotes: Vec<(String, u64, Option<crate::hw::ResourceSample>)> = peers
+        let mut remotes: Vec<(
+            String,
+            u64,
+            Option<crate::hw::ResourceSample>,
+            Option<i32>,
+        )> = peers
             .iter()
-            .filter(|(_, _, has, alive, _)| *has && *alive)
-            .map(|(id, rtt, _, _, res)| (id.clone(), *rtt, res.clone()))
+            .filter(|(_, _, has, alive, _, _)| *has && *alive)
+            .map(|(id, rtt, _, _, res, rep)| {
+                (id.clone(), *rtt, res.clone(), *rep)
+            })
             .collect();
-        remotes.sort_by_key(|(id, rtt, res)| {
-            (Self::placement_sort_key(*rtt, res.as_ref()), id.clone())
+        remotes.sort_by_key(|(id, rtt, res, rep)| {
+            (
+                reputation_tier(*rep),
+                Self::placement_sort_key(*rtt, res.as_ref()),
+                id.clone(),
+            )
         });
 
         let mut last_err = anyhow::anyhow!("no peers available for mesh chat fallback");
-        for (node_id, _rtt, _res) in remotes {
+        for (node_id, _rtt, _res, _rep) in remotes {
             let Some(addr) = peer_addrs.get(&node_id) else {
                 continue;
             };
@@ -613,7 +637,7 @@ impl ExpertRouter {
         req_id: &str,
         expert_id: &str,
         input: &[f32],
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
     ) -> anyhow::Result<Vec<f32>> {
@@ -714,7 +738,7 @@ impl ExpertRouter {
         req_id: &str,
         expert_id: &str,
         input: &[f32],
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
     ) -> anyhow::Result<Vec<f32>> {
@@ -748,7 +772,7 @@ impl ExpertRouter {
         req_id: &str,
         expert_id: &str,
         input: &[f32],
-        peers: &[(String, u64, bool, bool, Option<crate::hw::ResourceSample>)],
+        peers: &[crate::quic::MeshCandidate],
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
         served_by: &mut Option<String>,
@@ -2558,6 +2582,39 @@ pub async fn call(
 }
 
 // ============================================================================
+// Phase 5 reputation-weighted placement
+// ============================================================================
+
+/// The COARSER placement layer outside the capacity/RTT key. A peer whose
+/// placement carries a VERIFIED score stamp (§10 pin wall — the receiver
+/// itself verified the bootstrap's signature over the score) with a
+/// NEGATIVE number has verified offenses on record; it sinks behind every
+/// clean/unverified peer in the dispatch plan. Everything else — including
+/// score 0 (clean per the bootstrap's ledger) and unverified — keeps the
+/// capacity/RTT order. PLACEMENT preference only: a penalized peer remains
+/// in the plan and dispatchable when it is the only candidate; refusals
+/// live in the Phase 5 stake tier, never here (statistics, not verdicts).
+/// One remote dispatch candidate: node id, last RTT, hosts the requested
+/// expert, alive, self-reported resources, and (Phase 5) the VERIFIED
+/// reputation score — a placement hint sourced ONLY from our pin wall
+/// (see `reputation_tier`). Named because the tuple rides many signatures.
+pub type MeshCandidate = (
+    String,
+    u64,
+    bool,
+    bool,
+    Option<crate::hw::ResourceSample>,
+    Option<i32>,
+);
+
+pub(crate) fn reputation_tier(rep: Option<i32>) -> u64 {
+    match rep {
+        Some(score) if score < 0 => 1,
+        _ => 0,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2566,14 +2623,14 @@ mod tests {
     use super::*;
     use rustls::client::danger::ServerCertVerifier as _;
 
-    fn peers() -> Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)> {
+    fn peers() -> Vec<crate::quic::MeshCandidate> {
         vec![
-            ("near-a".into(), 10, true, true, None),
-            ("near-b".into(), 25, true, true, None),
-            ("far-c".into(), 180, true, true, None),
-            ("far-d".into(), 240, true, true, None),
-            ("dead-e".into(), 5, true, false, None), // not alive → excluded
-            ("noexp-f".into(), 3, false, true, None), // lacks expert → excluded
+            ("near-a".into(), 10, true, true, None, None),
+            ("near-b".into(), 25, true, true, None, None),
+            ("far-c".into(), 180, true, true, None, None),
+            ("far-d".into(), 240, true, true, None, None),
+            ("dead-e".into(), 5, true, false, None, None), // not alive → excluded
+            ("noexp-f".into(), 3, false, true, None, None), // lacks expert → excluded
         ]
     }
 
@@ -2612,8 +2669,8 @@ mod tests {
         let peers = vec![
             // has_expert = false on purpose: the layer OWNER gate is
             // liveness-only now.
-            ("layer-owner".into(), 40, false, true, None),
-            ("dead-owner".into(), 5, false, false, None),
+            ("layer-owner".into(), 40, false, true, None, None),
+            ("dead-owner".into(), 5, false, false, None, None),
         ];
         let layers: Vec<usize> = (0..6).collect();
         let plan = r
@@ -2637,8 +2694,8 @@ mod tests {
                 Some(node) => {
                     let rtt_ms = peers
                         .iter()
-                        .find(|(id, _, _, alive, _)| *id == node && *alive)
-                        .map(|(_, rtt, _, _, _)| *rtt)
+                        .find(|(id, _, _, alive, _, _)| *id == node && *alive)
+                        .map(|(_, rtt, _, _, _, _)| *rtt)
                         .unwrap_or(u64::MAX);
                     expected.push(ExpertLocation::Remote {
                         node_id: node,
@@ -2711,9 +2768,9 @@ mod tests {
             ..Default::default()
         };
         let peers = vec![
-            ("rich-far".into(), 190, true, true, Some(rich)),
-            ("poor-near".into(), 12, true, true, Some(poor)),
-            ("no-report".into(), 5, true, true, None),
+            ("rich-far".into(), 190, true, true, Some(rich), None),
+            ("poor-near".into(), 12, true, true, Some(poor), None),
+            ("no-report".into(), 5, true, true, None, None),
         ];
         let plan = r.plan_dispatch("exp-1", &peers).await;
         let ids: Vec<&str> = plan
@@ -2744,6 +2801,82 @@ mod tests {
         assert!(
             ExpertRouter::placement_sort_key(1, None) < ExpertRouter::placement_sort_key(2, None)
         );
+    }
+
+    /// Phase 5 tier thresholds: only a VERIFIED negative score penalizes.
+    #[test]
+    fn reputation_tier_thresholds_are_negative_s_only() {
+        assert_eq!(reputation_tier(None), 0, "unverified stays default tier");
+        assert_eq!(reputation_tier(Some(0)), 0, "clean ledger stays default");
+        assert_eq!(reputation_tier(Some(-1)), 1, "any verified offense penalizes");
+        assert_eq!(reputation_tier(Some(-100)), 1, "floor offense penalizes");
+    }
+
+    /// The interlock, at the dispatch plan: a peer with a VERIFIED offense
+    /// sinks BEHIND every clean/unverified peer — but it is still IN the
+    /// plan and still dispatchable when it is the only candidate. That is
+    /// the statistics-not-verdicts boundary in routing terms.
+    #[tokio::test]
+    async fn verified_offense_sinks_the_peer_but_stays_in_the_plan() {
+        let r = router(50);
+        let peers = vec![
+            // The offender wins every capacity/RTT metric (nearest, biggest).
+            (
+                "offender".to_string(),
+                5,
+                true,
+                true,
+                Some(crate::hw::ResourceSample {
+                    ram_available_bytes: 100_000_000,
+                    ..Default::default()
+                }),
+                Some(-100),
+            ),
+            // The clean peer is strictly worse on every capacity metric.
+            (
+                "clean".to_string(),
+                200,
+                true,
+                true,
+                Some(crate::hw::ResourceSample {
+                    ram_available_bytes: 1,
+                    ..Default::default()
+                }),
+                Some(0),
+            ),
+            // Unverified: neither positive nor negative word — default tier.
+            ("unverified".to_string(), 400, true, true, None, None),
+        ];
+        let ids: Vec<String> = r
+            .plan_dispatch("exp-1", &peers)
+            .await
+            .into_iter()
+            .filter_map(|l| match l {
+                ExpertLocation::Remote { node_id, .. } => Some(node_id),
+                _ => None,
+            })
+            .collect();
+        // Tier dominates: the verified offender is LAST despite winning
+        // capacity; clean-beats-unverified came along for the ride via the
+        // capacity key inside its tier.
+        assert_eq!(
+            ids,
+            Vec::from(["clean", "unverified", "offender"])
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            "verified offenses sink placement: {ids:?}"
+        );
+
+        // The boundary: alone, the offender is still the plan — never
+        // refused here (that would be statistics slashing).
+        let alone = vec![peers[0].clone()];
+        let plan = r.plan_dispatch("exp-1", &alone).await;
+        assert_eq!(plan.len(), 1, "penalized peer stays dispatchable");
+        assert!(matches!(
+            plan[0],
+            ExpertLocation::Remote { ref node_id, .. } if node_id == "offender"
+        ));
     }
 
     #[tokio::test]
@@ -3266,7 +3399,7 @@ mod tests {
         let near_node_id = near_identity.node_id();
         let r = router(50).with_speculative_remote(true);
         r.register_local_expert("exp.test").await;
-        let peers = vec![(near_node_id.clone(), 5, true, true, None)];
+        let peers = vec![(near_node_id.clone(), 5, true, true, None, None)];
         let mut addrs = HashMap::new();
         addrs.insert(near_node_id.clone(), near_addr);
         let client = pinned_client_endpoint_dyn(pins).unwrap();
@@ -3307,8 +3440,8 @@ mod tests {
 
         // near holds the expert at great rtt but has NO QUIC address.
         let peers = vec![
-            ("near-peer".to_string(), 5, true, true, None),
-            (far_node_id.clone(), 200, true, true, None),
+            ("near-peer".to_string(), 5, true, true, None, None),
+            (far_node_id.clone(), 200, true, true, None, None),
         ];
         let mut completed = HashMap::new();
         let out = r
@@ -3351,8 +3484,8 @@ mod tests {
 
         let r = router(50); // nearby threshold 50ms
         let peers = vec![
-            (near_node_id.clone(), 5, true, true, None),
-            (far_node_id.clone(), 200, true, true, None),
+            (near_node_id.clone(), 5, true, true, None, None),
+            (far_node_id.clone(), 200, true, true, None, None),
         ];
         let mut addrs = HashMap::new();
         addrs.insert(near_node_id.clone(), near_addr);
@@ -3531,8 +3664,8 @@ mod tests {
 
         let r = router_with_verify(50, 100);
         let peers = vec![
-            (near_id.clone(), 5, true, true, None),
-            (far_id.clone(), 200, true, true, None),
+            (near_id.clone(), 5, true, true, None, None),
+            (far_id.clone(), 200, true, true, None, None),
         ];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
@@ -3585,8 +3718,8 @@ mod tests {
 
         let r = router_with_verify(50, 100);
         let peers = vec![
-            (near_id.clone(), 5, true, true, None),
-            (far_id.clone(), 200, true, true, None),
+            (near_id.clone(), 5, true, true, None, None),
+            (far_id.clone(), 200, true, true, None, None),
         ];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
@@ -3637,7 +3770,7 @@ mod tests {
         // (transient outage) — plan falls through to the remote, whose
         // result is then arbitrated by the recovered local expert.
         r.register_local_expert("exp.test").await;
-        let peers = vec![(near_id.clone(), 5, true, true, None)];
+        let peers = vec![(near_id.clone(), 5, true, true, None, None)];
         let mut addrs = HashMap::new();
         addrs.insert(near_id.clone(), near_addr);
         let client = pinned_client_endpoint_dyn(pins).unwrap();
@@ -3762,7 +3895,7 @@ mod tests {
         let identity = SigningIdentity::generate();
         let mut addrs = HashMap::new();
         addrs.insert(node_id.clone(), addr);
-        let peers = vec![(node_id.clone(), 8, true, true, None)];
+        let peers = vec![(node_id.clone(), 8, true, true, None, None)];
 
         // 5 messages, one back-to-back duplicate: the local closure fails
         // so the request must ride the wire, carrying exactly the compacted
@@ -3850,7 +3983,7 @@ mod tests {
         let identity = SigningIdentity::generate();
         let mut addrs = HashMap::new();
         addrs.insert(node_id.clone(), addr);
-        let peers = vec![(node_id.clone(), 8, true, true, None)];
+        let peers = vec![(node_id.clone(), 8, true, true, None, None)];
 
         // Local runtime down → falls back to the mesh peer, attributed.
         let (content, served_by) = r

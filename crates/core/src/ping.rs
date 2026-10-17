@@ -504,18 +504,23 @@ impl MeshFallbackChat {
     }
 
     /// Build inputs for the router from live registry state: connectable
-    /// peers (rtt, alive, advertised resources) + their advertised QUIC
-    /// rpc addresses.
+    /// peers (rtt, alive, advertised resources, VERIFIED reputation (§10
+    /// / Phase 5)) + their advertised QUIC rpc addresses.
     async fn mesh_view(
         &self,
         state: &Arc<MeshState>,
         expert_id: Option<&str>,
     ) -> (
-        Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)>,
+        Vec<crate::quic::MeshCandidate>,
         HashMap<String, SocketAddr>,
     ) {
+        // Verified reputation map (Phase 5 placement weighting): newest
+        // stamp per subject from OUR pin wall — the cache is already
+        // bounded, so this is two lookups, not a scan.
+        let verified = verified_scores(state).await;
         let reg = state.registry.lock().await;
-        let peers: Vec<(String, u64, bool, bool, Option<crate::hw::ResourceSample>)> = reg
+        let peers: Vec<crate::quic::MeshCandidate> =
+            reg
             .all_ads()
             .into_iter()
             .filter_map(|ad| {
@@ -536,6 +541,7 @@ impl MeshFallbackChat {
                     has_expert,
                     alive,
                     ad.resources.clone(),
+                    verified.get(&ad.node_id).copied(),
                 ))
             })
             // Per-peer blocking (Phase 3): a blocked peer is never a
@@ -623,10 +629,21 @@ impl MeshFallbackChat {
                 && !peers.iter().any(|(id, ..)| *id == owner)
             {
                 let rtt = rtts.get(&owner).copied().unwrap_or(u64::MAX >> 2);
-                let resources = ads
+                let resources: Option<crate::hw::ResourceSample> = ads
                     .iter()
                     .find(|ad| ad.node_id == owner)
                     .and_then(|ad| ad.resources.clone());
+                // Verified reputation rides the extended candidate too
+                // (the owner is usually already in the plan from mesh_view,
+                // in which case its score was already attached).
+                let known_rep = peers
+                    .iter()
+                    .find(|(id, ..)| *id == owner)
+                    .and_then(|(.., rep)| *rep);
+                let rep = match known_rep {
+                    Some(r) => Some(r),
+                    None => verified_scores(state).await.get(&owner).copied(),
+                };
                 tracing::debug!(
                     target: "mesh",
                     expert = %expert_id,
@@ -635,7 +652,7 @@ impl MeshFallbackChat {
                 );
                 // Behind any advertised holder (there are none) and
                 // ahead of nothing: the owner is the candidate.
-                peers.push((owner, rtt, true, true, resources));
+                peers.push((owner, rtt, true, true, resources, rep));
             }
         }
         // Demand signal: this node wants this expert.
@@ -2014,6 +2031,17 @@ async fn verify_health_reply(
     (alive, measurement)
 }
 
+/// Verified reputation per subject (Phase 5 placement weighting): newest
+/// stamp for each subject from OUR pin wall. Two lookups per entry — the
+/// cache is already bounded, never a scan.
+async fn verified_scores(state: &Arc<MeshState>) -> std::collections::HashMap<String, i32> {
+    let cache = state.reputation_cache.lock().await.clone();
+    cache
+        .iter()
+        .map(|s| (s.subject.clone(), s.score))
+        .collect()
+}
+
 /// §10 quotient — how old a reputation stamp may be and still ride
 /// (direct fetches re-sign every response; gossip hops add minutes).
 /// Old verdicts from a dead origin stop propagating here, not by policy
@@ -2358,6 +2386,72 @@ mod tests {
             ),
         };
         assert!(!fp_signed.verifies(&origin.pubkey_hex()));
+    }
+
+    /// Phase 5 placement wiring: mesh_view attaches the VERIFIED score
+    /// (from our own pin-wall cache) to the right peer, and nobody else's.
+    #[tokio::test]
+    async fn mesh_view_attaches_verified_reputation_per_peer() {
+        use crate::config::NodeRole;
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        {
+            let mut reg = PeerRegistry::new(Some(crate::models::ModelId {
+                id: "glm-5.3".into(),
+                quant: "int4".into(),
+                source: crate::models::ModelSource::Curated,
+            }));
+            for id in ["scored-peer", "unscored-peer"] {
+                reg.upsert(crate::bootstrap::PeerAd {
+                    node_id: id.into(),
+                    address: "127.0.0.1:9090".into(),
+                    model_id: "glm-5.3".into(),
+                    quant: "int4".into(),
+                    contribution_percent: 30,
+                    rpc_address: String::new(),
+                    last_seen_ms: now_ms(),
+                    role: NodeRole::Hybrid,
+                    resources: None,
+                    hosted_experts: None,
+                    hosted_expert_count: None,
+                    discovery_servers: Vec::new(),
+                    gossip_reputations: None,
+                });
+                reg.record_ping_ok(id, 5);
+            }
+            *state.registry.lock().await = reg;
+        }
+        let stamp = crate::signing::ReputationStamp {
+            origin: "47bb0d50e3de1009".to_string(),
+            subject: "scored-peer".to_string(),
+            score: -25,
+            stamp_ms: now_ms(),
+            sig: String::new(),
+        };
+        // The pin wall normally fills the cache; inject directly for the
+        // wiring test (the wall itself is tested above).
+        state.reputation_cache.lock().await.push(stamp);
+
+        let router = MeshFallbackChat::spawn().expect("test router shell");
+        let (peers, _addrs) = router.mesh_view(&state, None).await;
+        let scored = peers
+            .iter()
+            .find(|(id, ..)| id == "scored-peer")
+            .expect("peer present");
+        assert_eq!(
+            scored.5,
+            Some(-25),
+            "verified score attached to the right peer"
+        );
+        let unscored = peers
+            .iter()
+            .find(|(id, ..)| id == "unscored-peer")
+            .expect("peer present");
+        assert_eq!(
+            unscored.5, None,
+            "no stamp ⇒ no placement word at all"
+        );
     }
 
     /// §12 privacy tiers are policy: changing them is a HOT reload

@@ -662,6 +662,21 @@ gotchas surfaced while building the finished parts.
   thresholds act through the Phase 5 stake tier, not reputation alone.
   Anti-sybil (identity age + stake weighting before scores count) remains
   Phase 5.
+- ✅ **Reputation-weighted placement (§10, the statistics half)** (landed
+  2026-10-17): pin-wall-verified negative scores now feed the dispatch
+  planner. Semantics: a verified score ≤ 0 (0 = clean, negatives =
+  offenses, floor −100) demotes a peer to `reputation_tier` 1, and
+  placement sorts clean peers before penalized ones — penalized peers
+  land at the BACK of the plan instead of the front-of-key ordering they
+  used to take, so they're only exercised when no clean peer holds the
+  expert. That's statistics, never refusal: without the Phase 5 stake
+  tier the verified-offense line can only reorder the plan, and the
+  typed-refusal boundary (no refusals without stake) is unit-tested.
+  Implementation carries it through the `MeshCandidate` type every
+  builder + planner site now shares (the fat `(id, rtt, has, alive,
+  res, rep)` tuple is gone), and `/status.reputation` renders the live
+  verification cache — per-subject score, tier, and the penalized flag
+  the planner is acting on right now
 - ✅ **Per-node wallet surfaces on-chain** (landed 2026-10-17):
   `economics::WalletCard` probes the token-authed chain RPC /balance live
   in /status (`wallet` section: reachable / exists / balance_uj+jer /
@@ -688,9 +703,12 @@ gotchas surfaced while building the finished parts.
 ### Phase 5+ — trust, attestation, scale
 
 - **Reputation-weighted placement + slashing interlock (§10's Phase 5
-  work)**: the stake tier exists and is live against the escrow contract;
-  wiring verified-offense thresholds into placement preference (and the
-  refusals) is the interlock that makes economics bite.
+  work)**: the stake tier exists and is live against the escrow contract,
+  and the placement half of the interlock LANDED (§10 above —
+  verified-offense peers drop to the back of the dispatch plan). What
+  remains is the economics bite: tying verified thresholds to the
+  escrow-driven typed refusals, so demotion escalates once a peer is
+  actually holding stake.
 - **TEE attestation & selective ZK proofs (research-grade §10)**. Honest
   ground truth today is the commitment layer + spot-check ringer + signed
   measurement blocks — hardware attestation arrives later, gated on a
