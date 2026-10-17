@@ -513,6 +513,12 @@ pub async fn chat_with_usage_live(
                 "tool round budget exhausted — one toolless landing round"
             );
             tools_enabled = false;
+            // Prose nudge: the tool-exchange context keeps pulling the model
+            // back into intent JSON (live 2026-10-16: a 111-char `{…` answer
+            // landed, degenerate, and the retry emitted it IDENTICALLY — the
+            // refusal then replaced the chance to answer). The toolless
+            // round exists to force an answer out; make that explicit.
+            messages.push(json!({"role": "system", "content": PROSE_ANSWER_NUDGE}));
             continue;
         }
         // Tool-bearing rounds never touch the live surface: their streamed
@@ -639,6 +645,10 @@ pub async fn chat_with_usage_live(
                 if !degenerate_retried {
                     degenerate_retried = true;
                     tools_enabled = false;
+                    // Same prose nudge: an intent-JSON answer on the retry
+                    // path is the model being pulled into tool shape by the
+                    // gathered exchange, not a real attempt to answer.
+                    messages.push(json!({"role": "system", "content": PROSE_ANSWER_NUDGE}));
                     continue;
                 }
                 return Ok((EMPTY_ANSWER_REFUSAL.to_string(), served_by, tokens_used));
@@ -784,6 +794,15 @@ fn truncate_degenerate_head(content: &str) -> String {
 
 pub const EMPTY_ANSWER_REFUSAL: &str =
     "⚠️ the runtime returned an empty answer — try rephrasing, or ask a direct question.";
+
+/// Appended as a per-round system instruction to the TOOLLESS answer rounds
+/// (the budget-exhausted landing and the degenerate retry): the gathered
+/// tool exchange keeps pulling the model into tool-intent JSON — the exact
+/// answers the degenerate gate refuses. This single line, chat-local (it
+/// never persists into caller history), converts those rounds back into
+/// plain-prose attempts.
+pub const PROSE_ANSWER_NUDGE: &str =
+    "You must now answer the user in plain readable prose. Do not use any tools, and do not output JSON or object syntax — reply with the answer text itself.";
 
 pub fn answer_is_degenerate(content: &str) -> bool {
     let t = content.trim();
