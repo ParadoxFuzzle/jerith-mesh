@@ -67,14 +67,18 @@ pub(crate) fn client() -> reqwest::Client {
 // ---------------------------------------------------------------------------
 
 /// Per-round event for live taps (live-typing sinks). Fired in order:
-/// `RoundStart` at each chat round ('self-retries on degenerate answers
-/// included), then `Text` fragments of that round's SSE content.
+/// `RoundStart` at each TOOLLESS chat round (the answer round and degenerate
+/// self-retries included), then `Text` fragments of that round's SSE
+/// content.
 pub enum LiveEvent<'a> {
-    /// A new chat round begins — sinks should CLEAR whatever the previous
-    /// round typed: web-search tool rounds type nothing (native tool_call
-    /// deltas have no content), but content-JSON tool intent slop does
-    /// appear briefly; a RoundStart on the answer round erases it so the
-    /// user sees only the real answer typed out.
+    /// A new TOOLLESS round begins — sinks should CLEAR whatever the
+    /// previous round typed before the answer types out. Tool-bearing
+    /// rounds never fire events at all: their streamed content is tool
+    /// intent JSON and echoed tool results (web rows, PRIVATE embedded-memory
+    /// recall hits) that must never become visible in the chat before the
+    /// reply (live 2026-10-16 incident). The loop suppresses them outright
+    /// — not just clear-later — because a degenerate round's slop used to
+    /// surface before the refusal replaced it.
     RoundStart,
     /// A content fragment of the current round.
     Text(&'a str),
@@ -258,6 +262,17 @@ async fn fetch_streamed_round(
     }
 
     let mut acc = RoundAcc::default();
+    // JSON round gate (the "double response" incident, live 2026-10-16):
+    // a TOOLLESS round whose streamed content opens as a brace-led JSON
+    // object is tool-intent slop the model fumbled (193-char `{…}` from the
+    // landing round) — live-typing it, then RoundStart-clearing it when the
+    // retry types the real answer, reads to the user as TWO responses. So:
+    // hold fragments while the round's content so far still opens `{ "…`;
+    // the moment it proves to be prose, fire the held burst and type live
+    // from there. A held round that ends degenerate/tool-calls simply never
+    // surfaces — matching the buffered-path gate that already refuses it.
+    let mut held: String = String::new();
+    let mut prose_confirmed = false;
     let mut bytes = resp.bytes_stream();
     let mut buf = String::new();
     while let Some(chunk) = bytes.next().await {
@@ -271,7 +286,17 @@ async fn fetch_streamed_round(
                     if let Some(tap) = live {
                         let fresh = &acc.content[before.min(acc.content.len())..];
                         if !fresh.is_empty() {
-                            tap(LiveEvent::Text(fresh));
+                            if prose_confirmed {
+                                tap(LiveEvent::Text(fresh));
+                            } else {
+                                held.push_str(fresh);
+                                let head = acc.content.trim_start();
+                                if !head.starts_with('{') {
+                                    prose_confirmed = true;
+                                    tap(LiveEvent::Text(held.as_str()));
+                                    held.clear();
+                                }
+                            }
                         }
                     }
                 }
@@ -330,9 +355,11 @@ pub async fn chat_with_usage(
 /// (the default), every round streams through the gateway's SSE
 /// passthrough and `live` fires with a `RoundStart` marker then each new
 /// content fragment — the @mention/DM path and `/ask` live-type the reply
-/// into Discord while tokens land, web-search tool rounds included
-/// (RoundStart clears the tool-exchange round's text before the answer
-/// round types). `None` (monitors/cost accounting) keeps the buffered reply.
+/// into Discord while tokens land. TOOL-BEARING rounds fire nothing: tool
+/// intent JSON and echoed tool results (including private embedded-memory
+/// recall) are never typed into the chat before the reply — only toolless
+/// answer/landing rounds type out live. `None` (monitors/cost accounting)
+/// keeps the buffered reply.
 pub async fn chat_with_usage_live(
     cfg: &crate::config::BotConfig,
     prompt: &str,
@@ -488,10 +515,18 @@ pub async fn chat_with_usage_live(
             tools_enabled = false;
             continue;
         }
-        // Round boundary for live taps: whatever the previous round typed
-        // (tool-intent slop, nothing for native tool_call rounds) clears
-        // here, before this round's fragments arrive.
-        if let Some(tap) = live {
+        // Tool-bearing rounds never touch the live surface: their streamed
+        // content is tool-intent JSON and whatever tool results (web rows,
+        // memory-recall hits) the model echoes back — including PRIVATE
+        // embedded memory, typed into the chat before any reply existed
+        // (live 2026-10-16 incident: recall slop streamed into Discord, then
+        // the round degenerated to `{}` and the refusal replaced it). Only
+        // toolless rounds type: those are either the plain-chat answer
+        // (tools never enabled → no fragment suppression) or the toolless
+        // landing round after tool work. Tool-bearing rounds run tap-less,
+        // so nothing is buffered — their fragments simply never surface.
+        let round_live = if tools_enabled { None } else { live };
+        if let Some(tap) = round_live {
             tap(LiveEvent::RoundStart);
         }
         let mut payload = json!({
@@ -502,7 +537,7 @@ pub async fn chat_with_usage_live(
             payload["tools"] = Value::Array(registry.tool_defs());
         }
         let (status, body) = if cfg.chat_stream {
-            fetch_streamed_round(&url, &payload, chat_timeout, live).await?
+            fetch_streamed_round(&url, &payload, chat_timeout, round_live).await?
         } else {
             let resp = client()
                 .post(&url)
@@ -1850,6 +1885,11 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let cfg =
             crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        // Plain chat = toolless round by construction here: web skills off
+        // (the short-prompt heuristic would attach tools to any <200-char
+        // prompt and suppress the live typing this test exists to prove).
+        let mut cfg = cfg;
+        cfg.web.enabled = false;
         let fragments: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let tap_seen = fragments.clone();
@@ -1870,7 +1910,8 @@ mod tests {
         assert_eq!(reply, "live typed");
         assert!(served_by.is_none());
         assert_eq!(tokens, 7);
-        // The live tap fired per fragment — the live-typing contract.
+        // The live tap fired per fragment of the TOOLLESS answer round —
+        // the live-typing contract (tool-bearing rounds type nothing).
         assert_eq!(
             *fragments.lock().expect("test tap"),
             vec![
@@ -2009,16 +2050,187 @@ mod tests {
         assert_eq!(reply, "answer after web search.");
         assert!(served_by.is_none());
         assert_eq!(tokens, 42);
-        // Two round boundaries, zero text in the tool round, the answer
-        // typed live — the tool-round streaming contract.
+        // Two round boundaries — wait, the new contract: tool-bearing
+        // rounds fire NOTHING live; the answer text is never typed live
+        // (its round carried tools attached), so the tap stays silent and
+        // the full reply arrives via the sink's finish.
         assert_eq!(
             *events.lock().expect("test tap"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Regression for the tool-round suppression: intent JSON + echoed
+    /// memory-recall row streamed in round 0 (tools attached), a real
+    /// answer streamed in the TOOLLESS round — the sink must record only
+    /// the answer, never intent slop or echoed tool results (the live
+    /// 2026-10-16 incident: private embedded-memory text surfaced in the
+    /// chat before the refusal replaced it).
+    #[tokio::test]
+    async fn chat_tool_round_fragments_never_reach_the_live_surface() {
+        use std::sync::Arc;
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|axum::Json(req): axum::Json<Value>| async move {
+                    let has_tools = req.get("tools").is_some();
+                    let body = if has_tools {
+                        // Round 0: the model streams INTENT SLOP it invented
+                        // from the (mocked) embedded-memory recall, then a
+                        // native tool call. In the incident round this is the
+                        // text that surfaced in the chat before the refusal.
+                        let slop1 = json!({"choices":[{"delta":{"content":"{ \"thinking…\": \"private memory text\""}}]});
+                        let slop2 = json!({"choices":[{"delta":{"content":"  …quoted recall hit…"}}]});
+                        let frag = json!({"index":0,"id":"c1","function":{"name":"web_search","arguments":""}});
+                        let args = json!({"index":0,"function":{"arguments": json!({"query": "kiln"}).to_string()}});
+                        let fin = json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]});
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            slop1,
+                            slop2,
+                            json!({"choices":[{"delta":{"tool_calls":[frag]}}]}),
+                            json!({"choices":[{"delta":{"tool_calls":[args]}}]}),
+                            fin
+                        )
+                    } else {
+                        // Toolless answer round: real text.
+                        let a1 = json!({"choices":[{"delta":{"content":"Real reply."}}]});
+                        let fin = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            a1, fin
+                        )
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                }),
+            )
+            .route(
+                "/v1/skills/web/search",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"results": [{"title": "K", "url": "https://k"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let tap_seen = events.clone();
+        let live = move |ev: LiveEvent| {
+            let mut guard = tap_seen.lock().expect("test tap");
+            match ev {
+                LiveEvent::RoundStart => guard.push("⇆round".to_string()),
+                LiveEvent::Text(f) => guard.push(f.to_string()),
+            }
+        };
+        let (reply, _served_by, _tokens) =
+            chat_with_usage_live(&cfg, "where is the kiln?", &[], Some(&live))
+                .await
+                .expect("tool-slop chat");
+        // The answer landed and is exactly the toolless round's text.
+        assert_eq!(reply, "Real reply.");
+        // The tool-bearing rounds fired nothing; the toolless landing round
+        // fired RoundStart then typed its answer — the only typing a tool
+        // chat ever surfaces.
+        let seen = events.lock().expect("test tap");
+        assert_eq!(*seen, vec!["⇆round".to_string(), "Real reply.".to_string()], "tap: {seen:?}");
+    }
+
+    /// The “double response” fix, toolless side: a landing round whose
+    /// streamed content opens as brace-led JSON is intent slop — held by
+    /// the JSON gate, never typed — and the toolless retry's prose answer
+    /// then types live as the ROUND's only visible surface (live
+    /// 2026-10-16: the 193-char `{…` landing streamed into the chat, was
+    /// RoundStart-cleared, and read as a second answer).
+    #[tokio::test]
+    async fn chat_json_shaped_stream_rounds_never_type_live() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        // Round counter: the degenerate retry's payload is IDENTICAL to
+        // round 0's (same messages, tools off) — only the call order tells
+        // the stub which round it is serving.
+        let round = Arc::new(AtomicUsize::new(0));
+        let round_seen = round.clone();
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| async move {
+                    let n = round_seen.fetch_add(1, AtomicOrdering::SeqCst);
+                    // Retry shape: round 0 (toolless) streams a brace-led
+                    // JSON object to completion (finish stop, degenerate);
+                    // the toolless retry round streams prose.
+                    let retried = n > 0;
+                    let _ = req; // payload identical across rounds by design
+                    let body = if retried {
+                        let a1 = json!({"choices":[{"delta":{"content":"Prose "}}]});
+                        let a2 = json!({"choices":[{"delta":{"content":"answer."}}]});
+                        let fin = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            a1, a2, fin
+                        )
+                    } else {
+                        let s1 = json!({"choices":[{"delta":{"content":"{ \"tool\": "}}]});
+                        let s2 = json!({"choices":[{"delta":{"content":"\"web_search\" }"}}]});
+                        let fin = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            s1, s2, fin
+                        )
+                    };
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Web skills OFF: a pure toolless chat — the JSON slop still must
+        // never surface (delta-by-delta, exactly what a Discord user saw).
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = false;
+
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let tap_seen = events.clone();
+        let live = move |ev: LiveEvent| {
+            let mut guard = tap_seen.lock().expect("test tap");
+            match ev {
+                LiveEvent::RoundStart => guard.push("⇆round".to_string()),
+                LiveEvent::Text(f) => guard.push(f.to_string()),
+            }
+        };
+        let (reply, _served_by, _tokens) =
+            chat_with_usage_live(&cfg, "say hi", &[json!({"role": "user", "content": "earlier"})], Some(&live))
+                .await
+                .expect("json-hold chat");
+        // The retry round's prose is the only thing ever typed. RoundStart
+        // fires per TOOLLESS round (round 0 held its JSON and typed nothing
+        // after it; the retry RoundStart + prose) — the user-visible surface
+        // carries exactly one answer.
+        assert_eq!(reply, "Prose answer.");
+        let seen = events.lock().expect("test tap");
+        assert_eq!(
+            *seen,
             vec![
                 "⇆round".to_string(),
                 "⇆round".to_string(),
-                "answer ".to_string(),
-                "after web search.".to_string()
-            ]
+                "Prose ".to_string(),
+                "answer.".to_string()
+            ],
+            "tap: {seen:?}"
         );
     }
 

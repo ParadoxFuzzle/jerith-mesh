@@ -489,11 +489,19 @@ remembering:
   logic stays single-source. Reality check: qwen3:8b thinking arrives as
   `delta.reasoning_content`, so live-typing shows the wait, then the
   answer tails in fast; a broken stream with real content already typed
-  degrades to a cut-marked partial, never a lost chat. `stream = false`
-  restores the buffered one-shot. Tool rounds stream too: taps see a
-  `RoundStart` per chat round (sinks clear the tool-exchange round's text
-  — native tool_call rounds type nothing, occasional JSON-intent slop
-  vanishes at the boundary — so web-informed answers type clean). The
+  degrades to a cut-marked partial, never a lost  chat. `stream = false` restores the buffered one-shot. Tool rounds
+  STREAM but never type: tool-bearing rounds fire no live events at all
+  (2026-10-16 contract change, after a recall-slop incident — echoed
+  embedded-memory text surfaced in the chat before the reply, then the
+  round degenerated to `{}` and the refusal replaced it). Toolless
+  rounds type, but their fragments are JSON-gated: while the round's
+  content still opens `{ "…` (the 193-char intent-slop landing round),
+  fragments are HELD and never surface — the moment the content proves
+  to be prose, the held burst fires and live-typing resumes (the
+  "double response" incident: brace-slop typed live, RoundStart-cleared,
+  and the retry's answer read as a second reply). Nothing a round yields
+  becomes chat-visible before it is either real prose or the delivered
+  final. The
   Discord edit wire path is verified live (say + two partial edits +
   final edit, all 200, content readback ok). Chat-guardrail state is
   observable: the node's `/status` carries `runtime_num_predict`, the

@@ -250,6 +250,36 @@ pub fn reroute_for_gateway(
     next.filter(|n| !n.is_empty() && *n != requested)
 }
 
+/// Gateway contract check for the `think: false` TOOL-tier merge — the
+/// other half of [`reroute_for_gateway`]. A tool-bearing AUTO request
+/// engages the tool tier EVEN when the rewrite is a no-op: the common
+/// operator shape pins `runtime_tool_model` equal to the base model, so
+/// the rewrite suppresses itself but the tier (and its think-free budget
+/// contract) is still the one serving the round. Returns whether the
+/// merge must apply.
+///
+/// Why it can't live inside the rewrite branch: the observed empty-`{}`
+/// tool-loop incident (reproduced live 2026-10-16 through the gateway
+/// smoke) recurs on exactly the no-op-rewrite shape — a thinking tool
+/// model burns the generation budget in its reasoning channel before any
+/// call/text is emitted, and ollama answers `content: ""` at the cap.
+/// Explicit caller models and a disabled tool tier keep their thinking
+/// untouched, same as the rewrite gate.
+pub fn auto_tool_tier_merge(
+    requested: Option<&str>,
+    base_model: Option<&str>,
+    tiers: &RouterModels,
+    has_tools: bool,
+) -> bool {
+    if !has_tools || tiers.tool.is_empty() {
+        return false;
+    }
+    let requested = requested.unwrap_or_default().trim();
+    requested.is_empty()
+        || requested == "jerith-mesh"
+        || base_model.is_some_and(|b| requested == b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +476,50 @@ mod tests {
             reroute_for_gateway(Some("qwen3:8b"), Some("qwen3:8b"), &msgs, &tiers(), false),
             None
         );
+    }
+
+    #[test]
+    fn auto_tool_tier_merge_follows_the_same_gate_as_the_rewrite() {
+        // Tool-bearing auto requests on a pinned same-as-base tool tier:
+        // the merge fires even though the rewrite suppresses itself.
+        let pinned = RouterModels {
+            tool: "qwen3:8b".into(),
+            ..RouterModels::default()
+        };
+        assert!(auto_tool_tier_merge(
+            Some("qwen3:8b"),
+            Some("qwen3:8b"),
+            &pinned,
+            true
+        ));
+        assert!(auto_tool_tier_merge(Some("jerith-mesh"), Some("qwen3:8b"), &pinned, true));
+        assert!(auto_tool_tier_merge(None, Some("qwen3:8b"), &pinned, true));
+        // No tools → nothing engages (basic chat keeps its thinking).
+        assert!(!auto_tool_tier_merge(
+            Some("qwen3:8b"),
+            Some("qwen3:8b"),
+            &pinned,
+            false
+        ));
+        // Tool tier disabled → plain toolless-shape behavior (caller keeps
+        // its model untouched and un-merged).
+        assert!(!auto_tool_tier_merge(
+            Some("qwen3:8b"),
+            Some("qwen3:8b"),
+            &RouterModels::default(),
+            true
+        ));
+        // Explicit caller model (not the auto gate) → caller choice wins.
+        let other_tool = RouterModels {
+            tool: "tier-tool:9b".into(),
+            ..RouterModels::default()
+        };
+        assert!(!auto_tool_tier_merge(
+            Some("another-model:9b"),
+            Some("qwen3:8b"),
+            &other_tool,
+            true
+        ));
     }
 
     #[test]

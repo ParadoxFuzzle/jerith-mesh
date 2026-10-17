@@ -1100,6 +1100,23 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                 body["think"] = serde_json::Value::Bool(false);
             }
             body["model"] = serde_json::Value::String(next);
+        } else if crate::model_router::auto_tool_tier_merge(
+            requested,
+            gw.base_model.as_deref(),
+            router,
+            has_tools,
+        ) {
+            // Tool tier engaged with NO model rewrite (the tool pick equals
+            // the caller's auto model — the pinned same-as-base shape). The
+            // think:false merge is the tier's whole remaining effect: skip
+            // it and the tool loop thinks, burns the budget in the reasoning
+            // channel, and lands empty (the reproduced `{}` incident).
+            let model_name = requested.unwrap_or("(none)").to_string();
+            body["think"] = serde_json::Value::Bool(false);
+            tracing::info!(
+                model = %model_name,
+                "model router: tool tier no-op rewrite — think:false merged in lane"
+            );
         }
     }
     // A model-less BASIC chat (no tier engaged) would forward `model: null`
@@ -2018,6 +2035,95 @@ mod tests {
         server.post("/v1/chat/completions").json(&basic).await;
         let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
         assert_eq!(forwarded["model"], json!("jerith-mesh"), "basic untouched");
+        assert_eq!(forwarded.get("think"), None);
+    }
+
+    /// The PINNED SAME-AS-BASE tool tier: runtime_tool_model equals the
+    /// caller's auto model, so the tier rewrite suppresses itself (no-op)
+    /// — and the think:true default would send the tool loop thinking.
+    /// The think:false merge must still fire (the reproduced empty-`{}`
+    /// tool-loop incident, live 2026-10-16), while the model id is left
+    /// exactly as the caller sent it.
+    #[tokio::test]
+    async fn tool_tier_no_op_rewrite_still_merges_think_false() {
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new("".to_string()));
+        let recv = received.clone();
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let recv = recv.clone();
+                async move {
+                    *recv.lock().await = body;
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.expect("runtime up") });
+        let runtime_url = format!("http://{addr}");
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.clone(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        // The live pin: tool tier EQUALS the base model.
+        cfg.runtime_tool_model = Some("qwen3:8b".to_string());
+        let (state, _rx) = MeshState::new(cfg.clone()).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: runtime_url.clone(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: Some(std::sync::Arc::new(
+                crate::model_router::RouterModels::from_config(&cfg),
+            )),
+            base_model: Some("qwen3:8b".to_string()),
+            web: None,
+            chain_url: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+
+        // Auto request (the advertised base model id) carrying tools: the
+        // tool tier engages, no rewrite is logged, and think:false lands.
+        let tool_request = json!({
+            "model": "qwen3:8b",
+            "messages": [{"role": "user", "content": "search the notes"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "search",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        });
+        let res = server.post("/v1/chat/completions").json(&tool_request).await;
+        assert_eq!(res.status_code(), 200);
+        let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
+        assert_eq!(forwarded["model"], json!("qwen3:8b"), "no-op rewrite keeps the model id");
+        assert_eq!(
+            forwarded["think"],
+            json!(false),
+            "tool tier disables thinking even without a model rewrite"
+        );
+
+        // Plain chat (no tools) on the same base model: untouched, no think
+        // key — the caller's model is not tier-routed without a tier.
+        let plain = json!({
+            "model": "qwen3:8b",
+            "messages": [{"role": "user", "content": "hey"}]
+        });
+        server.post("/v1/chat/completions").json(&plain).await;
+        let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
+        assert_eq!(forwarded["model"], json!("qwen3:8b"));
         assert_eq!(forwarded.get("think"), None);
     }
 
