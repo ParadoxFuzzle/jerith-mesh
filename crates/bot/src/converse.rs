@@ -76,6 +76,76 @@ pub fn buffered_delivery_needed(had_live_sink: bool) -> bool {
     !had_live_sink
 }
 
+/// Default question used when a message carries images but no usable
+/// text (image-only mentions and DMs): the vision tier describes, the
+/// chat model narrates.
+pub const IMAGE_ONLY_PROMPT: &str = "What's in this image? Describe it";
+
+/// Cap on image attachments processed per message: each walk costs one
+/// download + one vision-tier round-trip; beyond a few, the answer gets
+/// unreadable anyway.
+pub const MAX_IMAGES_PER_MESSAGE: usize = 3;
+
+/// Pure assembly behind the transports' image context: render one
+/// bracketed line per image — description or honest failure (never a
+/// silent drop) — into one block the chat model reads ahead of the
+/// prompt.
+fn assemble_image_context(lines: &[(String, Result<String, String>)]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from("[image context follows]\n");
+    for (label, result) in lines {
+        match result {
+            Ok(desc) if !desc.trim().is_empty() => {
+                out.push_str(&format!("- [{label}] {}\n", desc.trim()));
+            }
+            Ok(_) => out.push_str(&format!("- [{label}] (vision returned nothing)\n")),
+            Err(e) => out.push_str(&format!("- [{label}] (vision unavailable: {e})\n")),
+        }
+    }
+    out.truncate(out.trim_end().len());
+    Some(out)
+}
+
+/// Transport-side image handling: download each attached image, describe
+/// it through the gateway's vision skill, and assemble the bracketed
+/// context block for the prompt. The caller passes `(url, label)` pairs
+/// — Discord and any future transport already own their attachment
+/// representations. `None` = no images, no block.
+pub async fn image_context(
+    cfg: &crate::config::BotConfig,
+    attachments: &[(&str, &str)],
+    question: Option<&str>,
+) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+    // The user's own text describes what they want from the images; a
+    // plain describe when the message rides by on pixels alone.
+    let describe_prompt = question
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .unwrap_or(IMAGE_ONLY_PROMPT);
+    let mut lines = Vec::with_capacity(attachments.len());
+    for (url, fallback_label) in attachments {
+        let entry = match api::fetch_vision_image(url, fallback_label).await {
+            Ok(api::VisionImage { label, data_url }) => {
+                match api::vision_describe_skill(cfg, describe_prompt, &data_url).await {
+                    Ok(desc) => (label, Ok(desc)),
+                    Err(e) => (label, Err(format!("{e:#}"))),
+                }
+            }
+            Err(e) => (
+                (*fallback_label).to_string(),
+                Err(format!("{e:#}")),
+            ),
+        };
+        lines.push(entry);
+    }
+    assemble_image_context(&lines)
+}
+
 /// One request → reply conversational pass, defined once (was duplicated
 /// in `/ask` and the @mention fallback): squeeze (deep stage, may
 /// persist) → speaker tag → streamed chat with the sink bridged into
@@ -358,5 +428,106 @@ mod tests {
         );
         // A session with no surface at all still needs the plain send.
         assert!(buffered_delivery_needed(false));
+    }
+
+    /// Image handling: the vision skill line assembly — descriptions
+    /// (*the user's question rides along as the skill prompt*), honest
+    /// failure lines for broken downloads/replies, and a nothing case.
+    #[test]
+    fn assemble_image_context_renders_each_line_honestly() {
+        let lines = vec![
+            (
+                "kiln.png".to_string(),
+                Ok::<String, String>(String::from("  a brick kiln, fired   ")),
+            ),
+            (
+                "ghost.png".to_string(),
+                Err(String::from("vision skill failed: 503")),
+            ),
+            ("mute.png".to_string(), Ok(String::from(""))),
+        ];
+        let ctx = assemble_image_context(&lines).unwrap();
+        assert!(ctx.starts_with("[image context follows]"), "header: {ctx}");
+        assert!(ctx.contains("- [kiln.png] a brick kiln, fired"), "{ctx}");
+        assert!(
+            ctx.contains("- [ghost.png] (vision unavailable: vision skill failed: 503)"),
+            "{ctx}"
+        );
+        assert!(
+            ctx.contains("- [mute.png] (vision returned nothing)"),
+            "{ctx}"
+        );
+        // No images, no block (and the transports skip the plainly).
+        assert_eq!(assemble_image_context(&[]), None);
+    }
+
+    /// Transport-side image context end-to-end against a stub gateway:
+    /// the attachment URL downloads into a data URL, the user's question
+    /// becomes the skill's prompt, and the broken attachment lands as
+    /// the honest failure line instead of killing the answer.
+    #[tokio::test]
+    async fn image_context_describes_and_reports_failures() {
+        let seen = StdArc::new(TMutex::new(Vec::new()));
+        let seen_describe = seen.clone();
+        let app = axum::Router::new()
+            .route(
+                "/img.png",
+                axum::routing::get(|| async {
+                    (
+                        [("content-type", "image/png")],
+                        axum::body::Bytes::from(vec![1u8, 2, 3, 4]),
+                    )
+                }),
+            )
+            .route(
+                "/v1/skills/vision/describe",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| {
+                    let seen_describe = seen_describe.clone();
+                    async move {
+                        seen_describe.lock().await.push(req.clone());
+                        axum::Json(json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "a red brick kiln"}
+                            }]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg = cfg();
+        cfg.gateway_url = format!("http://{addr}");
+
+        let url = format!("http://{addr}/img.png");
+        let ctx = image_context(
+            &cfg,
+            &[
+                (url.as_str(), "kiln.png"),
+                ("http://127.0.0.1:1/missing.png", "ghost.png"),
+            ],
+            Some("what is it?"),
+        )
+        .await
+        .unwrap();
+
+        let ok_line = "- [kiln.png] a red brick kiln";
+        assert!(
+            ctx.contains("[image context follows]") && ctx.contains(ok_line),
+            "ctx: {ctx}"
+        );
+        assert!(ctx.contains("- [ghost.png] (vision unavailable: image download"), "{ctx}");
+        // The user's question — not the describe default — rode the
+        // vision skill's prompt.
+        let skill_reqs = seen.lock().await;
+        assert_eq!(skill_reqs.len(), 1, "only the good image reached the skill");
+        assert_eq!(skill_reqs[0]["prompt"], json!("what is it?"));
+        assert!(
+            skill_reqs[0]["image"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "bytes packed as a data url"
+        );
     }
 }

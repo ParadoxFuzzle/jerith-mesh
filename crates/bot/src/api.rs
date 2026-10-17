@@ -971,6 +971,107 @@ async fn post_gateway_skill(
     Ok(body)
 }
 
+/// Hard cap on image attachment downloads: the data URL rides the
+/// vision-tier request and the transport keeps one copy only; Discord
+/// attachments above ~8 MiB are almost always media meant for download,
+/// not analysis.
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Download an image attachment and pack it as a data URL — the form
+/// the gateway's vision skill accepts (`data:image/...;base64,...`)
+/// regardless of what runtime sits behind the tier.
+pub async fn fetch_vision_image(url: &str, label: &str) -> Result<VisionImage> {
+    if url.trim().is_empty() {
+        anyhow::bail!("empty image url");
+    }
+    let resp = client()
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("image download failed for {label}"))?;
+    let status = resp.status();
+    anyhow::ensure!(status.is_success(), "image download: HTTP {status}");
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        mime.starts_with("image/"),
+        "image download: not an image ({:?})",
+        mime
+    );
+    let bytes = resp.bytes().await.context("image body read failed")?;
+    anyhow::ensure!(
+        !bytes.is_empty(),
+        "image download: {label} arrived empty"
+    );
+    anyhow::ensure!(
+        bytes.len() <= MAX_IMAGE_BYTES,
+        "image too large: {} bytes (cap {})",
+        bytes.len(),
+        MAX_IMAGE_BYTES
+    );
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(VisionImage {
+        label: label.to_string(),
+        data_url: format!("data:{mime};base64,{b64}"),
+    })
+}
+
+/// A downloaded image attachment ready for the vision skill: its
+/// filename (context-line label) plus the data URL carrying the bytes.
+pub struct VisionImage {
+    pub label: String,
+    pub data_url: String,
+}
+
+/// POST /v1/skills/vision/describe on the gateway — the runtime sends
+/// the prompt + image through the node's vision tier (litellm-routed).
+pub async fn vision_describe_skill(
+    cfg: &crate::config::BotConfig,
+    prompt: &str,
+    image: &str,
+) -> Result<String> {
+    anyhow::ensure!(
+        image.trim().starts_with("data:image/"),
+        "vision skill needs a data:image/ payload"
+    );
+    let body = post_gateway_skill(
+        cfg,
+        "/v1/skills/vision/describe",
+        &json!({ "image": image, "prompt": prompt }),
+    )
+    .await?;
+    Ok(completion_text(&body))
+}
+
+/// Pull `choices[0].message.content` out of the chat-completion-shaped
+/// reply the vision skill forwards: `content` may be a plain string or
+/// the OpenAI parts array. Falls back to the reply's `error` field so a
+/// skewed runtime reads honestly instead of empty.
+pub fn completion_text(body: &Value) -> String {
+    let content = body.pointer("/choices/0/message/content");
+    if let Some(text) = content.and_then(Value::as_str) {
+        return text.to_string();
+    }
+    if let Some(Value::Array(parts)) = content {
+        let text = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    body.get("error")
+        .and_then(value_to_string)
+        .unwrap_or_else(|| String::from("no content in reply"))
+}
+
 /// POST /v1/skills/memory/embed — store text in the node's private memory.
 pub async fn memory_embed(cfg: &crate::config::BotConfig, text: &str) -> Result<(String, String)> {
     let url = format!("{}/v1/skills/memory/embed", cfg.gateway_url);
@@ -1399,6 +1500,39 @@ mod tests {
         assert_eq!(
             unwrap_json_text_envelope("{} is an empty set, in plain prose."),
             None
+        );
+    }
+
+    /// The vision skill forwards a chat-completion body: the assistant
+    /// text may be a string or the parts array — and a skewed runtime's
+    /// error field reads honestly instead of dropping to empty.
+    #[test]
+    fn completion_text_pulls_assistant_content() {
+        assert_eq!(
+            completion_text(&json!({
+                "choices": [{"message": {"role": "assistant", "content": "the kiln fires"}}]
+            })),
+            "the kiln fires"
+        );
+        // OpenAI parts-array shape.
+        assert_eq!(
+            completion_text(&json!(            {
+                "choices": [{"message": {"content": [{"type": "text", "text": "brick"}, {"type": "text", "text": "clay"}]}}]
+            })),
+            "brick clay"
+        );
+        // Error body (the gateway forwards non-provisioned vision tiers
+        // as the runtime's error).
+        assert_eq!(
+            completion_text(&json!({"error": "model does not support images"})),
+            "model does not support images"
+        );
+        // Nothing usable at all.
+        assert_eq!(completion_text(&json!({})), "no content in reply");
+        // Empty parts array → falls through to the error fallback.
+        assert_eq!(
+            completion_text(&json!({"choices": [{"message": {"content": []}}]})),
+            "no content in reply"
         );
     }
 

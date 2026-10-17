@@ -21,6 +21,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
+base64.workspace = true
 futures-util.workspace = true
 tokio-postgres = "0.7"
 

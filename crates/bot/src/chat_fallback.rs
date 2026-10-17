@@ -30,9 +30,15 @@ pub async fn handle(
     let serenityall::FullEvent::Message { new_message: msg } = event else {
         return Ok(());
     };
-    // Never react to other bots (incl. ourselves) or to attachments-only
-    // messages (nothing textual to forward).
-    if msg.author.bot || msg.content.is_empty() {
+    // Never react to other bots. But an image attachment IS content:
+    // image-only mentions/DMs are describable prompts, not noise — the
+    // 2026-10-17 deploy dropped them (and every text+image message went
+    // through text-only, with the vision model selected but unreachable).
+    let has_image_attachment = msg
+        .attachments
+        .iter()
+        .any(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")));
+    if msg.author.bot || (msg.content.is_empty() && !has_image_attachment) {
         return Ok(());
     }
 
@@ -50,8 +56,15 @@ pub async fn handle(
     let prompt = if !contacted {
         if is_dm {
             // Bare DM text (no mention possible medium-less): fully
-            // conversational, like the old agent stack behaved.
-            Some(msg.content.trim().to_string())
+            // conversational, like the old agent stack behaved. An
+            // image-only DM (empty text, image attached) IS the prompt:
+            // describe what was sent.
+            let trimmed = msg.content.trim().to_string();
+            if !trimmed.is_empty() {
+                Some(trimmed)
+            } else {
+                has_image_attachment.then(|| crate::converse::IMAGE_ONLY_PROMPT.to_string())
+            }
         } else {
             // Guild message not addressed to us: stay quiet. (Wider
             // "answer every channel message" would need Discord's
@@ -64,19 +77,26 @@ pub async fn handle(
         // prompt, so "check @Jerith status ok?" converses naturally.
         let cleaned = strip_bot_mentions(&msg.content, bot_id).trim().to_string();
         if cleaned.is_empty() {
-            // Bare "@bot" with no text: answer inline instead of sending an
-            // empty prompt to the gateway.
-            let _ = msg.channel_id.say(ctx.serenity_context, HINT).await;
-            return Ok(());
+            // Bare "@bot" with images attached: the images ARE the
+            // instruction. With no text and no images: inline hint.
+            if has_image_attachment {
+                Some(crate::converse::IMAGE_ONLY_PROMPT.to_string())
+            } else {
+                // Bare "@bot" with no text: answer inline instead of
+                // sending an empty prompt to the gateway.
+                let _ = msg.channel_id.say(ctx.serenity_context, HINT).await;
+                return Ok(());
+            }
+        } else {
+            // A LEADING mention that names a real command (@bot ask hi,
+            // @bot help, …) belongs to the framework: don't double-handle.
+            // Mid-sentence mentions are conversational by definition here —
+            // poise never sees them (it only dispatches on a leading glyph).
+            if leading && first_token_is_command(&cleaned, &ctx.options().commands) {
+                return Ok(());
+            }
+            Some(cleaned)
         }
-        // A LEADING mention that names a real command (@bot ask hi,
-        // @bot help, …) belongs to the framework: don't double-handle.
-        // Mid-sentence mentions are conversational by definition here —
-        // poise never sees them (it only dispatches on a leading glyph).
-        if leading && first_token_is_command(&cleaned, &ctx.options().commands) {
-            return Ok(());
-        }
-        Some(cleaned)
     };
     let Some(prompt) = prompt else { return Ok(()) };
 
@@ -93,6 +113,20 @@ pub async fn handle(
     let channel = msg.channel_id;
     let state = data.state.clone();
     let cfg = data.cfg.clone();
+    // Image attachments rode along: describe each through the gateway's
+    // vision skill and hand the chat model the bracketed context ahead
+    // of the prompt — the model-visible text stays a String, so the
+    // pipeline needs no multimodal plumbing.
+    let image_attachments: Vec<(String, String)> = if contacted || is_dm {
+        msg.attachments
+            .iter()
+            .filter(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")))
+            .take(crate::converse::MAX_IMAGES_PER_MESSAGE)
+            .map(|a| (a.url.clone(), a.filename.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     // Individual-user recognition: every turn keeps its speaker, so the
     // model (whose persona encodes the owner's id) can tell owner from
     // guests and address people by name across the conversation. The
@@ -101,6 +135,22 @@ pub async fn handle(
     let speaker_prefix = speaker_tag(&msg.author);
     tokio::spawn(async move {
         show_typing(&http_ctx, channel).await;
+        // Visions first (downloads + skill round-trips can be slow; the
+        // typing indicator already covers the wait): failures land as
+        // honest bracketed lines inside the prompt, never a silent drop.
+        let prompt = match crate::converse::image_context(
+            &cfg,
+            &image_attachments
+                .iter()
+                .map(|(u, l)| (u.as_str(), l.as_str()))
+                .collect::<Vec<_>>(),
+            Some(&prompt),
+        )
+        .await
+        {
+            Some(ctx) => format!("{ctx}\n{prompt}"),
+            None => prompt,
+        };
         // Live typing ([chat] stream, default on): the answer streams
         // through the gateway's SSE passthrough and edits into Discord
         // while tokens land. The sink degrades on its own — a failed
