@@ -67,6 +67,11 @@ pub struct Gateway {
     /// /status snapshot carries a live `chain` section (read-only probe,
     /// short timeout, null when unreachable).
     pub chain_url: Option<String>,
+    /// Per-node JER wallet card (Phase 4): which chain RPC to ask and
+    /// which identity/address answers for this node's wallet. Present when
+    /// the crypto chain is JerithChain; /status then carries a live
+    /// `wallet` section — chain-truthful balance rather than local wins.
+    pub wallet: Option<std::sync::Arc<crate::economics::WalletCard>>,
     /// Perf/cost meters (model-performance-benchmark + session-cost-tracker
     /// ports): per-model latency/success/tokens from live traffic.
     pub metrics: Arc<crate::metrics::Metrics>,
@@ -903,6 +908,11 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "security": serde_json::to_value(crate::metrics::security_snapshot())
             .expect("security counters serialize"),
         "chain": chain_probe(gw.chain_url.as_deref(), crate::economics::read_token().as_deref()).await,
+        // Per-node JER wallet card (Phase 4): live balance from the chain
+        // RPC — the earnings view's chain-truthful side. Null when no
+        // wallet card (non-JerithChain); {"reachable":false} reads like
+        // chain_probe: a downed chain never takes /status down with it.
+        "wallet": wallet_status(gw.wallet.as_deref()).await,
     });
     // Live counters: a heuristically cached stale snapshot would make the
     // web dashboard (and any monitor) read lagged values.
@@ -937,8 +947,7 @@ fn metrics_status(snap: &crate::metrics::MetricsSnapshot) -> Value {
 /// Live probe of the co-hosted JerithChain node's `/status` (read-only).
 /// Every failure path degrades to Null — a downed chain must never take
 /// the mesh status page with it.
-async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
-    let (Some(base), Some(token)) = (base, token) else {
+async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {    let (Some(base), Some(token)) = (base, token) else {
         return Value::Null;
     };
     let base = base.trim().trim_end_matches('/');
@@ -969,6 +978,33 @@ async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
             Err(_) => json!({"reachable": false, "url": base, "error": "non-JSON chain response"}),
         },
         Err(e) => json!({"reachable": false, "url": base, "error": e.to_string()}),
+    }
+}
+
+/// Live wallet-card probe: the node's own JER balance from the chain RPC
+/// (token-authed /balance). Reachability and wallet existence are separate
+/// bits — an un-created wallet shows 0-everything, NOT unreachable; a
+/// missing api token is an honest config error in the section itself.
+async fn wallet_status(card: Option<&crate::economics::WalletCard>) -> Value {
+    let Some(card) = card else {
+        return Value::Null;
+    };
+    match crate::economics::wallet_balance(card).await {
+        Ok(b) => json!({
+            "reachable": true,
+            "identity": card.identity,
+            "by_address": card.address.is_some(),
+            "exists": b.exists,
+            "address": b.address,
+            "balance_uj": b.balance_uj,
+            "balance_jer": b.balance_jer,
+            "available_jer": b.available_jer,
+        }),
+        Err(e) => json!({
+            "reachable": false,
+            "identity": card.identity,
+            "error": e.to_string(),
+        }),
     }
 }
 
@@ -1602,9 +1638,79 @@ mod tests {
             base_model: None,
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
+    }
+
+    /// The Phase-4 wallet card rides /status when built: chain-truthful
+    /// balance surfaced beside the local mined-wins counters.
+    #[tokio::test]
+    async fn status_carries_the_live_wallet_card_balance() {
+        // Stub chain node: token-gated /balance answering the card's query.
+        let app = axum::Router::new().route(
+            "/balance",
+            axum::routing::get(|uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok())
+                    != Some("Bearer tok")
+                {
+                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
+                if uri.query().unwrap_or("").contains("address=jer1pay") {
+                    return axum::Json(json!({
+                        "exists": true,
+                        "address": "jer1pay",
+                        "balance_uj": 7_500_000,
+                        "balance_jer": 7.5,
+                        "available_jer": 7.0,
+                    }))
+                    .into_response();
+                }
+                axum::http::StatusCode::NOT_FOUND.into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let card = crate::economics::WalletCard {
+            rpc_url: format!("http://{addr}"),
+            token: Some("tok".into()),
+            identity: "jer1pay".into(),
+            address: Some("jer1pay".into()),
+        };
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: Some(Arc::new(card)),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let body: Value = server.get("/status").await.json();
+        let w = body.get("wallet").expect("wallet section present");
+        assert_eq!(w["reachable"], json!(true));
+        assert_eq!(w["exists"], json!(true));
+        assert_eq!(w["balance_uj"], json!(7_500_000));
+        assert_eq!(w["balance_jer"], json!(7.5));
+        assert_eq!(w["available_jer"], json!(7.0));
+        assert_eq!(w["identity"], json!("jer1pay"));
+        assert_eq!(w["by_address"], json!(true));
     }
 
     /// Test server with the local memory backend armed (embed falls back
@@ -1641,6 +1747,7 @@ mod tests {
             base_model: None,
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
@@ -1674,6 +1781,7 @@ mod tests {
             base_model: None,
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("guarded test server")
@@ -1803,6 +1911,7 @@ mod tests {
             base_model: None,
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: metrics.clone(),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("metrics test server");
@@ -1905,6 +2014,7 @@ mod tests {
             base_model: None,
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -1988,6 +2098,7 @@ mod tests {
             base_model: None,
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2087,6 +2198,7 @@ mod tests {
             base_model: Some("qwen3:8b".to_string()),
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2324,6 +2436,7 @@ mod tests {
             base_model: Some("base:7b".to_string()),
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2376,6 +2489,7 @@ mod tests {
             base_model: Some("m".to_string()),
             web: None,
             chain_url: None,
+            wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");

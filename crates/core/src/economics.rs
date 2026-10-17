@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use crate::config::CryptoConfig;
+use crate::config::{CryptoChain, CryptoConfig};
 
 /// Local JerithChain node RPC defaults.
 pub const DEFAULT_JERITH_RPC_URL: &str = "http://127.0.0.1:8300";
@@ -93,6 +93,162 @@ pub fn chain_rpc_url(crypto: &CryptoConfig) -> String {
         .wallet_endpoint
         .clone()
         .unwrap_or_else(|| DEFAULT_JERITH_RPC_URL.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Per-node wallet card (Phase 4): the node's own JER balance from the
+// chain RPC, chain-truthful rather than locally-counted.
+// ---------------------------------------------------------------------------
+
+/// The wallet card's chain-RPC probe config: which RPC base, which token,
+/// and which identity/address answers as "this node's wallet".
+#[derive(Debug, Clone)]
+pub struct WalletCard {
+    /// Chain RPC base (config `[crypto] wallet_endpoint`, default :8300).
+    pub rpc_url: String,
+    /// The node api token — the chain node token-gates /balance.
+    pub token: Option<String>,
+    /// What the card shows as the wallet identity (address, else node id).
+    pub identity: String,
+    /// When `[crypto] wallet_address` is set, /balance is asked by ADDRESS;
+    /// otherwise the mined identity string (the node id) is asked by
+    /// discord_id (the chain keys wallets by identity strings — the miner
+    /// credits the node id, so the node's plain wallet card is the same
+    /// account).
+    pub address: Option<String>,
+}
+
+impl WalletCard {
+    /// Build from the crypto section: a card exists only on JerithChain.
+    /// The payout address comes from config `[crypto] wallet_address`; the
+    /// default wallet card follows the miner's credit identity (node id).
+    pub fn from_crypto(crypto: &CryptoConfig, node_id: &str) -> Option<Self> {
+        if crypto.chain != CryptoChain::Jerithchain {
+            return None;
+        }
+        let address = crypto.wallet_address.clone().filter(|a| !a.trim().is_empty());        let identity = address.clone().unwrap_or_else(|| node_id.to_string());
+        Some(Self {
+            rpc_url: chain_rpc_url(crypto),
+            token: read_token(),
+            identity,
+            address,
+        })
+    }
+
+    /// The /balance query string for this card's wallet.
+    fn balance_query(&self) -> String {
+        match &self.address {
+            Some(a) => format!("address={}", urlencode(a.trim())),
+            // The chain keys wallets by identity strings; a node identity
+            // behaves like any other account handle for this purpose.
+            None => format!("discord_id={}", urlencode(&self.identity)),
+        }
+    }
+}
+
+/// Percent/URL-encode for the /balance query (identity strings and chain
+/// addresses are plain hex/urlsafe today; encode anyway so a wallet
+/// address with exotic bytes survives the query).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// What the chain node answered about one wallet (jerith_node.py /balance).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainBalance {
+    /// False when the identity has no wallet yet (chain-node contract:
+    /// `discord_id` mode returns `exists:false` shape; `address` mode 404s
+    /// — both carry balance 0 here, NOT a transport error: reachability
+    /// is a separate bit from wallet existence).
+    pub exists: bool,
+    pub address: Option<String>,
+    pub balance_uj: u64,
+    pub balance_jer: f64,
+    pub available_jer: Option<f64>,
+}
+
+/// Token-authed live balance probe for one wallet card. HTTP 404 in
+/// address mode is an unknown wallet, not a failure — reachability and
+/// existence are separate (the dashboard must never show "—" just
+/// because the wallet wasn't created yet).
+pub async fn wallet_balance(card: &WalletCard) -> anyhow::Result<ChainBalance> {
+    let Some(token) = card.token.as_ref() else {
+        anyhow::bail!(
+            "chain api token missing — set JERITH_TOKEN or {}",
+            default_token_file().display()
+        );
+    };
+    let token: &str = token;
+    let url = format!(
+        "{}/balance?{}",
+        card.rpc_url.trim_end_matches('/'),
+        card.balance_query()
+    );
+    let resp = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(5))
+        .build()?
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("chain balance unreachable")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // Address asked, no wallet under it yet (chain-node contract).
+        return Ok(ChainBalance {
+            exists: false,
+            address: card.address.clone(),
+            balance_uj: 0,
+            balance_jer: 0.0,
+            available_jer: None,
+        });
+    }
+    let body: serde_json::Value = resp
+        .error_for_status()
+        .context("chain balance rejected")?
+        .json()
+        .await?;
+    if body.get("exists").and_then(|v| v.as_bool()) == Some(false) {
+        return Ok(ChainBalance {
+            exists: false,
+            address: card.address.clone().or_else(|| {
+                body.get("address")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }),
+            balance_uj: 0,
+            balance_jer: 0.0,
+            available_jer: None,
+        });
+    }
+    Ok(ChainBalance {
+        exists: true,
+        address: body
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| card.address.clone()),
+        balance_uj: body
+            .get("balance_uj")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        balance_jer: body
+            .get("balance_jer")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        available_jer: body
+            .get("available_jer")
+            .and_then(|v| v.as_f64()),
+    })
 }
 
 /// GET /balance?discord_id=<identity> → µJER credited balance.
@@ -254,6 +410,7 @@ pub async fn attempt_mine(
 mod tests {
     use super::*;
     use crate::config::{CryptoChain, CryptoConfig};
+    use serde_json::json;
 
     fn cfg(chance: u32) -> CryptoConfig {
         CryptoConfig {
@@ -344,6 +501,134 @@ mod tests {
         };
         let err = attempt_mine(&config, "n1", 1).await.unwrap_err();
         assert!(err.to_string().contains("api token"));
+    }
+
+    /// Stub chain node (jerith_node.py-shaped /balance): token-gated,
+    /// and the tests read back what it was asked (query + auth) from a
+    /// shared slot. 404 on `address-DNE`, full shape otherwise.
+    async fn stub_chain(
+        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) -> String {
+        use axum::response::IntoResponse as _;
+        let seen_chat = seen.clone();
+        let app = axum::Router::new().route(
+            "/balance",
+            axum::routing::get(move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                let seen = seen_chat.clone();
+                async move {
+                    seen.lock().unwrap().replace(format!(
+                        "{}|{}",
+                        uri.query().unwrap_or(""),
+                        headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("")
+                    ));
+                    if headers.get("authorization").and_then(|v| v.to_str().ok())
+                        != Some("Bearer tok")
+                    {
+                        return axum::http::StatusCode::UNAUTHORIZED
+                            .into_response();
+                    }
+                    let q = uri.query().unwrap_or("");
+                    if q.contains("address=addr-broke") {
+                        return axum::http::StatusCode::NOT_FOUND.into_response();
+                    }
+                    let bal: u64 = if q.contains("balance=55") { 5_500_000 } else { 1_234_567 };
+                    axum::Json(json!({
+                        "exists": true,
+                        "address": "jer1abc",
+                        "balance_uj": bal,
+                        "balance_jer": bal as f64 / 1e6,
+                        "available_jer": bal as f64 / 1e6 - 0.5,
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn card(rpc: &str, address: Option<&str>) -> WalletCard {
+        WalletCard {
+            rpc_url: rpc.to_string(),
+            token: Some("tok".into()),
+            identity: address.unwrap_or("n1").to_string(),
+            address: address.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn wallet_card_from_crypto_address_wins_node_id_falls_back() {
+        let mut crypto = cfg(120);
+        crypto.wallet_endpoint = Some("http://127.0.0.1:9999".into());
+        // Default: the card follows the miner's credit identity (node id).
+        let c = WalletCard::from_crypto(&crypto, "nodeid1").unwrap();
+        assert_eq!(c.rpc_url, "http://127.0.0.1:9999");
+        assert_eq!(c.identity, "nodeid1");
+        assert_eq!(c.address, None);
+        // A config payout address becomes the card's identity.
+        crypto.wallet_address = Some("jer1pay".into());
+        let c = WalletCard::from_crypto(&crypto, "nodeid1").unwrap();
+        assert_eq!(c.identity, "jer1pay");
+        assert_eq!(c.address.as_deref(), Some("jer1pay"));
+        // Non-JerithChain: no card.
+        crypto.chain = CryptoChain::Bitcoin;
+        assert!(WalletCard::from_crypto(&crypto, "n1").is_none());
+    }
+
+    #[tokio::test]
+    async fn wallet_balance_asks_address_mode_and_authenticates() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rpc = stub_chain(seen.clone()).await;
+        let b = wallet_balance(&card(&rpc, Some("jer1abc"))).await.unwrap();
+        assert!(b.exists);
+        assert_eq!(b.address.as_deref(), Some("jer1abc"));
+        assert_eq!(b.balance_uj, 1_234_567);
+        let q = seen.lock().unwrap().take().unwrap();
+        assert!(
+            q.starts_with("address=jer1abc|Bearer tok"),
+            "must ask by ADDRESS with the bearer token, got {q}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_balance_asks_discord_id_mode_without_address() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rpc = stub_chain(seen.clone()).await;
+        wallet_balance(&card(&rpc, None)).await.unwrap();
+        let q = seen.lock().unwrap().take().unwrap();
+        assert!(
+            q.starts_with("discord_id=n1|Bearer tok"),
+            "default card asks by the miner's credit identity, got {q}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_balance_unknown_address_is_exists_false_not_error() {
+        // A dedicated stub: 404 → the typed not-a-wallet answer.
+        let app = axum::Router::new().route(
+            "/balance",
+            axum::routing::get(
+                || async { axum::http::StatusCode::NOT_FOUND },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let b = wallet_balance(&card(&format!("http://{addr}"), Some("addr-broke")))
+            .await
+            .unwrap();
+        assert!(!b.exists);
+        assert_eq!(b.balance_uj, 0);
+    }
+
+    #[tokio::test]
+    async fn wallet_balance_without_token_fails_config_clearly() {
+        let mut c = card("http://127.0.0.1:1", None);
+        c.token = None;
+        let err = wallet_balance(&c).await.unwrap_err();
+        assert!(err.to_string().contains("api token missing"), "{err}");
     }
 
     #[test]

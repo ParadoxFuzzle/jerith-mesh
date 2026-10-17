@@ -399,7 +399,11 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   and Jerith Guard counters (screens, blocked, redacted, logged) on the
   node status page, fed from `/status`
 - ✅ Dashboard with earnings/expert-hit-rate/latency views (Phase 2–3) — same-origin only
-  (CSP-pinned, no remote content): earnings = JER mining wins + attempts for this node
+  (CSP-pinned, no remote content): earnings = the node's own ~JER wallet card
+  (chain-truthful balance from the token-authed chain RPC /balance —
+  `[crypto] wallet_address` when set, the miner's credit identity
+  (node id) otherwise; "no wallet yet" vs "unreachable" kept honest and
+  separate) + mining wins/attempts for this node
   with the chain probe's height/circulating line (honest "chain view unreachable"
   when the co-hosted chain node is down), expert hit-rate = the expert store's LRU
   cache hit/miss ratio plus the measured activation demand (total/distinct, hot/cold
@@ -563,10 +567,15 @@ gotchas surfaced while building the finished parts.
   boundary kept: thresholds act through the Phase 5 stake tier, not
   through reputation alone. Anti-sybil: identity age + stake weighting
   before scores count.
-- **Per-node wallet surfaces on-chain**. The dashboard shows mining wins
-  and the chain-at-large stats; the natural next step is the node's own
-  JER balance from the chain RPC (payout address in config), keeping the
-  earnings card chain-truthful rather than locally-counted.
+- ✅ **Per-node wallet surfaces on-chain** (landed 2026-10-17):
+  `economics::WalletCard` probes the token-authed chain RPC /balance live
+  in /status (`wallet` section: reachable / exists / balance_uj+jer /
+  available_jer / by_address), the dashboard's card reads it with the
+  local mined-wins counters as the honest fallback, and the startup
+  banner prints the wallet line. Discovery drill bonus: the mesh default
+  token file (`keys/api.token`) can drift stale from the co-hosted
+  chain node's own key — the miner was silently 401ing until the token
+  was resynced; wallet_balance surfaces that as an explicit error
 - **Optional chains (§9): Bitcoin / Ethereum / Dogecoin / Monero.** The
   config accepts the labels today and nothing else exists — each chain
   needs its miner/wallet adapter against user-supplied endpoints, with

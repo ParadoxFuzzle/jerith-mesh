@@ -2165,6 +2165,28 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         base_model: cfg.model.as_ref().map(|m| m.id.clone()),
         web,
         chain_url: Some(cfg.chain_url.clone()),
+        // Per-node JER wallet card (Phase 4): present on JerithChain nodes;
+        // shows config `wallet_address`'s balance or the miner's default
+        // credit identity (the node id). /status probes it live.
+        wallet: {
+            let card = jerith_mesh_core::economics::WalletCard::from_crypto(&cfg.crypto, &cfg.node_id)
+                .map(std::sync::Arc::new);
+            if let Some(w) = &card {
+                match jerith_mesh_core::economics::wallet_balance(w).await {
+                    Ok(b) if b.exists => println!(
+                        "   wallet      {} · {:.6} JER",
+                        w.identity,
+                        b.balance_jer
+                    ),
+                    Ok(_) => println!(
+                        "   wallet      {} · no wallet on the chain yet",
+                        w.identity
+                    ),
+                    Err(e) => println!("   wallet      unreachable: {e:#}") ,
+                }
+            }
+            card
+        },
         metrics: std::sync::Arc::new(jerith_mesh_core::metrics::Metrics::new()),
     };
     let app = axum::Router::new()

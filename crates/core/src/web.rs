@@ -143,7 +143,7 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Expert activations</h2><p id="acts">—</p><div class="fine">loads served to peers</div></div>
   <div class="card"><h2>Phase 4 verification</h2><p id="ccommit">—</p><div class="fine" id="ccommitfine">commitment checks</div></div>
   <div class="card"><h2>Jerith Guard</h2><p id="guard">—</p><div class="fine" id="guardfine">outbound screens</div></div>
-  <div class="card"><h2>Earnings (mined)</h2><p id="earn">—</p><div class="fine" id="earnfine">JER mining wins</div></div>
+  <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div></div>
   <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
   <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
   <div class="card"><h2>Pipeline routes</h2><p id="pipeline">—</p><div class="fine" id="pipelinefine">multi-hop walks</div></div>
@@ -221,14 +221,32 @@ async function refresh() {
     document.getElementById('pipelinefine').textContent = pj
       ? `routes walked · over-budget hops ${pj.over_budget_hops ?? 0} · last walk ${pj.last_route_ms ?? 0} ms`
       : 'no route data yet';
-    // Earnings view: JER mining wins for this node + chain reachability.
-    document.getElementById('earn').textContent = String(j.meters?.mines_won ?? 0);
+    // Earnings view: chain-truthful JER balance when the wallet card is
+    // live (Phase 4); the local mines-won count stays the honest fallback
+    // whenever the chain RPC is down or this node isn't a JerithChain one.
     const ch = j.chain;
-    document.getElementById('earnfine').textContent =
-      `mining attempts ${j.meters?.mines_attempted ?? 0}` +
+    const chainInfo =
       (ch && ch.reachable
         ? ` · chain height ${ch.height ?? '—'} · circulating ${(ch.circulating_jer ?? '—')} JER`
         : ' · chain view unreachable');
+    const w = j.wallet;
+    if (w && w.reachable) {
+      const bal = Number(w.balance_uj ?? 0) / 1e6;
+      document.getElementById('earn').textContent = bal.toFixed(6) + ' JER';
+      document.getElementById('earnfine').textContent =
+        (w.exists
+          ? `chain wallet ${w.identity}`
+          : `chain wallet ${w.identity} · no wallet yet (first mined JER creates it)`) +
+        (w.available_jer != null ? ` · spendable ${Number(w.available_jer).toFixed(6)}` : '') +
+        ` · mined-this-node ${j.meters?.mines_won ?? 0}/${j.meters?.mines_attempted ?? 0}` +
+        chainInfo;
+    } else {
+      document.getElementById('earn').textContent = String(j.meters?.mines_won ?? 0);
+      document.getElementById('earnfine').textContent =
+        `mining attempts ${j.meters?.mines_attempted ?? 0}` +
+        (w && !w.reachable ? ` · wallet probe failed: ${w.error ?? '—'}` : ' · wallet card off (not JerithChain)') +
+        chainInfo;
+    }
   } catch (e) { /* node stopped */ }
 }
 refresh();
