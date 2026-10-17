@@ -293,7 +293,13 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   (`/stake/lock|unlock`, `GET /stake`, `/stake/slash` with Ed25519-signed slash
   notices) trueing up the chain view every tick, and the `/status` chain probe
   (height, tip, circulating, miners, total mined) that the bot and the dashboard read
-- 📋 Optional Bitcoin, Ethereum, Dogecoin, Monero (user supplies own miner/wallet endpoints) (Phase 4)
+- 🔄 Optional Bitcoin, Ethereum, Dogecoin, Monero (user supplies own miner/wallet endpoints) (Phase 4)
+  - ✅ Typed refusal landed (2026-10-17): a configured-but-unimplemented optional
+    chain surfaces an honest note instead of unlabeled silence —
+    `economics::optional_chain_note` feeds the startup banner
+    (`economics off — <note>`) and the `/status` `crypto` section
+    (`chain` / `mining_enabled` / `wallet_card` / `note` — no fake mining stats
+    for an unconfigured chain). The adapters themselves remain 📋 Phase 4.
 - ✅ Interval metering hooks (tokens, expert activations, bandwidth, uptime) wired through the ping loop
 - ✅ Automatic JER mining attempt on each served inference — the chain's passive-mining
   mechanic reimplemented mesh-side: every served completion rolls `mine_chance_permille`
@@ -590,9 +596,12 @@ gotchas surfaced while building the finished parts.
   was resynced; wallet_balance surfaces that as an explicit error
 - **Optional chains (§9): Bitcoin / Ethereum / Dogecoin / Monero.** The
   config accepts the labels today and nothing else exists — each chain
-  needs its miner/wallet adapter against user-supplied endpoints, with
-  the *honest* answer being typed refusals until then (no fake mining
-  stats for an unconfigured chain).
+  needs its miner/wallet adapter against user-supplied endpoints.
+  Landed 2026-10-17: the *honest* answer until then — typed refusals
+  (`economics::optional_chain_note`) in the startup banner and the
+  `/status` `crypto` section (see §9) — so an unconfigured chain says
+  WHY it is idle instead of showing fake mining stats (or silence).
+  The adapters themselves remain 📋 Phase 4.
 - **Chain-side hardening**: chain-RPC token rotation, mine-rate behavior
   vs. the chain's bookkeeping (`total_mined_uj` drift watch), payout and
   escrow edge cases on node exit (escrow returned on graceful shutdown —

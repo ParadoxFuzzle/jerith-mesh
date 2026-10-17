@@ -855,6 +855,15 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     // config labels: the config hot-reload swaps it without a restart
     // (or keeps serving the previous store when the new one won't open).
     let memory_store_value = gw.state.memory.read().await.as_ref().map(|m| m.describe());
+    // §9 honest crypto surface: what is configured, what is actually live,
+    // and — for an optional chain — the typed refusal for the not-yet-
+    // implemented adapter (no fake mining stats for an unconfigured chain).
+    let crypto_value = json!({
+        "chain": cfg.crypto.chain,
+        "mining_enabled": gw.miner.is_some(),
+        "wallet_card": gw.wallet.is_some(),
+        "note": crate::economics::optional_chain_note(cfg.crypto.chain),
+    });
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -881,6 +890,9 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
                 .unwrap_or(0),
         },
         "runtime_url": gw.runtime_url,
+        // Crypto surface (§9): configured chain vs what is actually live,
+        // with the typed adapter refusal for optional chains.
+        "crypto": crypto_value,
         // Runaway-generation cap state (armed via config `runtime_num_predict`;
         // the site dashboard surfaces it so an operator can see it live).
         "runtime_num_predict": gw.runtime_num_predict,
@@ -1715,6 +1727,75 @@ mod tests {
         assert_eq!(w["available_jer"], json!(7.0));
         assert_eq!(w["identity"], json!("jer1pay"));
         assert_eq!(w["by_address"], json!(true));
+    }
+
+    /// §9 honest crypto surface: an optional chain surfaces the typed
+    /// adapter refusal in /status instead of a unlabeled quiet off.
+    #[tokio::test]
+    async fn status_types_the_optional_chain_refusal() {
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        cfg.crypto.chain = crate::config::CryptoChain::Ethereum;
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let body: Value = server.get("/status").await.json();
+        let c = body.get("crypto").expect("crypto section present");
+        assert_eq!(c["chain"], json!("ethereum"));
+        assert_eq!(c["mining_enabled"], json!(false));
+        assert_eq!(c["wallet_card"], json!(false));
+        let note = c["note"].as_str().expect("typed refusal present");
+        assert!(note.contains("ethereum"), "note names the chain: {note}");
+        assert!(note.contains("disabled"), "note says what is off: {note}");
+    }
+
+    /// The JerithChain side stays quiet — the typed refusal is only for
+    /// chains whose adapter does not exist yet.
+    #[tokio::test]
+    async fn status_leaves_the_real_chain_unannotated() {
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let body: Value = server.get("/status").await.json();
+        let c = body.get("crypto").expect("crypto section present");
+        assert_eq!(c["chain"], json!("jerithchain"));
+        assert_eq!(c["note"], Value::Null);
     }
 
     /// Test server with the local memory backend armed (embed falls back

@@ -95,6 +95,30 @@ pub fn chain_rpc_url(crypto: &CryptoConfig) -> String {
         .unwrap_or_else(|| DEFAULT_JERITH_RPC_URL.to_string())
 }
 
+/// The typed §9 refusal for an optional chain: the config accepts the
+/// label (bitcoin / ethereum / dogecoin / monero) but no miner/wallet
+/// adapter exists yet. Returned wherever those would be built so the node
+/// says WHY it is idle instead of presenting a unlabeled quiet minimum —
+/// there is no fake mining stats for an unconfigured chain.
+/// `None` for JerithChain (the real adapter) and `None` (nothing configured).
+pub fn optional_chain_note(chain: CryptoChain) -> Option<&'static str> {
+    match chain {
+        CryptoChain::Bitcoin => Some(
+            "bitcoin: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+        ),
+        CryptoChain::Ethereum => Some(
+            "ethereum: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+        ),
+        CryptoChain::Dogecoin => Some(
+            "dogecoin: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+        ),
+        CryptoChain::Monero => Some(
+            "monero: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+        ),
+        CryptoChain::Jerithchain | CryptoChain::None => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-node wallet card (Phase 4): the node's own JER balance from the
 // chain RPC, chain-truthful rather than locally-counted.
@@ -411,6 +435,28 @@ mod tests {
     use super::*;
     use crate::config::{CryptoChain, CryptoConfig};
     use serde_json::json;
+
+    #[test]
+    fn optional_chain_note_types_the_refusal_honestly() {
+        // Each optional chain gets its own named refusal…
+        for (chain, label) in [
+            (CryptoChain::Bitcoin, "bitcoin"),
+            (CryptoChain::Ethereum, "ethereum"),
+            (CryptoChain::Dogecoin, "dogecoin"),
+            (CryptoChain::Monero, "monero"),
+        ] {
+            let note = optional_chain_note(chain)
+                .unwrap_or_else(|| panic!("{label} must carry a typed refusal"));
+            assert!(note.contains(label), "{label} note must name the chain");
+            assert!(
+                note.contains("disabled"),
+                "{label} note must say what is off"
+            );
+        }
+        // …and the real adapters stay silent (nothing to refuse).
+        assert_eq!(optional_chain_note(CryptoChain::Jerithchain), None);
+        assert_eq!(optional_chain_note(CryptoChain::None), None);
+    }
 
     fn cfg(chance: u32) -> CryptoConfig {
         CryptoConfig {

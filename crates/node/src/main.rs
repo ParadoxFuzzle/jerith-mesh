@@ -1943,7 +1943,17 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
                 cfg.crypto.mine_chance_permille
             );
         }
-        None => println!("   economics   off"),
+        None => {
+            // §9 typed refusal: a configured-but-unimplemented optional
+            // chain says WHY it is off, in the banner as everywhere else.
+            if let Some(note) =
+                jerith_mesh_core::economics::optional_chain_note(cfg.crypto.chain)
+            {
+                println!("   economics   off — {note}");
+            } else {
+                println!("   economics   off");
+            }
+        }
     }
 
     // Local memory: the backend the operator chose is the one opened.
