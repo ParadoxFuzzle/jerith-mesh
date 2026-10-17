@@ -65,6 +65,11 @@ pub async fn ask(
     // definition now (converse::run_session); /ask's remaining
     // transport-specific bits: tally persistence on chat success, the
     // buffered `say_long`, and poise error propagation when no sink exists.
+    // Pre-session capture of the "live surface in play" bit: run_session
+    // consumes the sink Option, so `sink.is_none()` afterwards no longer
+    // means "no live surface" — testing it post-session re-posted every
+    // successful streamed chat (the live 2026-10-17 09:55 double).
+    let had_live_sink = sink.is_some();
     let chat = crate::converse::run_session(
         &cfg,
         &ctx.data().state,
@@ -78,7 +83,7 @@ pub async fn ask(
             // Persist after chats too (not just /mine wins) so token spend and
             // history survive restarts on chat-active bots.
             persist_tally_after_win(ctx).await;
-            if sink.is_none() {
+            if crate::converse::buffered_delivery_needed(had_live_sink) {
                 say_long(ctx, &text).await?;
             }
             // Sink-delivered: the pipeline already streamed + finished.

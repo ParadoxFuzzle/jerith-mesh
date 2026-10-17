@@ -63,6 +63,19 @@ pub struct Session {
     pub prompt: String,
 }
 
+/// How a transport decides post-session delivery when a chat returns
+/// `Ok`: a live sink that was in play has already been finished by the
+/// pipeline (the text is delivered); a session that never had one
+/// (buffered config, or the placeholder POST failed) still needs a plain
+/// send. The "was a sink in play" bit must be captured BEFORE the
+/// session: run_session consumes the Option, so testing `sink.is_none()`
+/// afterwards is true for a session that DID live-stream — the live
+/// 2026-10-17 09:55 double (every successful streamed chat re-posted the
+/// same answer ~60 s later) was exactly that mis-test.
+pub fn buffered_delivery_needed(had_live_sink: bool) -> bool {
+    !had_live_sink
+}
+
 /// One request → reply conversational pass, defined once (was duplicated
 /// in `/ask` and the @mention fallback): squeeze (deep stage, may
 /// persist) → speaker tag → streamed chat with the sink bridged into
@@ -308,5 +321,42 @@ mod tests {
             !text.contains("— served by"),
             "local answers carry no mesh attribution"
         );
+    }
+
+    /// The live 2026-10-17 09:55 double: every successful streamed chat
+    /// re-posted the identical answer ~60 s later as a fresh Discord
+    /// message. Front-ends decided buffered delivery by testing
+    /// `sink.is_none()` AFTER run_session — always true, because the
+    /// pipeline consumes the Option — so `send_long` fired on every Ok.
+    /// The gate must read the PRE-session sink presence instead.
+    #[tokio::test]
+    async fn post_session_delivery_gate_reads_pre_session_sink_presence() {
+        let cfg_url = stub_gateway(StdArc::new(TMutex::new(Vec::new()))).await;
+        let mut cfg = cfg();
+        cfg.gateway_url = cfg_url;
+        cfg.chat_stream = true;
+        let state = crate::state::new_state();
+
+        // A live surface was in play when the session started.
+        let mut boxed = Some(Arc::new(MemorySink::new(true)) as Arc<dyn ConversationSink>);
+        let had_live_sink = boxed.is_some();
+        run_session(&cfg, &state, Session { user: 7, prompt: "ping".into() }, "", &mut boxed)
+            .await
+            .unwrap();
+        // The pipeline consumed the sink — this is exactly why reading
+        // `sink.is_none()` after the call is the bug shape:
+        assert!(boxed.is_none(), "run_session consumed the sink");
+        assert!(
+            boxed.is_none() == true && had_live_sink == true,
+            "post-session is_none() is true even though a live surface delivered — pre-session capture required"
+        );
+        // The rule: a consumed live surface means the text is already
+        // delivered — a second (buffered) send would be the double.
+        assert!(
+            !buffered_delivery_needed(had_live_sink),
+            "live-delivered session must not re-post"
+        );
+        // A session with no surface at all still needs the plain send.
+        assert!(buffered_delivery_needed(false));
     }
 }

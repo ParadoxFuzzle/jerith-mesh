@@ -119,6 +119,12 @@ pub async fn handle(
         // bookkeeping → reply formatting → streamed delivery) has one
         // definition now (converse::run_session); this front-end only
         // chooses the sink and the error display.
+        // Pre-session capture of the "live surface in play" bit: run_session
+        // consumes the sink Option, so `sink.is_none()` afterwards no longer
+        // means "no live surface". Testing it post-session was the live
+        // 2026-10-17 09:55 double — every successful streamed chat re-posted
+        // the same answer ~60 s later via send_long.
+        let had_live_sink = sink.is_some();
         match crate::converse::run_session(
             &cfg,
             &state,
@@ -130,8 +136,10 @@ pub async fn handle(
         {
             Ok((text, _served_by)) => {
                 // A live sink was already finished inside the pipeline;
-                // buffered configs deliver here, as before.
-                if sink.is_none() {
+                // buffered configs deliver here, as before — decided by
+                // pre-session sink presence, not by the (now consumed)
+                // Option.
+                if crate::converse::buffered_delivery_needed(had_live_sink) {
                     send_long(&http_ctx, channel, &text).await;
                 }
             }
