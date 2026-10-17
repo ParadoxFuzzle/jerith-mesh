@@ -28,6 +28,18 @@ its auth and introspects it:
   gateway's chain probe and the CLI).
 - **Ledger**: SQLite at `<jerithchain repo>/data/jerith.db` (config
   `chain_data_dir` / `$JERITH_CHAIN_DATA` override). Reads are read-only.
+- **LLM runtime**: LiteLLM proxy on `127.0.0.1:8000` (`litellm-proxy.service`,
+  config `~/.openclaw/litellm-config.json`, master key in
+  `general_settings.master_key`). The node's `[chat] runtime_*` model pins
+  resolve through it. Every fallback ladder ends at the LOCAL Ollama
+  `qwen3:8b` last resort — when the OpenRouter free tier exhausts its
+  daily cap (`free-models-per-day`, HTTP 429 with `type: throttling_error`),
+  chats degrade to local instead of failing (2026-10-17 outage: the
+  ladders were OpenRouter-only, so a 50/day-cap 429 killed every rung and
+  the bot showed the failure banner ~35 s later — the whole ladder has to
+  walk its 429s first, so expect ~30–40 s before the local answer lands).
+  Config edits need `systemctl --user restart litellm-proxy`; boot takes
+  ~45 s before the port opens (model registration).
 - **CLI** (read-only):
   ```
   jerith chain status              # height, supply, wallet counts, mining stats
