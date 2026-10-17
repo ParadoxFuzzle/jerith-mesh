@@ -286,6 +286,7 @@ fn router_with_limiters(
         .route("/v1/advertise", put(advertise))
         .route("/v1/report-dead", post(report_dead))
         .route("/v1/report-fraud", post(report_fraud))
+        .route("/v1/leave", post(leave))
         .route("/v1/models/counts", get(model_counts))
         .with_state((state, ttl_ms))
         .layer(axum::middleware::from_fn_with_state(
@@ -584,6 +585,57 @@ pub struct FraudReport {
     pub reporter: String,
     /// Observed failure kind.
     pub kind: FraudKind,
+}
+
+/// Graceful self-retraction (§2 model-switch machinery): a node leaves
+/// the mesh IMMEDIATELY instead of waiting its ad TTL out (90 s of a peer
+/// that no longer serves the mesh's model). Signed fail-closed like every
+/// other registry write: the leaver must BE the identity of the entry —
+/// node_id ↔ pubkey is bound the same way as advertise — so nobody can
+/// scrape /v1/peers and undeclare somebody else (a doS on the mesh).
+/// Idempotent: leaving twice answers `left:false`, never an error.
+async fn leave(
+    State((registry, _ttl_ms)): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LeaveNotice>,
+) -> Response {
+    if body.node_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "node_id required"})),
+        )
+            .into_response();
+    }
+    let stamp = match headers
+        .get("x-jerith-stamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(s) => s,
+        None => return unauthorized("missing or malformed stamp"),
+    };
+    if let Err(resp) = verify_report_auth(
+        &headers,
+        &body.node_id,
+        &crate::signing::leave_payload(&body.node_id, stamp),
+    ) {
+        return *resp;
+    }
+    let mut entries = registry.entries.write().await;
+    let existed = entries.remove(&body.node_id).is_some();
+    tracing::info!(
+        node = %body.node_id,
+        existed,
+        "graceful mesh leave applied (model switch or clean shutdown)"
+    );
+    (StatusCode::OK, Json(serde_json::json!({"left": existed}))).into_response()
+}
+
+/// What `/v1/leave` carries: only the leaver's own identity (the
+/// signature does the trusting).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveNotice {
+    pub node_id: String,
 }
 
 async fn report_fraud(
@@ -1084,6 +1136,92 @@ mod tests {
                 r.status()
             );
         }
+    }
+
+    /// §2 model-switch machinery: a node may retract ITS OWN ad instantly
+    /// (signed, fail-closed, idempotent) — and nobody else's.
+    #[tokio::test]
+    async fn leave_retracts_own_entry_idempotent_and_unforgeable() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::http::mesh_http();
+        let ad_url = format!("http://{addr}/v1/advertise");
+        let url = format!("http://{addr}/v1/leave");
+
+        // Headers for one leave, with the stamped payload and the header
+        // stamp frozen to the SAME clock read (avoids the 1 ms cross-tick
+        // flake the two-clock pattern has under load).
+        let leave_headers = |id: &crate::signing::SigningIdentity,
+                             node_id: &str| {
+            let stamp = now_ms();
+            let payload = crate::signing::leave_payload(node_id, stamp);
+            let auth =
+                crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
+            h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+            h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+            h
+        };
+
+        // Two real nodes on the wire (signature-bound just like prod).
+        let (id, ad) = make_peer("glm-5.3");
+        let (blind_owner, blind_ad) = make_peer("qwen3.8-flash-next");
+        for (idn, adn) in [(&id, &ad), (&blind_owner, &blind_ad)] {
+            let r = client
+                .put(&ad_url)
+                .headers(signed_headers(idn, adn))
+                .json(adn)
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success(), "seed ad accepted");
+        }
+        assert_eq!(registry.entries.read().await.len(), 2);
+
+        // The identity that owns the entry leaves: accepted and gone.
+        let r = client
+            .post(&url)
+            .headers(leave_headers(&id, &ad.node_id))
+            .json(&serde_json::json!({"node_id": ad.node_id}))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "own leave accepted");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["left"], serde_json::json!(true), "the ad existed");
+        assert_eq!(registry.entries.read().await.len(), 1);
+
+        // Idempotent: a second leave answers left:false, never an error.
+        let r = client
+            .post(&url)
+            .headers(leave_headers(&id, &ad.node_id))
+            .json(&serde_json::json!({"node_id": ad.node_id}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["left"], serde_json::json!(false));
+
+        // Unforgeable: a THIRD party cannot undeclare somebody else —
+        // 401 (identity binding), and the victim's entry survives.
+        let attacker = crate::signing::SigningIdentity::generate();
+        let r = client
+            .post(&url)
+            .headers(leave_headers(&attacker, &blind_ad.node_id))
+            .json(&serde_json::json!({"node_id": blind_ad.node_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "forged leave refused"
+        );
+        assert_eq!(registry.entries.read().await.len(), 1, "victim survives");
     }
 
     fn signed_headers(id: &crate::signing::SigningIdentity, a: &PeerAd) -> axum::http::HeaderMap {

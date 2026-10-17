@@ -437,6 +437,33 @@ impl BootstrapClient {
         Ok(())
     }
 
+    /// Gracefully retract our own advertisement (§2 model-switch/ exit
+    /// machinery): signed — the bootstrap only removes entries the matching
+    /// identity asks to remove. Idempotent on the server (`left:false`).
+    pub async fn leave(
+        &self,
+        node_id: &str,
+        identity: &crate::signing::SigningIdentity,
+    ) -> anyhow::Result<bool> {
+        let stamp = now_ms();
+        let payload = crate::signing::leave_payload(node_id, stamp);
+        let auth = crate::signing::WireAuth::with_stamp(identity, stamp, payload.as_bytes());
+        let url = format!("{}/v1/leave", self.base_url.trim_end_matches('/'));
+        let body: serde_json::Value = self
+            .inner
+            .post(&url)
+            .json(&serde_json::json!({ "node_id": node_id }))
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body.get("left").and_then(serde_json::Value::as_bool).unwrap_or(false))
+    }
+
     /// Report that a peer is dead (so the bootstrap deprecates it globally).
     /// Signed: the bootstrap now requires `jerith-dead1|stamp|reporter|target`
     /// wire-auth headers and refuses unsigned eviction votes (fail-closed).

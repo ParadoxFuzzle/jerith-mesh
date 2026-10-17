@@ -110,6 +110,15 @@ pub struct MeshState {
     /// the newly-configured store won't open (postgres down), skip the
     /// retry for this long so a dead neighbor doesn't spam every tick.
     memory_swap_backoff_until: std::sync::Mutex<Option<std::time::Instant>>,
+    /// §2 model-switch machinery: a graceful mesh EXIT is latched (the
+    /// `model` cold change in a reload plan) — the bootstrap got our
+    /// signed /v1/leave, the advertise tick stops, and /status reports
+    /// the pending restart instead of a wedge. One-shot: the executor
+    /// fires once per process via compare_exchange.
+    pub left_mesh_latch: std::sync::atomic::AtomicBool,
+    /// Why the latch fired (typed journal: config model id we would serve
+    /// after a restart), surfaced beside the latch in /status.
+    pub pending_model: tokio::sync::RwLock<Option<String>>,
     /// Where those counters persist (see
     /// [`set_expert_stats`](Self::set_expert_stats)).
     expert_stats_path: std::sync::Mutex<std::path::PathBuf>,
@@ -276,6 +285,8 @@ impl MeshState {
             discovery: std::sync::Arc::new(tokio::sync::Mutex::new(discovery)),
             memory: RwLock::new(None),
             memory_swap_backoff_until: std::sync::Mutex::new(None),
+            left_mesh_latch: std::sync::atomic::AtomicBool::new(false),
+            pending_model: tokio::sync::RwLock::new(None),
         });
         Ok((state, rx))
     }
@@ -1088,8 +1099,58 @@ async fn reload_config_from_disk(state: &Arc<MeshState>) {
     for field in plan.hot {
         tracing::info!(field, "config hot-applied (took effect this tick)");
     }
-    for field in plan.cold {
+    for field in &plan.cold {
         tracing::warn!(field, "config field changed — restart required to apply");
+    }
+    // §2 model-switch machinery: a model change is cold by deliberate
+    // design (model switching is MESH RE-IDENTITY — routers, tier
+    // bindings and the registry key off the boot-time model), but the
+    // graceful HALF is live right now: signed /v1/leave retracts the
+    // old-model ad instantly, the advertise latch closes, and /status
+    // carries the pending restart.
+    if plan.cold.contains(&"model") {
+        let pending = disk
+            .model
+            .as_ref()
+            .map(|m| format!("{} ({})", m.id, m.quant));
+        graceful_model_exit(state, pending).await;
+    }
+}
+
+/// The graceful half of the model-switch: retract our own advertisement
+/// NOW (a stop then restart otherwise leaves the old ad up for the whole
+/// 90 s TTL — a peer in the old mesh that no longer serves its model).
+/// Idempotent per process: the first model-change tick fires the leave
+/// and closes the advertise latch; later ticks see both latched.
+async fn graceful_model_exit(state: &Arc<MeshState>, pending: Option<String>) {
+    let first_change = !state
+        .left_mesh_latch
+        .swap(true, std::sync::atomic::Ordering::SeqCst);
+    *state.pending_model.write().await = pending;
+    if !first_change {
+        return;
+    }
+    let order = { state.discovery.lock().await.order(None) };
+    let node_id = { state.config.read().await.node_id.clone() };
+    let node_id_ref = &node_id;
+    let identity_ref = &state.identity;
+    let legs = crate::discovery::try_each(&order, |url| {
+        let client = BootstrapClient::new(url.to_string());
+        async move { client.leave(node_id_ref, identity_ref).await }
+    })
+    .await;
+    match legs {
+        Ok((advertised_before, used)) => tracing::warn!(
+            target: "mesh",
+            bootstrap = %used,
+            advertised_before,
+            "model changed in config — LEFT the old mesh (signed /v1/leave, not re-advertising); restart `jerith run` to rejoin under the new model"
+        ),
+        Err(e) => tracing::warn!(
+            target: "mesh",
+            error = %e,
+            "model changed — graceful leave could not reach any bootstrap; the old ad expires by TTL instead"
+        ),
     }
 }
 
@@ -1388,17 +1449,35 @@ async fn run_loop(
             let identity_ref = &state.identity;
             let ad_ref = &ad;
             let advertise_order = state.discovery.lock().await.order(None);
-            let advertise_leg = crate::discovery::try_each(&advertise_order, |url| {
-                let client = BootstrapClient::new(url.to_string());
-                async move { client.advertise(ad_ref, identity_ref).await }
-            })
-            .await;
+            // §2 model-switch latch: a graceful exit means STOP re-adver-
+            // tising the old identity — the signed /v1/leave already retrac-
+            // ted it, and dialing again would un-exit. Restart joins the
+            // new model's mesh fresh.
+            let advertise_leg = if state
+                .left_mesh_latch
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                tracing::debug!(
+                    target: "mesh",
+                    "mesh exit latched — advertise skipped (restart re-joins under the new model)"
+                );
+                None
+            } else {
+                Some(
+                    crate::discovery::try_each(&advertise_order, |url| {
+                        let client = BootstrapClient::new(url.to_string());
+                        async move { client.advertise(ad_ref, identity_ref).await }
+                    })
+                    .await,
+                )
+            };
             match advertise_leg {
-                Ok(((), used)) => {
+                None => {}
+                Some(Ok(((), used))) => {
                     state.discovery.lock().await.note_good(&used);
                     tracing::debug!(target: "mesh", bootstrap = %used, "advertised to bootstrap");
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     // An advertise failure means the mesh can't see us — warn.
                     tracing::warn!(target: "mesh", error = %e, "advertise rejected/failed on every bootstrap");
                 }
@@ -1983,6 +2062,74 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no trusted nodes configured"), "{msg}");
         assert!(msg.contains("local runtime down"), "{msg}");
+    }
+
+    /// §2 model-switch machinery: the graceful half fires exactly once —
+    /// a signed /v1/leave at the (stub) bootstrap, the advertise latch
+    /// closes, /status's pending_model records the restart target; later
+    /// ticks never re-fire it.
+    #[tokio::test]
+    async fn graceful_model_exit_leaves_once_and_latches() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_ref = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/leave",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let hits = hits_ref.clone();
+                    async move {
+                        hits.fetch_add(1, AtomicOrdering::SeqCst);
+                        let _ = body;
+                        axum::Json(serde_json::json!({"left": true}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        {
+            let mut d = state.discovery.lock().await;
+            d.configured = vec![format!("http://{addr}")];
+            d.last_good = None;
+        }
+
+        graceful_model_exit(
+            &state,
+            Some("newmodel (bogquant)".to_string()),
+        )
+        .await;
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one leave fired"
+        );
+        assert!(
+            state.left_mesh_latch.load(std::sync::atomic::Ordering::SeqCst),
+            "advertise latch closed"
+        );
+        assert_eq!(
+            state.pending_model.read().await.as_deref(),
+            Some("newmodel (bogquant)"),
+            "pending restart model recorded"
+        );
+        // Idempotence: the reload executor runs every tick — the second
+        // invocation (any pending value) must not re-fire the leave.
+        graceful_model_exit(
+            &state,
+            Some("newmodel (bogquant)".to_string()),
+        )
+        .await;
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            1,
+            "latch made the leave one-shot"
+        );
     }
 
     #[test]

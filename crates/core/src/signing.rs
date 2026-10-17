@@ -23,6 +23,7 @@ pub const ADV_PREFIX: &str = "jerith-adv1";
 pub const PING_PREFIX: &str = "jerith-ping1";
 pub const HEALTH_PREFIX: &str = "jerith-health1";
 pub const DEAD_PREFIX: &str = "jerith-dead1";
+pub const LEAVE_PREFIX: &str = "jerith-leave1";
 
 /// Max acceptable age for a stamp (advertisement TTL is 90 s; the stamp
 /// window is tighter to block replays).
@@ -144,6 +145,14 @@ pub fn legacy_ad_excerpt(ad: &PeerAd, stamp_ms: u64) -> String {
 /// the bootstrap verifies before counting a vote.
 pub fn dead_payload(reporter_node_id: &str, target_node_id: &str, stamp_ms: u64) -> String {
     format!("{DEAD_PREFIX}|{stamp_ms}|{reporter_node_id}|{target_node_id}")
+}
+
+/// Canonical leave payload: a node retracting ITS OWN advertisement signs
+/// `prefix|stamp|node_id`, and the bootstrap binds node_id ↔ pubkey before
+/// removing the entry — only the identity that created an ad can revoke it,
+/// so a graceful model-switch exit cannot be forged onto somebody else.
+pub fn leave_payload(node_id: &str, stamp_ms: u64) -> String {
+    format!("{LEAVE_PREFIX}|{stamp_ms}|{node_id}")
 }
 
 fn role_str(role: crate::config::NodeRole) -> &'static str {
@@ -274,6 +283,24 @@ mod tests {
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn leave_payload_binds_the_leaver_itself() {
+        let id = SigningIdentity::generate();
+        let stamp = now_ms();
+        let payload = leave_payload(&id.node_id(), stamp);
+        assert!(payload.starts_with("jerith-leave1|"), "{payload}");
+        // The leaver's OWN key validates against its own node id...
+        assert!(WireAuth::with_stamp(&id, stamp, payload.as_bytes())
+            .validate(payload.as_bytes(), &id.node_id())
+            .is_ok());
+        // ...and a DIFFERENT identity cannot undeclare somebody else —
+        // the payload binds the node id, so a forged leave fails id check.
+        let other = SigningIdentity::generate();
+        assert!(WireAuth::with_stamp(&other, stamp, payload.as_bytes())
+            .validate(payload.as_bytes(), &id.node_id())
+            .is_err());
     }
 
     #[test]

@@ -91,7 +91,12 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ Contribution changeable at any time (hot reload via `jerith config set contribution_percent N` —
   the config file is re-read every ping tick: hot fields land within one tick, cold
   ones WARN restart-required, identity fields are refused outright)
-- ✅ Model switching cleanly disconnects from all current peers, then joins the new mesh
+- ✅ Model switching cleanly disconnects from all current peers, then joins the
+  new mesh (landed for real 2026-10-17: a cold `[model]` change in the reload
+  plan fires ONE signed `/v1/leave` — the old-model ad is retracted instantly
+  instead of riding out the 90 s TTL, the advertise latch closes, and
+  `/status` `mesh_exit` shows `left_mesh` + `pending_model`; the restart is the
+  join — see §13's model-switch item for the live drill evidence)
 - ✅ Real-time contribution measurement and cryptographic verification
   (Phase 4): every ping tick diffs the cumulative serve/consume meters
   into an interval share (idle = absence, not 0 %), EWMA-smooths it
@@ -585,9 +590,23 @@ gotchas surfaced while building the finished parts.
   of the same loop.
 - **Model-switch hot path (§2's model switching)**. Config hot-reload
   deliberately leaves `[model]` cold (echo: model switching is mesh
-  re-identity work — disconnect then rejoin); the remaining piece is the
-  graceful-disconnect/rejoin machinery, then the cold-field WARN turns
-  into a live apply.
+  re-identity work — disconnect then rejoin). Landed 2026-10-17, the
+  graceful half is LIVE (verified end-to-end against the real bootstrap,
+  2026-10-17): a cold model change fires ONE signed `/v1/leave` on the
+  ping tick — the old-model ad is retracted instantly (no 90 s TTL of a
+  peer that no longer serves), the advertise latch closes, and `/status`
+  `mesh_exit` carries `left_mesh` + `pending_model`. Restart `jerith run`
+  to rejoin under the new model (Rest: in-process rejoin is deliberately
+  NOT attempted — routers, tier bindings and every boot-time identity
+  path read the config once; the cold-field WARN stays for the restart
+  half). Live drill evidence: real node switched models, the journal
+  warned `model changed in config — LEFT the old mesh (signed /v1/leave,
+  not re-advertising)`, our node id dropped off the public peers list
+  within one tick (entries 3→2, no TTL wait), and after restoring the
+  config + restart the node rejoined (`left_mesh: false`, peers alive).
+  What remains: the rejoin half (a supervisor/watchdog applying the new
+  identity in-process) stays 📋 — the honest boundary is documenting
+  that the restart is the intended join mechanic.
 - **Cold-list watch for the config hot-reload.** Every new hot field must
   genuinely read from the running config at its use site — the reload
   plan classifier (`ping.rs`) keeps the cold list short and deliberate.

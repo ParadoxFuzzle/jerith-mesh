@@ -876,6 +876,19 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             "allowlist_size": trusted,
         })
     };
+    // §2 model-switch machinery: whether this node has gracefully LEFT the
+    // mesh (signed leave + advertise latch) ahead of a config-model
+    // restart, and which model it would serve when it rejoins.
+    let mesh_exit_value = {
+        let left = gw
+            .state
+            .left_mesh_latch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        json!({
+            "left_mesh": left,
+            "pending_model": *gw.state.pending_model.read().await,
+        })
+    };
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -907,6 +920,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "crypto": crypto_value,
         // Privacy tiers (§12): live level + trusted-node allowlist size.
         "privacy": privacy_value,
+        // Model-switch (§2): graceful-exit latch + pending restart model.
+        "mesh_exit": mesh_exit_value,
         // Runaway-generation cap state (armed via config `runtime_num_predict`;
         // the site dashboard surfaces it so an operator can see it live).
         "runtime_num_predict": gw.runtime_num_predict,
