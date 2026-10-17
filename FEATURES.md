@@ -449,7 +449,23 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   - CLI prints entries/bytes/skips and the privacy note; unit tests cover
     the roundtrip, weight opt-in, checksum/truncation failures, overwrite
     semantics, path-traversal refusal and the no-config refusal
-- 📋 Privacy levels: local-only / trusted-peers / full-mesh (Phase 3)
+- ✅ Privacy levels: local-only / trusted-peers / full-mesh (Phase 3, landed
+  2026-10-17): `[privacy] level` in config.toml — `full_mesh` (default,
+  today's shape), `trusted_peers` (hops land only on the `[privacy]
+  trusted_nodes` allowlist), `local_only` (no prompt ever leaves the node
+  via mesh dispatch; the local runtime still serves). Enforcement is a
+  policy read at the chat-dispatch choke point (`MeshFallbackChat::
+  chat_with_fallback`, re-read every attempt — HOT in the config reload
+  classifier, binding within one tick): tier-forbidden hops fail with a
+  message that names the policy ("no mesh hop attempted — privacy tier
+  …"), so a downed runtime under a strict tier reads as a refusal, not a
+  generic outage. `/status` gained a `privacy` section (level,
+  trusted_nodes, allowlist_size — null means the full-mesh default).
+  Honest boundary: the gate covers prompt-bearing chat hops; expert
+  activations and the signed node-level meter blocks (serve/consume
+  counts, no prompt content) still ride the mesh at every tier — the
+  pipeline-hop gate lands with live pipeline transport. Config values
+  are snake_case (`local_only`, `trusted_peers`, `full_mesh`).
 - ✅ Compatibility check for model id + quantization (Phase 2, landed
   2026-10-17): the bootstrap's `/v1/models/counts` census now splits per
   quant, and every node runs a ONE-TIME pre-join compat probe on its first
@@ -550,10 +566,14 @@ gotchas surfaced while building the finished parts.
   non-idempotency (commitments prevent a tampered node from re-selling the
   same answer, but a dead hop must not wedge the request) and flapping-peer
   hysteresis at the router.
-- **Privacy levels: local-only / trusted-peers / full-mesh (§12)**. Memory
-  is strictly local already; what is left is a routing-tier policy for
-  *prompt* and metadata forwarding (logs, metrics, usage), a config
-  surface, and honest refusals at the gateway when a tier forbids a hop.
+- ✅ **Privacy levels: local-only / trusted-peers / full-mesh (§12)** —
+  landed 2026-10-17 (see §12 for the full shape): `[privacy] level`
+  config surface, hot-reloadable policy read at the chat-dispatch choke
+  point, typed policy-named refusals, and the `/status` `privacy`
+  section. Remaining next step: gating expert-activation hops (the
+  pipeline side) when real pipeline transport goes live, and a
+  metadata-tier verdict if the meter blocks ever grow prompt-derived
+  payloads.
 - **Compatibility check for quantization / context length / tokenizer
   version (§12)**. Model identity already hashes quantization and context
   length; the remaining piece is a pre-join validation against live peers

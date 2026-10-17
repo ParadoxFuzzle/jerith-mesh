@@ -107,6 +107,59 @@ impl Default for CryptoConfig {
     }
 }
 
+/// §12 privacy tiers: how far prompt-bearing traffic may leave this node.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyLevel {
+    /// No prompt ever leaves the node: mesh chat hops are refused with a
+    /// typed error (the local runtime still serves).
+    LocalOnly,
+    /// Prompt-bearing hops land only on explicitly trusted node ids.
+    TrustedPeers,
+    /// Default: any live connectable peer is a candidate (today's shape).
+    #[default]
+    FullMesh,
+}
+
+/// `[privacy]` in config.toml (§12). Memory is strictly node-local
+/// already; this config tiers everything else that bears prompt or
+/// account metadata across the gateways — chat hops today — and is a
+/// hot-reloadable policy: a stricter level binds within one ping tick.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivacyConfig {
+    #[serde(default)]
+    pub level: PrivacyLevel,
+    /// trusted_peers allowlist (node ids). Peers outside the list are
+    /// untrusted at that tier; the list is empty by default, so a fresh
+    /// install at `trusted_peers` refuses peer hops loudly until the
+    /// operator explicitly names whom to trust.
+    #[serde(default)]
+    pub trusted_nodes: Vec<String>,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            level: PrivacyLevel::FullMesh,
+            trusted_nodes: Vec::new(),
+        }
+    }
+}
+
+impl PrivacyConfig {
+    /// Hop candidate filter: Some(trusted ids) when the tier restricts,
+    /// None when everything connectable is allowed (full_mesh).
+    pub fn hop_allowlist(&self) -> Option<Vec<&str>> {
+        match self.level {
+            PrivacyLevel::FullMesh => None,
+            PrivacyLevel::LocalOnly => Some(Vec::new()),
+            PrivacyLevel::TrustedPeers => {
+                Some(self.trusted_nodes.iter().map(|s| s.as_str()).collect())
+            }
+        }
+    }
+}
+
 /// Local specialist models — always private, never part of the 25 % quota.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialistConfig {
@@ -408,6 +461,10 @@ pub struct NodeConfig {
     /// failure.
     #[serde(default)]
     pub discovery: crate::discovery::DiscoveryConfig,
+    /// §12 privacy tiers (see PrivacyConfig). Default full_mesh — the
+    /// mesh behaves exactly as before until this is set.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 impl NodeConfig {
@@ -694,6 +751,7 @@ impl Default for NodeConfig {
             resources: ResourceIsolationConfig::default(),
             peers: PeerPolicyConfig::default(),
             discovery: crate::discovery::DiscoveryConfig::default(),
+            privacy: PrivacyConfig::default(),
         }
     }
 }
@@ -1163,6 +1221,37 @@ mod tests {
         );
         let cfg: NodeConfig = toml::from_str(&text).unwrap();
         assert_eq!(cfg.effective_gateway_bind(), "0.0.0.0");
+    }
+
+    #[test]
+    fn privacy_tiers_parse_default_and_allowlist() {
+        // Default: full_mesh, empty allowlist — the pre-feature shape.
+        let d = NodeConfig::default();
+        assert_eq!(d.privacy.level, PrivacyLevel::FullMesh);
+        assert!(d.privacy.trusted_nodes.is_empty());
+        assert!(d.privacy.hop_allowlist().is_none(), "full_mesh must not restrict");
+
+        // Parse + allowlist at trusted_peers (the table parses on its own
+        // type; a NodeConfig-level snippet would collide with the [privacy]
+        // table the default serializer already emits).
+        let pc: PrivacyConfig =
+            toml::from_str("level = 'trusted_peers'\ntrusted_nodes = ['aa', 'bb']\n").unwrap();
+        assert_eq!(pc.level, PrivacyLevel::TrustedPeers);
+        assert_eq!(pc.hop_allowlist().unwrap(), vec!["aa", "bb"]);
+
+        // Parse local_only (empty allowlist → no candidates survive).
+        let pc: PrivacyConfig = toml::from_str("level = 'local_only'\n").unwrap();
+        assert_eq!(pc.level, PrivacyLevel::LocalOnly);
+        assert_eq!(pc.hop_allowlist().unwrap().len(), 0);
+
+        // Round-trip: the tier survives a save/reload (like gateway_bind).
+        let mut cfg = NodeConfig::default();
+        cfg.privacy.level = PrivacyLevel::LocalOnly;
+        cfg.privacy.trusted_nodes = vec!["aa".to_string()];
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let cfg: NodeConfig = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.privacy.level, PrivacyLevel::LocalOnly);
+        assert_eq!(cfg.privacy.trusted_nodes, vec!["aa".to_string()]);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::bootstrap::{BootstrapClient, PeerAd, PeerRegistry, PeerState, now_ms};
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, PrivacyLevel};
 use serde::Serialize;
 
 /// Shared Phase 4 verification tracker: counters + pending fraud evidence.
@@ -786,6 +786,14 @@ impl MeshFallbackChat {
     /// Try local-strict chat (the gateway's existing forward); on failure
     /// fall back through the mesh. Returns content + which node answered
     /// (None = local).
+    ///
+    /// §12 privacy tiers (hot-reloaded, read from state.config here at the
+    /// dispatch choke point): `local_only` never leaves the node for a
+    /// hop; `trusted_peers` keeps only the `[privacy] trusted_nodes`
+    /// allowlist; `full_mesh` is every alive connectable peer. A tier-
+    /// forbidden hop fails with a message that names the policy — a
+    /// downed runtime under a strict tier reads as "refused by policy",
+    /// never as a generic outage.
     pub async fn chat_with_fallback(
         &self,
         state: &Arc<MeshState>,
@@ -794,8 +802,49 @@ impl MeshFallbackChat {
     ) -> anyhow::Result<(String, Option<String>)> {
         req_id_tracker();
         let req_id = format!("chat-{}", crate::bootstrap::now_ms());
-        let (peers, addrs) = self.mesh_view(state, None).await;
+        let tier = state.config.read().await.privacy.clone();
+        let (peers, addrs) = {
+            let (peers, addrs) = self.mesh_view(state, None).await;
+            match tier.hop_allowlist() {
+                Some(allow) => {
+                    // local_only produces an empty allowlist: no candidate
+                    // survives, so nothing can be dispatched.
+                    (
+                        peers
+                            .into_iter()
+                            .filter(|(id, ..)| allow.contains(&id.as_str()))
+                            .collect::<Vec<_>>(),
+                        addrs
+                            .into_iter()
+                            .filter(|(id, _)| allow.contains(&id.as_str()))
+                            .collect(),
+                    )
+                }
+                None => (peers, addrs),
+            }
+        };
         self.refresh_pins(state).await;
+        // trusted_peers with nobody trusted (or local_only outright): the
+        // local runtime still runs, and a local failure must say WHY no
+        // hop was attempted instead of printing a bare outage.
+        if peers.is_empty() {
+            let policy_note = match tier.level {
+                PrivacyLevel::LocalOnly => "no mesh hop attempted — privacy tier local-only forbids peer dispatch (config [privacy] level)".to_string(),
+                PrivacyLevel::TrustedPeers => "no mesh hop attempted — privacy tier trusted-peers has no trusted nodes configured ([privacy] trusted_nodes)".to_string(),
+                PrivacyLevel::FullMesh => "no mesh hop attempted — no alive connectable peers".to_string(),
+            };
+            tracing::info!(
+                target: "mesh",
+                level = ?tier.level,
+                %policy_note
+            );
+            return match local_try() {
+                Ok(text) => Ok((text, None)),
+                Err(local_err) => {
+                    anyhow::bail!("local runtime failed ({local_err}) — {policy_note}")
+                }
+            };
+        }
         let local_attempt = local_try();
         let router = self.router.clone();
         let endpoint = self.endpoint.clone();
@@ -880,6 +929,12 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
     }
     if disk.peers.blocked != live.peers.blocked {
         plan.hot.push("peers.blocked");
+    }
+    // §12 privacy tiers are policy the operator should be able to tighten
+    // without a restart window (and widen the same way): the dispatch
+    // choke point re-reads state.config each attempt.
+    if disk.privacy != live.privacy {
+        plan.hot.push("privacy");
     }
     let mem_key = |c: &NodeConfig| {
         (
@@ -1020,6 +1075,7 @@ async fn reload_config_from_disk(state: &Arc<MeshState>) {
         live.verify_percent = disk.verify_percent;
         live.freerider_enabled = disk.freerider_enabled;
         live.peers.blocked = disk.peers.blocked.clone();
+        live.privacy = disk.privacy.clone();
         if memory_adopted {
             live.memory_backend = disk.memory_backend;
             live.memory_dsn = disk.memory_dsn.clone();
@@ -1861,6 +1917,72 @@ mod tests {
         let v = compat_verdict(&local("glm-5.3", "int4"), &census(&[]));
         assert_eq!(v.verdict, "no_peers_on_model");
         assert!(v.message.contains("you ARE the mesh"), "{}", v.message);
+    }
+
+    /// §12 privacy tiers are policy: changing them is a HOT reload
+    /// (binds within one tick), never a cold restart-only field.
+    #[test]
+    fn config_reload_plan_privacy_tiers_are_hot() {
+        let live = NodeConfig::default();
+        let mut disk = live.clone();
+        disk.privacy.level = PrivacyLevel::LocalOnly;
+        disk.privacy.trusted_nodes = vec!["aa".to_string()];
+        let plan = plan_config_reload(&disk, &live);
+        assert!(plan.hot.contains(&"privacy"), "tiers must bind within one tick");
+        assert!(plan.cold.is_empty());
+        assert!(!plan.memory_changed);
+        assert!(plan.identity_violations.is_empty());
+        // An identical config stays silent.
+        assert!(plan_config_reload(&disk, &disk) == ConfigReloadPlan::default());
+    }
+
+    /// The dispatch choke point: at local_only, a local runtime failure
+    /// fails with the POLICY note (no peer hop was even attempted), not a
+    /// generic outage message.
+    #[tokio::test]
+    async fn chat_fallback_never_hops_at_local_only() {
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        cfg.privacy.level = PrivacyLevel::LocalOnly;
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let mf = MeshFallbackChat::spawn().expect("test fallback chat");
+        let err = mf
+            .chat_with_fallback(
+                &state,
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                || Err(anyhow::anyhow!("local runtime down")),
+            )
+            .await
+            .expect_err("a failed local runtime must surface with the policy note");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("local-only forbids peer dispatch"),
+            "typed refusal required: {msg}"
+        );
+        assert!(msg.contains("local runtime down"), "cause kept: {msg}");
+    }
+
+    /// trusted_peers with an EMPTY allowlist (fresh install): the honest
+    /// answer names the un-actuated policy, and the local runtime still
+    /// serves — hopping to unknown peers is exactly what the tier forbids.
+    #[tokio::test]
+    async fn chat_fallback_trusted_peers_without_allowlist_refuses_honestly() {
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        cfg.privacy.level = PrivacyLevel::TrustedPeers;
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let mf = MeshFallbackChat::spawn().expect("test fallback chat");
+        let err = mf
+            .chat_with_fallback(
+                &state,
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                || Err(anyhow::anyhow!("local runtime down")),
+            )
+            .await
+            .expect_err("a failed local runtime must surface with the policy note");
+        let msg = err.to_string();
+        assert!(msg.contains("no trusted nodes configured"), "{msg}");
+        assert!(msg.contains("local runtime down"), "{msg}");
     }
 
     #[test]

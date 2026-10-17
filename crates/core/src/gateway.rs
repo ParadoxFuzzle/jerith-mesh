@@ -864,6 +864,18 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "wallet_card": gw.wallet.is_some(),
         "note": crate::economics::optional_chain_note(cfg.crypto.chain),
     });
+    // §12 privacy tiers: the live policy (hot-reloaded) and how narrow it
+    // currently makes peer placement — an operator auditing "where can my
+    // prompts go" reads this section, not the config file.
+    let privacy_value = {
+        let trusted = cfg.privacy.hop_allowlist().map(|l| l.len());
+        json!({
+            "level": cfg.privacy.level,
+            "trusted_nodes": cfg.privacy.trusted_nodes,
+            // None = everything connectable is a hop candidate (full_mesh).
+            "allowlist_size": trusted,
+        })
+    };
     let value = json!({
         "node_id": cfg.node_id,
         "role": cfg.role,
@@ -893,6 +905,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         // Crypto surface (§9): configured chain vs what is actually live,
         // with the typed adapter refusal for optional chains.
         "crypto": crypto_value,
+        // Privacy tiers (§12): live level + trusted-node allowlist size.
+        "privacy": privacy_value,
         // Runaway-generation cap state (armed via config `runtime_num_predict`;
         // the site dashboard surfaces it so an operator can see it live).
         "runtime_num_predict": gw.runtime_num_predict,
@@ -1764,6 +1778,18 @@ mod tests {
         let note = c["note"].as_str().expect("typed refusal present");
         assert!(note.contains("ethereum"), "note names the chain: {note}");
         assert!(note.contains("disabled"), "note says what is off: {note}");
+    }
+
+    /// §12 privacy tiers ride /status: the live level + allowlist size
+    /// (None = full_mesh, everything connectable is a hop candidate).
+    #[tokio::test]
+    async fn status_carries_the_live_privacy_tier() {
+        let server = spawn_plain("http://127.0.0.1:1", false);
+        let body: Value = server.get("/status").await.json();
+        let p = body.get("privacy").expect("privacy section present");
+        assert_eq!(p["level"], json!("full_mesh"));
+        assert_eq!(p["allowlist_size"], Value::Null);
+        assert_eq!(p["trusted_nodes"], json!([]));
     }
 
     /// The JerithChain side stays quiet — the typed refusal is only for
