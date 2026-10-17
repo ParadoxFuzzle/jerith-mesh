@@ -603,6 +603,7 @@ mod tests {
             external_plugins: Vec::new(),
             chat_timeout_secs: 240,
             chat_stream: false,
+            chat_max_tool_rounds: 2,
         }
     }
 

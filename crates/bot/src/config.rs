@@ -104,11 +104,24 @@ pub struct BotConfig {
     /// single-shot reply. Degenerates to a buffered answer automatically
     /// whenever the gateway answers non-SSE (JSON error/fallback paths).
     pub chat_stream: bool,
+    /// Max tool rounds per chat before the forced toolless landing round
+    /// (FEATURES §7 web-skill loop). Default 2: a web_search + answer is
+    /// the common shape, and each round rides the runtime's tool tier —
+    /// with the remote-only routing that tier is OpenRouter free (30 s+
+    /// live mean), so a third round doubles wall time for marginal
+    /// gather. `[chat] max_tool_rounds = 3` restores the old local-
+    /// sized budget (clamped 0–6).
+    pub chat_max_tool_rounds: usize,
 }
 
-/// Chat timeout default ([chat] timeout_secs), years after the 90 s
+/// Chat timeout default (`[chat] timeout_secs`), years after the 90 s
 /// constant died on a slow thinking answer.
 const DEFAULT_CHAT_TIMEOUT_SECS: u64 = 240;
+
+/// Tool round budget default (`[chat] max_tool_rounds`): a web_search +
+/// one answer. Sized for the remote tier pricing (see
+/// `BotConfig::chat_max_tool_rounds`), not the old local 3-round habit.
+const DEFAULT_CHAT_MAX_TOOL_ROUNDS: u32 = 2;
 
 impl BotConfig {
     /// Load from env, falling back to `~/.jerith-mesh/bot.toml`.
@@ -197,6 +210,12 @@ impl BotConfig {
                 .unwrap_or(DEFAULT_CHAT_TIMEOUT_SECS)
                 .clamp(60, 600),
             chat_stream: file.chat.as_ref().and_then(|c| c.stream).unwrap_or(true),
+            chat_max_tool_rounds: file
+                .chat
+                .as_ref()
+                .and_then(|c| c.max_tool_rounds)
+                .unwrap_or(DEFAULT_CHAT_MAX_TOOL_ROUNDS)
+                .clamp(0, 6) as usize,
             external_plugins,
         })
     }
@@ -255,6 +274,7 @@ impl BotConfig {
             external_plugins: Vec::new(),
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
             chat_stream: true,
+            chat_max_tool_rounds: DEFAULT_CHAT_MAX_TOOL_ROUNDS as usize,
         }
     }
 }
@@ -558,6 +578,9 @@ struct ChatTable {
     timeout_secs: Option<u64>,
     /// Stream + live-type (see BotConfig::chat_stream). Default true.
     stream: Option<bool>,
+    /// Max tool rounds before the toolless landing (see
+    /// `BotConfig::chat_max_tool_rounds`). Default 2.
+    max_tool_rounds: Option<u32>,
 }
 
 /// `[owner] discord_id = <decimal>` in bot.toml.
@@ -630,5 +653,20 @@ mod tests {
         assert_eq!(clamped_hi.chat.as_ref().unwrap().timeout_secs, Some(5000)); // parse keeps it; clamp is at load()
         let none = toml::from_str::<FileConfig>("discord_token = \"x\"\n").unwrap();
         assert!(none.chat.is_none());
+    }
+
+    /// The tool-round budget knob parses and defaults to 2 (remote-tier
+    /// sized): `[chat] max_tool_rounds` — see BotConfig::chat_max_tool_rounds.
+    #[test]
+    fn chat_max_tool_rounds_parses_and_defaults() {
+        let none = toml::from_str::<FileConfig>("discord_token = \"x\"\n").unwrap();
+        assert!(none.chat.is_none());
+        let set = toml::from_str::<FileConfig>("[chat]\nmax_tool_rounds = 4\n").unwrap();
+        assert_eq!(set.chat.as_ref().unwrap().max_tool_rounds, Some(4));
+        let cfg =
+            BotConfig::from_parts("http://gateway", "http://chain");
+        // Default budget: 2 rounds (web_search + answer), not the old 3.
+        assert_eq!(cfg.chat_max_tool_rounds, 2, "remote-only routing sized default");
+        assert_eq!(cfg.chat_timeout_secs, DEFAULT_CHAT_TIMEOUT_SECS);
     }
 }

@@ -471,7 +471,11 @@ pub async fn chat_with_usage_live(
             .with_external(cfg.external_plugins.clone())
             .expect("external drops validated at config load"),
     );
-    const MAX_TOOL_ROUNDS: usize = 3;
+    // Tool round budget — `[chat] max_tool_rounds` (default 2): a
+    // web_search + an answer. Each round rides the runtime's tool tier;
+    // with remote-only routing that is OpenRouter free (~30 s/round
+    // live), so the old 3-round habit more than doubled wall time.
+    let max_tool_rounds = cfg.chat_max_tool_rounds;
     // Tokens accumulated across rounds (session-cost-tracker port input).
     let mut tokens_used: u64 = 0;
     // Tools only for prompts that read as information requests. A shared
@@ -506,7 +510,7 @@ pub async fn chat_with_usage_live(
         // over the accumulated exchange forces the model to answer from
         // what it gathered; only a degenerate answer from THERE falls
         // back to the plain-refusal path below.
-        if rounds >= MAX_TOOL_ROUNDS && tools_enabled {
+        if rounds >= max_tool_rounds && tools_enabled {
             tracing::info!(
                 target: "bot",
                 rounds,
@@ -581,7 +585,7 @@ pub async fn chat_with_usage_live(
         // it to the same loop (same mock unit tests cover both shapes).
         if tools_enabled
             && tool_calls.is_empty()
-            && rounds < MAX_TOOL_ROUNDS
+            && rounds < max_tool_rounds
             && let Some((name, args)) = content_tool_intent(&body, &registry.enabled_skill_names())
         {
             tool_calls = vec![json!({
@@ -2320,13 +2324,16 @@ mod tests {
         let mut cfg =
             crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
         cfg.web.enabled = true;
+        // Budget set UP to 3 explicitly proves the config knob is honored;
+        // the DEFAULT is 2 (remote-tier sized) — covered by the config test.
+        cfg.chat_max_tool_rounds = 3;
         let (reply, served_by) = chat(&cfg, "find the kiln", &[])
             .await
             .expect("budget-exhausted loop chat");
         assert_eq!(reply, "Landed after the tool budget.");
         assert!(served_by.is_none());
-        // Rounds: three tool calls, then the toolless landing — never a
-        // fourth tool round.
+        // Rounds: three tool calls (the explicit budget), then the toolless
+        // landing — never a fourth tool round.
         assert_eq!(
             calls.lock().expect("test calls").as_slice(),
             &[true, true, true, false]

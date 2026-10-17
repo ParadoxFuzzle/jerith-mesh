@@ -347,7 +347,7 @@ mod tests {
         // `sink.is_none()` after the call is the bug shape:
         assert!(boxed.is_none(), "run_session consumed the sink");
         assert!(
-            boxed.is_none() == true && had_live_sink == true,
+            boxed.is_none() && had_live_sink,
             "post-session is_none() is true even though a live surface delivered — pre-session capture required"
         );
         // The rule: a consumed live surface means the text is already
