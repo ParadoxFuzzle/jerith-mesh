@@ -351,23 +351,51 @@ impl crate::converse::ConversationSink for LiveSink {
         Box::pin(async move {
             self.ticker.abort();
             let clipped = clip_tail(&text, 1990);
-            if let Err(e) = self
-                .channel
-                .edit_message(
-                    &self.http_ctx,
-                    self.msg_id,
-                    poise::serenity_prelude::EditMessage::new().content(clipped),
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "live sink final edit failed — resending (a second message appears when this fires)");
+            // Two identical messages = the resend path firing: the ticker
+            // already typed the full answer into the placeholder, and ONE
+            // failed final edit then posted the same text again as a NEW
+            // message (the live 2026-10-16 19:08 "two identical answers"
+            // incident shape). Retry the edit IN PLACE first — a transient
+            // Discord 429/5xx clears in a second or two; only a persistent
+            // failure (deleted placeholder, lost permission) deserves the
+            // resend fallback.
+            let mut delivered = false;
+            for attempt in 1..=3u8 {
+                let step = self
+                    .channel
+                    .edit_message(
+                        &self.http_ctx,
+                        self.msg_id,
+                        poise::serenity_prelude::EditMessage::new().content(&clipped),
+                    )
+                    .await;
+                match step {
+                    Ok(_) => {
+                        delivered = true;
+                        tracing::info!(
+                            channel = %self.channel,
+                            message_id = %self.msg_id,
+                            attempt,
+                            "live sink: final edit applied in place (no resend)"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < 3 {
+                            tracing::warn!(
+                                attempt,
+                                error = %e,
+                                "live sink final edit failed — retrying in place before any resend"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        } else {
+                            tracing::warn!(error = %e, "live sink final edit failed 3× — resending (a second message appears when this fires)");
+                        }
+                    }
+                }
+            }
+            if !delivered {
                 send_long(&self.http_ctx, self.channel, &text).await;
-            } else {
-                tracing::info!(
-                    channel = %self.channel,
-                    message_id = %self.msg_id,
-                    "live sink: final edit applied in place (no resend)"
-                );
             }
         })
     }
