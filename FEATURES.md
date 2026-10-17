@@ -306,7 +306,24 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     `economics::optional_chain_note` feeds the startup banner
     (`economics off — <note>`) and the `/status` `crypto` section
     (`chain` / `mining_enabled` / `wallet_card` / `note` — no fake mining stats
-    for an unconfigured chain). The adapters themselves remain 📋 Phase 4.
+    for an unconfigured chain). Mining stays refused for these chains.
+  - ✅ Wallet-card half of the adapters landed (2026-10-17):
+    `economics::OptionalChainWallet` probes the operator's OWN chain node
+    for a chain-truthful balance — Bitcoin/Dogecoin Core JSON-RPC
+    (`getreceivedbyaddress` when `[crypto] wallet_address` is set,
+    else the node wallet's `getbalance`; credentials ride the
+    `wallet_endpoint` as `user:pass@`), Ethereum `eth_getBalance`
+    (hex wei → human ETH + the full raw-wei decimal string), Monero
+    wallet-RPC `get_balance` (piconero → XMR). `/status` carries it as
+    `crypto.optional_wallet` (`{ok, chain, unit, amount, raw, address}`
+    or `{ok:false, error}` — a transport/typed-config failure is an
+    honest error, never a fake zero), the banner prints
+    `wallet(oc)` at boot, and the note stays accurate in both states
+    (mining disabled, wallet card live when configured). Tests: per-chain
+    parses, basic-auth from URL, missing/malformed-address typed
+    refusals, unreachable-node error, and the live /status integration.
+    The mining half remains 📋 (PoW chains don't mesh-mine; ERC-20-style
+    balance-only adapters may extend the card later).
 - ✅ Interval metering hooks (tokens, expert activations, bandwidth, uptime) wired through the ping loop
 - ✅ Automatic JER mining attempt on each served inference — the chain's passive-mining
   mechanic reimplemented mesh-side: every served completion rolls `mine_chance_permille`
@@ -634,12 +651,17 @@ gotchas surfaced while building the finished parts.
   consistent, tampered-figure refusal (the subject's own sig catches a
   colluding falsifier) and forged-reporter refusal; live-deployed 2026-
   10-17 with the node's uploads tallied on the real bootstrap
-- **Gossiped signed reputation (§10)**. Bootstrap-verified offenses today
-  score; the gossip layer carries signed scores node-to-node inside ads
-  (capped like the discovery rotation), with the no-statistics-slash
-  boundary kept: thresholds act through the Phase 5 stake tier, not
-  through reputation alone. Anti-sybil: identity age + stake weighting
-  before scores count.
+- ✅ **Gossiped signed reputation (§10)** (landed 2026-10-17): the bootstrap
+  publishes its own signing identity + per-subject signed score stamps in
+  `/v1/peers`; nodes pin the origin key trust-on-first-use from the
+  operator-configured URL (rotation journaled) and re-verify every stamp —
+  direct or carried inside ads against OUR pins. Self-stamps, unknown
+  origins, forged sigs, and stale stamps drop at the pin wall; the honest
+  path lands in a bounded newest-per-subject cache riding ads fleet-wide
+  WITHOUT trusting the advertiser. The no-statistics-slash boundary kept:
+  thresholds act through the Phase 5 stake tier, not reputation alone.
+  Anti-sybil (identity age + stake weighting before scores count) remains
+  Phase 5.
 - ✅ **Per-node wallet surfaces on-chain** (landed 2026-10-17):
   `economics::WalletCard` probes the token-authed chain RPC /balance live
   in /status (`wallet` section: reachable / exists / balance_uj+jer /
@@ -649,14 +671,14 @@ gotchas surfaced while building the finished parts.
   token file (`keys/api.token`) can drift stale from the co-hosted
   chain node's own key — the miner was silently 401ing until the token
   was resynced; wallet_balance surfaces that as an explicit error
-- **Optional chains (§9): Bitcoin / Ethereum / Dogecoin / Monero.** The
-  config accepts the labels today and nothing else exists — each chain
-  needs its miner/wallet adapter against user-supplied endpoints.
-  Landed 2026-10-17: the *honest* answer until then — typed refusals
-  (`economics::optional_chain_note`) in the startup banner and the
-  `/status` `crypto` section (see §9) — so an unconfigured chain says
-  WHY it is idle instead of showing fake mining stats (or silence).
-  The adapters themselves remain 📋 Phase 4.
+- 🔄 **Optional chains (§9): Bitcoin / Ethereum / Dogecoin / Monero.** The
+  config accepts the labels and (since 2026-10-17) supplies the WALLET half:
+  `OptionalChainWallet` probes the user's own chain node live
+  (`crypto.optional_wallet` in /status; see §9 for the per-chain shapes).
+  What remains 📋 for this line: the mining half (PoW chains don't
+  mesh-mine — mining stays refused by the typed note) and any
+  dotenv-free chain-specific subtleties an operator hits running real
+  Core/wallet-rpc endpoints.
 - **Chain-side hardening**: chain-RPC token rotation, mine-rate behavior
   vs. the chain's bookkeeping (`total_mined_uj` drift watch), payout and
   escrow edge cases on node exit (escrow returned on graceful shutdown —

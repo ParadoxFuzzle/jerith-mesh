@@ -72,6 +72,13 @@ pub struct Gateway {
     /// the crypto chain is JerithChain; /status then carries a live
     /// `wallet` section — chain-truthful balance rather than local wins.
     pub wallet: Option<std::sync::Arc<crate::economics::WalletCard>>,
+    /// Optional-chain wallet card (§9, Phase 4): the user-supplied chain
+    /// node's balance probe when chain ∈ {bitcoin, ethereum, dogecoin,
+    /// monero} AND `wallet_endpoint` is configured. /status carries it in
+    /// the crypto section as `optional_wallet` — mined balance by their
+    /// own node, typed refusal on error, never a fake number.
+    pub optional_wallet:
+        Option<std::sync::Arc<crate::economics::OptionalChainWallet>>,
     /// Perf/cost meters (model-performance-benchmark + session-cost-tracker
     /// ports): per-model latency/success/tokens from live traffic.
     pub metrics: Arc<crate::metrics::Metrics>,
@@ -856,12 +863,28 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     // (or keeps serving the previous store when the new one won't open).
     let memory_store_value = gw.state.memory.read().await.as_ref().map(|m| m.describe());
     // §9 honest crypto surface: what is configured, what is actually live,
-    // and — for an optional chain — the typed refusal for the not-yet-
-    // implemented adapter (no fake mining stats for an unconfigured chain).
+    // and — for an optional chain — the typed refusal for the un-
+    // implemented mining half (no fake mining stats), plus the live wallet
+    // card for the configured wallet_endpoint half.
+    let optional_wallet_value = match gw.optional_wallet.as_ref() {
+        Some(card) => match crate::economics::optional_chain_probe(card).await {
+            Ok(b) => json!({
+                "ok": true,
+                "chain": b.chain,
+                "unit": b.unit,
+                "amount": b.amount,
+                "raw": b.raw,
+                "address": b.address,
+            }),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
+        None => Value::Null,
+    };
     let crypto_value = json!({
         "chain": cfg.crypto.chain,
         "mining_enabled": gw.miner.is_some(),
         "wallet_card": gw.wallet.is_some(),
+        "optional_wallet": optional_wallet_value,
         "note": crate::economics::optional_chain_note(cfg.crypto.chain),
     });
     // §12 privacy tiers: the live policy (hot-reloaded) and how narrow it
@@ -1684,6 +1707,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
@@ -1744,6 +1768,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: Some(Arc::new(card)),
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -1782,6 +1807,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -1793,6 +1819,125 @@ mod tests {
         let note = c["note"].as_str().expect("typed refusal present");
         assert!(note.contains("ethereum"), "note names the chain: {note}");
         assert!(note.contains("disabled"), "note says what is off: {note}");
+        // No endpoint configured → the optional-card slot stays honestly
+        // empty (Null), not a fake zero.
+        assert_eq!(c["optional_wallet"], Value::Null);
+    }
+
+    /// §9 optional-chain wallet card, live: a configured endpoint's probe
+    /// rides /status next to the (mining-halved) honest note — an
+    /// unreachable node answers `{ok:false, error}`, never a fake balance.
+    #[tokio::test]
+    async fn status_carries_the_live_optional_wallet_card() {
+        // Mock Ethereum RPC answering the address-keyed probe.
+        let eth_hex = "0x4563918244F40000"; // 5 ETH in wei
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move || async move {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "result": eth_hex
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg_addr = format!("http://{rpc_addr}");
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        cfg.crypto.chain = crate::config::CryptoChain::Ethereum;
+        cfg.crypto.wallet_endpoint = Some(cfg_addr.clone());
+        cfg.crypto.wallet_address = Some("0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5".to_string());
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: crate::economics::OptionalChainWallet::from_crypto(
+                &crate::config::CryptoConfig {
+                    chain: crate::config::CryptoChain::Ethereum,
+                    wallet_endpoint: Some(cfg_addr),
+                    wallet_address: Some("0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5".to_string()),
+                    ..crate::config::CryptoConfig::default()
+                },
+            )
+            .map(std::sync::Arc::new),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+
+        // Healthy chain: the card carries real numbers.
+        let body: Value = server.get("/status").await.json();
+        let c = body.get("crypto").expect("crypto section present");
+        let ow = c["optional_wallet"].as_object().expect("card present");
+        assert_eq!(ow["ok"], json!(true), "{ow:?}");
+        assert_eq!(ow["unit"], json!("ETH"));
+        assert_eq!(ow["amount"], json!(5.0));
+        assert_eq!(ow["raw"], json!("5000000000000000000"));
+        // The honest note stays: mining is still not implemented for ETH.
+        assert!(
+            c["note"].as_str().unwrap_or("").contains("disabled"),
+            "mining refusal kept next to the live card"
+        );
+
+        // Unreachable chain: typed error, no fake balance.
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        cfg.crypto.chain = crate::config::CryptoChain::Ethereum;
+        cfg.crypto.wallet_endpoint = Some("http://127.0.0.1:1".to_string());
+        cfg.crypto.wallet_address = Some("0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5".to_string());
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: crate::economics::OptionalChainWallet::from_crypto(
+                &crate::config::CryptoConfig {
+                    chain: crate::config::CryptoChain::Ethereum,
+                    wallet_endpoint: Some("http://127.0.0.1:1".to_string()),
+                    wallet_address: Some("0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5".to_string()),
+                    ..crate::config::CryptoConfig::default()
+                },
+            )
+            .map(std::sync::Arc::new),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let body: Value = server.get("/status").await.json();
+        let ow = body["crypto"]["optional_wallet"].as_object().expect("card present");
+        assert_eq!(ow["ok"], json!(false));
+        assert!(
+            ow["error"].as_str().unwrap_or_default().contains("unreachable"),
+            "typed transport error: {ow:?}"
+        );
+        assert!(ow.get("amount").is_none(), "no fake balance on error");
     }
 
     /// §12 privacy tiers ride /status: the live level + allowlist size
@@ -1830,6 +1975,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -1874,6 +2020,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
@@ -1908,6 +2055,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         TestServer::new(gw.router().into_make_service()).expect("guarded test server")
@@ -2038,6 +2186,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: metrics.clone(),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("metrics test server");
@@ -2141,6 +2290,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2225,6 +2375,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2325,6 +2476,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2563,6 +2715,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
@@ -2616,6 +2769,7 @@ mod tests {
             web: None,
             chain_url: None,
             wallet: None,
+            optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");

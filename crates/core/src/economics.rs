@@ -104,16 +104,16 @@ pub fn chain_rpc_url(crypto: &CryptoConfig) -> String {
 pub fn optional_chain_note(chain: CryptoChain) -> Option<&'static str> {
     match chain {
         CryptoChain::Bitcoin => Some(
-            "bitcoin: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+            "bitcoin: mining is not implemented for this chain and stays disabled (no fake stats); the wallet card probes your supplied wallet_endpoint live when configured",
         ),
         CryptoChain::Ethereum => Some(
-            "ethereum: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+            "ethereum: mining is not implemented for this chain and stays disabled (no fake stats); the wallet card probes your supplied wallet_endpoint live when configured",
         ),
         CryptoChain::Dogecoin => Some(
-            "dogecoin: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+            "dogecoin: mining is not implemented for this chain and stays disabled (no fake stats); the wallet card probes your supplied wallet_endpoint live when configured",
         ),
         CryptoChain::Monero => Some(
-            "monero: config accepted, no miner/wallet adapter yet — mining and the wallet card are disabled (no fake stats)",
+            "monero: mining is not implemented for this chain and stays disabled (no fake stats); the wallet card probes your supplied wallet_endpoint live when configured",
         ),
         CryptoChain::Jerithchain | CryptoChain::None => None,
     }
@@ -273,6 +273,268 @@ pub async fn wallet_balance(card: &WalletCard) -> anyhow::Result<ChainBalance> {
             .get("available_jer")
             .and_then(|v| v.as_f64()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Optional-chain wallet cards (§9, Phase 4): the wallet-card half of the
+// Bitcoin / Ethereum / Dogecoin / Monero adapters. Mining on those chains
+// stays honestly refused (the note above); the user's OWN node is probed
+// for a chain-truthful balance, the same contract WalletCard serves for
+// JER — no fake numbers, reachability carried separately.
+// ---------------------------------------------------------------------------
+
+/// Split a user-supplied endpoint `scheme://[user:pass@]host[:port][/path]`
+/// into base URL + optional Basic-auth credentials (Bitcoin/Dogecoin Core
+/// and monerod-style RPC auth embed in the URL — no new config fields).
+/// Upper-case schemes accepted; anything without an http(s):// scheme is
+/// None (a typed config error, never a silent guess).
+pub fn split_endpoint(
+    url: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return None;
+    }
+    let (creds, hostpart) = match rest.split_once('@') {
+        Some((c, h)) => (Some(c), h),
+        None => (None, rest),
+    };
+    let (user, pass) = match creds {
+        Some(c) => match c.split_once(':') {
+            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+            None => (Some(c.to_string()), None),
+        },
+        None => (None, None),
+    };
+    Some((format!("{scheme}://{hostpart}"), user, pass))
+}
+
+/// The wallet-card probe config for one optional chain.
+#[derive(Debug, Clone)]
+pub struct OptionalChainWallet {
+    pub chain: CryptoChain,
+    /// User-supplied RPC base (may embed user:pass@ for Core-style auth).
+    pub rpc_url: String,
+    user: Option<String>,
+    pass: Option<String>,
+    /// Config `[crypto] wallet_address` — required for Ethereum; optional
+    /// for Core chains (falls back to the wallet's own balance) and not
+    /// meaningful for Monero (wallet-rpc is bound to its wallet file).
+    pub address: Option<String>,
+}
+
+impl OptionalChainWallet {
+    /// Build from the crypto section: exists when an optional chain has a
+    /// wallet_endpoint worth probing. JerithChain has WalletCard; None
+    /// chain has nothing configured.
+    pub fn from_crypto(crypto: &CryptoConfig) -> Option<Self> {
+        match crypto.chain {
+            CryptoChain::Bitcoin
+            | CryptoChain::Ethereum
+            | CryptoChain::Dogecoin
+            | CryptoChain::Monero => crypto.wallet_endpoint.as_ref().and_then(|url| {
+                let (rpc_url, user, pass) = split_endpoint(url)?;
+                Some(Self {
+                    chain: crypto.chain,
+                    rpc_url,
+                    user,
+                    pass,
+                    address: crypto.wallet_address.clone().filter(|a| !a.trim().is_empty()),
+                })
+            }),
+            CryptoChain::Jerithchain | CryptoChain::None => None,
+        }
+    }
+
+    /// The human display unit for this chain's balance.
+    pub fn unit(&self) -> &'static str {
+        match self.chain {
+            CryptoChain::Bitcoin => "BTC",
+            CryptoChain::Ethereum => "ETH",
+            CryptoChain::Dogecoin => "DOGE",
+            CryptoChain::Monero => "XMR",
+            _ => "?",
+        }
+    }
+
+    /// One client with the probe timeout (per call, like wallet_balance).
+    fn http(&self) -> anyhow::Result<reqwest::Client> {
+        Ok(reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(Duration::from_secs(5))
+            .build()?)
+    }
+
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match (&self.user, &self.pass) {
+            (Some(u), Some(p)) => req.basic_auth(u, Some(p)),
+            (Some(u), None) => req.basic_auth(u, Some("")),
+            _ => req,
+        }
+    }
+
+    /// POST one Core-style JSON-RPC call (Bitcoin/Dogecoin), returning the
+    /// `result` member. The RPC's own error member is surfaced as an Err —
+    /// the chain said no, and the card must show that, not a fake zero.
+    async fn core_rpc(&self, client: &reqwest::Client, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let resp = self
+            .auth(client.post(&self.rpc_url))
+            .json(&serde_json::json!({
+                "jsonrpc": "1.0",
+                "id": "jerith",
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+            .context("chain RPC unreachable")?;
+        let body: serde_json::Value = resp
+            .error_for_status()
+            .context("chain RPC rejected")?
+            .json()
+            .await
+            .context("chain RPC did not answer JSON")?;
+        if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
+            anyhow::bail!("chain RPC error: {err}");
+        }
+        body
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("chain RPC answer missing result"))
+    }
+
+    /// POST one EIP-1474 style JSON-RPC call (Ethereum, monero-wallet-rpc).
+    async fn jsonrpc(&self, client: &reqwest::Client, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let resp = self
+            .auth(client.post(&self.rpc_url))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "jerith",
+                "method": method,
+                "params": params,
+            }))
+            .send()
+            .await
+            .context("chain RPC unreachable")?;
+        let body: serde_json::Value = resp
+            .error_for_status()
+            .context("chain RPC rejected")?
+            .json()
+            .await
+            .context("chain RPC did not answer JSON")?;
+        if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
+            anyhow::bail!("chain RPC error: {err}");
+        }
+        body.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("chain RPC answer missing result"))
+    }
+
+    /// Chain-truthful balance for the address (or the wallet itself on
+    /// Core/Monero). Succeeds with honest numbers or errs with the typed
+    /// reason — the caller must never guess a balance.
+    pub async fn balance(&self) -> anyhow::Result<OptionalBalance> {
+        let unit = self.unit();
+        let client = self.http()?;
+        match self.chain {
+            CryptoChain::Bitcoin | CryptoChain::Dogecoin => {
+                // An address watches exactly that one; no address asks the
+                // node wallet's own total (the operator's node, their truth).
+                let (method, params) = match self.address.as_deref() {
+                    Some(addr) => ("getreceivedbyaddress", serde_json::json!([addr, 1])),
+                    None => ("getbalance", serde_json::json!([])),
+                };
+                let result = self.core_rpc(&client, method, params).await?;
+                let amount = result
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("chain RPC returned a non-numeric balance"))?;
+                Ok(OptionalBalance {
+                    ok: true,
+                    chain: self.chain,
+                    unit,
+                    amount,
+                    raw: None,
+                    address: self.address.clone(),
+                    error: None,
+                })
+            }
+            CryptoChain::Ethereum => {
+                let addr = self.address.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ethereum probes need [crypto] wallet_address (eth_getBalance is address-keyed)"
+                    )
+                })?;
+                if !addr.starts_with("0x") || addr.len() != 42 {
+                    anyhow::bail!("wallet_address must be a 0x-prefixed 20-byte address");
+                }
+                let hex = self
+                    .jsonrpc(&client, "eth_getBalance", serde_json::json!([addr, "latest"]))
+                    .await?;
+                let hexs = hex
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("eth_getBalance returned a non-string result"))?;
+                let digits = hexs.strip_prefix("0x").unwrap_or(hexs);
+                if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                    anyhow::bail!("eth_getBalance returned {hexs:?} — not hex");
+                }
+                let wei = u128::from_str_radix(digits, 16)
+                    .map_err(|e| anyhow::anyhow!("eth_getBalance number too large: {e}"))?;
+                Ok(OptionalBalance {
+                    ok: true,
+                    chain: self.chain,
+                    unit,
+                    amount: wei as f64 / 1e18,
+                    raw: Some(wei.to_string()),
+                    address: self.address.clone(),
+                    error: None,
+                })
+            }
+            CryptoChain::Monero => {
+                let result = self.jsonrpc(&client, "get_balance", serde_json::json!({})).await?;
+                let atomic = result
+                    .get("balance")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| anyhow::anyhow!("monero get_balance missing numeric balance"))?;
+                Ok(OptionalBalance {
+                    ok: true,
+                    chain: self.chain,
+                    unit,
+                    amount: atomic as f64 / 1e12,
+                    raw: Some(atomic.to_string()),
+                    address: None,
+                    error: None,
+                })
+            }
+            CryptoChain::Jerithchain | CryptoChain::None => {
+                anyhow::bail!("not an optional chain")
+            }
+        }
+    }
+}
+
+/// The probe outcome /status and the banner render: honest numbers, or the
+/// typed reason the card is empty. `ok=false` never carries amounts.
+#[derive(Debug, Clone, Serialize)]
+pub struct OptionalBalance {
+    /// False when the probe couldn't produce a trustworthy number.
+    pub ok: bool,
+    pub chain: CryptoChain,
+    pub unit: &'static str,
+    /// Human coin units (BTC/ETH/DOGE/XMR) when ok.
+    pub amount: f64,
+    /// Atomic units as a decimal string when derivable (wei / piconero);
+    /// f64 display of 1e18-scale numbers loses digits, raw keeps them.
+    pub raw: Option<String>,
+    pub address: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Live probe wrapper for one optional-chain wallet card: Ok(numbers) or
+/// Err(reason) — /status turns Err into `{ok:false, error}`.
+pub async fn optional_chain_probe(
+    card: &OptionalChainWallet,
+) -> anyhow::Result<OptionalBalance> {
+    card.balance().await
 }
 
 /// GET /balance?discord_id=<identity> → µJER credited balance.
@@ -456,6 +718,250 @@ mod tests {
         // …and the real adapters stay silent (nothing to refuse).
         assert_eq!(optional_chain_note(CryptoChain::Jerithchain), None);
         assert_eq!(optional_chain_note(CryptoChain::None), None);
+    }
+
+    /// The optional-chain wallet card exists exactly when an http(s)
+    /// endpoint is configured; Core-RPC credentials ride the URL, and the
+    /// real chain configs still pass them through untouched.
+    #[test]
+    fn optional_wallet_from_crypto_and_split_endpoint() {
+        // Plain endpoint, no creds, address carried.
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Bitcoin,
+            wallet_endpoint: Some("http://127.0.0.1:8332".to_string()),
+            wallet_address: Some("bc1qtest".to_string()),
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).expect("endpoint configured");
+        assert_eq!(w.rpc_url, "http://127.0.0.1:8332");
+        assert_eq!(w.address.as_deref(), Some("bc1qtest"));
+        assert_eq!(w.unit(), "BTC");
+
+        // Core-RPC auth via user:pass@ (no new config fields needed).
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Dogecoin,
+            wallet_endpoint: Some("https://user:pass@pool.example:22555/wallet".to_string()),
+            wallet_address: None,
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).expect("endpoint configured");
+        assert_eq!(w.rpc_url, "https://pool.example:22555/wallet");
+        assert!(matches!(&w.user, Some(u) if u == "user"));
+        assert!(matches!(&w.pass, Some(p) if p == "pass"));
+        assert_eq!(w.unit(), "DOGE");
+
+        // JerithChain and no-endpoint stay None; a broken scheme refuses.
+        let jer = CryptoConfig {
+            chain: CryptoChain::Jerithchain,
+            wallet_endpoint: Some("http://x".to_string()),
+            ..CryptoConfig::default()
+        };
+        assert!(OptionalChainWallet::from_crypto(&jer).is_none());
+        let none = CryptoConfig {
+            chain: CryptoChain::Bitcoin,
+            ..CryptoConfig::default()
+        };
+        assert!(OptionalChainWallet::from_crypto(&none).is_none());
+        let bad = CryptoConfig {
+            chain: CryptoChain::Bitcoin,
+            wallet_endpoint: Some("ftp://nope".to_string()),
+            ..CryptoConfig::default()
+        };
+        assert!(OptionalChainWallet::from_crypto(&bad).is_none());
+    }
+
+    /// Core-RPC happy path: an address watches getreceivedbyaddress; no
+    /// address falls back to the wallet's own balance. The probe result is
+    /// human coin units, and the RPC's OWN error member is an Err (no fake
+    /// zero on a chain-side refusal).
+    #[tokio::test]
+    async fn optional_wallet_core_rpc_getreceived_and_getbalance() {
+        use std::sync::Arc as Arcasier;
+        let method_hits = Arcasier::new(std::sync::atomic::AtomicI64::new(-1));
+        let auth_seen = Arcasier::new(std::sync::atomic::AtomicBool::new(false));
+        let (hits, authh) = (method_hits.clone(), auth_seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(
+                    move |hdrs: axum::http::HeaderMap,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let hits = hits.clone();
+                        let authh = authh.clone();
+                        async move {
+                            // basic_auth for the URL-embedded creds.
+                            let b64 = hdrs
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .strip_prefix("Basic ")
+                                .unwrap_or("")
+                                .to_string();
+                            authh.store(
+                                b64 == "dXNlcjpwYXNz", // base64("user:pass")
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            let m = body.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                            hits.store(
+                                match m {
+                                    "getreceivedbyaddress" => 0,
+                                    "getbalance" => 1,
+                                    _ => 2,
+                                },
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            axum::Json(serde_json::json!({"result": 1.5, "error": null, "id": "x"}))
+                        }
+                    },
+                ),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = format!("http://user:pass@{addr}");
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Bitcoin,
+            wallet_endpoint: Some(endpoint.clone()),
+            wallet_address: Some("bc1qwatched".to_string()),
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
+        let b = optional_chain_probe(&w).await.expect("probe ok");
+        assert!(b.ok);
+        assert_eq!(b.amount, 1.5);
+        assert_eq!(b.unit, "BTC");
+        assert_eq!(method_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(auth_seen.load(std::sync::atomic::Ordering::SeqCst));
+
+        // No address → the wallet's own getbalance.
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Bitcoin,
+            wallet_endpoint: Some(endpoint.clone()),
+            wallet_address: None,
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
+        let b = optional_chain_probe(&w).await.expect("probe ok");
+        assert_eq!(b.amount, 1.5);
+        assert_eq!(method_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(b.address.is_none());
+
+        // The chain refusing (error member) must reach the caller as Err —
+        // Reach a hanging server: reuse the stub but ask an unreachable port.
+        let w = OptionalChainWallet {
+            chain: CryptoChain::Dogecoin,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            user: None,
+            pass: None,
+            address: None,
+        };
+        let e = optional_chain_probe(&w).await.expect_err("unreachable errs");
+        assert!(e.to_string().contains("unreachable"), "{e}");
+    }
+
+    /// Ethereum: address-keyed eth_getBalance, hex wei → human ETH + raw
+    /// decimal string; the missing/wrong address is a typed refusal.
+    #[tokio::test]
+    async fn optional_wallet_ethereum_hex_wei_and_typed_refusals() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(
+                    move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("eth_getBalance")
+                        );
+                        axum::Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": "0x1bc16d674ec80000"
+                        }))
+                    },
+                ),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let endpoint = format!("http://{addr}");
+        let addr_hex = "0x95222290dd7278aa3ddd389cc1e1d165cc4bafe5";
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Ethereum,
+            wallet_endpoint: Some(endpoint.clone()),
+            wallet_address: Some(addr_hex.to_string()),
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
+        let b = optional_chain_probe(&w).await.expect("probe ok");
+        assert_eq!(b.raw.as_deref(), Some("2000000000000000000"));
+        assert_eq!(b.amount, 2.0);
+        assert_eq!(b.unit, "ETH");
+
+        // No address → typed refusal, not an empty card.
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Ethereum,
+            wallet_endpoint: Some(endpoint.clone()),
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
+        let e = optional_chain_probe(&w).await.expect_err("no address errs");
+        assert!(e.to_string().contains("wallet_address"), "{e}");
+
+        // Malformed address → typed refusal.
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Ethereum,
+            wallet_endpoint: Some(endpoint.clone()),
+            wallet_address: Some("0xshort".to_string()),
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
+        let e = optional_chain_probe(&w).await.expect_err("bad address errs");
+        assert!(e.to_string().contains("0x-prefixed"), "{e}");
+    }
+
+    /// Monero: wallet-rpc get_balance, atomic piconero → human XMR + raw;
+    /// a missing numeric balance is an honest Err, never a fake zero.
+    #[tokio::test]
+    async fn optional_wallet_monero_piconero() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/json_rpc",
+                axum::routing::post(
+                    move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(
+                            body.get("method").and_then(|v| v.as_str()),
+                            Some("get_balance")
+                        );
+                        axum::Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": "0",
+                            "result": {"balance": 1_500_000_000_000u64, "unlocked_balance": 1_500_000_000_000u64}
+                        }))
+                    },
+                ),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // The wallet file is address-agnostic — endpoint carries the path.
+        let endpoint = format!("http://{addr}/json_rpc");
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Monero,
+            wallet_endpoint: Some(endpoint),
+            wallet_address: None,
+            ..CryptoConfig::default()
+        };
+        let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
+        let b = optional_chain_probe(&w).await.expect("probe ok");
+        assert_eq!(b.amount, 1.5);
+        assert_eq!(b.raw.as_deref(), Some("1500000000000"));
+        assert_eq!(b.unit, "XMR");
     }
 
     fn cfg(chance: u32) -> CryptoConfig {

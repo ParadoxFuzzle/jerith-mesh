@@ -2197,6 +2197,29 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             }
             card
         },
+        // Optional-chain wallet card (§9, Phase 4): probes the operator's
+        // OWN chain node for a live balance (bitcoin/ethereum/dogecoin/
+        // monero), the same chain-truthful contract as the JER card;
+        // mining on these chains stays honestly refused via the note.
+        optional_wallet: {
+            let card = jerith_mesh_core::economics::OptionalChainWallet::from_crypto(&cfg.crypto)
+                .map(std::sync::Arc::new);
+            if let Some(w) = &card {
+                match jerith_mesh_core::economics::optional_chain_probe(w).await {
+                    Ok(b) => println!(
+                        "   wallet(oc)  {} · {:.8} {}",
+                        b.address.as_deref().unwrap_or("wallet"),
+                        b.amount,
+                        b.unit
+                    ),
+                    Err(e) => println!(
+                        "   wallet(oc)  {} · ({e:#})",
+                        w.unit()
+                    ),
+                }
+            }
+            card
+        },
         metrics: std::sync::Arc::new(jerith_mesh_core::metrics::Metrics::new()),
     };
     let app = axum::Router::new()
