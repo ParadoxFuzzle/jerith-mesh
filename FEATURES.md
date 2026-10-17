@@ -111,9 +111,11 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   < half the declared, ≥25 % floor) queue signed `Leeching` evidence —
   statistics never slash; `/status.contribution` shows declared vs
   measured side by side. 10 dedicated tests incl. the crypto roundtrip.
-  (MVP scope: this measurement is the node's own statement, signed and
-  locally verified — a coordinator-side quorum over multiple pingers'
-  tallies stays with the Phase 4–5 reputation work.)
+  (MVP scope note, updated 2026-10-17: the coordinator-side quorum over
+  multiple pingers' tallies has since landed — every pinger forwards its
+  verified block to the bootstrap and `/v1/peers` publishes the
+  corroborated aggregate; see §13 Phase 4. Statistics, not verdicts:
+  the reputation-weighted use of that tally stays with Phase 4–5.)
 
 ## 3. Connectivity & Discovery
 - ✅ Bootstrap + DHT hybrid discovery (Phase 0: single bootstrap file + HTTP peer list)
@@ -613,11 +615,25 @@ gotchas surfaced while building the finished parts.
 
 ### Phase 4 — economics & reputation close the loop
 
-- **Coordinator-side quorum over contribution measurements** (§2's marked
-  MVP gap). The cryptographic substrate is done: per-interval signed
-  `measurement` blocks a pinger re-verifies field-for-field. What remains:
-  several peers talling the same interval at the bootstrap, aggregate
-  publishing, and protection against a single-biased-pinger world.
+- ✅ **Coordinator-side quorum over contribution measurements** (§2's marked
+  MVP gap) — landed 2026-10-17. The cryptographic substrate (per-interval
+  signed `measurement` blocks a pinger verifies field-for-field) now has
+  its tally: every pinger forwards its verified block to the bootstrap
+  (`POST /v1/report-measure`) with BOTH signatures — the subject's own sig
+  anchors the figures (a biased pinger can attest delivery, never alter
+  numbers), the reporter's attestation binds who corroborated it. The
+  bootstrap tallies per subject (deduped per (reporter, block), bounded
+  ring) and publishes the aggregate additively in `/v1/peers`
+  (`measurements`: distinct_reporters, median, spread, consistent).
+  Protection against the single-biased-pinger world: one report is
+  explicitly UNQUORUMED (`consistent: null`) — statistics, not verdicts,
+  and the no-statistics-slash boundary kept (thresholds act through the
+  Phase 5 stake tier). Divergence beyond 10 pp between distinct reporters'
+  recent blocks flags `consistent:false` (per-asker lying evidence).
+  Wire tests cover the double-signature accept, dedupe, unquorumed,
+  consistent, tampered-figure refusal (the subject's own sig catches a
+  colluding falsifier) and forged-reporter refusal; live-deployed 2026-
+  10-17 with the node's uploads tallied on the real bootstrap
 - **Gossiped signed reputation (§10)**. Bootstrap-verified offenses today
   score; the gossip layer carries signed scores node-to-node inside ads
   (capped like the discovery rotation), with the no-statistics-slash

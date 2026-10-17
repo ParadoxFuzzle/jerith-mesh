@@ -120,9 +120,17 @@ impl PeerAd {
     }
 }
 
+/// §2 contribution quorum, additively published beside the peer list:
+/// per-subject aggregate of corroborated measurement blocks (distinct
+/// reporters / median / spread / consistency). `#[serde(default)]` keeps
+/// old servers and new clients compatible during rolling upgrades.
+type QuorumJson = serde_json::Map<String, serde_json::Value>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerListResponse {
     pub peers: Vec<PeerAd>,
+    #[serde(default)]
+    pub measurements: QuorumJson,
 }
 
 /// Running state for a peer in the local registry.
@@ -428,6 +436,42 @@ impl BootstrapClient {
         self.inner
             .put(&url)
             .json(ad)
+            .header("x-jerith-pubkey", &auth.pubkey)
+            .header("x-jerith-stamp", auth.stamp_ms.to_string())
+            .header("x-jerith-sig", &auth.sig)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// §2 contribution quorum: forward a peer's SIGNED measurement block
+    /// with our attestation. The subject's figures travel under THE SUBJECT'S
+    /// signature (a biased pinger cannot change them); the reporter's
+    /// attestation binds who corroborated the delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn report_measure(
+        &self,
+        obs: &crate::bootstrap_server::MeasureObservation,
+        reporter_identity: &crate::signing::SigningIdentity,
+    ) -> anyhow::Result<()> {
+        let stamp = now_ms();
+        let payload = crate::signing::measure_attest_payload(
+            &obs.reporter,
+            &obs.subject,
+            obs.block_stamp_ms,
+            obs.window_secs,
+            obs.tokens_served,
+            obs.tokens_consumed,
+            obs.declared_percent,
+            obs.measured_percent,
+            stamp,
+        );
+        let auth = crate::signing::WireAuth::with_stamp(reporter_identity, stamp, payload.as_bytes());
+        let url = format!("{}/v1/report-measure", self.base_url.trim_end_matches('/'));
+        self.inner
+            .post(&url)
+            .json(obs)
             .header("x-jerith-pubkey", &auth.pubkey)
             .header("x-jerith-stamp", auth.stamp_ms.to_string())
             .header("x-jerith-sig", &auth.sig)

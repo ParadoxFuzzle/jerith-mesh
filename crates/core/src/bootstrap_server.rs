@@ -69,6 +69,10 @@ struct Registry {
     /// Maximum live node identities retained (NEW ads beyond this are
     /// refused with 503; refreshes always succeed).
     max_entries: usize,
+    /// §2 contribution quorum: contributors' forward-verified measurement
+    /// blocks, tallied per subject (see `MeasureTally`). Bounded per the
+    /// same registry cap discipline as `entries`.
+    measures: RwLock<MeasureTally>,
 }
 
 impl Default for Registry {
@@ -76,8 +80,141 @@ impl Default for Registry {
         Self {
             entries: RwLock::new(HashMap::new()),
             max_entries: MAX_REGISTRY_ENTRIES,
+            measures: RwLock::new(MeasureTally::default()),
         }
     }
+}
+
+/// ONE forwarded measurement block: the subject-signed figures plus who
+/// attested delivering them. Reports dedupe on (reporter, block_stamp).
+#[derive(Debug, Clone)]
+struct MeasureRecord {
+    reporter: String,
+    block_stamp_ms: u64,
+    window_secs: u64,
+    measured_percent: u64,
+}
+
+/// §2 quorum constants. The subject's OWN signature anchors the figures;
+/// what quorum adds is CORROBORATION — how many distinct peers observed
+/// and forwarded the same self-signed numbers. Statistics, not verdicts:
+/// a single report is "unquorumed", never a suspicion.
+const MEASURE_TALLY_RING_PER_SUBJECT: usize = 32;
+/// Measured-share spread (percentage points) across distinct reporters'
+/// most-recent blocks above which the subject is flagged INCONSISTENT
+/// (each asker received different self-signed numbers).
+const MEASURE_CONSISTENCY_SLACK_PERCENT: u64 = 10;
+/// Distinct reporters required before the aggregate says anything at all.
+const MEASURE_QUORUM_MIN_REPORTERS: usize = 2;
+
+/// The per-subject tally ring + aggregate view. Bounded: a ring of
+/// `MEASURE_TALLY_RING_PER_SUBJECT` per subject, subjects bounded by the
+/// live registry (sweep drops subjects no longer advertised).
+#[derive(Debug, Default)]
+struct MeasureTally {
+    subjects: HashMap<String, Vec<MeasureRecord>>,
+    uploads_accepted: u64,
+    uploads_duped: u64,
+}
+
+impl MeasureTally {
+    /// Record one (verified, deduped) observation. Returns the ring depth
+    /// after the insert so the handler can report it.
+    fn record(&mut self, subject: &str, rec: MeasureRecord) -> (usize, bool) {
+        let ring = self.subjects.entry(subject.to_string()).or_default();
+        if ring
+            .iter()
+            .any(|r| r.reporter == rec.reporter && r.block_stamp_ms == rec.block_stamp_ms)
+        {
+            self.uploads_duped += 1;
+            return (ring.len(), false);
+        }
+        ring.push(rec);
+        // Bounded ring: drop the OLDEST half when full (a full flush each
+        // time keeps the newest window intact for downstream aggregation).
+        while ring.len() >= MEASURE_TALLY_RING_PER_SUBJECT {
+            ring.remove(0);
+        }
+        self.uploads_accepted += 1;
+        (ring.len(), true)
+    }
+
+    /// The aggregate for one subject over its RING-recency horizon
+    /// (`3 × window_secs` of the newest block): distinct reporters,
+    /// measured spread, and — past the quorum floor — the consistency
+    /// verdict (`None` = unquorumed: one reporter is never a suspicion).
+    fn quorum_view(&self, subject: &str) -> Option<QuorumViewShared> {
+        let ring = self.subjects.get(subject)?;
+        let newest = ring.iter().map(|r| r.block_stamp_ms).max()?;
+        let window = ring
+            .iter()
+            .filter(|r| r.block_stamp_ms == newest)
+            .min_by_key(|r| r.window_secs)
+            .map(|r| r.window_secs)
+            .unwrap_or(60)
+            .max(1);
+        let horizon_ms = window.saturating_mul(3_000);
+        let recent: Vec<&MeasureRecord> = ring
+            .iter()
+            .filter(|r| r.block_stamp_ms.saturating_add(horizon_ms) >= newest)
+            .collect();
+        let mut reporters: Vec<&str> = recent.iter().map(|r| r.reporter.as_str()).collect();
+        reporters.sort_unstable();
+        reporters.dedup();
+        let measureds: Vec<u64> = recent.iter().map(|r| r.measured_percent).collect();
+        let spread = measureds.iter().max().copied().unwrap_or(0)
+            - measureds.iter().min().copied().unwrap_or(0);
+        Some(QuorumViewShared {
+            reports: recent.len(),
+            distinct_reporters: reporters.len(),
+            measured_median: median(measureds),
+            spread_percent: spread,
+            consistent: if reporters.len() < MEASURE_QUORUM_MIN_REPORTERS {
+                None
+            } else {
+                Some(spread <= MEASURE_CONSISTENCY_SLACK_PERCENT)
+            },
+        })
+    }
+
+    /// The serialized form for `/v1/peers`: one entry per subject with a
+    /// quorum view (subjects with no recent records stay absent).
+    fn shared_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        for subject in self.subjects.keys() {
+            if let Some(v) = self.quorum_view(subject) {
+                out.insert(
+                    subject.clone(),
+                    serde_json::json!({
+                        "reports": v.reports,
+                        "distinct_reporters": v.distinct_reporters,
+                        "measured_median": v.measured_median,
+                        "spread_percent": v.spread_percent,
+                        "consistent": v.consistent,
+                    }),
+                );
+            }
+        }
+        out
+    }
+}
+
+fn median(mut v: Vec<u64>) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+/// The aggregate view (server-side shape before serializing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuorumViewShared {
+    reports: usize,
+    distinct_reporters: usize,
+    measured_median: u64,
+    spread_percent: u64,
+    consistent: Option<bool>,
 }
 
 /// Field-length sanity on an incoming advertisement. Length-only checks —
@@ -286,6 +423,7 @@ fn router_with_limiters(
         .route("/v1/advertise", put(advertise))
         .route("/v1/report-dead", post(report_dead))
         .route("/v1/report-fraud", post(report_fraud))
+        .route("/v1/report-measure", post(report_measure))
         .route("/v1/leave", post(leave))
         .route("/v1/models/counts", get(model_counts))
         .with_state((state, ttl_ms))
@@ -374,7 +512,11 @@ async fn peers(
         .filter(|e| score_of(e) > HALT_SCORE_THRESHOLD)
         .map(|e| e.ad)
         .collect();
-    (StatusCode::OK, Json(PeerListResponse { peers })).into_response()
+    // §2 contribution quorum (additive wire field): the aggregate per peer
+    // (distinct corroborating reporters / spread / consistency) — statistics
+    // for operators and bots, never a verdict.
+    let measurements = registry.measures.read().await.shared_json();
+    (StatusCode::OK, Json(PeerListResponse { peers, measurements })).into_response()
 }
 
 async fn advertise(
@@ -585,6 +727,117 @@ pub struct FraudReport {
     pub reporter: String,
     /// Observed failure kind.
     pub kind: FraudKind,
+}
+
+/// §2 contribution quorum: a pinger forwards a peer's SIGNED measurement
+/// block, attesting to the exact figures it verified. The subject's own
+/// signature anchors the numbers (a biased pinger cannot change them); the
+/// reporter's attestation binds WHO corroborated the block. Accept requires
+/// BOTH signatures to hold server-side. Statistics, not verdicts: the tally
+/// is corroborated evidence for the reputation/stake layers, never an
+/// auto-slash (no-statistics-slash boundary kept).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeasureObservation {
+    pub reporter: String,
+    pub subject: String,
+    /// The subject's wire pubkey — its fingerprint must equal `subject`
+    /// and it must verify the block's own signature.
+    pub subject_pubkey: String,
+    /// The subject's own signature over its measurement block (travels in
+    /// the body: the REPORTER authenticates via headers, the subject via
+    /// this field).
+    pub subject_sig: String,
+    pub block_stamp_ms: u64,
+    pub window_secs: u64,
+    pub tokens_served: u64,
+    pub tokens_consumed: u64,
+    pub declared_percent: u64,
+    pub measured_percent: u64,
+}
+
+/// Forwarded blocks may lag their health reply by a ping cycle or two.
+const MEASURE_BLOCK_MAX_AGE_MS: u64 = 300_000;
+
+async fn report_measure(
+    State((registry, _ttl_ms)): State<Shared>,
+    headers: axum::http::HeaderMap,
+    Json(obs): Json<MeasureObservation>,
+) -> Response {
+    // Sanity caps (registry discipline): identities well-formed, figures
+    // impossible to fake into overflow/div-zero paths downstream.
+    if obs.subject.is_empty()
+        || obs.reporter.is_empty()
+        || obs.subject == obs.reporter
+        || obs.subject_pubkey.len() != 64
+        || obs.subject_pubkey[..16] != obs.subject
+        || obs.subject_sig.is_empty()
+        || obs.block_stamp_ms == 0
+        || obs.window_secs == 0
+        || obs.window_secs > 3_600
+        || obs.tokens_served > 10_000_000_000_000
+        || obs.tokens_consumed > 10_000_000_000_000
+        || obs.declared_percent > 1_000
+        || obs.measured_percent > 1_000
+        || now_ms().saturating_sub(obs.block_stamp_ms) > MEASURE_BLOCK_MAX_AGE_MS
+    {
+        crate::metrics::bump(&crate::metrics::OVERSIZE_BOOTSTRAP_REJECTS);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "malformed measurement observation"})),
+        )
+            .into_response();
+    }
+    // Subject's own signature anchors the figures (fingerprint already
+    // bound above; stamp freshness checked by the cap above).
+    let subject_payload = crate::signing::measurement_payload(
+        &obs.subject,
+        obs.block_stamp_ms,
+        obs.window_secs,
+        obs.tokens_served,
+        obs.tokens_consumed,
+        obs.declared_percent,
+        obs.measured_percent,
+    );
+    if !crate::signing::verify(&obs.subject_pubkey, subject_payload.as_bytes(), &obs.subject_sig) {
+        tracing::warn!(subject = %obs.subject, "tampered/forged subject block refused");
+        return unauthorized("subject block signature invalid");
+    }
+    // Reporter attestation over the EXACT block it claims to have seen.
+    let reporter_stamp = match headers
+        .get("x-jerith-stamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(s) => s,
+        None => return unauthorized("missing or malformed stamp"),
+    };
+    let reporter_payload = crate::signing::measure_attest_payload(
+        &obs.reporter,
+        &obs.subject,
+        obs.block_stamp_ms,
+        obs.window_secs,
+        obs.tokens_served,
+        obs.tokens_consumed,
+        obs.declared_percent,
+        obs.measured_percent,
+        reporter_stamp,
+    );
+    if let Err(resp) = verify_report_auth(&headers, &obs.reporter, &reporter_payload) {
+        return *resp;
+    }
+    let (depth, fresh) = {
+        let mut tally = registry.measures.write().await;
+        tally.record(
+            &obs.subject,
+            MeasureRecord {
+                reporter: obs.reporter.clone(),
+                block_stamp_ms: obs.block_stamp_ms,
+                window_secs: obs.window_secs,
+                measured_percent: obs.measured_percent,
+            },
+        )
+    };
+    (StatusCode::OK, Json(serde_json::json!({"tallied": fresh, "ring": depth}))).into_response()
 }
 
 /// Graceful self-retraction (§2 model-switch machinery): a node leaves
@@ -1224,6 +1477,204 @@ mod tests {
         assert_eq!(registry.entries.read().await.len(), 1, "victim survives");
     }
 
+    /// §2 contribution quorum — the tally accepts a double-signed block
+    /// (subject's own sig anchors the figures, reporter attests delivery),
+    /// dedupes per (reporter, block), aggregates distinct-reporter
+    /// consistency into /v1/peers, and refuses tampered/forged
+    /// observations. Statistics, not verdicts: one report stays unquorumed.
+    #[tokio::test]
+    async fn measure_quorum_tallies_aggregates_and_refuses() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::http::mesh_http();
+        let url = format!("http://{addr}/v1/report-measure");
+        let peers_url = format!("http://{addr}/v1/peers");
+
+        let subject = crate::signing::SigningIdentity::generate();
+        let reporter = crate::signing::SigningIdentity::generate();
+        let (obs1, headers1) = make_observation(&subject, &reporter, 60, 400, 100, 25, 80);
+        let r = client
+            .post(&url)
+            .headers(headers1)
+            .json(&obs1)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "double-signed observation accepted");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["tallied"], serde_json::json!(true));
+
+        // One report alone is UNQUORUMED — statistics, not a verdict.
+        let body: serde_json::Value = client.get(&peers_url).send().await.unwrap().json().await.unwrap();
+        let q = body["measurements"][&obs1.subject].as_object().expect("aggregate present");
+        assert_eq!(q["distinct_reporters"], serde_json::json!(1));
+        assert_eq!(q["consistent"], serde_json::Value::Null);
+
+        // A SECOND reporter forwarding its own verified copy of the same
+        // self-signed block: quorum reached, consistent.
+        let reporter2 = crate::signing::SigningIdentity::generate();
+        let (obs2, headers2) = make_observation(&subject, &reporter2, 60, 400, 100, 25, 80);
+        // Each helper call is a fresh block (new stamp) — the quorum view
+        // groups by RECENCY HORIZON (3× window), not identical stamps, so
+        // two ping cycles' blocks still corroborate the same subject.
+        let r = client
+            .post(&url)
+            .headers(headers2)
+            .json(&obs2)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let body: serde_json::Value = client.get(&peers_url).send().await.unwrap().json().await.unwrap();
+        let q = body["measurements"][&obs1.subject].as_object().expect("aggregate present");
+        assert_eq!(q["distinct_reporters"], serde_json::json!(2));
+        assert_eq!(q["consistent"], serde_json::json!(true));
+
+        // Dedupe: the SAME reporter forwarding the SAME (reporter,
+        // block_stamp) pair is tallied:false, ring unchanged. Frozen-stamp: the
+        // attestation embeds the SAME clock read the header carries.
+        let stamp = now_ms();
+        let attest = crate::signing::measure_attest_payload(
+            &obs1.reporter,
+            &obs1.subject,
+            obs1.block_stamp_ms,
+            obs1.window_secs,
+            obs1.tokens_served,
+            obs1.tokens_consumed,
+            obs1.declared_percent,
+            obs1.measured_percent,
+            stamp,
+        );
+        let auth = crate::signing::WireAuth::with_stamp(&reporter, stamp, attest.as_bytes());
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
+        h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+        h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+        let r = client
+            .post(&url)
+            .headers(h)
+            .json(&obs1)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let body: serde_json::Value = client.get(&peers_url).send().await.unwrap().json().await.unwrap();
+        let q = body["measurements"][&obs1.subject].as_object().expect("aggregate present");
+        assert_eq!(q["distinct_reporters"], serde_json::json!(2), "deduped reporter");
+
+        // TAMPERED figures: flip the measured share without re-signing the
+        // subject block → 401, subject's signature catches it.
+        let (mut obs_t, headers_dup) = make_observation(&subject, &reporter, 60, 400, 100, 25, 55);
+        obs_t.declared_percent = 25;
+        obs_t.measured_percent = 99; // NOT what the subject signed
+        let _ = headers_dup;
+        // Sign the attestation over the FALSIFIED set (a lying collab) —
+        // the subject's own sig must still refuse it.
+        let stamp = now_ms();
+        let falsified_attest = crate::signing::measure_attest_payload(
+            &obs_t.reporter,
+            &obs_t.subject,
+            obs_t.block_stamp_ms,
+            obs_t.window_secs,
+            obs_t.tokens_served,
+            obs_t.tokens_consumed,
+            obs_t.declared_percent,
+            obs_t.measured_percent,
+            stamp,
+        );
+        let auth = crate::signing::WireAuth::with_stamp(&reporter, stamp, falsified_attest.as_bytes());
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
+        h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+        h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+        let r = client.post(&url).headers(h).json(&obs_t).send().await.unwrap();
+        assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "tampered figures refused");
+
+        // FORGED reporter: headers signed by a DIFFERENT key than the
+        // claimed reporter → identity binding refuses.
+        let attacker = crate::signing::SigningIdentity::generate();
+        let stamp = now_ms();
+        let attest = crate::signing::measure_attest_payload(
+            &obs2.reporter,
+            &obs2.subject,
+            obs2.block_stamp_ms,
+            obs2.window_secs,
+            obs2.tokens_served,
+            obs2.tokens_consumed,
+            obs2.declared_percent,
+            obs2.measured_percent,
+            stamp,
+        );
+        let auth = crate::signing::WireAuth::with_stamp(&attacker, stamp, attest.as_bytes());
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
+        h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+        h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+        let r = client.post(&url).headers(h).json(&obs2).send().await.unwrap();
+        assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "forged reporter refused");
+    }
+
+    /// Builds a well-formed observation: the SUBJECT signs its own
+    /// measurement block (the figures' anchor), the REPORTER signs the
+    /// attestation headers (delivery corroboration).
+    fn make_observation(
+        subject: &crate::signing::SigningIdentity,
+        reporter: &crate::signing::SigningIdentity,
+        window_secs: u64,
+        served: u64,
+        consumed: u64,
+        declared: u64,
+        measured: u64,
+    ) -> (MeasureObservation, axum::http::HeaderMap) {
+        let block_stamp = now_ms();
+        let subject_payload = crate::signing::measurement_payload(
+            &subject.node_id(),
+            block_stamp,
+            window_secs,
+            served,
+            consumed,
+            declared,
+            measured,
+        );
+        let obs = MeasureObservation {
+            reporter: reporter.node_id(),
+            subject: subject.node_id(),
+            subject_pubkey: subject.pubkey_hex(),
+            subject_sig: subject.sign(subject_payload.as_bytes()),
+            block_stamp_ms: block_stamp,
+            window_secs,
+            tokens_served: served,
+            tokens_consumed: consumed,
+            declared_percent: declared,
+            measured_percent: measured,
+        };
+        let stamp = now_ms();
+        let attest = crate::signing::measure_attest_payload(
+            &obs.reporter,
+            &obs.subject,
+            obs.block_stamp_ms,
+            window_secs,
+            served,
+            consumed,
+            declared,
+            measured,
+            stamp,
+        );
+        let headers = {
+            let auth =
+                crate::signing::WireAuth::with_stamp(reporter, stamp, attest.as_bytes());
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
+            h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
+            h.insert("x-jerith-sig", auth.sig.parse().unwrap());
+            h
+        };
+        (obs, headers)
+    }
+
     fn signed_headers(id: &crate::signing::SigningIdentity, a: &PeerAd) -> axum::http::HeaderMap {
         let stamp = crate::bootstrap::now_ms();
         let payload = crate::signing::advertise_payload(a, stamp);
@@ -1458,6 +1909,7 @@ mod tests {
     async fn advertise_caps_new_entries_but_allows_refresh() {
         // Capacity-bound registry of ONE entry for a test-scale probe.
         let registry = Arc::new(Registry {
+            measures: Default::default(),
             entries: RwLock::new(HashMap::new()),
             max_entries: 1,
         });

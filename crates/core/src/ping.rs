@@ -1620,23 +1620,69 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
                     // evidence through the same flush cadence as every
                     // other fraud layer (verified here locally, signed by
                     // the peer's own key, so the bootstrap can weigh it).
-                    let targets = match meas {
-                        Some(Ok((declared, measured))) => state
-                            .contrib_ledger
-                            .lock()
-                            .await
-                            .record_verified(&node_id, declared, measured),
-                        Some(Err(())) => {
-                            state.contrib_ledger.lock().await.record_tampered(&node_id)
+                    let (verified, targets): (Option<VerifiedMeasurement>, Vec<String>) = match meas
+                    {
+                        Some(Ok(block)) => {
+                            let flagged = state
+                                .contrib_ledger
+                                .lock()
+                                .await
+                                .record_verified(
+                                    &node_id,
+                                    block.declared_percent,
+                                    block.measured_percent,
+                                );
+                            (Some(block), flagged)
                         }
-                        None => Vec::new(),
+                        Some(Err(())) => {
+                            let flagged = state
+                                .contrib_ledger
+                                .lock()
+                                .await
+                                .record_tampered(&node_id);
+                            (None, flagged)
+                        }
+                        None => (None, Vec::new()),
                     };
                     if !targets.is_empty() {
-                        let refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
+                        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
                         state
                             .verify
                             .flag_fraud(crate::bootstrap_server::FraudKind::Leeching, &refs)
                             .await;
+                    }
+                    // §2 QUORUM: the verified block itself is FORWARDED to
+                    // the bootstrap under both signatures — the subject's
+                    // own signature anchors the figures (a biased pinger
+                    // cannot change them), ours attests it verified exactly
+                    // this block. Off the inference hot path (one POST per
+                    // verified ping); failures log at debug and count for
+                    // nothing else.
+                    if let Some(block) = &verified {
+                        let obs = crate::bootstrap_server::MeasureObservation {
+                            reporter: my_id.clone(),
+                            subject: block.subject.clone(),
+                            subject_pubkey: block.subject_pubkey.clone(),
+                            subject_sig: block.subject_sig.clone(),
+                            block_stamp_ms: block.block_stamp_ms,
+                            window_secs: block.window_secs,
+                            tokens_served: block.tokens_served,
+                            tokens_consumed: block.tokens_consumed,
+                            declared_percent: block.declared_percent,
+                            measured_percent: block.measured_percent,
+                        };
+                        match bootstrap.report_measure(&obs, &state.identity).await {
+                            Ok(()) => tracing::debug!(
+                                target: "mesh",
+                                subject = %obs.subject,
+                                "measurement block forwarded for the quorum tally"
+                            ),
+                            Err(e) => tracing::debug!(
+                                target: "mesh",
+                                error = %e,
+                                "measurement quorum upload skipped (bootstrap unavailable?)"
+                            ),
+                        }
                     }
                 } else {
                     tracing::warn!(peer = %node_id, "health reply signature invalid — not counted alive");
@@ -1841,11 +1887,28 @@ async fn maybe_spot_check_ringer(state: &Arc<MeshState>) {
 /// as alive, plus the verified (declared, measured) sample or a tamper
 /// marker. The verification-phase check of the payload signature uses the
 /// very identity whose key signed the whole reply.
+/// A verified measurement block, field-for-field: everything the §2
+/// quorum uploader forwards (the subject's own signature anchors it).
+#[derive(Debug, Clone)]
+pub struct VerifiedMeasurement {
+    pub block_stamp_ms: u64,
+    pub window_secs: u64,
+    pub tokens_served: u64,
+    pub tokens_consumed: u64,
+    pub declared_percent: u64,
+    pub measured_percent: u64,
+    /// The subject's wire pubkey + the block signature, carried so the
+    /// bootstrap can re-verify both signatures at tally time.
+    pub subject: String,
+    pub subject_pubkey: String,
+    pub subject_sig: String,
+}
+
 async fn verify_health_reply(
     _state: &Arc<MeshState>,
     expected_node_id: &str,
     resp: reqwest::Response,
-) -> (bool, Option<Result<(u64, u64), ()>>) {
+) -> (bool, Option<Result<VerifiedMeasurement, ()>>) {
     #[derive(serde::Deserialize)]
     struct MeasurementBlock {
         window_secs: u64,
@@ -1900,8 +1963,17 @@ async fn verify_health_reply(
             m.measured_percent,
         );
         if crate::signing::verify(&reply.pubkey, payload.as_bytes(), &m.sig) {
-            let _ = m.window_secs;
-            Ok((m.declared_percent, m.measured_percent))
+            Ok(VerifiedMeasurement {
+                block_stamp_ms: reply.stamp_ms,
+                window_secs: m.window_secs,
+                tokens_served: m.tokens_served,
+                tokens_consumed: m.tokens_consumed,
+                declared_percent: m.declared_percent,
+                measured_percent: m.measured_percent,
+                subject: reply.node_id.clone(),
+                subject_pubkey: reply.pubkey.clone(),
+                subject_sig: m.sig,
+            })
         } else {
             Err(())
         }

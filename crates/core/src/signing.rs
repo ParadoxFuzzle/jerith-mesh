@@ -25,6 +25,13 @@ pub const HEALTH_PREFIX: &str = "jerith-health1";
 pub const DEAD_PREFIX: &str = "jerith-dead1";
 pub const LEAVE_PREFIX: &str = "jerith-leave1";
 
+/// Canonical measure-report payload (§2 contribution quorum): a pinger
+/// forwarding a peer's SIGNED measurement block to the bootstrap attests
+/// to the exact block it saw. The figures ride the subject's own
+/// signature, so a biased or lying pinger can only attest delivery —
+/// it can never alter the numbers it reports.
+pub const MEASURE_ATTEST_PREFIX: &str = "measure-rept1";
+
 /// Max acceptable age for a stamp (advertisement TTL is 90 s; the stamp
 /// window is tighter to block replays).
 pub const STAMP_MAX_AGE_MS: u64 = 120_000;
@@ -153,6 +160,36 @@ pub fn dead_payload(reporter_node_id: &str, target_node_id: &str, stamp_ms: u64)
 /// so a graceful model-switch exit cannot be forged onto somebody else.
 pub fn leave_payload(node_id: &str, stamp_ms: u64) -> String {
     format!("{LEAVE_PREFIX}|{stamp_ms}|{node_id}")
+}
+
+/// Attestation over one forwarded measurement block: the reporter signs
+/// the subject's complete field set (`prefix|stamp|reporter|subject|block_
+/// stamp|window|served|consumed|declared|measured`), so the bootstrap can
+/// bind reporter → the exact signed block it claims to have verified. The
+/// stamp is the caller's (frozen into both signature and wire headers).
+#[allow(clippy::too_many_arguments)]
+pub fn measure_attest_payload(
+    reporter_node_id: &str,
+    subject_node_id: &str,
+    block_stamp_ms: u64,
+    window_secs: u64,
+    tokens_served: u64,
+    tokens_consumed: u64,
+    declared_percent: u64,
+    measured_percent: u64,
+    stamp_ms: u64,
+) -> String {
+    format!(
+        "{MEASURE_ATTEST_PREFIX}|{stamp_ms}|{reporter}|{subject}|{block_stamp}|{window}|{served}|{consumed}|{declared}|{measured}",
+        reporter = reporter_node_id,
+        subject = subject_node_id,
+        block_stamp = block_stamp_ms,
+        window = window_secs,
+        served = tokens_served,
+        consumed = tokens_consumed,
+        declared = declared_percent,
+        measured = measured_percent,
+    )
 }
 
 fn role_str(role: crate::config::NodeRole) -> &'static str {
@@ -300,6 +337,35 @@ mod tests {
         let other = SigningIdentity::generate();
         assert!(WireAuth::with_stamp(&other, stamp, payload.as_bytes())
             .validate(payload.as_bytes(), &id.node_id())
+            .is_err());
+    }
+
+    #[test]
+    fn measure_attest_payload_binds_reporter_to_the_exact_block() {
+        let reporter = SigningIdentity::generate();
+        let claimed_reporter = reporter.node_id();
+        let stamp = now_ms();
+        let payload = measure_attest_payload(
+            &claimed_reporter,
+            "ee55ff66aa77bb88",
+            1_720_000_000_000,
+            60,
+            400,
+            100,
+            25,
+            80,
+            stamp,
+        );
+        assert!(payload.starts_with("measure-rept1|"), "{payload}");
+        assert!(payload.contains("|25|80"), "declared and measured in the payload");
+        assert!(WireAuth::with_stamp(&reporter, stamp, payload.as_bytes())
+            .validate(payload.as_bytes(), &claimed_reporter)
+            .is_ok());
+        // Any other identity cannot attest AS the claimed reporter (the
+        // pubkey fingerprint binding catches it).
+        let other = SigningIdentity::generate();
+        assert!(WireAuth::with_stamp(&other, stamp, payload.as_bytes())
+            .validate(payload.as_bytes(), &claimed_reporter)
             .is_err());
     }
 
