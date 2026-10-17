@@ -112,6 +112,71 @@ pub struct BotConfig {
     /// gather. `[chat] max_tool_rounds = 3` restores the old local-
     /// sized budget (clamped 0–6).
     pub chat_max_tool_rounds: usize,
+    /// Docker-sandboxed attachment reading (`[sandbox]` in bot.toml, see
+    /// sandbox.rs): non-image files are read inside a disposable no-
+    /// network, caps-dropped, read-only container. Default on with the
+    /// repo-built `jerith-sandbox` image; missing docker degrades to
+    /// honest per-file failure lines, never a silent drop.
+    pub sandbox: SandboxConfig,
+}
+
+/// Docker-sandboxed attachment reading (`[sandbox]` in bot.toml).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SandboxConfig {
+    /// Read non-image attachments in the sandbox at all.
+    #[serde(default = "default_sandbox_on")]
+    pub enabled: bool,
+    /// Container image the extractor runs in (repo-baked by
+    /// `deploy/docker/sandbox.Dockerfile`).
+    #[serde(default = "default_sandbox_image")]
+    pub image: String,
+    /// Wall-clock cap for one extraction batch (the container is killed
+    /// on timeout; per-file honest failure lines).
+    #[serde(default = "default_sandbox_timeout")]
+    pub timeout_secs: u64,
+    /// Per-file download cap in MiB (Discord attachments are 25 MiB at
+    /// most on most guilds; the reader stops well below the noisy end).
+    #[serde(default = "default_sandbox_max_file_mb")]
+    pub max_file_mb: usize,
+    /// Files processed per message (each rides the same container).
+    #[serde(default = "default_sandbox_max_files")]
+    pub max_files: usize,
+    /// Extracted-text budget per file in KiB (the extractor caps too;
+    /// twice-bounded on purpose).
+    #[serde(default = "default_sandbox_max_output_kb")]
+    pub max_output_kb: usize,
+}
+
+fn default_sandbox_on() -> bool {
+    true
+}
+fn default_sandbox_image() -> String {
+    "jerith-sandbox:latest".to_string()
+}
+fn default_sandbox_timeout() -> u64 {
+    90
+}
+fn default_sandbox_max_file_mb() -> usize {
+    12
+}
+fn default_sandbox_max_files() -> usize {
+    3
+}
+fn default_sandbox_max_output_kb() -> usize {
+    24
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_sandbox_on(),
+            image: default_sandbox_image(),
+            timeout_secs: default_sandbox_timeout(),
+            max_file_mb: default_sandbox_max_file_mb(),
+            max_files: default_sandbox_max_files(),
+            max_output_kb: default_sandbox_max_output_kb(),
+        }
+    }
 }
 
 /// Chat timeout default (`[chat] timeout_secs`), years after the 90 s
@@ -216,6 +281,14 @@ impl BotConfig {
                 .and_then(|c| c.max_tool_rounds)
                 .unwrap_or(DEFAULT_CHAT_MAX_TOOL_ROUNDS)
                 .clamp(0, 6) as usize,
+            sandbox: {
+                let mut s = file.sandbox.clone().unwrap_or_default();
+                s.timeout_secs = s.timeout_secs.clamp(10, 300);
+                s.max_file_mb = s.max_file_mb.clamp(1, 25);
+                s.max_files = s.max_files.clamp(1, 10);
+                s.max_output_kb = s.max_output_kb.clamp(4, 64);
+                s
+            },
             external_plugins,
         })
     }
@@ -275,6 +348,7 @@ impl BotConfig {
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
             chat_stream: true,
             chat_max_tool_rounds: DEFAULT_CHAT_MAX_TOOL_ROUNDS as usize,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -544,6 +618,9 @@ struct FileConfig {
     chat: Option<ChatTable>,
     /// Optional `[plugins]` table — plugin/skill gating (see plugins.rs).
     plugins: Option<PluginsConfig>,
+    /// Optional `[sandbox]` table — Docker-sandboxed attachment reading
+    /// (see sandbox.rs; on by default with the repo-built image).
+    sandbox: Option<SandboxConfig>,
 }
 
 /// `[plugins] enabled = [...]` — names the pre-packaged plugins that

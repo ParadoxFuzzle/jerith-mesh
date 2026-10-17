@@ -76,46 +76,65 @@ pub fn buffered_delivery_needed(had_live_sink: bool) -> bool {
     !had_live_sink
 }
 
-/// Default question used when a message carries images but no usable
+/// Default question used when a message carries attachments but no usable
 /// text (image-only mentions and DMs): the vision tier describes, the
 /// chat model narrates.
 pub const IMAGE_ONLY_PROMPT: &str = "What's in this image? Describe it";
 
 /// Cap on image attachments processed per message: each walk costs one
 /// download + one vision-tier round-trip; beyond a few, the answer gets
-/// unreadable anyway.
+/// unreadable anyway. Files ride the sandbox's own `[sandbox]` caps.
 pub const MAX_IMAGES_PER_MESSAGE: usize = 3;
 
-/// Pure assembly behind the transports' image context: render one
-/// bracketed line per image — description or honest failure (never a
-/// silent drop) — into one block the chat model reads ahead of the
-/// prompt.
-fn assemble_image_context(lines: &[(String, Result<String, String>)]) -> Option<String> {
+/// What a transport hands over per attachment: the CDN url, display
+/// label (the filename) and the kind that routes it — images through
+/// the gateway's vision skill, everything else through the Docker
+/// sandbox ([sandbox] config, see sandbox.rs).
+#[derive(Debug, Clone)]
+pub struct AttSpec {
+    pub url: String,
+    pub label: String,
+    pub kind: AttKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttKind {
+    Image,
+    Other,
+}
+
+/// Pure assembly behind the transports' attachment context: render one
+/// bracketed line per attachment — description/extracted text or an
+/// honest failure (never a silent drop) — into one block the chat
+/// model reads ahead of the prompt.
+fn assemble_attachment_context(lines: &[(String, Result<String, String>)]) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    let mut out = String::from("[image context follows]\n");
+    let mut out = String::from("[attachment context follows]\n");
     for (label, result) in lines {
         match result {
             Ok(desc) if !desc.trim().is_empty() => {
                 out.push_str(&format!("- [{label}] {}\n", desc.trim()));
             }
-            Ok(_) => out.push_str(&format!("- [{label}] (vision returned nothing)\n")),
-            Err(e) => out.push_str(&format!("- [{label}] (vision unavailable: {e})\n")),
+            Ok(_) => out.push_str(&format!("- [{label}] (no readable content)\n")),
+            Err(e) => {
+                out.push_str(&format!("- [{label}] (could not read: {e})\n"));
+            }
         }
     }
     out.truncate(out.trim_end().len());
     Some(out)
 }
 
-/// Transport-side image handling: download each attached image, describe
-/// it through the gateway's vision skill, and assemble the bracketed
-/// context block for the prompt. The caller passes `(url, label)` pairs
-/// — Discord and any future transport already own their attachment
-/// representations. `None` = no images, no block.
-pub async fn image_context(
+/// Transport-side attachment handling: images get described through the
+/// gateway's vision skill, files get read inside the disposable sandbox
+/// container, and the whole story assembles into the bracketed context
+/// block the chat model reads ahead of the prompt. `None` = nothing to
+/// say, no block.
+pub async fn attachments_context(
     cfg: &crate::config::BotConfig,
-    attachments: &[(&str, &str)],
+    attachments: &[AttSpec],
     question: Option<&str>,
 ) -> Option<String> {
     if attachments.is_empty() {
@@ -128,22 +147,42 @@ pub async fn image_context(
         .filter(|q| !q.is_empty())
         .unwrap_or(IMAGE_ONLY_PROMPT);
     let mut lines = Vec::with_capacity(attachments.len());
-    for (url, fallback_label) in attachments {
-        let entry = match api::fetch_vision_image(url, fallback_label).await {
-            Ok(api::VisionImage { label, data_url }) => {
-                match api::vision_describe_skill(cfg, describe_prompt, &data_url).await {
-                    Ok(desc) => (label, Ok(desc)),
-                    Err(e) => (label, Err(format!("{e:#}"))),
+    let mut file_batch = Vec::new();
+    let mut images_used = 0usize;
+    for att in attachments {
+        match att.kind {
+            AttKind::Image => {
+                images_used += 1;
+                if images_used > MAX_IMAGES_PER_MESSAGE {
+                    continue; // the walk budget ends at the cap
                 }
+                let entry = match api::fetch_vision_image(&att.url, &att.label).await {
+                    Ok(api::VisionImage { label, data_url }) => {
+                        match api::vision_describe_skill(cfg, describe_prompt, &data_url).await {
+                            Ok(desc) => (label, Ok(desc)),
+                            Err(e) => (label, Err(format!("{e:#}"))),
+                        }
+                    }
+                    Err(e) => (att.label.clone(), Err(format!("{e:#}"))),
+                };
+                lines.push(entry);
             }
-            Err(e) => (
-                (*fallback_label).to_string(),
-                Err(format!("{e:#}")),
-            ),
-        };
-        lines.push(entry);
+            AttKind::Other => {
+                file_batch.push(crate::sandbox::FileAttachment {
+                    url: att.url.clone(),
+                    label: att.label.clone(),
+                });
+            }
+        }
     }
-    assemble_image_context(&lines)
+    // One sandbox container reads every file in the batch — capped by
+    // [sandbox] max_files (message order kept), each outcome an honest
+    // line. Images carry their own MAX cap.
+    file_batch.truncate(cfg.sandbox.max_files);
+    if !file_batch.is_empty() {
+        lines.extend(crate::sandbox::read_attachments(&cfg.sandbox, &file_batch).await);
+    }
+    assemble_attachment_context(&lines)
 }
 
 /// One request → reply conversational pass, defined once (was duplicated
@@ -430,11 +469,12 @@ mod tests {
         assert!(buffered_delivery_needed(false));
     }
 
-    /// Image handling: the vision skill line assembly — descriptions
-    /// (*the user's question rides along as the skill prompt*), honest
-    /// failure lines for broken downloads/replies, and a nothing case.
+    /// Attachment handling: the context line assembly — descriptions
+    /// (*the user's question rides along as the skill prompt*) and
+    /// sandbox text, honest failure lines for broken downloads/replies,
+    /// and a nothing case.
     #[test]
-    fn assemble_image_context_renders_each_line_honestly() {
+    fn assemble_attachment_context_renders_each_line_honestly() {
         let lines = vec![
             (
                 "kiln.png".to_string(),
@@ -445,28 +485,31 @@ mod tests {
                 Err(String::from("vision skill failed: 503")),
             ),
             ("mute.png".to_string(), Ok(String::from(""))),
+            (
+                "notes.txt".to_string(),
+                Ok(String::from("(binary file, 42 bytes — no text extracted)")),
+            ),
         ];
-        let ctx = assemble_image_context(&lines).unwrap();
-        assert!(ctx.starts_with("[image context follows]"), "header: {ctx}");
+        let ctx = assemble_attachment_context(&lines).unwrap();
+        assert!(ctx.starts_with("[attachment context follows]"), "header: {ctx}");
         assert!(ctx.contains("- [kiln.png] a brick kiln, fired"), "{ctx}");
         assert!(
-            ctx.contains("- [ghost.png] (vision unavailable: vision skill failed: 503)"),
+            ctx.contains("- [ghost.png] (could not read: vision skill failed: 503)"),
             "{ctx}"
         );
-        assert!(
-            ctx.contains("- [mute.png] (vision returned nothing)"),
-            "{ctx}"
-        );
-        // No images, no block (and the transports skip the plainly).
-        assert_eq!(assemble_image_context(&[]), None);
+        assert!(ctx.contains("- [mute.png] (no readable content)"), "{ctx}");
+        assert!(ctx.contains("- [notes.txt] (binary file, 42 bytes"), "{ctx}");
+        // No attachments, no block (and the transports skip the plainly).
+        assert_eq!(assemble_attachment_context(&[]), None);
     }
 
-    /// Transport-side image context end-to-end against a stub gateway:
-    /// the attachment URL downloads into a data URL, the user's question
-    /// becomes the skill's prompt, and the broken attachment lands as
-    /// the honest failure line instead of killing the answer.
+    /// Transport-side attachment context end-to-end against a stub
+    /// gateway: the image attachment URL downloads into a data URL, the
+    /// user's question becomes the skill's prompt, and the broken
+    /// attachment lands as the honest failure line instead of killing
+    /// the answer.
     #[tokio::test]
-    async fn image_context_describes_and_reports_failures() {
+    async fn attachments_context_describes_and_reports_failures() {
         let seen = StdArc::new(TMutex::new(Vec::new()));
         let seen_describe = seen.clone();
         let app = axum::Router::new()
@@ -500,11 +543,19 @@ mod tests {
         cfg.gateway_url = format!("http://{addr}");
 
         let url = format!("http://{addr}/img.png");
-        let ctx = image_context(
+        let ctx = attachments_context(
             &cfg,
             &[
-                (url.as_str(), "kiln.png"),
-                ("http://127.0.0.1:1/missing.png", "ghost.png"),
+                AttSpec {
+                    url: url.clone(),
+                    label: "kiln.png".into(),
+                    kind: AttKind::Image,
+                },
+                AttSpec {
+                    url: "http://127.0.0.1:1/missing.png".into(),
+                    label: "ghost.png".into(),
+                    kind: AttKind::Image,
+                },
             ],
             Some("what is it?"),
         )
@@ -513,10 +564,10 @@ mod tests {
 
         let ok_line = "- [kiln.png] a red brick kiln";
         assert!(
-            ctx.contains("[image context follows]") && ctx.contains(ok_line),
+            ctx.contains("[attachment context follows]") && ctx.contains(ok_line),
             "ctx: {ctx}"
         );
-        assert!(ctx.contains("- [ghost.png] (vision unavailable: image download"), "{ctx}");
+        assert!(ctx.contains("- [ghost.png] (could not read: image download"), "{ctx}");
         // The user's question — not the describe default — rode the
         // vision skill's prompt.
         let skill_reqs = seen.lock().await;
@@ -529,5 +580,65 @@ mod tests {
                 .starts_with("data:image/png;base64,"),
             "bytes packed as a data url"
         );
+    }
+
+    /// File attachments ride the sandbox path: a text file and a binary
+    /// blob through one container batch, honest lines both ways (host
+    /// has docker; skips rather than fails where it doesn't).
+    #[tokio::test]
+    async fn attachments_context_reads_files_in_the_sandbox() {
+        let probe = tokio::process::Command::new("docker").arg("info").output().await;
+        if !probe.map(|p| p.status.success()).unwrap_or(false) {
+            eprintln!("docker not available — skipping live sandbox test");
+            return;
+        }
+        // a text attachment and a binary one, served by the stub gateway
+        let app = axum::Router::new()
+            .route(
+                "/note.txt",
+                axum::routing::get(|| async {
+                    (
+                        [("content-type", "text/plain")],
+                        axum::body::Bytes::from_static(b"kiln schedule: fire at 980"),
+                    )
+                }),
+            )
+            .route(
+                "/blob.bin",
+                axum::routing::get(|| async {
+                    (
+                        [("content-type", "application/octet-stream")],
+                        axum::body::Bytes::from(vec![0xFF, 0x00, 0xFE, 0x01]),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = cfg();
+
+        let ctx = attachments_context(
+            &cfg,
+            &[
+                AttSpec {
+                    url: format!("http://{addr}/note.txt"),
+                    label: "note.txt".into(),
+                    kind: AttKind::Other,
+                },
+                AttSpec {
+                    url: format!("http://{addr}/blob.bin"),
+                    label: "blob.bin".into(),
+                    kind: AttKind::Other,
+                },
+            ],
+            Some("summarize what was sent"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            ctx.contains("- [note.txt] kiln schedule: fire at 980"),
+            "sandbox text: {ctx}"
+        );
+        assert!(ctx.contains("- [blob.bin] (binary file"), "{ctx}");
     }
 }

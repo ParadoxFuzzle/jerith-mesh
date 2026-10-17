@@ -604,6 +604,7 @@ mod tests {
             chat_timeout_secs: 240,
             chat_stream: false,
             chat_max_tool_rounds: 2,
+            sandbox: crate::config::SandboxConfig::default(),
         }
     }
 

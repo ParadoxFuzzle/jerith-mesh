@@ -203,6 +203,29 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
 - ✅ Discord bot (`crates/bot`, poise/serenity): `/ask` (mesh-peer fallback included,
   screened outbound by Jerith Guard before the gateway call — optional
   `[guard]` in bot.toml),
+  - ✅ **Attachment reading** (landed 2026-10-17): the @mention/DM fallback
+    turns Discord attachments into one bracketed context block ahead of
+    the prompt — the model-visible text stays a String, no multimodal
+    plumbing in the pipeline. Images ride the gateway's vision skill
+    (data URL → `[image]` description lines; capped 3/message); every
+    OTHER file rides the **Docker sandbox** (`crates/bot/src/sandbox.rs`,
+    `[sandbox]` in bot.toml: enabled/image/timeout_secs/max_file_mb/
+    max_files/max_output_kb — on by default over the repo-baked
+    `jerith-sandbox` image built by `deploy/docker/sandbox.Dockerfile`
+    from the migrated OpenClaw sandbox base + poppler-utils): one
+    disposable container per batch, `--network none`, `--cap-drop ALL`,
+    no-new-privileges, read-only rootfs, 16 MiB noexec tmpfs as the only
+    writable path, uid 65534, memory/pids/cpu caps, fresh staging volume
+    per request, wall-clock kill. The extractor (`sandbox_extract.py`,
+    baked into the bot binary via include_str! — filenames are data,
+    never executed) reads text/code raw (binary-sniffed), .pdf through
+    pdftotext (first 10 pages), the OOXML/ODF family through stdlib
+    zipfile+untagging, and .zip as an entry listing. Every per-file
+    outcome — extracted text, `(binary file, N bytes)`, or the honest
+    `(could not read: …)` line — reaches the prompt; nothing drops
+    silently. Tests cover argv construction/label-injection, output
+    parsing, hostile names, and a LIVE container round-trip over an
+    axum stub (text + binary); verified live with a real whitepaper PDF
   `/reset`, `/remember`, `/recall`, `/status`, `/peers`, `/mine`, `/help`;
   per-user chat history (in-memory, capped) + per-user cooldowns; token via
   `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via

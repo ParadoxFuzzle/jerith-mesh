@@ -24,6 +24,7 @@ mod monitor;
 mod owner;
 mod people;
 mod plugins;
+mod sandbox;
 mod squeeze;
 mod state;
 mod workspace;

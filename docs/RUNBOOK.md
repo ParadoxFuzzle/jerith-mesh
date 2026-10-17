@@ -40,6 +40,16 @@ its auth and introspects it:
   walk its 429s first, so expect ~30–40 s before the local answer lands).
   Config edits need `systemctl --user restart litellm-proxy`; boot takes
   ~45 s before the port opens (model registration).
+- **Bot attachment sandbox**: non-image Discord attachments are read
+  inside a disposable container from `jerith-sandbox:latest` — built by
+  `docker build -f deploy/docker/sandbox.Dockerfile -t jerith-sandbox:latest .`
+  (extends the migrated OpenClaw sandbox base with poppler-utils; rebuild
+  it on the host after a fresh clone or the files line reads
+  "could not read: sandbox …"). Safety contract lives in
+  `crates/bot/src/sandbox.rs` (`--network none`, caps dropped, read-only
+  rootfs, uid 65534, fresh staging dir per message); knobs in bot.toml
+  `[sandbox]`. Missing docker only degrades files to honest
+  "could not read" lines — images (vision tier) are unaffected.
 - **CLI** (read-only):
   ```
   jerith chain status              # height, supply, wallet counts, mining stats
