@@ -316,9 +316,17 @@ impl StakeManager {
             .unwrap_or(0);
         {
             let mut ledger = self.ledger.lock().unwrap();
-            let changed = ledger.staked_uj != staked || ledger.slashed_total_uj != slashed;
+            let changed = ledger.staked_uj != staked
+                || ledger.slashed_total_uj != slashed
+                || ledger.escrowed_uj != staked;
             ledger.staked_uj = staked;
             ledger.slashed_total_uj = slashed;
+            // The idempotency marker follows the live truth: while the
+            // chain is reachable it IS what this node's escrow is, so a
+            // stale (or lost, or too-big) marker is recovered from the
+            // same view — the marker's remaining job is only the
+            // chain-down case.
+            ledger.escrowed_uj = staked;
             if changed {
                 self.save_ledger(&ledger);
             }
@@ -348,9 +356,24 @@ impl StakeManager {
         if required == 0 {
             return false; // staking off — never escrow
         }
+        // Kill-mid-cycle reconciliation (Phase 4 chain-side hardening):
+        // the local ledger can be stale or even EMPTY — the process may
+        // have died between the chain accepting the lock and the marker
+        // save reaching disk, or the file itself is gone. The chain is
+        // the authority on what is already escrowed, so it is consulted
+        // right before any top-up decision: when the chain answers, its
+        // number alone decides coverage — a marker that claims MORE than
+        // the chain holds (e.g. a crashed partial unlock) no longer
+        // lowers the real shortfall. An unreachable chain falls back to
+        // the local ledger exactly as before.
+        let chain_live = self.refresh_from_chain().await;
         let covered = {
             let ledger = self.ledger.lock().unwrap();
-            ledger.staked_uj.max(ledger.escrowed_uj)
+            if chain_live {
+                ledger.staked_uj
+            } else {
+                ledger.staked_uj.max(ledger.escrowed_uj)
+            }
         };
         if covered >= required {
             return true; // escrow already in place (marker or live view)
@@ -709,19 +732,31 @@ mod tests {
     struct ChainStub {
         addr: std::net::SocketAddr,
         hits: Arc<StdMutex<Vec<(String, serde_json::Value)>>>,
+        /// The GET /stake view, stateful: a successful lock/unlock moves
+        /// it, so the stub simulates a chain with persisting truth.
+        view_value: Arc<StdMutex<u64>>,
     }
 
     impl ChainStub {
         /// `staked_after_lock`: what GET /stake and /stake/lock report once
         /// the escrow went through (mimics the chain clamping to reality).
+        /// `initial_view` seeds the GET view for drill scenarios that
+        /// start with the escrow ALREADY on-chain (the kill-mid-cycle
+        /// reconciliation tests).
         async fn spawn(staked_after_lock: Option<u64>) -> Self {
+            Self::spawn_with_view(staked_after_lock, 0).await
+        }
+
+        async fn spawn_with_view(staked_after_lock: Option<u64>, initial_view: u64) -> Self {
             let hits: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
                 Arc::new(StdMutex::new(Vec::new()));
             let view_hits = hits.clone();
+            let view_value: Arc<StdMutex<u64>> = Arc::new(StdMutex::new(initial_view));
             let app = axum::Router::new()
                 .route(
                     "/stake",
-                    axum::routing::get(
+                    axum::routing::get({
+                        let view = view_value.clone();
                         move |axum::extract::Query(q): axum::extract::Query<
                             std::collections::HashMap<String, String>,
                         >| {
@@ -733,23 +768,27 @@ mod tests {
                                     .push(("GET /stake".into(), serde_json::Value::Null));
                                 axum::Json(serde_json::json!({
                                     "discord_id": q.get("discord_id").cloned().unwrap_or_default(),
-                                    "staked_uj": 0,
+                                    "staked_uj": *view.lock().unwrap(),
                                     "slashed_total_uj": 0,
                                     "events": [],
                                 }))
                             }
-                        },
-                    ),
+                        }
+                    }),
                 )
                 .route(
                     "/stake/lock",
                     axum::routing::post({
                         let state = hits.clone();
+                        let view = view_value.clone();
                         move |axum::Json(body): axum::Json<serde_json::Value>| async move {
                             state
                                 .lock()
                                 .unwrap()
                                 .push(("POST /stake/lock".into(), body.clone()));
+                            // A successful lock MOVES the chain state: every
+                            // later GET /stake reports the chain's truth.
+                            *view.lock().unwrap() = staked_after_lock.unwrap_or(0);
                             (
                                 axum::http::StatusCode::OK,
                                 axum::Json(serde_json::json!({
@@ -764,11 +803,13 @@ mod tests {
                     "/stake/unlock",
                     axum::routing::post({
                         let state = hits.clone();
+                        let view = view_value.clone();
                         move |axum::Json(body): axum::Json<serde_json::Value>| async move {
                             state
                                 .lock()
                                 .unwrap()
                                 .push(("POST /stake/unlock".into(), body.clone()));
+                            *view.lock().unwrap() = 0;
                             (
                                 axum::http::StatusCode::OK,
                                 axum::Json(serde_json::json!({
@@ -827,7 +868,11 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            Self { addr, hits }
+            Self {
+                addr,
+                hits,
+                view_value,
+            }
         }
 
         fn path_hits(&self) -> Vec<String> {
@@ -837,6 +882,13 @@ mod tests {
                 .iter()
                 .map(|(p, _)| p.clone())
                 .collect()
+        }
+
+        /// The chain's CURRENT truth (the GET /stake number) — test
+        /// assertions read this to prove the ledger reconciled to what
+        /// the chain actually holds.
+        fn view(&self) -> u64 {
+            *self.view_value.lock().unwrap()
         }
     }
 
@@ -887,10 +939,21 @@ mod tests {
         let stub = ChainStub::spawn(Some(1_000_000)).await;
         let mgr = manager_with_stub(&stub);
         assert!(mgr.lock_required().await);
-        let hits_after_first = stub.path_hits().len();
-        // Covered now → a second call must not POST anything.
+        let locks_after_first = stub
+            .path_hits()
+            .iter()
+            .filter(|p| *p == "POST /stake/lock")
+            .count();
+        // Covered now (chain truth + marker agree) → a second call must
+        // not POST anything (it still refreshes its view).
         assert!(mgr.lock_required().await);
-        assert_eq!(stub.path_hits().len(), hits_after_first);
+        assert_eq!(
+            stub.path_hits()
+                .iter()
+                .filter(|p| *p == "POST /stake/lock")
+                .count(),
+            locks_after_first
+        );
     }
 
     #[tokio::test]
@@ -1024,5 +1087,93 @@ mod tests {
             stamp,
         );
         assert!(crate::signing::verify(&pk, payload.as_bytes(), &sig));
+    }
+
+    /// Phase 4 chain-side hardening (FEATURES §13's kill-mid-cycle
+    /// drill, in miniature): the process died between the chain ACCEPTING
+    /// the lock and the marker save reaching disk — a fresh process loads
+    /// an EMPTY ledger while the chain already holds the full escrow. The
+    /// reconciliation inside `lock_required` must true up to chain truth
+    /// and NOT post a second lock: the chain is the authority, and a
+    /// stale/lost ledger must never double-escrow.
+    #[tokio::test]
+    async fn lock_required_reconciles_chain_truth_before_topping_up() {
+        let stub = ChainStub::spawn_with_view(Some(1_000_000), 1_000_000).await;
+        let mgr = manager_with_stub(&stub); // fresh, empty ledger
+        assert!(mgr.lock_required().await);
+        let lock_posts = stub
+            .path_hits()
+            .iter()
+            .filter(|p| *p == "POST /stake/lock")
+            .count();
+        assert_eq!(
+            lock_posts, 0,
+            "chain truth says covered — a lost ledger marker must not re-escrow"
+        );
+        // The reconciliation also wrote the chain truth into the loaded
+        // ledger (marker recovered from the chain, not just trusted).
+        let ledger = mgr.snapshot();
+        assert_eq!(ledger.staked_uj, 1_000_000);
+        assert_eq!(ledger.escrowed_uj, 1_000_000);
+    }
+
+    /// The complement: the chain genuinely has nothing (fresh mesh, first
+    /// join) — exactly ONE lock for the requirement goes out, and a repeat
+    /// call stays silent even after the ledger is lost mid-flight (the
+    /// chain view now reflects the first lock).
+    #[tokio::test]
+    async fn lock_required_covers_once_and_stays_quiet_after_ledger_loss() {
+        let stub = ChainStub::spawn(Some(1_000_000)).await;
+        let mgr = manager_with_stub(&stub);
+        assert!(mgr.lock_required().await);
+        // Simulate the marker save being lost again after the first lock.
+        {
+            let mut l = mgr.ledger.lock().unwrap();
+            l.staked_uj = 0;
+            l.escrowed_uj = 0;
+        }
+        assert!(mgr.lock_required().await);
+        let lock_posts = stub
+            .path_hits()
+            .iter()
+            .filter(|p| *p == "POST /stake/lock")
+            .count();
+        assert_eq!(
+            lock_posts, 1,
+            "the chain view must carry the first lock — no second POST"
+        );
+        // And the chain state itself tracked the escrow (the stub's truth).
+        assert_eq!(stub.view(), 1_000_000);
+    }
+
+    /// Covering mismatch the old code allowed: a ledger marker claims more
+    /// than the chain holds (crashed before a partial unlock landed, say).
+    /// The chain's SMALLER number wins — the gate reads the live truth.
+    #[tokio::test]
+    async fn lock_required_never_trusts_a_ledger_above_chain_truth() {
+        let stub = ChainStub::spawn_with_view(Some(300_000), 300_000).await;
+        let mgr = manager_with_stub(&stub);
+        {
+            let mut l = mgr.ledger.lock().unwrap();
+            l.staked_uj = 999_999;
+            l.escrowed_uj = 999_999; // stale marker: too big
+        }
+        // The stale marker must not fake coverage: the call tops the
+        // real shortfall up on-chain and only then reports covered.
+        assert!(mgr.lock_required().await);
+        // The shortfall was EXACTLY the chain-truth gap:
+        // 700 000 µJ (1 JER − the 300 000 the chain actually holds), NOT
+        // zero despite the stale 999 999 marker.
+        let hits = stub.hits.lock().unwrap().clone();
+        let (_, body) = hits
+            .iter()
+            .find(|(p, _)| p == "POST /stake/lock")
+            .cloned()
+            .expect("shortfall posted against chain truth");
+        assert!((body["amount_jer"].as_f64().unwrap() - 0.7).abs() < 1e-9);
+        // `record_chain_stake` records the chain's reply verbatim — this
+        // fixture clamps every lock reply to its `staked_after_lock` —
+        // so the ledger now says what the ROOT stubbornly said it says.
+        assert_eq!(mgr.snapshot().staked_uj, 300_000);
     }
 }
