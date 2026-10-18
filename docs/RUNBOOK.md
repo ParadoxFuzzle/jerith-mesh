@@ -46,6 +46,13 @@ its auth and introspects it:
   gateway's chain probe and the CLI).
 - **Ledger**: SQLite at `<jerithchain repo>/data/jerith.db` (config
   `chain_data_dir` / `$JERITH_CHAIN_DATA` override). Reads are read-only.
+- **Wallet-card endpoint** (verified 2026-10-18): the startup /balance
+  probe resolves `[crypto] wallet_endpoint` → the mesh's chain base
+  (config `chain_url` / `$JERITH_CHAIN_URL`, i.e. the :8322 co-host the
+  miner credits) → the legacy miner-facing :8300 default. The :8300 and
+  :8322 instances token-gate independently — a 401 at startup means the
+  resolved endpoint and `keys/api.token` disagree, not that the wallet
+  is empty.
 - **LLM runtime**: LiteLLM proxy on `127.0.0.1:8000` (`litellm-proxy.service`,
   config `~/.openclaw/litellm-config.json`, master key in
   `general_settings.master_key`). The node's `[chat] runtime_*` model pins
@@ -264,6 +271,20 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 #        refused at the tick with an ERROR (hot identity swap would
 #        forge every signed wire surface); cold fields (model, ports,
 #        runtime…) WARN restart-required instead of hot-applying.
+#
+# 5e. SQLite file-backed stores open with `PRAGMA synchronous = NORMAL`
+#     (verified live 2026-10-18). WAL alone still fsyncs every
+#     transaction: 10k inserts at the MAX_MEMORY_ROWS retention cap took
+#     60.4 s (~6 ms each); with NORMAL the same corpus builds in 2.5-3.2 s
+#     steady state (~20x). Durability contract: an app crash cannot
+#     corrupt or roll back committed writes; ONLY an OS power-loss can
+#     drop the most recent (un-checkpointed) transactions - the accepted
+#     stance for a retention-capped, fully-rebuildable chat-memory cache.
+#     If an operator needs power-loss safety, set synchronous=FULL in
+#     memory.rs's open path, then re-run the release bench
+#     (`cargo test --release -p jerith-mesh-core -- --ignored
+#     bench_sqlite_search_at_retention_cap --nocapture`) to see the new
+#     per-insert cost before committing to it.
 # 6. Design checks that must always hold (fail-closed, not fail-open):
 #    - unsigned/replayed advertisements and pings get 401/403, never accepted
 #    - peers list only returns same-model nodes
