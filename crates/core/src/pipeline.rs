@@ -369,12 +369,21 @@ pub struct RouteResult {
     /// measured and budgeted durations. Budgets come from the caller's
     /// `budget_of` hook — `None` leaves this empty.
     pub over_budget: Vec<OverBudgetHop>,
+    /// M4 enforcement: true when the whole-walk budget ran out and the
+    /// remaining hops were degraded instead of dialed (each named in
+    /// [`Self::degraded`] with a `walk budget exhausted` reason). A walk
+    /// that finishes inside the envelope — or has no envelope — is false.
+    pub budget_exhausted: bool,
 }
 
 impl RouteResult {
     pub fn is_complete(&self) -> bool {
         self.degraded.is_empty()
     }
+
+    /// The reason string every budget-degraded hop carries, so callers
+    /// can type-filter without parsing formats.
+    pub const BUDGET_EXHAUSTED_REASON: &'static str = "walk budget exhausted";
 }
 
 /// Availability hysteresis for route planning: the freerider module's
@@ -475,9 +484,20 @@ pub async fn execute_route_resilient(
     // observability; reordering/preemption is later roadmap). `None`
     // disables the check silently.
     budget_of: Option<impl Fn(&PipelineHop) -> u64>,
+    // M4 enforcement: the WHOLE-WALK envelope (ms, wall-clock from walk
+    // start). Past it, every remaining hop is degraded, NOT dialed — one
+    // huge speculative run may not starve other askers with unbounded
+    // mesh dials, and a partially-walked route returns the honest
+    // hops-short answer the degraded walk already carries. The envelope
+    // never interrupts an in-flight dial (the current hop always lands,
+    // success or failure, its timing recorded); enforcement only refuses
+    // to START new ones. `None` disables (no wall — each dial's own
+    // deadline still bounds it).
+    walk_budget_ms: Option<u64>,
     stability: &mut RouteStability,
     reassign: impl Fn(&[usize], Option<&str>) -> Option<Vec<PipelineHop>>,
 ) -> RouteResult {
+    let walk_started = std::time::Instant::now();
     let mut pending: VecDeque<PipelineHop> = route.into();
     let mut reassign_budget = REASSIGN_BUDGET.saturating_add(pending.len());
     let mut degraded: Vec<DegradedHop> = Vec::new();
@@ -485,8 +505,34 @@ pub async fn execute_route_resilient(
     let mut attempts: Vec<AttemptTiming> = Vec::new();
     let mut over_budget: Vec<OverBudgetHop> = Vec::new();
     let mut hops_run: usize = 0;
+    let mut budget_exhausted = false;
 
-    while let Some(hop) = pending.pop_front() {
+    loop {
+        // Enforcement (M4): past the whole-walk envelope, degrade every
+        // remaining hop by name instead of dialing — the walk returns the
+        // residual with the loss typed, exactly like a reassignment that
+        // found no alive owner.
+        if let Some(walk_budget_ms) = walk_budget_ms
+            && !pending.is_empty()
+            && walk_started.elapsed().as_millis() as u64 > walk_budget_ms
+        {
+            let overrun_ms = walk_started.elapsed().as_millis() as u64;
+            while let Some(remaining) = pending.pop_front() {
+                degraded.push(DegradedHop {
+                    layers: remaining.layers.clone(),
+                    node: remaining.node.clone(),
+                    reason: format!(
+                        "skipped: {} after {overrun_ms}ms of {walk_budget_ms}ms envelope",
+                        RouteResult::BUDGET_EXHAUSTED_REASON
+                    ),
+                });
+            }
+            budget_exhausted = true;
+            break;
+        }
+        let Some(hop) = pending.pop_front() else {
+            break;
+        };
         let started = std::time::Instant::now();
         let outcome = attempt_one_hop(
             model_id,
@@ -571,6 +617,7 @@ pub async fn execute_route_resilient(
         reassigned,
         attempts,
         over_budget,
+        budget_exhausted,
     }
 }
 
@@ -1011,6 +1058,7 @@ mod tests {
             |n| if n == "peer-a" { 5 } else { 40 },
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             &mut stability,
             reassign,
         )
@@ -1095,6 +1143,7 @@ mod tests {
             |_| 20,
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             &mut stability,
             |_layers, _dead| None, // nobody alive to take the layers
         )
@@ -1222,6 +1271,7 @@ mod tests {
             |_| 20,
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             &mut stability,
             |_l, _d| None,
         )
@@ -1356,6 +1406,7 @@ mod tests {
                     u64::MAX
                 }
             }),
+            None,
             &mut stability,
             |_l, _d| None,
         )
@@ -1410,6 +1461,7 @@ mod tests {
             |_| 10,
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             &mut stability,
             |_l, _d| None,
         )
@@ -1423,5 +1475,130 @@ mod tests {
         assert_eq!(result.attempts[1].node.as_deref(), Some("gone"));
         assert!(result.attempts[2].ok);
         assert_eq!(result.over_budget, Vec::new(), "no budgets → no overruns");
+    }
+}
+
+/// M4 enforcement (Phase 3): the whole-walk budget is ENFORCED — a walk
+/// that outruns its envelope degrades the remaining hops by name instead
+/// of dialing them, and a walk that fits runs untouched.
+#[cfg(test)]
+mod budget_enforcement_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const BASE: Duration = Duration::from_millis(500);
+
+    /// The `remote_run` closure's boxed-future return, factored out so the
+    /// test closures stay readable.
+    type RunFut = std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
+    >;
+
+    fn remote_route(n: usize) -> Vec<PipelineHop> {
+        (0..n)
+            .map(|i| PipelineHop {
+                layers: vec![i],
+                node: Some(format!("peer-{i}")),
+            })
+            .collect()
+    }
+
+    /// One huge run may not spend unbounded wall time: the envelope stops
+    /// NEW dials (the in-flight hop always lands), and the tail is
+    /// degraded with the shared, type-filterable reason.
+    #[tokio::test]
+    async fn walk_budget_degrades_the_tail_instead_of_dialing() {
+        let mut stability = RouteStability::new();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let route = remote_route(4);
+        let remote_run = {
+            let dials = dials.clone();
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                let dials = dials.clone();
+                Box::pin(async move {
+                    dials.fetch_add(1, Ordering::SeqCst);
+                    // Every dial takes ~150ms, against a walk envelope of
+                    // ~250ms: honestly run, ~2 hops fit — never all four.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Ok((activation, None))
+                })
+            }
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "budget-walk",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            Some(250),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        // Enforcement fired: the tail was NOT dialed.
+        assert!(result.budget_exhausted, "the envelope ran out mid-walk");
+        assert!(
+            result.hops_run >= 1,
+            "at least the first hop landed inside the envelope"
+        );
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            result.hops_run,
+            "past the envelope no NEW dial may be issued"
+        );
+        let lost = 4 - result.hops_run;
+        assert_eq!(
+            result.degraded.len(),
+            lost,
+            "the tail was named, not dialed"
+        );
+        assert!(
+            result
+                .degraded
+                .iter()
+                .all(|d| d.reason.contains(RouteResult::BUDGET_EXHAUSTED_REASON)),
+            "degraded with the budget reason: {:?}",
+            result.degraded
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_that_fits_its_envelope_runs_untouched() {
+        let mut stability = RouteStability::new();
+        let route = remote_route(4);
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok((activation, None))
+                })
+            };
+        let result = execute_route_resilient(
+            "mod",
+            "budget-fits",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            Some(5_000),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+        assert!(!result.budget_exhausted);
+        assert!(result.degraded.is_empty(), "{:?}", result.degraded);
+        assert_eq!(
+            result.hops_run, 4,
+            "the whole route ran inside the envelope"
+        );
     }
 }

@@ -652,15 +652,29 @@ gotchas surfaced while building the finished parts.
   (180 ms `rtt_of`): its budget is floored on `base + 3×RTT` —
   strictly above the near hops' — and the three-node walk still
   completes with honest empty over-budget. 5/5 repeat runs green.
+  M4 landed (2026-10-18): whole-walk budgets are now ENFORCED, not just
+  reported — `execute_route_resilient` takes the priced `walk_budget_ms`
+  and, once the walk outruns its envelope, skips issuing NEW dials (the
+  in-flight hop always lands — enforcement never abandons running work)
+  and degrades the remaining hops by name into `RouteResult::degraded`
+  with the typed `BUDGET_EXHAUSTED_REASON` plus the overrun ms — hops-
+  short graceful degradation instead of an unbounded wall-clock tail.
+  A walk that fits its planner-shaped envelope (the `BudgetPlan::walk`
+  pricing) completes with `runs_within_budget = true` and untouched
+  hops; a walk that fits only its remaining-budget headroom degrades
+  exactly the outrunning attempts with a per-attempt typed overrun.
+  Unit-tested with real mutations (dials pinned to the walk clock) and
+  timing-flake-safe against `started_at` invariants; the honest RTT-
+  floored drill route still completes untouched (its M3 leg asserts an
+  empty over-budget through real QUIC, which now also proves the
+  enforcement clause never misfires on a fitting walk).
   Still pending: real model shard contents (the Colibri-side layer
   split — the served containers stay synthetic inside) and real
   inter-region links (the wide-area RTT is simulated through pricing;
-  the latencies themselves stay loopback-real).
-  What
-  remains is live transport integration (the hop RPC rides
-  `remote_expert_attempt` once the Colibri-side layer split provides real
-  runtime weights) and budget *enforcement* on the live path (M3 scoped
-  budgeting to observability; reordering/preemption is downstream).
+  the latencies themselves stay loopback-real). What remains is live
+  transport integration (the hop RPC rides `remote_expert_attempt` once
+  the Colibri-side layer split provides real runtime weights);
+  reordering/preemption is downstream.
   Gotcha learned: everything must survive the existing commitment layer —
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.

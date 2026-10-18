@@ -446,6 +446,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         rtt_of,
         Duration::from_millis(250),
         Some(budget_of),
+        None,
         &mut stability,
         |_l, _d| None,
     )
@@ -621,6 +622,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             rtt_of,
             Duration::from_millis(250),
             Some(budget_of_dead.clone()),
+            None,
             &mut stability3,
             reassign,
         )
@@ -692,6 +694,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             rtt_of,
             Duration::from_millis(250),
             Some(budget_of_dead),
+            None,
             &mut stability4,
             |_l, _d| None,
         )
@@ -821,6 +824,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             rtt_far,
             Duration::from_millis(250),
             Some(budget_of_far),
+            None,
             &mut stability,
             |_l, _d| None,
         )
