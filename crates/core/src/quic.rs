@@ -242,19 +242,32 @@ pub struct RouterOptions {
     pub verify_percent: u32,
     /// Absolute tolerance when comparing replayed outputs (0 = exact).
     pub verify_tolerance: f32,
-    /// Phase 2: speculative remote pre-flight. When the dispatch plan
-    /// starts with Local but the best remote also holds the expert, the
-    /// remote attempt is kicked off while the local attempt runs; its
-    /// result is consumed only if the local try fails. Latency-hiding per
-    /// the mesh spec ("hide latency, never assume low latency"): a local
-    /// win simply drops the kicked request (cost: occasional unused RPC;
-    /// win: no serialized network timeout before the pool is even tried).
     pub speculative_remote: bool,
+    /// Phase 3 async mesh chat (FEATURES §13): how many chat candidates
+    /// may be in flight at once — launched in plan order, staggered by
+    /// `chat_hedge_delay_ms`, first attribution-checked answer wins and
+    /// the rest cancel. 0 or 1 = the legacy serial walk. (Default from
+    /// this struct is 0 so tests keep the serial shape; the node wires
+    /// the config's 3.)
+    pub chat_hedged_peers: usize,
+    /// Delay (ms) before the walk adds the next contender while the
+    /// earlier ones are still unanswered.
+    pub chat_hedge_delay_ms: u64,
+    /// Whole-walk budget (ms; 0 = unbounded walk — each dial still
+    /// bounded by `dispatch_timeout`). Past the budget the walk degrades
+    /// with a typed error naming it.
+    pub chat_walk_budget_ms: u64,
 }
 
 /// The locality-aware expert router.
 pub struct ExpertRouter {
     pub options: RouterOptions,
+    /// Phase 3 flapping-peer hysteresis (chat walk): consecutive chat
+    /// failures per peer with the time of the last failure. ≥2 failures
+    /// inside the window demote a peer BEHIND clean peers in the walk's
+    /// order — statistics, never refusal: the peer stays dialable and
+    /// one clean answer resets it immediately.
+    chat_failures: std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
     /// Experts hosted locally (expert_id → present).
     local_experts: RwLock<std::collections::HashSet<String>>,
     /// Phase 4: verification counters + queued fraud evidence about peers
@@ -272,6 +285,27 @@ type PreflightAttempt<'a> = (
     String,
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<f32>>> + 'a>>,
 );
+
+/// The hedged chat-walk's concurrent dial set: one boxed future per
+/// candidate (slow-first start, then staggered), racing attribution-
+/// checked answers against failures. Send matters — the walk runs
+/// inside the gateway's request future, Send end to end.
+type ChatDials<'a> = futures_util::stream::FuturesUnordered<
+    std::pin::Pin<Box<dyn std::future::Future<Output = (String, ChatOutcome)> + Send + 'a>>,
+>;
+
+/// One hedged chat-walk dial's outcome (Phase 3 async walk). `Answer` is
+/// an attribution-checked ChatResult; everything else is a failure flavor
+/// the walk books into the flapping-peer hysteresis and walks past.
+enum ChatOutcome {
+    /// The peer answered; content accepted (attribution passed).
+    Answer(String),
+    /// The peer replied but not with what the request asked for
+    /// (refusal, misattribution, wrong reply kind).
+    Rejected(String),
+    /// Transport-level failure (timeout, connect, decode).
+    Failed(String),
+}
 
 impl ExpertRouter {
     pub fn new(options: RouterOptions) -> Self {
@@ -306,7 +340,54 @@ impl ExpertRouter {
             local_experts: RwLock::new(std::collections::HashSet::new()),
             verify,
             expert_store: RwLock::new(None),
+            chat_failures: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Book one chat-walk failure for `node_id` (streak +1, timer reset).
+    pub fn note_chat_failure(&self, node_id: &str) {
+        let mut map = self.chat_failures.lock().unwrap_or_else(|e| e.into_inner());
+        let streak = map
+            .entry(node_id.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        streak.0 = streak.0.saturating_add(1);
+        streak.1 = std::time::Instant::now();
+    }
+
+    /// Book a chat success: the streak clears immediately — one clean
+    /// answer restores full standing (hysteresis in one direction only).
+    pub fn note_chat_ok(&self, node_id: &str) {
+        self.chat_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(node_id);
+    }
+
+    /// Is `node_id` currently demoted (≥ `CHAT_FLAP_LINE` consecutive
+    /// failures inside the window)? Statistics only — ordering, never
+    /// refusal.
+    fn chat_flapping(&self, node_id: &str) -> bool {
+        const CHAT_FLAP_LINE: u32 = 2;
+        const CHAT_FLAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        match self
+            .chat_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(node_id)
+        {
+            Some((streak, at)) => *streak >= CHAT_FLAP_LINE && at.elapsed() < CHAT_FLAP_WINDOW,
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn chat_failure_streak(&self, node_id: &str) -> u32 {
+        self.chat_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(node_id)
+            .map(|(n, _)| *n)
+            .unwrap_or(0)
     }
 
     /// The router's verification tracker — shared with the mesh state so
@@ -546,72 +627,141 @@ impl ExpertRouter {
         remotes.sort_by_key(|(id, rtt, res, rep)| {
             (
                 reputation_tier(*rep),
+                // Flapping-peer hysteresis (Phase 3): a peer that recently
+                // walked into a failure streak sinks BEHIND clean peers —
+                // statistics only: it stays dialable, and one clean
+                // answer restores it immediately.
+                u8::from(self.chat_flapping(id)),
                 Self::placement_sort_key(*rtt, res.as_ref()),
                 id.clone(),
             )
         });
 
-        let mut last_err = anyhow::anyhow!("no peers available for mesh chat fallback");
-        for (node_id, _rtt, _res, _rep) in remotes {
+        // ---- Phase 3 async walk: hedged, staggered, budgeted ----------
+        //
+        // The serial walk paid a bad peer's ENTIRE dial timeout before the
+        // next candidate was even considered. This walk keeps up to
+        // `chat_hedged_peers` dials in flight (candidates beyond the cap
+        // refill as permits free, so the plan is still walked), launched
+        // staggered by `chat_hedge_delay_ms`, and takes the first
+        // attribution-checked answer. All in-flight dials cancel the
+        // moment an answer is accepted — a peer that was mid-dial did the
+        // work speculatively for nothing, the same trade the expert
+        // speculative pre-flight makes (bounded by the cap and the
+        // whole-walk budget). Every failure — refused, misattributed, or
+        // transport — books one flapping streak for that peer.
+        let delay_ms = self.options.chat_hedge_delay_ms;
+        let in_flight_cap = self.options.chat_hedged_peers.max(1);
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(in_flight_cap));
+        let base_req = NodeRpcRequest::ChatQuery {
+            req_id: req_id.to_string(),
+            messages: Self::compact_chat_history(messages),
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        use futures_util::stream::StreamExt;
+        let mut futs: ChatDials<'_> = futures_util::stream::FuturesUnordered::new();
+        for (i, (node_id, _rtt, _res, _rep)) in remotes.into_iter().enumerate() {
             let Some(addr) = peer_addrs.get(&node_id) else {
                 continue;
             };
-            let mut req = NodeRpcRequest::ChatQuery {
-                req_id: req_id.to_string(),
-                messages: Self::compact_chat_history(messages),
-                from_node_id: identity.node_id(),
-                stamp_ms: 0,
-                sig: String::new(),
+            let stagger = if i < in_flight_cap {
+                delay_ms * i as u64
+            } else {
+                0
             };
-            sign_request(&mut req, identity);
-            match call(
-                endpoint,
-                *addr,
-                &node_id,
-                &req,
-                identity,
-                self.options.dispatch_timeout,
-            )
-            .await
-            {
-                Ok(NodeRpcReply::ChatResult {
-                    req_id: rid,
-                    content,
-                    node_id: server_id,
-                }) => {
-                    if rid != req_id || server_id != node_id {
+            let permits = permits.clone();
+            let base = base_req.clone();
+            let node_id = node_id.clone();
+            let addr = *addr;
+            futs.push(Box::pin(async move {
+                if stagger > 0 {
+                    tokio::time::sleep(Duration::from_millis(stagger)).await;
+                }
+                // In-flight cap: candidates beyond the cap poll the permit
+                // and dial the moment an earlier attempt finishes — the
+                // walk still covers the whole plan, just never one peer
+                // at a time.
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("in-flight semaphore is never closed");
+                let mut req = base;
+                sign_request(&mut req, identity);
+                let outcome = match call(
+                    endpoint,
+                    addr,
+                    &node_id,
+                    &req,
+                    identity,
+                    self.options.dispatch_timeout,
+                )
+                .await
+                {
+                    Ok(NodeRpcReply::ChatResult {
+                        req_id: rid,
+                        content,
+                        node_id: server_id,
+                    }) if rid == req_id && server_id == node_id => ChatOutcome::Answer(content),
+                    Ok(NodeRpcReply::ChatResult {
+                        node_id: server_id, ..
+                    }) => ChatOutcome::Rejected(format!(
+                        "chat reply identity mismatch: expected {node_id}, got {server_id}"
+                    )),
+                    Ok(NodeRpcReply::Error { message, .. }) => {
+                        ChatOutcome::Rejected(format!("peer rejected chat: {message}"))
+                    }
+                    Ok(other) => ChatOutcome::Rejected(format!("unexpected reply kind: {other:?}")),
+                    Err(e) => ChatOutcome::Failed(format!("quic chat dispatch failed: {e}")),
+                };
+                (node_id, outcome)
+            }));
+        }
+
+        // The walk owns its own accumulated error; the budget wall reads
+        // `last_message` (kept outside the future, so a cancelled-by-timeout
+        // walk still reports what it had learned so far).
+        let mut last_message = String::from("no peers available for mesh chat fallback");
+        let walk = async {
+            let mut last_err = anyhow::anyhow!("no peers available for mesh chat fallback");
+            while let Some((node_id, outcome)) = futs.next().await {
+                match outcome {
+                    ChatOutcome::Answer(content) => {
+                        self.note_chat_ok(&node_id);
+                        tracing::info!(
+                            target: "mesh",
+                            peer = %node_id,
+                            "chat served via mesh fallback"
+                        );
+                        return Ok((content, node_id));
+                    }
+                    ChatOutcome::Rejected(message) | ChatOutcome::Failed(message) => {
                         tracing::debug!(
                             target: "mesh",
                             peer = %node_id,
-                            "chat reply attribution mismatch — trying next peer"
+                            error = %message,
+                            "chat candidate failed — walk continues"
                         );
-                        last_err = anyhow::anyhow!(
-                            "chat reply identity mismatch: expected {node_id}, got {server_id}"
-                        );
-                        continue;
+                        self.note_chat_failure(&node_id);
+                        last_message = message.clone();
+                        last_err = anyhow::anyhow!("{message}");
                     }
-                    tracing::info!(
-                        target: "mesh",
-                        peer = %node_id,
-                        "chat served via mesh fallback"
-                    );
-                    return Ok((content, node_id));
-                }
-                Ok(NodeRpcReply::Error {
-                    req_id: _id,
-                    message,
-                }) => {
-                    last_err = anyhow::anyhow!("peer rejected chat: {message}");
-                }
-                Ok(other) => {
-                    last_err = anyhow::anyhow!("unexpected reply kind: {other:?}");
-                }
-                Err(e) => {
-                    last_err = anyhow::anyhow!("quic chat dispatch failed: {e}");
                 }
             }
+            Err(last_err)
+        };
+        let budget_ms = self.options.chat_walk_budget_ms;
+        if budget_ms > 0 {
+            match tokio::time::timeout(Duration::from_millis(budget_ms), walk).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "mesh chat walk exceeded its {budget_ms}ms budget — degraded honestly (last failure: {last_message})"
+                )),
+            }
+        } else {
+            walk.await
         }
-        Err(last_err)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2655,7 +2805,7 @@ mod tests {
         ]
     }
 
-    fn router(nearby: u64) -> ExpertRouter {
+    pub(super) fn router(nearby: u64) -> ExpertRouter {
         ExpertRouter::new(RouterOptions {
             nearby_rtt_ms: nearby,
             // Generous on purpose: the routing semantics under test are
@@ -3069,7 +3219,7 @@ mod tests {
     /// Spawn an identity-bound server and return its addr + identity +
     /// a dynamic pin map preloaded with `node_id -> addr`, matching the
     /// node_id-keyed lookup the production client path uses.
-    async fn test_server_and_pins(
+    pub(super) async fn test_server_and_pins(
         handler: Arc<dyn ExpertHandler>,
     ) -> anyhow::Result<(SocketAddr, SigningIdentity, SharedPinMap)> {
         let identity = SigningIdentity::generate();
@@ -3088,7 +3238,9 @@ mod tests {
 
     #[tokio::test]
     async fn quic_expert_query_roundtrip() {
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(TimesTwo))
+            .await
+            .unwrap();
 
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
@@ -3159,7 +3311,9 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_frame_cap_never_emits_unbounded_buffer_growth() {
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(TimesTwo))
+            .await
+            .unwrap();
         let (_endpoint, conn) = raw_dial(&server_identity.node_id(), addr, &pins)
             .await
             .unwrap();
@@ -3186,7 +3340,9 @@ mod tests {
 
     #[tokio::test]
     async fn expert_input_cap_rejects_before_handler() {
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(TimesTwo))
+            .await
+            .unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut req = NodeRpcRequest::ExpertQuery {
@@ -3380,7 +3536,9 @@ mod tests {
 
     #[tokio::test]
     async fn quic_ping_roundtrip() {
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(TimesTwo))
+            .await
+            .unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let mut req = NodeRpcRequest::Ping {
@@ -3419,7 +3577,7 @@ mod tests {
         // One remote (×3) + a locally-registered expert: local must win
         // even with speculative_remote on — the kicked RPC is discarded.
         let (near_addr, near_identity, pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
                 .await
                 .unwrap();
         let near_node_id = near_identity.node_id();
@@ -3454,7 +3612,7 @@ mod tests {
         // the pre-flight is consumed once, and the walk must NOT retry the
         // same peer — it falls through to the second remote (×7).
         let (far_addr, far_identity, far_pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
                 .await
                 .unwrap();
         let far_node_id = far_identity.node_id();
@@ -3493,11 +3651,11 @@ mod tests {
     async fn router_execute_over_quic_prefers_local_and_falls_through() {
         // Two remote servers: near (×3, rtt 5) and far (×7, rtt 200).
         let (near_addr, near_identity, pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
                 .await
                 .unwrap();
         let (far_addr, far_identity, far_pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
                 .await
                 .unwrap();
         {
@@ -3618,7 +3776,9 @@ mod tests {
         // RuntimeExpert with a dead runtime URL — builtin experts must still
         // be served exactly (they never reach the runtime).
         let handler = RuntimeExpert::for_tests("http://127.0.0.1:1", "stub");
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(handler)).await.unwrap();
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(handler))
+            .await
+            .unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let (expert_id, input, expected) = crate::verify::ringer_task(crate::bootstrap::now_ms());
@@ -3676,11 +3836,11 @@ mod tests {
     #[tokio::test]
     async fn replay_agrees_on_honest_pairs() {
         let (near_addr, near_identity, pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
                 .await
                 .unwrap();
         let (far_addr, far_identity, far_pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
                 .await
                 .unwrap();
         let far_map = far_pins.try_read().expect("far pins readable").clone();
@@ -3730,11 +3890,11 @@ mod tests {
     #[tokio::test]
     async fn replay_mismatch_flags_both_and_aborts() {
         let (near_addr, near_identity, pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
                 .await
                 .unwrap();
         let (far_addr, far_identity, far_pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
                 .await
                 .unwrap();
         let far_map = far_pins.try_read().expect("far pins readable").clone();
@@ -3786,7 +3946,7 @@ mod tests {
     #[tokio::test]
     async fn local_arbiter_conicts_single_remote() {
         let (near_addr, near_identity, pins) =
-            test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
                 .await
                 .unwrap();
         let near_id = near_identity.node_id();
@@ -3912,7 +4072,7 @@ mod tests {
     async fn chat_query_wire_carries_compacted_history() {
         let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (addr, server_identity, pins) =
-            test_server_and_pins(Arc::new(ChatCapture(sink.clone())))
+            super::tests::test_server_and_pins(Arc::new(ChatCapture(sink.clone())))
                 .await
                 .unwrap();
         let node_id = server_identity.node_id();
@@ -3997,11 +4157,12 @@ mod tests {
 
     #[tokio::test]
     async fn chat_over_quic_falls_back_to_peer() {
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(ChatAnswer {
-            content: "mesh hello".into(),
-        }))
-        .await
-        .unwrap();
+        let (addr, server_identity, pins) =
+            super::tests::test_server_and_pins(Arc::new(ChatAnswer {
+                content: "mesh hello".into(),
+            }))
+            .await
+            .unwrap();
         let node_id = server_identity.node_id();
 
         let r = router(50);
@@ -4061,7 +4222,9 @@ mod tests {
 
     #[tokio::test]
     async fn quic_rejects_stale_stamp() {
-        let (addr, server_identity, pins) = test_server_and_pins(Arc::new(TimesTwo)).await.unwrap();
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(TimesTwo))
+            .await
+            .unwrap();
         let client = pinned_client_endpoint_dyn(pins).unwrap();
         let identity = SigningIdentity::generate();
         let req = NodeRpcRequest::Ping {
@@ -4208,5 +4371,134 @@ mod tests {
             request_payload_for_stamp(&req, 5)
         );
         assert!(request_payload_for_stamp(&req, 5).starts_with("rpc-expq1|"));
+    }
+}
+
+#[cfg(test)]
+mod chat_walk_tests {
+    use super::*;
+
+    /// A chat handler that answers after a fixed delay — the hang-peer
+    /// half of the hedge drill (its serial dial timeout is what the
+    /// hedged walk exists to avoid paying).
+    struct DelayedChat {
+        delay: Duration,
+        content: &'static str,
+    }
+
+    impl ExpertHandler for DelayedChat {
+        fn run(&self, _expert_id: &str, _input: &[f32]) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _messages: &'a [serde_json::Value],
+        ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+            let content = self.content;
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(content.to_string())
+            })
+        }
+    }
+
+    /// Phase 3 async chat walk, the point of the ticket: the plan-leads
+    /// peer SLEEPS 8 s before answering; with the hedge (2 in flight,
+    /// 300 ms stagger) the second contender answers at ~300 ms and the
+    /// walk takes it — instead of serially paying the 8 s dial timeout.
+    #[tokio::test]
+    async fn chat_hedged_walk_takes_the_fast_peer_instead_of_paying_the_slow_timeout() {
+        let (slow_addr, slow_id, _slow_pins) =
+            super::tests::test_server_and_pins(Arc::new(DelayedChat {
+                delay: Duration::from_secs(8),
+                content: "too late",
+            }))
+            .await
+            .unwrap();
+        let (fast_addr, fast_id, _fast_pins) =
+            super::tests::test_server_and_pins(Arc::new(DelayedChat {
+                delay: Duration::from_millis(5),
+                content: "fast",
+            }))
+            .await
+            .unwrap();
+
+        let slow_node = slow_id.node_id();
+        let fast_node = fast_id.node_id();
+        let mut pins: PinMap = HashMap::new();
+        pins.insert(slow_node.clone(), slow_addr);
+        pins.insert(fast_node.clone(), fast_addr);
+        let pinned: SharedPinMap = Arc::new(RwLock::new(pins));
+        let client = pinned_client_endpoint_dyn(pinned).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut addrs = HashMap::new();
+        addrs.insert(slow_node.clone(), slow_addr);
+        addrs.insert(fast_node.clone(), fast_addr);
+        // Plan lead: the SLEEPER (lower RTT) — exactly the shape the
+        // resource-aware sort produces under a transient slow node.
+        let peers = vec![
+            (slow_node.clone(), 1u64, true, true, None, None),
+            (fast_node.clone(), 9u64, true, true, None, None),
+        ];
+        let router = ExpertRouter::new(RouterOptions {
+            nearby_rtt_ms: 50,
+            dispatch_timeout: Duration::from_secs(9),
+            speculative_remote: false,
+            verify_percent: 0,
+            verify_tolerance: 0.0,
+            chat_hedged_peers: 2,
+            chat_hedge_delay_ms: 300,
+            chat_walk_budget_ms: 0,
+        });
+
+        let started = std::time::Instant::now();
+        let (content, served_by) = router
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "hedge-1",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(served_by, fast_node, "the fast contender must win");
+        assert_eq!(content, "fast");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "hedged walk answered in {elapsed:?}; the serial walk would pay ~8s"
+        );
+        // The winner is booked clean and the cancelled slow dial booked
+        // nothing (its outcome never arrived).
+        assert_eq!(router.chat_failure_streak(fast_node.as_str()), 0);
+        assert_eq!(router.chat_failure_streak(slow_node.as_str()), 0);
+    }
+
+    /// Flapping-peer hysteresis: two consecutive chat failures demote a
+    /// peer for the walk ordering; ONE clean answer restores it —
+    /// statistics, never refusal.
+    #[tokio::test]
+    async fn chat_flapping_hysteresis_demotes_recent_streaks_and_restores_on_success() {
+        let router = super::tests::router(50);
+        router.note_chat_failure("flap");
+        assert_eq!(router.chat_failure_streak("flap"), 1);
+        assert!(
+            !router.chat_flapping("flap"),
+            "one failure alone is not a streak"
+        );
+        router.note_chat_failure("flap");
+        assert!(
+            router.chat_flapping("flap"),
+            "two consecutive failures demote the peer for ordering"
+        );
+        // One clean answer clears immediately.
+        router.note_chat_ok("flap");
+        assert_eq!(router.chat_failure_streak("flap"), 0);
+        assert!(!router.chat_flapping("flap"));
     }
 }

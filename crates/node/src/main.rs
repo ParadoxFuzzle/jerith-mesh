@@ -2080,10 +2080,20 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     // Mesh fallback for chat: a QUIC client endpoint + router, wired into
     // the gateway so /v1/chat/completions can fail over to runtime-backed
     // peers when the local runtime is unavailable.
-    let mesh_fallback = match jerith_mesh_core::ping::MeshFallbackChat::spawn_with(
+    let mesh_fallback = match jerith_mesh_core::ping::MeshFallbackChat::spawn_with_options(
         state.verify.clone(),
-        // Phase 4 verification policy: replay probability from config.
-        cfg.verify_percent,
+        // Full router knobs: Phase 4 replay policy + the Phase 3 async
+        // chat-walk shape (hedged in-flight count, stagger, walk budget).
+        jerith_mesh_core::quic::RouterOptions {
+            nearby_rtt_ms: 50,
+            dispatch_timeout: Duration::from_secs(30),
+            speculative_remote: true,
+            verify_tolerance: 0.0,
+            verify_percent: cfg.verify_percent,
+            chat_hedged_peers: cfg.chat_hedged_peers,
+            chat_hedge_delay_ms: cfg.chat_hedge_delay_ms,
+            chat_walk_budget_ms: cfg.chat_walk_budget_ms,
+        },
     ) {
         Ok(mf) => {
             if let Some(store) = &expert_store {

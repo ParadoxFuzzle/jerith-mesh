@@ -555,21 +555,35 @@ impl MeshFallbackChat {
         verify: SharedVerifyTracker,
         verify_percent: u32,
     ) -> anyhow::Result<Arc<Self>> {
-        let pins = std::sync::Arc::new(tokio::sync::RwLock::new(Default::default()));
-        let endpoint = crate::quic::pinned_client_endpoint_dyn(pins.clone())
-            .map_err(|e| anyhow::anyhow!("pinned client endpoint: {e}"))?;
-        let router = std::sync::Arc::new(crate::quic::ExpertRouter::new_with_tracker(
+        Self::spawn_with_options(
+            verify,
             crate::quic::RouterOptions {
                 nearby_rtt_ms: 50,
                 dispatch_timeout: Duration::from_secs(30),
                 // Phase 2: hybrid local + remote execution — kick the best
                 // remote while local runs (latency hiding per the spec).
                 speculative_remote: true,
-                verify_percent,
                 verify_tolerance: 0.0,
+                // chat_hedged_peers stays 0 (the legacy serial walk) unless
+                // the caller wires the async-walk knobs.
+                verify_percent,
+                ..Default::default()
             },
-            verify,
-        ));
+        )
+    }
+
+    /// Full knob surface (Phase 3 async walk): the credit-bearing walk's
+    /// hedge shape comes from `[experts]/chat` config via the node's own
+    /// call site; tests use the serial spawn above.
+    pub fn spawn_with_options(
+        verify: SharedVerifyTracker,
+        options: crate::quic::RouterOptions,
+    ) -> anyhow::Result<Arc<Self>> {
+        let pins = std::sync::Arc::new(tokio::sync::RwLock::new(Default::default()));
+        let endpoint = crate::quic::pinned_client_endpoint_dyn(pins.clone())
+            .map_err(|e| anyhow::anyhow!("pinned client endpoint: {e}"))?;
+        let router =
+            std::sync::Arc::new(crate::quic::ExpertRouter::new_with_tracker(options, verify));
         Ok(Arc::new(Self {
             endpoint,
             router,
@@ -1080,6 +1094,15 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
         || disk.experts.prefetch_horizon != live.experts.prefetch_horizon
     {
         plan.hot.push("experts.prefetch");
+    }
+    // Phase 3 async chat-walk knobs: the router reads them at boot (the
+    // walk lives on a boot-built router), so changes warn restart-required
+    // like every other router knob — never silently ignored.
+    if disk.chat_hedged_peers != live.chat_hedged_peers
+        || disk.chat_hedge_delay_ms != live.chat_hedge_delay_ms
+        || disk.chat_walk_budget_ms != live.chat_walk_budget_ms
+    {
+        plan.cold.push("chat_hedge");
     }
     let mem_key = |c: &NodeConfig| {
         (

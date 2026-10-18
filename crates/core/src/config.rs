@@ -407,6 +407,23 @@ pub struct NodeConfig {
     /// 5–15 %; 0 disables replay (commitments always checked).
     #[serde(default = "default_verify_percent")]
     pub verify_percent: u32,
+    /// Phase 3 async mesh chat (FEATURES §13): how many candidates may be
+    /// in flight at once during the mesh chat fallback walk — launched
+    /// staggered, first attribution-checked answer wins, the rest cancel.
+    /// 0 or 1 = the legacy serial walk (one peer at a time).
+    #[serde(default = "default_chat_hedged_peers")]
+    pub chat_hedged_peers: usize,
+    /// Delay (ms) before the walk adds the next contender while the
+    /// earlier ones are still unanswered — the hedge keeps a bad peer
+    /// from serially paying its full dial timeout.
+    #[serde(default = "default_chat_hedge_delay_ms")]
+    pub chat_hedge_delay_ms: u64,
+    /// Whole-walk budget (ms): past it the walk degrades honestly (typed
+    /// error with the accumulated failures) instead of waiting forever
+    /// across a mesh of flapping peers. 0 = unbounded (each dial still
+    /// bounded by its own timeout).
+    #[serde(default = "default_chat_walk_budget_ms")]
+    pub chat_walk_budget_ms: u64,
     /// Phase 4: spot-check (ringer) challenge probability per ping tick —
     /// a signed builtin known-answer expert query is sent to one random
     /// alive peer; a wrong answer queues DishonestResults evidence.
@@ -719,6 +736,18 @@ impl ExpertStoreConfig {
     }
 }
 
+fn default_chat_hedged_peers() -> usize {
+    3
+}
+
+fn default_chat_hedge_delay_ms() -> u64 {
+    1_500
+}
+
+fn default_chat_walk_budget_ms() -> u64 {
+    45_000
+}
+
 fn default_verify_percent() -> u32 {
     10
 }
@@ -768,6 +797,9 @@ impl Default for NodeConfig {
             runtime_primary_model: None,
             runtime_url: "http://127.0.0.1:8000".to_string(),
             verify_percent: default_verify_percent(),
+            chat_hedged_peers: default_chat_hedged_peers(),
+            chat_hedge_delay_ms: default_chat_hedge_delay_ms(),
+            chat_walk_budget_ms: default_chat_walk_budget_ms(),
             ringer_percent: default_ringer_percent(),
             freerider_enabled: true,
             guard: crate::guard::GuardConfig::default(),

@@ -674,12 +674,33 @@ gotchas surfaced while building the finished parts.
   other askers (current prefetch is 1 bounded background walk per node,
   local-hosted candidates only — the budget question does not arise for
   that shape, it appears when real speculative runs start).
-- **Asynchronous, timeout-tolerant forward passes + graceful degradation
-  (§1)**. Today's dispatch is plan-ordered with fallbacks but synchronous
-  per attempt; mesh hops need per-hop timeouts, retry walks that respect
-  non-idempotency (commitments prevent a tampered node from re-selling the
-  same answer, but a dead hop must not wedge the request) and flapping-peer
-  hysteresis at the router.
+- ✅ **Asynchronous, timeout-tolerant forward passes + graceful degradation
+  (§1)** — the mesh CHAT walk landed async 2026-10-18 (see §2's gateway
+  tier notes and §13's config surface for the knobs; the expert walk keeps
+  its existing plan + replay semantics, its async shape is the speculative
+  pre-flight). Shape:
+  - `chat_over_quic`'s remote phase keeps up to `chat_hedged_peers`
+    (default 3; 0/1 = the legacy serial walk) dials in flight — plan
+    order, staggered `chat_hedge_delay_ms` (default 1500 ms) so the best
+    candidate is tried first, and dials beyond the cap refill as permits
+    free — the plan is still walked, just never one peer at a time.
+  - The first attribution-checked ChatResult wins; everything else
+    cancels in flight (a peer that was mid-dial served speculatively —
+    the same trade the expert pre-flight makes, bounded by cap + budget).
+  - Whole-walk budget `chat_walk_budget_ms` (default 45 s): past it the
+    walk degrades with a typed error naming the budget and the best
+    failure — a mesh of flapping peers can never wedge the gateway.
+  - Flapping-peer hysteresis at the router: two consecutive chat
+    failures inside a 60 s window sink a peer BEHIND clean peers in the
+    walk's order (statistics, never refusal — it stays dialable and one
+    clean answer clears it outright). Cancels don't book; real
+    answers/failures do.
+  - Knobs read at router boot (`chat_hedged_peers` /
+    `chat_hedge_delay_ms` / `chat_walk_budget_ms` — classified cold
+    `chat_hedge` in the reload plan, so drift warns restart-required),
+    verified by the wire drills: a slow-plan-lead peer (8 s sleep) loses
+    to a staggered contender at ~300 ms, and the streak/clear semantics
+    are unit-pinned.
 - ✅ **Privacy levels: local-only / trusted-peers / full-mesh (§12)** —
   landed 2026-10-17 (see §12 for the full shape): `[privacy] level`
   config surface, hot-reloadable policy read at the chat-dispatch choke
