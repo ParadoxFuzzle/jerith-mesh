@@ -164,10 +164,12 @@ echo "==> 4/6 start nodes"
 JERITH_HOME="$E2E_DIR/b" "$BIN" run & PIDS+=($!)
 JERITH_HOME="$E2E_DIR/a" "$BIN" run & PIDS+=($!)
 
-# Wait for both nodes to see the full two-node mesh.
+# Wait for both nodes to see the full two-node mesh. peers_alive counts
+# OTHER nodes ping-alive (the roster excludes the self-ad — a node is not
+# its own peer), so a fully connected two-node mesh reads 1 here.
 waited=0
-until [ "$(curl -sf http://127.0.0.1:$B_GW/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["peers_alive"])' 2>/dev/null || echo 0)" -ge 2 ] \
-   && [ "$(curl -sf http://127.0.0.1:$A_GW/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["peers_alive"])' 2>/dev/null || echo 0)" -ge 2 ]; do
+until [ "$(curl -sf http://127.0.0.1:$B_GW/status | python3 -c 'import json,sys; d=json.load(sys.stdin); print(min(d["peers_alive"], d["peer_count"]))' 2>/dev/null || echo 0)" -ge 1 ] \
+   && [ "$(curl -sf http://127.0.0.1:$A_GW/status | python3 -c 'import json,sys; d=json.load(sys.stdin); print(min(d["peers_alive"], d["peer_count"]))' 2>/dev/null || echo 0)" -ge 1 ]; do
   if [ "$waited" -ge 30 ]; then echo "timeout waiting for mesh connectivity" >&2; exit 1; fi
   sleep 1; waited=$((waited + 1))
 done
