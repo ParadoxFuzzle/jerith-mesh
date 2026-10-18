@@ -613,9 +613,42 @@ pub struct MineOutcome {
 pub struct MineStats {
     pub attempted: AtomicU64,
     pub won: AtomicU64,
+    /// Consecutive FAILED attempts (any Err: transport, 401 token drift,
+    /// chain down). The silent-token-drift incident taught why this
+    /// exists: the miner only debug-logged its failures, so a stale api
+    /// token mined nothing for a long stretch with zero loud surface.
+    /// Reset to 0 by any successful attempt.
+    pub failure_streak: AtomicU64,
+    /// Total failed attempts since boot (the streak's long-window
+    /// companion; a chain flap shows up here without tripping the
+    /// streak-WARN every time).
+    pub failures: AtomicU64,
 }
 
 impl MineStats {
+    /// Record one failed attempt; the NEW streak is returned (caller
+    /// decides threshold logging; the built-in miner warns every multiple
+    /// of 5 — a 401 drone hits this within a couple of request cycles).
+    pub fn record_failure(&self) -> u64 {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        let streak = self.failure_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= 5 && streak.is_multiple_of(5) {
+            tracing::warn!(
+                target: "economics",
+                streak,
+                total = self.failures.load(Ordering::Relaxed),
+                "miner failing repeatedly — token drift? api token missing? chain down? (the silent-401 class of incident)"
+            );
+        }
+        streak
+    }
+
+    /// Record one successful attempt (win OR a clean non-win — the
+    /// transport worked): the failure streak resets, total failures stay.
+    pub fn record_success(&self) {
+        self.failure_streak.store(0, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.attempted.load(Ordering::Relaxed),
@@ -659,12 +692,17 @@ impl JerithMiner {
             match &outcome {
                 Ok(o) if o.won => {
                     stats.won.fetch_add(1, Ordering::Relaxed);
+                    stats.record_success();
                     tracing::info!(target: "economics", "mined JER 🎉");
                 }
                 Ok(o) => {
+                    stats.record_success();
                     tracing::debug!(target: "economics", reason = ?o.reason, "mine attempt did not win")
                 }
-                Err(e) => tracing::debug!(target: "economics", error = %e, "mine attempt failed"),
+                Err(e) => {
+                    stats.record_failure();
+                    tracing::debug!(target: "economics", error = %e, "mine attempt failed");
+                }
             }
         });
         true
@@ -676,6 +714,141 @@ impl JerithMiner {
             return true;
         }
         rand::random::<u32>() % 1000 < self.config.mine_chance_permille
+    }
+}
+
+// ===================== §13: chain bookkeeping drift watch =====================
+
+/// §13 chain-side hardening: the mesh's `/status` probe reads the co-hosted
+/// chain node's bookkeeping (`/status` → `mining.total_mined_uj`,
+/// `chain.height`) on every poll; a healthy ledger is MONOTONIC — the
+/// mined total only grows (mines pay into it) and the height only grows
+/// (blocks append). A DECREASE across two live readings is a chain-side
+/// ledger event the mesh must surface loudly (reorg / rollback / restore
+/// — the manual-restore harness rewound a ledger once), never a silent
+/// number drifting backwards between dashboard polls.
+///
+/// Instance methods carry the logic (unit-testable); the process-global
+/// probe (`probe_for_status`) is what `/status` calls — one node per
+/// process, so a `OnceLock` global is the honest home (no new Gateway
+/// plumbing).
+#[derive(Debug, Default)]
+pub struct ChainDriftWatch {
+    /// Last ACCEPTED `mining.total_mined_uj` (the baseline the next
+    /// sample is compared against — after a regression the lower reading
+    /// becomes the new baseline, so the violation counts once, not on
+    /// every later sample). 0 = no sample yet.
+    last_total_mined_uj: AtomicU64,
+    /// Last accepted `chain.height`, same rule.
+    last_height: AtomicU64,
+    /// Total monotonicity violations observed across all samples (each
+    /// field pair contributes at most one per sample).
+    regressions: AtomicU64,
+    /// Valid samples observed (both fields numeric in the probe body).
+    samples: AtomicU64,
+    /// Wall-clock ms (`bootstrap::now_ms`) of the last valid sample.
+    last_ok_ms: AtomicU64,
+}
+
+impl ChainDriftWatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Absorb one live sample; returns the regressions this sample
+    /// introduced (0, 1 or 2 — total and height are each checked).
+    /// A violation counts against the PREVIOUS baseline and then the
+    /// new (lower) reading is accepted: the ledger genuinely is there
+    /// now, and parking on the old peak would flag every sample after
+    /// the incident forever.
+    pub fn observe(&self, total_mined_uj: u64, height: u64, now_ms: u64) -> u8 {
+        let mut regressions: u8 = 0;
+        let prev_total = self
+            .last_total_mined_uj
+            .swap(total_mined_uj, Ordering::Relaxed);
+        if total_mined_uj < prev_total {
+            self.regressions.fetch_add(1, Ordering::Relaxed);
+            regressions += 1;
+        }
+        let prev_height = self.last_height.swap(height, Ordering::Relaxed);
+        if height < prev_height {
+            self.regressions.fetch_add(1, Ordering::Relaxed);
+            regressions += 1;
+        }
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.last_ok_ms.store(now_ms, Ordering::Relaxed);
+        regressions
+    }
+
+    /// Absorb a live probe body: parses `/mining/total_mined_uj` and
+    /// `/chain.height` (u64 — ints, or floats rounded; the chain emits
+    /// plain numbers), returns the regression count. `None` fields are
+    /// non-samples: nothing is updated, nothing is flagged (missing
+    /// shape ≠ broken monotonicity).
+    pub fn probe_body(&self, body: &serde_json::Value, now_ms: u64) -> Option<u8> {
+        let total = numeric_u64(body.pointer("/mining/total_mined_uj"))?;
+        let height = numeric_u64(body.pointer("/chain/height"))?;
+        Some(self.observe(total, height, now_ms))
+    }
+
+    /// The `/status` surface: honest counters. Called with THIS probe's
+    /// parsed numbers (when the probe body had both fields) plus the
+    /// regression verdict; with a regression a loud error lands in the
+    /// journal next to every dashboard reading of the number.
+    pub fn global_probe(total_mined_uj: Option<u64>, height: Option<u64>) -> serde_json::Value {
+        let w = Self::global();
+        let regressions_now = match (total_mined_uj, height) {
+            (Some(t), Some(h)) => {
+                let r = w.observe(t, h, crate::bootstrap::now_ms());
+                if r > 0 {
+                    tracing::error!(
+                        target: "economics",
+                        regressions = r,
+                        total_mined_uj = t,
+                        height = h,
+                        "chain bookkeeping regressed — monotonicity broken (reorg/rollback/restore? ledger shrank between live reads)"
+                    );
+                }
+                r
+            }
+            _ => 0,
+        };
+        let (samples, regressions, last_ok_ms, lt, lh) = (
+            w.samples.load(Ordering::Relaxed),
+            w.regressions.load(Ordering::Relaxed),
+            w.last_ok_ms.load(Ordering::Relaxed),
+            w.last_total_mined_uj.load(Ordering::Relaxed),
+            w.last_height.load(Ordering::Relaxed),
+        );
+        serde_json::json!({
+            "samples": samples,
+            "last_total_mined_uj": lt,
+            "last_height": lh,
+            "regressions": regressions,
+            "last_ok_ms": last_ok_ms,
+            "regressed_this_probe": regressions_now > 0,
+        })
+    }
+
+    /// The process-global watch (the /status probe's home).
+    pub fn global() -> &'static Self {
+        static CHAIN_DRIFT: std::sync::OnceLock<ChainDriftWatch> = std::sync::OnceLock::new();
+        CHAIN_DRIFT.get_or_init(ChainDriftWatch::default)
+    }
+}
+
+/// A JSON number as u64 — ints and integral floats both count (a chain
+/// emitting 21.0 must parse as the height 21).
+fn numeric_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    match v? {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Some(u)
+            } else {
+                n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1253,5 +1426,109 @@ mod tests {
         let json = serde_json::to_string(&o).unwrap();
         let back: MineOutcome = serde_json::from_str(&json).unwrap();
         assert!(back.won);
+    }
+
+    // ---- §13 drift watch: monotonicity over injected live samples ----
+
+    /// The watch keeps the HIGH-water mark: growth merges silently, a
+    /// shrink counts exactly one regression per regressed field pair.
+    #[test]
+    fn drift_watch_flags_only_real_regressions_and_keeps_high_water() {
+        let w = ChainDriftWatch::new();
+        assert_eq!(w.observe(1_000, 10, 100), 0, "first sample is a baseline");
+        assert_eq!(w.observe(1_500, 11, 200), 0, "growth is monotonic");
+        assert_eq!(w.observe(2_500, 13, 300), 0, "mixed growth still monotonic");
+        // Counts once at the transition, then the lower reading becomes
+        // the baseline.
+        assert_eq!(
+            w.observe(2_400, 14, 400),
+            1,
+            "only the regressed field counts (total shrank, height grew)"
+        );
+        assert_eq!(w.last_total_mined_uj.load(Ordering::Relaxed), 2_400);
+        assert_eq!(
+            w.observe(2_400, 14, 500),
+            0,
+            "a held-flat ledger is NOT a regression (no mine, no block)"
+        );
+        assert_eq!(w.observe(2_300, 12, 600), 2, "both fields shrinking = 2");
+        // After each incident the stored baseline is the ACCEPTED reading
+        // — lower than the peak with the peak's incident counted exactly
+        // once, never re-flagged on every later sample.
+        assert_eq!(w.last_total_mined_uj.load(Ordering::Relaxed), 2_300);
+        assert_eq!(w.last_height.load(Ordering::Relaxed), 12);
+        assert_eq!(
+            w.samples.load(Ordering::Relaxed),
+            6,
+            "every observe() is a sample — even the regressing ones"
+        );
+        assert_eq!(
+            w.regressions.load(Ordering::Relaxed),
+            3,
+            "1 + 2, counted once each"
+        );
+        assert_eq!(
+            w.last_ok_ms.load(Ordering::Relaxed),
+            600,
+            "even a regressing sample is a live sample (the chain answered)"
+        );
+    }
+
+    /// The probe body seam: numeric shapes parse, a missing field is a
+    /// NON-sample (no update, no flag — missing shape ≠ broken ledger).
+    #[test]
+    fn drift_watch_probe_body_parses_shapes_and_skips_non_samples() {
+        let w = ChainDriftWatch::new();
+        let good = serde_json::json!({
+            "mining": {"total_mined_uj": 5_000_i64},
+            "chain": {"height": 42},
+        });
+        assert_eq!(w.probe_body(&good, 1), Some(0));
+        // Float-shaped height (a chain emitting 43.0) parses as 43.
+        let floaty = serde_json::json!({
+            "mining": {"total_mined_uj": 5_500.0},
+            "chain": {"height": 43.0},
+        });
+        assert_eq!(w.probe_body(&floaty, 2), Some(0));
+        assert_eq!(w.last_height.load(Ordering::Relaxed), 43);
+        // Regression through the body seam too.
+        let regressed = serde_json::json!({
+            "mining": {"total_mined_uj": 5_400},
+            "chain": {"height": 42},
+        });
+        assert_eq!(w.probe_body(&regressed, 3), Some(2), "both fields shrank");
+        // Missing field → None, and NOTHING updates: samples are only
+        // valid reads.
+        let truncated = serde_json::json!({"mining": {"total_mined_uj": 9_999}});
+        assert_eq!(w.probe_body(&truncated, 4), None);
+        assert_eq!(
+            w.last_total_mined_uj.load(Ordering::Relaxed),
+            5_400,
+            "the regressed reading was accepted as the new baseline"
+        );
+        assert_eq!(w.last_ok_ms.load(Ordering::Relaxed), 3);
+        assert_eq!(w.samples.load(Ordering::Relaxed), 3);
+    }
+
+    /// The miner-half streak: failures add (with the every-5 WARN
+    /// threshold encoded), any success resets, totals persist.
+    #[test]
+    fn mine_flip_failure_streak_counts_resets_and_totals() {
+        let s = MineStats::default();
+        assert_eq!(s.record_failure(), 1);
+        assert_eq!(s.record_failure(), 2);
+        assert_eq!(s.record_failure(), 3);
+        assert_eq!(s.record_failure(), 4);
+        assert_eq!(s.record_failure(), 5, "the WARN threshold passes here");
+        assert_eq!(s.record_failure(), 6);
+        assert_eq!(s.failures.load(Ordering::Relaxed), 6);
+        s.record_success(); // any Ok clears the streak (win or not)
+        assert_eq!(s.failure_streak.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            s.failures.load(Ordering::Relaxed),
+            6,
+            "the long-window total keeps the incident count"
+        );
+        assert_eq!(s.record_failure(), 1, "the streak restarts cleanly");
     }
 }

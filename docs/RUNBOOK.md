@@ -126,6 +126,37 @@ Rotation procedure:
    a copy is stale. Then `/status` (`wallet.reachable`) and the
    bootstrap's `/health` (still 200).
 
+### Chain smoke + bookkeeping drift watch (2026-10-18)
+
+The rotation section above was written because token drift was SILENT.
+Two surfaces now catch it — and catch the other chain-side failure class
+(a ledger that shrinks between live reads):
+
+```bash
+# Read-only live-chain smoke suite: run it after any chain upgrade,
+# token rotation, or restore. READ-ONLY by construction (GETs only).
+JERITH_TEST_CHAIN_URL=http://127.0.0.1:8322 \
+  cargo test -p jerith-mesh-core --test chain_smoke
+# → 5/5 pass on a healthy chain: /status shape + supply invariant,
+# token-less reads REFUSED, exists:false balance for an unknown identity,
+# /stake view contract, and monotonic bookkeeping across two reads.
+# WITHOUT the env var the suite SKIPS LOUDLY (the reason is printed —
+# never silent).
+```
+
+Runtime drift surfaces (live in every `/status` since 2026-10-18):
+
+- `/status` → chain section → `drift`: the monotonicity watch's counters
+  (`regressions` MUST stay 0; a nonzero value means the chain's
+  `total_mined_uj` or height SHRANK between live reads — reorg, rollback,
+  or a manual restore rewound the ledger). Every regression also lands a
+  journal error: grep `bookkeeping regressed`.
+- `/status.crypto` → `mine_failure_streak` / `mine_failures_total`: the
+  miner-half alarm. A streak ≥ 5 journal-warns on its own
+  (`miner failing repeatedly — token drift?`); in practice a rising
+  streak + frozen `mine_wins_total` is exactly the silent-401 class the
+  rotation procedure above fixes.
+
 ## Post-deploy verification (in order)
 
 ```bash

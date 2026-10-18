@@ -992,6 +992,30 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     let crypto_value = json!({
         "chain": cfg.crypto.chain,
         "mining_enabled": gw.miner.is_some(),
+        // §13 drift watch, miner half: attempts/wins are the existing
+        // counters; the FAILURE STREAK is the silent-token-drift alarm
+        // (a stale api token mined nothing for a long stretch with only
+        // debug logs before). streak > 0 with a healthy chain = red flag.
+        "mine_attempts_total": gw
+            .miner
+            .as_ref()
+            .map(|m| m.stats.attempted.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+        "mine_wins_total": gw
+            .miner
+            .as_ref()
+            .map(|m| m.stats.won.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+        "mine_failure_streak": gw
+            .miner
+            .as_ref()
+            .map(|m| m.stats.failure_streak.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
+        "mine_failures_total": gw
+            .miner
+            .as_ref()
+            .map(|m| m.stats.failures.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0),
         "wallet_card": gw.wallet.is_some(),
         "optional_wallet": optional_wallet_value,
         "note": crate::economics::optional_chain_note(cfg.crypto.chain),
@@ -1210,20 +1234,44 @@ async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
         .await
     {
         Ok(r) => match r.json::<Value>().await {
-            Ok(body) => json!({
-                "reachable": true,
-                "url": base,
-                "height": body.pointer("/chain/height"),
-                "tip_hash": body.pointer("/chain/tip_hash"),
-                "circulating_jer": body.pointer("/chain/circulating_jer"),
-                "max_supply_jer": body.pointer("/chain/max_supply_jer"),
-                "wallets": body.pointer("/wallets"),
-                "miners": body.pointer("/mining/miners"),
-                "total_mined_uj": body.pointer("/mining/total_mined_uj"),
-            }),
+            Ok(body) => {
+                // §13 drift watch: every live probe feed the monotonicity
+                // watch — a shrinking total_mined_uj/height is a chain
+                // ledger event, surfaced here next to the numbers.
+                let total_mined_uj = numeric_u64(body.pointer("/mining/total_mined_uj"));
+                let height = numeric_u64(body.pointer("/chain/height"));
+                let drift = crate::economics::ChainDriftWatch::global_probe(total_mined_uj, height);
+                json!({
+                    "reachable": true,
+                    "url": base,
+                    "height": body.pointer("/chain/height"),
+                    "tip_hash": body.pointer("/chain/tip_hash"),
+                    "circulating_jer": body.pointer("/chain/circulating_jer"),
+                    "max_supply_jer": body.pointer("/chain/max_supply_jer"),
+                    "wallets": body.pointer("/wallets"),
+                    "miners": body.pointer("/mining/miners"),
+                    "total_mined_uj": body.pointer("/mining/total_mined_uj"),
+                    "drift": drift,
+                })
+            }
             Err(_) => json!({"reachable": false, "url": base, "error": "non-JSON chain response"}),
         },
         Err(e) => json!({"reachable": false, "url": base, "error": e.to_string()}),
+    }
+}
+
+/// A JSON number as u64 — ints and integral floats both count (a chain
+/// emitting 21.0 must parse as the height 21).
+fn numeric_u64(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Some(u)
+            } else {
+                n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)
+            }
+        }
+        _ => None,
     }
 }
 

@@ -862,9 +862,33 @@ gotchas surfaced while building the finished parts.
   Core/wallet-rpc endpoints.
 - **Chain-side hardening**: chain-RPC token rotation, mine-rate behavior
   vs. the chain's bookkeeping (`total_mined_uj` drift watch), payout and
-  escrow edge cases on node exit (escrow returned on graceful shutdown —
-  what happens when the process is killed mid-cycle deserves its own
-  drill).
+  escrow edge cases on node exit (the mid-cycle kill drill LANDED
+  2026-10-18 — the §2/§13 escrow training notes and “live drills” record
+  it: zero re-escrow after SIGKILL, chain truth intact).
+  The drift watch + chain smoke half LANDED 2026-10-18:
+  `economics::ChainDriftWatch` (process-global, fed by every `/status`
+  chain probe) enforces MONOTONICITY on the live bookkeeping —
+  `mining.total_mined_uj` and `chain.height` may never shrink between
+  live reads; a violation is counted exactly once (the new lower value
+  becomes the accepted baseline — no peak-worship flag loop), surfaced
+  in the `/status.chain_value.drift` subsection AND journal-errored
+  (`chain bookkeeping regressed — monotonicity broken`) next to every
+  dashboard reading. The miner's silent-failure half is covered too:
+  `MineStats` gained failure_streak/failures totals — a stale api token
+  (the wallet-drift incident class) now journal-WARNs every 5
+  consecutive failures (`miner failing repeatedly — token drift?`) and
+  `/status.crypto` carries attempts/wins/streak/failure counters. The
+  env-gated live-chain smoke suite (`JERITH_TEST_CHAIN_URL` → the
+  skip-loud test-posture pattern) pins the real chain's READ contracts:
+  /status shape + supply invariant, token-less reads REFUSED (401–403),
+  `exists:false` /balance for a never-created identity, the /stake view
+  contract (numeric µJ fields or honest 4xx), and bookkeeping monotonic
+  across two live reads — READ-ONLY by construction (no POST anywhere,
+  a smoke run can never move escrow or mint). Live-verified against the
+  co-hosted chain node 2026-10-18: 5/5 pass, and the very first run
+  caught a contract drift (miners is a COUNT, not a roster — the smoke
+  assertion now pins the real shape). Token rotation stays
+  runbook-procedural (RUNBOOK §rotation).
 
 ### Phase 5+ — trust, attestation, scale
 
@@ -940,8 +964,9 @@ gotchas surfaced while building the finished parts.
 - **Expert-budget telemetry once budgeting lands (Phase 3)**:
 - **Testing posture**: the env-gated live-PG tests (`JERITH_TEST_PG_URL`,
   `JERITH_TEST_PG_URL_NOEXT`) are the pattern to copy for any future
-  backend (chain node smoke tests are the likely next adopter) — skip
-  loudly with the reason, never silently.
+  backend — and the chain node smoke tests ADOPTED it 2026-10-18
+  (`JERITH_TEST_CHAIN_URL`, `crates/core/tests/chain_smoke.rs`, read-only
+  contracts above) — skip loudly with the reason, never silently.
 
 ### Final note
 
