@@ -181,35 +181,31 @@ impl MemoryStore {
     /// memory.search — embed the query and return the most similar hits.
     pub async fn search(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<MemoryHit>> {
         let (qvec, _) = self.embed_text(query).await?;
+        // Score pass allocates nothing per row: the blob is read by
+        // reference (no copy) and text is refetched for the top_k winners
+        // only, by primary key, afterwards.
         let conn = self.conn.lock().await;
         let mut stmt = conn
-            .prepare("SELECT id, text, dim, embedding, provider, created_ms FROM memories")
+            .prepare("SELECT id, dim, embedding, provider FROM memories")
             .context("preparing memory query")?;
-        let mut hits: Vec<MemoryHit> = stmt
+        let mut scored: Vec<ScoredRow> = stmt
             .query_map([], |row| {
-                let bytes: Vec<u8> = row.get(3)?;
-                let provider_s: String = row.get(4)?;
-                let mut hit = MemoryHit {
+                let bytes = row.get_ref(2)?.as_blob()?;
+                Ok(ScoredRow {
                     id: row.get(0)?,
-                    text: row.get(1)?,
-                    score: 0.0,
-                    dim: row.get::<_, i64>(2)? as usize,
-                    provider: provider_from_str(&provider_s),
-                    created_ms: row.get(5)?,
-                };
-                hit.score = cosine(&qvec, &unpack_vector(&bytes));
-                Ok(hit)
+                    dim: row.get::<_, i64>(1)? as usize,
+                    provider: provider_from_str(row.get_ref(3)?.as_str()?),
+                    score: ScoreOrd(cosine_bytes(&qvec, bytes)),
+                })
             })
             .context("scanning memories")?
             .filter_map(|r| r.ok())
             .collect();
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(top_k);
-        Ok(hits)
+        if scored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let top = select_top_k(&mut scored, top_k);
+        fetch_hit_rows(&conn, &top)
     }
 
     /// Produce an embedding: Ollama nomic when reachable, hashing fallback
@@ -342,33 +338,26 @@ impl MemoryStore {
         };
         let conn = self.conn.lock().await;
         let mut stmt = conn
-            .prepare("SELECT id, text, dim, embedding, provider, created_ms FROM memories WHERE id != ?1")
+            .prepare("SELECT id, dim, embedding, provider FROM memories WHERE id != ?1")
             .context("preparing similar query")?;
-        let mut hits: Vec<MemoryHit> = stmt
+        let mut scored: Vec<ScoredRow> = stmt
             .query_map([seed_id], |row| {
-                let bytes: Vec<u8> = row.get(3)?;
-                let provider_s: String = row.get(4)?;
-                let mut hit = MemoryHit {
+                let bytes = row.get_ref(2)?.as_blob()?;
+                Ok(ScoredRow {
                     id: row.get(0)?,
-                    text: row.get(1)?,
-                    score: 0.0,
-                    dim: row.get::<_, i64>(2)? as usize,
-                    provider: provider_from_str(&provider_s),
-                    created_ms: row.get(5)?,
-                };
-                hit.score = cosine(&seed_vec, &unpack_vector(&bytes));
-                Ok(hit)
+                    dim: row.get::<_, i64>(1)? as usize,
+                    provider: provider_from_str(row.get_ref(3)?.as_str()?),
+                    score: ScoreOrd(cosine_bytes(&seed_vec, bytes)),
+                })
             })
             .context("scanning memories for similar")?
             .filter_map(|r| r.ok())
             .collect();
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(top_k);
-        Ok(hits)
+        if scored.is_empty() {
+            return Ok(Vec::new());
+        }
+        let top = select_top_k(&mut scored, top_k);
+        fetch_hit_rows(&conn, &top)
     }
 
     /// memory.stats — health-dashboard port: count, dimensions, provider
@@ -395,9 +384,9 @@ impl MemoryStore {
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
                     ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            for (dim, provider, bytes, created) in rows {
+                })?;
+            for row in rows {
+                let (dim, provider, bytes, created) = row?;
                 *dims.entry(dim).or_default() += 1;
                 *providers.entry(provider).or_default() += 1;
                 bytes_total += bytes;
@@ -513,6 +502,111 @@ fn unpack_vector(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|c| f32::from_le_bytes(*c))
         .collect()
+}
+
+/// Total order over f32 cosine scores for top-k selection. Real cosine
+/// values are finite; NaN (a corrupt blob would be the only source) orders
+/// as equal, mirroring the scan's old partial_cmp fallback.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScoreOrd(f32);
+impl Eq for ScoreOrd {}
+impl Ord for ScoreOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+impl PartialOrd for ScoreOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One scanned row kept between the score pass and the text refetch.
+#[derive(Debug, Clone, Copy)]
+struct ScoredRow {
+    id: i64,
+    dim: usize,
+    provider: EmbedProvider,
+    score: ScoreOrd,
+}
+
+/// Cosine between a vector and a packed little-endian f32 blob (how the
+/// SQLite columns store embeddings) without materializing the unpacked
+/// vector per row. Semantics match `cosine(a, &unpack_vector(bytes))`
+/// exactly: dot over the shared prefix on mismatched lengths, norms over
+/// the full lengths, and a trailing partial chunk dropped like
+/// `unpack_vector` does.
+fn cosine_bytes(a: &[f32], bytes: &[u8]) -> f32 {
+    let chunks = bytes.as_chunks::<4>().0;
+    let dot: f32 = a
+        .iter()
+        .zip(chunks.iter())
+        .map(|(x, c)| x * f32::from_le_bytes(*c))
+        .sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = chunks
+        .iter()
+        .map(|c| {
+            let y = f32::from_le_bytes(*c);
+            y * y
+        })
+        .sum::<f32>()
+        .sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Deterministic top-k over a scanned score list: O(n) partition, then a
+/// stable sort of just the k winners. Ties within a partition keep scan
+/// order; ties straddling the kth boundary pick arbitrarily, the same
+/// tolerance the old full sort + truncate had.
+fn select_top_k(rows: &mut [ScoredRow], top_k: usize) -> Vec<ScoredRow> {
+    if top_k == 0 || rows.is_empty() {
+        return Vec::new();
+    }
+    let k = top_k.min(rows.len());
+    rows.select_nth_unstable_by(k - 1, |a, b| b.score.cmp(&a.score));
+    let mut top: Vec<ScoredRow> = rows[..k].to_vec();
+    top.sort_by_key(|row| std::cmp::Reverse(row.score));
+    top
+}
+
+/// Second pass: text + created_ms for the top-k winners by primary key,
+/// after the pure-score scan. A row deleted underneath the scan is skipped
+/// (it is no longer in the store).
+fn fetch_hit_rows(
+    conn: &Connection,
+    rows: &[ScoredRow],
+) -> anyhow::Result<Vec<MemoryHit>> {
+    let mut hits: Vec<MemoryHit> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let got: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT text, created_ms FROM memories WHERE id = ?1",
+                [row.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .context("fetching top hit text")?;
+        let (text, created_ms) = match got {
+            Some(x) => x,
+            None => continue,
+        };
+        hits.push(MemoryHit {
+            id: row.id,
+            text,
+            score: row.score.0,
+            dim: row.dim,
+            provider: row.provider,
+            created_ms: created_ms.max(0) as u64,
+        });
+    }
+    Ok(hits)
 }
 
 fn provider_str(p: EmbedProvider) -> &'static str {
@@ -1624,6 +1718,78 @@ use super::*;
         assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
         assert!((cosine(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    /// The blob scanner must be bit-for-bit equivalent to the old
+    /// unpack-then-cosine path — mixed-dim stores rely on the shared-prefix
+    /// dot + full-length-norm semantics.
+    #[test]
+    fn cosine_bytes_matches_unpack_then_cosine() {
+        // Deterministic pseudo-random f32 vectors (fnv1a-driven).
+        let pseudo = |dim: usize, seed: u64| -> Vec<f32> {
+            (0..dim)
+                .map(|i| {
+                    let h = fnv1a(&((i as u64).wrapping_add(seed)).to_le_bytes());
+                    (h >> 11) as f32 / ((u64::MAX >> 11) as f32) * 2.0 - 1.0
+                })
+                .collect()
+        };
+        for dim in [1, 7, 64, 137] {
+            let v = pseudo(dim, 7);
+            let a = pseudo(dim, 9);
+            let bytes = pack_vector(&v);
+            // Packed corpus scan: same result as unpack cosine.
+            assert_eq!(cosine(&v, &v), cosine_bytes(&v, &bytes));
+            assert_eq!(cosine(&a, &v), cosine_bytes(&a, &bytes), "mismatched a-length");
+            // Trailing partial chunk: unpack drops it; blob scan must too.
+            let mut tailed = bytes.clone();
+            tailed.push(0x7f);
+            assert_eq!(
+                cosine(&a, &unpack_vector(&tailed)),
+                cosine_bytes(&a, &tailed)
+            );
+            // Empty vec and empty blob hit the zero-norm guard.
+            assert_eq!(cosine_bytes(&[], &bytes), 0.0);
+            assert_eq!(cosine_bytes(&a, &[]), 0.0);
+        }
+    }
+
+    /// Top-k selection on a corpus big enough to exercise the partition
+    /// path: the returned ranking must match a brute-force computation
+    /// over the same offline embedder.
+    #[tokio::test]
+    async fn search_top_k_matches_brute_force_on_a_larger_corpus() {
+        let s = store();
+        // 40 entries with distinct vectors: shared prefix tokens + i extra
+        // repeated tokens each — the extra mass changes the normalized
+        // magnitudes, so scores are strictly ordered unlike duplicate text
+        // (where every hash bucket collision would tie).
+        let texts: Vec<String> = (0..40)
+            .map(|i| format!("alpha kiln note{}", " x".repeat(i)))
+            .collect();
+        let mut ids = Vec::new();
+        for t in &texts {
+            ids.push(s.embed_and_store(t).await.unwrap().0);
+        }
+        let (qvec, _) = s.embed_text("alpha kiln note").await.unwrap();
+        let mut expected: Vec<(i64, f32)> = texts
+            .iter()
+            .zip(&ids)
+            .map(|(t, id)| (*id, cosine(&qvec, &hash_embed(t, 64))))
+            .collect();
+        expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Strictly decreasing across the whole top-8 (including the kth
+        // boundary pair) makes the id assertions tie-free.
+        assert!(
+            (0..7).all(|i| expected[i].1 > expected[i + 1].1),
+            "test corpus produced tied scores"
+        );
+        let hits = s.search("alpha kiln note", 7).await.unwrap();
+        assert_eq!(hits.len(), 7);
+        for (hit, (id, score)) in hits.iter().zip(&expected) {
+            assert_eq!(hit.id, *id);
+            assert!((hit.score - *score).abs() < 1e-6);
+        }
     }
 
     #[tokio::test]
