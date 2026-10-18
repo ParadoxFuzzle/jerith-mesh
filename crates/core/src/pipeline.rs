@@ -374,6 +374,15 @@ pub struct RouteResult {
     /// [`Self::degraded`] with a `walk budget exhausted` reason). A walk
     /// that finishes inside the envelope — or has no envelope — is false.
     pub budget_exhausted: bool,
+
+    /// §1 per-request budget ledger, observed: every wire byte the
+    /// request caused (hop activations in and out at 4 B per f32, plus
+    /// any speculative warm-prefetch pulls) — the mesh spend an
+    /// operator can audit per request.
+    pub wire_bytes_moved: u64,
+    /// Speculative warm-prefetches that LANDED (§1); a failed prefetch
+    /// is an honest no-op and does not count.
+    pub prefetches: usize,
 }
 
 impl RouteResult {
@@ -411,6 +420,17 @@ pub struct RequestBudget {
     pub max_wire_bytes: Option<u64>,
 }
 
+impl RequestBudget {
+    /// Caps normalized to ≥1 (a zero cap must not silently disable the
+    /// guard — the internal post-mapping the walk applies).
+    fn normalized(&self) -> (Option<usize>, Option<u64>) {
+        (
+            self.max_remote_attempts.map(|n| n.max(1)),
+            self.max_wire_bytes.map(|b| b.max(1)),
+        )
+    }
+}
+
 /// Cap on remote attempts per request (SPECULATIVE_RUN headroom: the
 /// honest layer walk is one attempt per hop, and a full reassignment
 /// storm fits `REASSIGN_BUDGET` + route length — far below this; the cap
@@ -428,6 +448,49 @@ impl Default for RequestBudget {
         Self {
             max_remote_attempts: Some(DEFAULT_MAX_REMOTE_ATTEMPTS),
             max_wire_bytes: Some(DEFAULT_REQUEST_WIRE_BYTES),
+        }
+    }
+}
+
+/// §1 speculative decoding, transport-side: as the walk approaches each
+/// remote hop it may PRE-PAY the NEXT hop's weights into the walking
+/// node's local store (a real mesh fetch) so a dead owner's layers can
+/// be re-hosted LOCALLY (self-host reassignment) instead of degraded —
+/// the honest answer upgrades itself from "hops-short" to complete when
+/// the walker can serve the layers from the warm cache. Every pre-paid
+/// byte is request-cause mesh spend and rides the SAME per-request
+/// [`RequestBudget`] ledger; the headroom rule refuses to pre-pay when
+/// the remaining byte budget cannot comfortably cover the estimate —
+/// speculative work must never starve the real walk.
+/// The warm-fetch hook's object type: pull the named hop's containers
+/// into the walking node's local store, return the bytes
+/// actually pulled. The hook takes the hop OWNED (clones are cheap) so
+/// the returned future is plain `+ Send` and spawnable. Failures are
+/// honest no-ops (prefetch is optional work).
+pub type PrefetchHook = dyn Fn(
+        PipelineHop,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<u64>> + Send>>
+    + Send
+    + Sync;
+
+pub struct WalkLimits<'a> {
+    pub budget: RequestBudget,
+    /// The warm-fetch hook (see [`PrefetchHook`]). `None` = no
+    /// speculative work.
+    pub prefetch_next: Option<&'a PrefetchHook>,
+    /// Estimated bytes for ONE expert layer's container — the headroom
+    /// rule multiplies by the next hop's layer count.
+    pub est_layer_bytes: u64,
+}
+
+impl<'a> WalkLimits<'a> {
+    /// Budget-only limits (no prefetch): the shape every M4-era call
+    /// site wants.
+    pub fn with_budget(budget: RequestBudget) -> Self {
+        Self {
+            budget,
+            prefetch_next: None,
+            est_layer_bytes: 0,
         }
     }
 }
@@ -540,15 +603,16 @@ pub async fn execute_route_resilient(
     // to START new ones. `None` disables (no wall — each dial's own
     // deadline still bounds it).
     walk_budget_ms: Option<u64>,
-    // §1 per-request expert budget (work units). Enforced like the wall:
-    // never interrupts an in-flight attempt, refuses to START new REMOTE
-    // ones past the caps and degrades the remaining REMOTE hops by name
-    // with [`RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON`] — local hops
-    // stay free (the caps bound what one request spends on the MESH, not
+    // §1 per-request expert budget (work units) + the speculative
+    // warm-prefetch hook, bundled. Enforced like the wall: never
+    // interrupts an in-flight attempt, refuses to START new REMOTE ones
+    // past the caps and degrades the remaining REMOTE hops by name with
+    // [`RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON`] — local hops stay
+    // free (the caps bound what one request spends on the MESH, not
     // what it may compute locally). `None` disables entirely; the walk
     // keeps [`RequestBudget::default`]-shaped generosity available to
     // callers that pass `Some`.
-    request_budget: Option<&RequestBudget>,
+    limits: Option<&WalkLimits<'_>>,
     stability: &mut RouteStability,
     reassign: impl Fn(&[usize], Option<&str>) -> Option<Vec<PipelineHop>>,
 ) -> RouteResult {
@@ -562,24 +626,34 @@ pub async fn execute_route_resilient(
     let mut hops_run: usize = 0;
     let mut budget_exhausted = false;
     // §1 per-request budget ledger: remote dials started, wire bytes
-    // actually shipped (4 bytes per f32, in + out). Only REMOTE attempts
-    // accrue — local hops are not mesh spend. Caps are normalized to ≥1
-    // so a zero/absent cap never disables the guard by accident.
+    // actually shipped (4 bytes per f32, in + out) + speculative
+    // pre-pays (accrued into the same ledger — they are mesh spend the
+    // request caused). Only REMOTE attempts accrue dials; local hops
+    // are not mesh spend. Caps are normalized to ≥1 so a zero/absent
+    // cap never disables the guard by accident.
     let mut remote_attempts: usize = 0;
     let mut wire_bytes: u64 = 0;
-    let caps = request_budget.map(
-        |RequestBudget {
-             max_remote_attempts,
-             max_wire_bytes,
-         }| {
-            (
-                max_remote_attempts.map(|n| n.max(1)),
-                max_wire_bytes.map(|b| b.max(1)),
-            )
-        },
-    );
+    let caps = limits.map(|WalkLimits { budget, .. }| budget.normalized());
+    let mut prefetch_inflight: Option<tokio::task::JoinHandle<anyhow::Result<u64>>> = None;
+    let mut prefetches: usize = 0;
 
     loop {
+        // A speculative pre-pay in flight from the previous hop's dial
+        // lands FIRST — its bytes are mesh spend the request caused and
+        // belong to the ledger BEFORE any cap evaluates on them.
+        if let Some(handle) = prefetch_inflight.take() {
+            match handle.await {
+                Ok(Ok(bytes)) => {
+                    wire_bytes = wire_bytes.saturating_add(bytes);
+                    prefetches += 1;
+                }
+                Ok(Err(e)) => {
+                    // Prefetch is optional work: an honest no-op.
+                    tracing::debug!(target: "pipeline", error = %e, "speculative prefetch failed — walk unaffected");
+                }
+                Err(_) => {} // spawn panic — treat like any failure no-op
+            }
+        }
         // Enforcement (M4): past the whole-walk envelope, degrade every
         // remaining hop by name instead of dialing — the walk returns the
         // residual with the loss typed, exactly like a reassignment that
@@ -638,6 +712,34 @@ pub async fn execute_route_resilient(
         if remote {
             remote_attempts += 1;
             wire_bytes = wire_bytes.saturating_add((activation.len() * 4) as u64);
+        }
+        // §1 speculative warm-prefetch: while THIS hop dials, the NEXT
+        // hop's containers pre-pay their way to the walker's local store
+        // (a real mesh fetch the caller wires) — so a dead owner can be
+        // served by a self-host reassignment instead of a degraded walk.
+        // Only pre-pay when the caps are not tripped AND the remaining
+        // byte budget can comfortably cover the estimate (≥ 2× —
+        // speculation must never starve the real walk).
+        if remote
+            && let Some(next_hop) = pending.front()
+            && next_hop.node.is_some()
+            && let Some(l) = limits
+            && let Some(hook) = l.prefetch_next
+        {
+            let est = l
+                .est_layer_bytes
+                .saturating_mul(next_hop.layers.len().max(1) as u64);
+            let tripped = caps.as_ref().is_some_and(|(h, b)| {
+                h.is_some_and(|x| remote_attempts >= x) || b.is_some_and(|y| wire_bytes >= y)
+            });
+            // No byte cap → unlimited room; a cap requires ≥2× the
+            // estimate free — speculation must never starve the walk.
+            let room_ok = caps.as_ref().is_none_or(|(_, max_wire)| {
+                max_wire.is_none_or(|cap| cap.saturating_sub(wire_bytes) >= 2 * est)
+            });
+            if !tripped && room_ok {
+                prefetch_inflight = Some(tokio::spawn(hook(next_hop.clone())));
+            }
         }
         let started = std::time::Instant::now();
         let outcome = attempt_one_hop(
@@ -727,6 +829,8 @@ pub async fn execute_route_resilient(
         attempts,
         over_budget,
         budget_exhausted,
+        wire_bytes_moved: wire_bytes,
+        prefetches,
     }
 }
 
@@ -1608,6 +1712,9 @@ mod budget_enforcement_tests {
     type RunFut = std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<(Vec<f32>, Option<String>)>> + Send>,
     >;
+    /// The prefetch hook's boxed-future return: bytes actually pulled.
+    type PrefetchFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<u64>> + Send>>;
 
     fn remote_route(n: usize) -> Vec<PipelineHop> {
         (0..n)
@@ -1752,7 +1859,7 @@ mod budget_enforcement_tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             None,
-            Some(&budget),
+            Some(&WalkLimits::with_budget(budget)),
             &mut stability,
             |_l, _d| None,
         )
@@ -1805,7 +1912,7 @@ mod budget_enforcement_tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             None,
-            Some(&budget),
+            Some(&WalkLimits::with_budget(budget)),
             &mut stability,
             |_l, _d| None,
         )
@@ -1852,7 +1959,7 @@ mod budget_enforcement_tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             None,
-            Some(&RequestBudget::default()),
+            Some(&WalkLimits::with_budget(RequestBudget::default())),
             &mut stability,
             |_l, _d| None,
         )
@@ -1913,7 +2020,7 @@ mod budget_enforcement_tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             None,
-            Some(&budget),
+            Some(&WalkLimits::with_budget(budget)),
             &mut stability,
             |_l, _d| None,
         )
@@ -1939,6 +2046,273 @@ mod budget_enforcement_tests {
             result.degraded[0]
                 .reason
                 .contains(RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON)
+        );
+    }
+
+    // ---- §1 speculative decoding: warm prefetch + self-host -------------
+
+    const PREFETCH_PULL_BYTES: u64 = 100;
+
+    /// The counting warm-fetch hook: every invocation "pulls" the next
+    /// hop's containers (ONE call per fire) and reports the ledger size
+    /// `[PREFETCH_PULL_BYTES]`. The Arc rides inside the boxed future so
+    /// the counting stays with the generated work.
+    fn counting_prefetch(
+        pulls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> &'static (dyn Fn(PipelineHop) -> PrefetchFut + Send + Sync) {
+        use std::sync::atomic::Ordering;
+        Box::leak(Box::new(move |_hop: PipelineHop| -> PrefetchFut {
+            let pulls = std::sync::Arc::clone(&pulls);
+            Box::pin(async move {
+                pulls.fetch_add(1, Ordering::SeqCst);
+                Ok(PREFETCH_PULL_BYTES)
+            })
+        }))
+    }
+
+    /// While each remote hop dials, the NEXT hop's containers pre-pay
+    /// through the hook; every byte joins the SAME ledger the caps
+    /// read. Three remote hops → two prefetches (the tail hop has no
+    /// next): 2×100 pull bytes + 3×64 transport bytes (8-float act in
+    /// + out, 4 B per f32).
+    #[tokio::test]
+    async fn speculative_prefetch_fires_warms_and_accrues() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut stability = RouteStability::new();
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let route = remote_route(3);
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move { Ok((activation, None)) })
+            };
+        let limits = WalkLimits {
+            budget: RequestBudget::default(),
+            prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
+            est_layer_bytes: 50,
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "spec-warm",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&limits),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        assert!(!result.budget_exhausted);
+        assert!(result.degraded.is_empty(), "{:?}", result.degraded);
+        assert_eq!(result.hops_run, 3);
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            2,
+            "hops 1 and 2 fire a prefetch for the NEXT hop; the tail has none"
+        );
+        assert_eq!(result.prefetches, 2, "both pulls landed (per ledger)");
+        assert_eq!(
+            result.wire_bytes_moved,
+            2 * PREFETCH_PULL_BYTES + 3 * 64,
+            "prefetch bytes ride the request ledger: {}",
+            result.wire_bytes_moved
+        );
+    }
+
+    /// The headroom rule: when the remaining byte budget cannot cover
+    /// 2× the estimate, the prefetch DOES NOT FIRE — speculation must
+    /// never starve the real walk.
+    #[tokio::test]
+    async fn prefetch_heads_off_when_headroom_is_tight() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut stability = RouteStability::new();
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let route = remote_route(3);
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move { Ok((activation, None)) })
+            };
+        // 15 kB cap against a 10 kB/layer estimate: 2×est never fits in
+        // the remaining headroom → the prefetch must never fire.
+        let budget = RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: Some(15_000),
+        };
+        let limits = WalkLimits {
+            budget,
+            prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
+            est_layer_bytes: 10_000,
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "spec-no-headroom",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&limits),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        assert_eq!(result.hops_run, 3, "the walk itself is untouched");
+        assert_eq!(result.prefetches, 0);
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            0,
+            "2×10k est > 15 kB cap − 64 B used: no call ever fires"
+        );
+        // And the honest inverse: an corroborating UNLIMITED budget
+        // fires from the same fixture.
+        let mut stability2 = RouteStability::new();
+        let pulls2 = Arc::new(AtomicUsize::new(0));
+        let route2 = remote_route(3);
+        let remote_run2 =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move { Ok((activation, None)) })
+            };
+        let budget2 = RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: None,
+        };
+        let limits2 = WalkLimits {
+            budget: budget2,
+            prefetch_next: Some(counting_prefetch(Arc::clone(&pulls2))),
+            est_layer_bytes: 10_000,
+        };
+        let result2 = execute_route_resilient(
+            "mod",
+            "spec-unlimited",
+            route2,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run2,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&limits2),
+            &mut stability2,
+            |_l, _d| None,
+        )
+        .await;
+        assert_eq!(result2.prefetches, 2);
+        assert_eq!(pulls2.load(Ordering::SeqCst), 2);
+    }
+
+    /// Self-host reassignment: a routed-to-a-dead-owner hop upgrades
+    /// from "degraded" to "served LOCALLY from the warm cache" when the
+    /// caller's reassign resolution hands back a LOCAL hop — the
+    /// completing answer the warm prefetch exists to enable.
+    #[tokio::test]
+    async fn self_host_reassignment_completes_the_walk() {
+        let mut stability = RouteStability::new();
+        // Route: remote A (healthy), remote B (DEAD owner), remote C.
+        let route = vec![
+            PipelineHop {
+                layers: vec![0],
+                node: Some("peer-a".into()),
+            },
+            PipelineHop {
+                layers: vec![1],
+                node: Some("peer-dead".into()),
+            },
+            PipelineHop {
+                layers: vec![2],
+                node: Some("peer-c".into()),
+            },
+        ];
+        let remote_run =
+            move |_expert_id: &str, node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                // Copy the predicate first: the boxed future must not
+                // borrow the &str (RunFut is 'static).
+                let dead_owner = node == "peer-dead";
+                Box::pin(async move {
+                    if dead_owner {
+                        anyhow::bail!("owner dead: halt sign");
+                    }
+                    Ok((activation, None))
+                })
+            };
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let limits = WalkLimits {
+            budget: RequestBudget::default(),
+            prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
+            est_layer_bytes: 50,
+        };
+        // The ring (ring-rule rehost) yields nothing for the dead owner —
+        // but the warm cache (the prefetch ALREADY fired for this hop)
+        // lets the caller fall back to SELF-HOST: node = None.
+        let reassign = |layers: &[usize], dead: Option<&str>| {
+            if dead == Some("peer-dead") {
+                Some(vec![PipelineHop {
+                    layers: layers.to_vec(),
+                    node: None,
+                }])
+            } else {
+                None
+            }
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "spec-self-host",
+            route,
+            vec![0.5_f32; 8],
+            |act, _layers| Ok(act.to_vec()),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&limits),
+            &mut stability,
+            reassign,
+        )
+        .await;
+
+        assert!(
+            result.is_complete(),
+            "the self-host completes what the ring could not: {:?}",
+            result.degraded
+        );
+        assert_eq!(result.hops_run, 3, "A remote, B SELF-HOSTED, C remote");
+        assert_eq!(
+            result.reassigned.len(),
+            1,
+            "the dead owner's hop was re-hosted: {:?}",
+            result.reassigned
+        );
+        assert_eq!(result.reassigned[0].was_node.as_deref(), Some("peer-dead"));
+        // The attempt ledger mirrors the walk: [1] is the FAILED remote
+        // dial (its long-dead wait stays on record), [2] is the local
+        // self-host that serviced the layers.
+        assert_eq!(result.attempts[1].node.as_deref(), Some("peer-dead"));
+        assert!(!result.attempts[1].ok);
+        assert_eq!(
+            result.attempts[2].node.as_deref(),
+            None,
+            "the self-host ran as a LOCAL attempt"
+        );
+        assert!(result.attempts[2].ok);
+        // The warm prefetches ride the dial order: hop A's dial fired
+        // for the (dead) B — the mechanism that made self-host viable —
+        // and B's own dial (before its failure was known) fired for C.
+        assert_eq!(
+            pulls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "A dial prefetches B; B dial prefetches C"
         );
     }
 }

@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
 use jerith_mesh_core::pipeline::{
-    PipelineHop, RequestBudget, RouteResult, RouteStability, execute_route_resilient,
+    PipelineHop, RequestBudget, RouteResult, RouteStability, WalkLimits, execute_route_resilient,
     hop_expert_id, plan_route, plan_route_budget,
 };
 use jerith_mesh_core::quic::{
@@ -910,7 +910,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
                 Duration::from_millis(250),
                 Some(budget_of_far.clone()),
                 None,
-                Some(&request_budget),
+                Some(&WalkLimits::with_budget(request_budget)),
                 &mut stability,
                 |_l, _d| None,
             )
@@ -969,7 +969,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
                 Duration::from_millis(250),
                 Some(budget_of_far.clone()),
                 None,
-                Some(&RequestBudget::default()),
+                Some(&WalkLimits::with_budget(RequestBudget::default())),
                 &mut stability,
                 |_l, _d| None,
             )
@@ -988,6 +988,224 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
                 assert!(
                     (got - expected).abs() < 1e-6,
                     "default-cap walk activation mismatch: got {got}, want {expected}"
+                );
+            }
+        }
+
+        // --- Criterion 8 (Phase 3 M4+§1): speculative warm prefetch
+        // rides the dial order over REAL QUIC — while hop A runs, the
+        // next hop's containers travel from the canonical source into
+        // the walker's local cache; the mute owner's dial dies at its
+        // deadline, and the caller upgrades the answer with a SELF-HOST
+        // reassignment: those layers run LOCALLY from the warm cache
+        // instead of degrading. Every pre-paid byte lands in the same
+        // per-request ledger the caps read.
+        {
+            let walker_cache_dir = std::env::temp_dir()
+                .join(format!("jerith-drill-walker-cache-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&walker_cache_dir);
+            let walker_cache = std::sync::Arc::new(
+                ExpertStore::new(&walker_cache_dir, 8).context("walker warm cache store")?,
+            );
+
+            let hook_client = client.clone();
+            let hook_walker = walker.clone();
+            let hook_source_addr = addr_s;
+            let hook_source_id = node_s.clone();
+            let hook_cache = walker_cache.clone();
+            let hook_bytes: std::sync::Arc<std::sync::atomic::AtomicU64> =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            // The hook keeps its OWN handle (the closure moves it in);
+            // the assertion reads through the original.
+            let hook_bytes_for_hook = hook_bytes.clone();
+            let prefetch_closure = Box::leak(Box::new(
+                move |hop: PipelineHop| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = anyhow::Result<u64>> + Send>,
+                > {
+                    let client = hook_client.clone();
+                    let walker = hook_walker.clone();
+                    let cache = hook_cache.clone();
+                    let source_addr = hook_source_addr;
+                    let source_id = hook_source_id.clone();
+                    let warm_bytes = hook_bytes_for_hook.clone();
+                    let expert_id = hop_expert_id(MODEL, &hop);
+                    Box::pin(async move {
+                        let bytes = fetch_expert(
+                            &client,
+                            source_addr,
+                            &source_id,
+                            &walker,
+                            &expert_id,
+                            Duration::from_secs(15),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("speculative warm fetch of {expert_id} over QUIC")
+                        })?;
+                        let n = bytes.len();
+                        cache
+                            .put_bytes(&bytes)
+                            .with_context(|| format!("ingesting warm-prefetched {expert_id}"))?;
+                        warm_bytes.store(
+                            warm_bytes.load(std::sync::atomic::Ordering::SeqCst) + n as u64,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        Ok::<u64, anyhow::Error>(n as u64)
+                    })
+                },
+            )
+                as Box<
+                    dyn Fn(
+                            PipelineHop,
+                        ) -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = anyhow::Result<u64>> + Send>,
+                        > + Send
+                        + Sync,
+                >);
+
+            // The route over the drill's real 4-layer model: A hosts
+            // layers 0–1, the MUTE owner owns layer 2, B owns layer 3 —
+            // the muted dial is a genuine deadline death.
+            let ownership_spec: BTreeMap<usize, String> = [
+                (0usize, node_a.clone()),
+                (1, node_a.clone()),
+                (2, node_c.clone()),
+                (3, node_b.clone()),
+            ]
+            .into();
+            let spec_route = plan_route(&walk_node_id, &ownership_spec);
+            assert_eq!(
+                spec_route.len(),
+                3,
+                "A, mute, B hops in walk order: {:?}",
+                spec_route
+            );
+
+            // The walker self-hosts from its warm cache; a miss is an
+            // honest error (proving the prefetch, not luck, carried the
+            // tensors).
+            let cache_for_local = walker_cache.clone();
+            let local_run = move |act: &[f32], layers: &[usize]| {
+                let hop = PipelineHop {
+                    node: None,
+                    layers: layers.to_vec(),
+                };
+                let id = hop_expert_id(MODEL, &hop);
+                let weights = cache_for_local
+                    .get(&id)
+                    .map_err(|e| anyhow::anyhow!("walker self-host miss on {id}: {e}"))?;
+                weights.forward(act)
+            };
+            let reassign_self_host = |layers: &[usize], dead: Option<&str>| {
+                if dead == Some(node_c.as_str()) {
+                    Some(vec![PipelineHop {
+                        node: None,
+                        layers: layers.to_vec(),
+                    }])
+                } else {
+                    None
+                }
+            };
+            let limits_spec = WalkLimits {
+                budget: RequestBudget::default(),
+                prefetch_next: Some(&*prefetch_closure),
+                est_layer_bytes: 1, // unit-tested headroom rule; live rule: always room
+            };
+            let mut stability_spec = RouteStability::new();
+            let result9 = execute_route_resilient(
+                MODEL,
+                &walk_req_id,
+                spec_route,
+                input.clone(),
+                local_run,
+                remote_run.clone(),
+                rtt_far,
+                Duration::from_millis(250),
+                None::<fn(&PipelineHop) -> u64>,
+                None,
+                Some(&limits_spec),
+                &mut stability_spec,
+                reassign_self_host,
+            )
+            .await;
+
+            assert!(
+                result9.is_complete(),
+                "the warm-prefetched walker self-hosts the mute owner's layers: {:?}",
+                result9.degraded
+            );
+            assert_eq!(result9.hops_run, 3, "A remote, mute SELF-HOSTED, B remote");
+            assert_eq!(
+                result9.reassigned.len(),
+                1,
+                "the dead owner was re-hosted to SELF: {:?}",
+                result9.reassigned
+            );
+            assert_eq!(
+                result9.reassigned[0].was_node.as_deref(),
+                Some(node_c.as_str()),
+                "the mute owner was re-hosted by name"
+            );
+            assert_eq!(
+                result9.attempts[1].node.as_deref(),
+                Some(node_c.as_str()),
+                "the mute dial died at its deadline first"
+            );
+            assert!(!result9.attempts[1].ok);
+            assert_eq!(
+                result9.attempts[2].node.as_deref(),
+                None,
+                "the self-host ran as a LOCAL attempt"
+            );
+            assert!(result9.attempts[2].ok);
+            assert_eq!(
+                result9.prefetches, 2,
+                "A's dial warmed the mute hop; the mute dial warmed B"
+            );
+            // The ledger: 3 remote attempts' transport bytes (A in+out,
+            // mute in only, B in+out) + the two warm pulls, exactly.
+            let in_bytes = (input.len() * 4) as u64;
+            assert_eq!(
+                result9.wire_bytes_moved,
+                5 * in_bytes + hook_bytes.load(std::sync::atomic::Ordering::SeqCst),
+                "prefetch bytes and transport bytes share one request ledger"
+            );
+            // And the activation is byte-equal to the honest local chain
+            // (including the self-hosted layer run on the warm tensors).
+            let r1g = run_hop(
+                &hop_expert_id(
+                    MODEL,
+                    &PipelineHop {
+                        node: None,
+                        layers: vec![0, 1],
+                    },
+                ),
+                &input,
+            )?;
+            let r2g = run_hop(
+                &hop_expert_id(
+                    MODEL,
+                    &PipelineHop {
+                        node: None,
+                        layers: vec![2],
+                    },
+                ),
+                &r1g,
+            )?;
+            let want9 = run_hop(
+                &hop_expert_id(
+                    MODEL,
+                    &PipelineHop {
+                        node: None,
+                        layers: vec![3],
+                    },
+                ),
+                &r2g,
+            )?;
+            for (got, expected) in result9.activation.iter().zip(&want9) {
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "self-host walk activation mismatch: got {got}, want {expected}"
                 );
             }
         }

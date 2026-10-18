@@ -702,10 +702,31 @@ gotchas surfaced while building the finished parts.
   (see "Route pricing + enforcement" for `RequestBudget`: per-request
   remote-attempt and wire-byte caps on the resilient walk, typed hops-
   short degradation, local hops never collared, real-QUIC drill-verified).
-  Still open: speculative decoding itself (the budget's consumer), and
-  the per-request budget's CONFIG surface (deferred until real
-  speculative runs ride the transport — the caps exist and are enforced
-  at generous defaults meanwhile).
+  The SPECULATIVE half LANDED 2026-10-18 (transport-side warm pre-pay):
+  `pipeline::WalkLimits` carries an optional `prefetch_next` hook —
+  while each remote hop dials, the NEXT hop's containers travel into the
+  walker's local cache over the real transport (a genuinely concurrent
+  `tokio` task whose bytes join the SAME per-request ledger), and the
+  caller's reassign resolution can now fall back to a LOCAL hop — the
+  self-host reassignment — so a dead owner's layers upgrade from
+  "degraded" to "served-from-warm-cache" (the completion the prefetch
+  exists to enable). The headroom rule is a hard invariant: prefetches
+  fire only when the remaining byte budget covers ≥2× the estimate, and
+  a tripped or absent-caps state disables them — speculation never
+  starves the real walk. Telemetry: `RouteResult.wire_bytes_moved` (the
+  single ledger: transport bytes + warm pulls) and `RouteResult.
+  prefetches` (landed pulls; failures are honest no-ops). Unit-tested
+  (fire/accrue exactness, headroom-off, self-host complements the
+  degraded path) and drill-proven through real QUIC (criterion 8 bound:
+  two warm pulls + one mute-owner deadline death + a self-hosted local
+  run = a byte-equal-to-reference COMPLETION with the ledger exactly
+  5×transport + the warm bytes). Still open: speculative DECODING
+  itself (draft-model/speculative stream on the chat path) — the walk's
+  pre-flight is its transport-side substrate; the per-request budget's
+  CONFIG surface (deferred until real speculative runs ride the
+  transport — the caps exist and are enforced at generous defaults
+  meanwhile); and speculative-decode-level telemetry once the budget
+  gains a production caller.
 - ✅ **Asynchronous, timeout-tolerant forward passes + graceful degradation
   (§1)** — the mesh CHAT walk landed async 2026-10-18 (see §2's gateway
   tier notes and §13's config surface for the knobs; the expert walk keeps
