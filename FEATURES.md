@@ -668,6 +668,24 @@ gotchas surfaced while building the finished parts.
   floored drill route still completes untouched (its M3 leg asserts an
   empty over-budget through real QUIC, which now also proves the
   enforcement clause never misfires on a fitting walk).
+  The per-request expert budget (§1's remaining half) landed ON the
+  walk 2026-10-18: `pipeline::RequestBudget` caps what ONE request may
+  spend on the mesh in work units — `max_remote_attempts` (reassignment
+  dials included; default 64, sized to fit a full REASSIGN_BUDGET storm
+  plus a route with room to spare) and `max_wire_bytes` (counted as the
+  walk ships them, 4 B per f32 in and out; default 256 MiB, a flood
+  guard not a squeeze). Enforced inline like the wall: in-flight work
+  always lands, past a cap the walk refuses to START new REMOTE dials
+  and degrades the remaining REMOTE hops with the typed
+  `REQUEST_BUDGET_EXHAUSTED_REASON` — LOCAL hops stay free (the caps
+  bound mesh spend, not local compute), so a walk past a tripped cap
+  still finishes its local work. This is the exact path speculative
+  replays will reuse, so the budget exists before real speculative runs
+  do; config knobs are deliberately DEFERRED to transport integration
+  (no unread config fields — the cold-field gotcha). Drill-verified
+  through real QUIC (criterion 7 bind: a two-remote-attempt cap walks
+  A + B live and refuses the far D hop by name, byte-equal to the two-
+  hop reference; default caps end the same A → B → D walk untouched).
   Still pending: real model shard contents (the Colibri-side layer
   split — the served containers stay synthetic inside) and real
   inter-region links (the wide-area RTT is simulated through pricing;
@@ -679,15 +697,15 @@ gotchas surfaced while building the finished parts.
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.
 - **Speculative decoding + expert budgeting + prefetching (§1)**. The
-  prefetching half LANDED 2026-10-18 (see §1 for the full shape): the
-  measured-demand store (`expert_stats`, activation counts, hot/cold split)
-  is the prefetch oracle and the layer-walk prediction (`L<k> served →
-  `L<k+1>` preloaded) popped out of it with no new exchange — experts were
-  already advertised per layer. Still open: speculative decoding, and the
-  per-request expert budget so one huge speculative run cannot starve
-  other askers (current prefetch is 1 bounded background walk per node,
-  local-hosted candidates only — the budget question does not arise for
-  that shape, it appears when real speculative runs start).
+  prefetching half LANDED 2026-10-18 (see §1 for the full shape), and as
+  of the same day the per-request expert budget's WORK-CAP half is in
+  (see "Route pricing + enforcement" for `RequestBudget`: per-request
+  remote-attempt and wire-byte caps on the resilient walk, typed hops-
+  short degradation, local hops never collared, real-QUIC drill-verified).
+  Still open: speculative decoding itself (the budget's consumer), and
+  the per-request budget's CONFIG surface (deferred until real
+  speculative runs ride the transport — the caps exist and are enforced
+  at generous defaults meanwhile).
 - ✅ **Asynchronous, timeout-tolerant forward passes + graceful degradation
   (§1)** — the mesh CHAT walk landed async 2026-10-18 (see §2's gateway
   tier notes and §13's config surface for the knobs; the expert walk keeps

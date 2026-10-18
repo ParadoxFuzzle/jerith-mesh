@@ -71,8 +71,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
 use jerith_mesh_core::pipeline::{
-    PipelineHop, RouteStability, execute_route_resilient, hop_expert_id, plan_route,
-    plan_route_budget,
+    PipelineHop, RequestBudget, RouteResult, RouteStability, execute_route_resilient,
+    hop_expert_id, plan_route, plan_route_budget,
 };
 use jerith_mesh_core::quic::{
     ExpertServing, NodeRpcReply, NodeRpcRequest, PinMap, SharedPinMap, call, fetch_expert,
@@ -447,6 +447,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
         Duration::from_millis(250),
         Some(budget_of),
         None,
+        None,
         &mut stability,
         |_l, _d| None,
     )
@@ -623,6 +624,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             Duration::from_millis(250),
             Some(budget_of_dead.clone()),
             None,
+            None,
             &mut stability3,
             reassign,
         )
@@ -694,6 +696,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             rtt_of,
             Duration::from_millis(250),
             Some(budget_of_dead),
+            None,
             None,
             &mut stability4,
             |_l, _d| None,
@@ -823,7 +826,8 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             remote_run.clone(),
             rtt_far,
             Duration::from_millis(250),
-            Some(budget_of_far),
+            Some(budget_of_far.clone()),
+            None,
             None,
             &mut stability,
             |_l, _d| None,
@@ -880,6 +884,112 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
                 (got - expected).abs() < 1e-6,
                 "three-node activation mismatch: got {got}, want {expected}"
             );
+        }
+
+        // --- Criterion 7: the budgets are ENFORCED through the real
+        // transport (M4 wall + §1 per-request work caps).
+        //
+        // (a) A per-request budget allowing only two REMOTE attempts
+        //     walks A and B over real QUIC and refuses the far D hop by
+        //     name with the typed per-request reason — deterministic (a
+        //     count, not a race), so the degradation is proven live,
+        //     against the actual wire, not just in unit simulations.
+        {
+            let request_budget = RequestBudget {
+                max_remote_attempts: Some(2),
+                max_wire_bytes: None,
+            };
+            let result7 = execute_route_resilient(
+                MODEL,
+                &walk_req_id,
+                far_route.clone(),
+                input.clone(),
+                |_a, _l| anyhow::bail!("drill router hosts no layers"),
+                remote_run.clone(),
+                rtt_far,
+                Duration::from_millis(250),
+                Some(budget_of_far.clone()),
+                None,
+                Some(&request_budget),
+                &mut stability,
+                |_l, _d| None,
+            )
+            .await;
+            assert!(
+                result7.budget_exhausted,
+                "the per-request cap must degrade the far hop: {:?}",
+                result7.degraded
+            );
+            assert_eq!(result7.hops_run, 2, "A and B walked inside the cap");
+            assert_eq!(
+                result7.degraded.len(),
+                1,
+                "only the far hop was refused: {:?}",
+                result7.degraded
+            );
+            assert_eq!(
+                result7.degraded[0].node.as_deref(),
+                Some(node_d.as_str()),
+                "the far hop was refused by name"
+            );
+            assert!(
+                result7.degraded[0]
+                    .reason
+                    .contains(RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON),
+                "typed per-request reason: {:?}",
+                result7.degraded[0].reason
+            );
+            assert_eq!(
+                result7.attempts.last().map(|a| a.node.as_deref()),
+                Some(Some(node_b.as_str())),
+                "the walk stopped after the second remote attempt"
+            );
+            // The partial answer equals the two-hop local reference —
+            // refusal costs the refused hop, nothing else (residual
+            // unchanged through L2).
+            for (got, expected) in result7.activation.iter().zip(&r2f) {
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "two-node degraded activation mismatch: got {got}, want {expected}"
+                );
+            }
+        }
+        // (b) The DEFAULT per-request caps must never misfire on the
+        // honest live walk: the same A → B → far-D route completes
+        // untouched and byte-equal to the full reference under defaults.
+        {
+            let result8 = execute_route_resilient(
+                MODEL,
+                &walk_req_id,
+                far_route.clone(),
+                input.clone(),
+                |_a, _l| anyhow::bail!("drill router hosts no layers"),
+                remote_run.clone(),
+                rtt_far,
+                Duration::from_millis(250),
+                Some(budget_of_far.clone()),
+                None,
+                Some(&RequestBudget::default()),
+                &mut stability,
+                |_l, _d| None,
+            )
+            .await;
+            assert!(
+                !result8.budget_exhausted,
+                "default caps are not a squeeze: the honest walk completes"
+            );
+            assert!(
+                result8.degraded.is_empty(),
+                "no honest hop degrades under defaults: {:?}",
+                result8.degraded
+            );
+            assert_eq!(result8.hops_run, 3, "A, B, far D walked under default caps");
+            for (got, expected) in result8.activation.iter().zip(&want6) {
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "default-cap walk activation mismatch: got {got}, want {expected}"
+                );
+            }
         }
     }
 

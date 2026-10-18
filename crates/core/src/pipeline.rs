@@ -384,6 +384,52 @@ impl RouteResult {
     /// The reason string every budget-degraded hop carries, so callers
     /// can type-filter without parsing formats.
     pub const BUDGET_EXHAUSTED_REASON: &'static str = "walk budget exhausted";
+    /// The reason string every per-request-budget-degraded hop carries
+    /// (§1). Type-filterable without parsing formats, like the M4 wall.
+    pub const REQUEST_BUDGET_EXHAUSTED_REASON: &'static str = "per-request budget exhausted";
+}
+
+/// §1 per-request expert budget: work-unit caps on what ONE top-level
+/// request may spend on the mesh, enforced inline by the resilient walk
+/// — the path speculative replays will reuse, so the budget exists before
+/// real speculative runs do (the feature note's exact gap: a huge
+/// speculative run cannot starve other askers).
+///
+/// Wall-clock budgets (M4's whole-walk envelope) only bite when dials are
+/// SLOW; these caps bite when a single request issues more WORK than a
+/// mesh share should carry — an unbounded speculative replay loop, a
+/// poisoned plan with endless reassignment churn, or a request moving
+/// wire-scale payloads hop by hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    /// Max REMOTE dial attempts (fault reassignments included — every
+    /// reassignment sub-hop is a fresh dial). `None` = no cap in play.
+    pub max_remote_attempts: Option<usize>,
+    /// Max wire payload (bytes, counted exactly as the walk ships them:
+    /// 4 bytes per f32 element, in AND out) one request may move.
+    /// `None` = no cap in play.
+    pub max_wire_bytes: Option<u64>,
+}
+
+/// Cap on remote attempts per request (SPECULATIVE_RUN headroom: the
+/// honest layer walk is one attempt per hop, and a full reassignment
+/// storm fits `REASSIGN_BUDGET` + route length — far below this; the cap
+/// exists for unbounded speculative replay, never to squeeze honest
+/// walks).
+pub const DEFAULT_MAX_REMOTE_ATTEMPTS: usize = 64;
+
+/// Cap on wire bytes per request (honest MoE activations — d_model-sized
+/// f32 vectors over a bounded hop count — sit orders of magnitude below;
+/// the cap is a flood guard, not a squeeze).
+pub const DEFAULT_REQUEST_WIRE_BYTES: u64 = 256 * 1024 * 1024;
+
+impl Default for RequestBudget {
+    fn default() -> Self {
+        Self {
+            max_remote_attempts: Some(DEFAULT_MAX_REMOTE_ATTEMPTS),
+            max_wire_bytes: Some(DEFAULT_REQUEST_WIRE_BYTES),
+        }
+    }
 }
 
 /// Availability hysteresis for route planning: the freerider module's
@@ -494,6 +540,15 @@ pub async fn execute_route_resilient(
     // to START new ones. `None` disables (no wall — each dial's own
     // deadline still bounds it).
     walk_budget_ms: Option<u64>,
+    // §1 per-request expert budget (work units). Enforced like the wall:
+    // never interrupts an in-flight attempt, refuses to START new REMOTE
+    // ones past the caps and degrades the remaining REMOTE hops by name
+    // with [`RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON`] — local hops
+    // stay free (the caps bound what one request spends on the MESH, not
+    // what it may compute locally). `None` disables entirely; the walk
+    // keeps [`RequestBudget::default`]-shaped generosity available to
+    // callers that pass `Some`.
+    request_budget: Option<&RequestBudget>,
     stability: &mut RouteStability,
     reassign: impl Fn(&[usize], Option<&str>) -> Option<Vec<PipelineHop>>,
 ) -> RouteResult {
@@ -506,6 +561,23 @@ pub async fn execute_route_resilient(
     let mut over_budget: Vec<OverBudgetHop> = Vec::new();
     let mut hops_run: usize = 0;
     let mut budget_exhausted = false;
+    // §1 per-request budget ledger: remote dials started, wire bytes
+    // actually shipped (4 bytes per f32, in + out). Only REMOTE attempts
+    // accrue — local hops are not mesh spend. Caps are normalized to ≥1
+    // so a zero/absent cap never disables the guard by accident.
+    let mut remote_attempts: usize = 0;
+    let mut wire_bytes: u64 = 0;
+    let caps = request_budget.map(
+        |RequestBudget {
+             max_remote_attempts,
+             max_wire_bytes,
+         }| {
+            (
+                max_remote_attempts.map(|n| n.max(1)),
+                max_wire_bytes.map(|b| b.max(1)),
+            )
+        },
+    );
 
     loop {
         // Enforcement (M4): past the whole-walk envelope, degrade every
@@ -530,9 +602,43 @@ pub async fn execute_route_resilient(
             budget_exhausted = true;
             break;
         }
+        // §1 per-request budget enforcement: past either cap, refuse to
+        // START new remote attempts — degrade the remaining REMOTE hops
+        // by name (locals stay free and keep walking). Mirrors the M4
+        // wall: in-flight work always lands, nothing is abandoned; with
+        // no remote hops left the guard is inert (the walk finishes on
+        // local work without spending further mesh units).
+        if let Some((max_hops, max_bytes)) = &caps
+            && (max_hops.is_some_and(|h| remote_attempts >= h)
+                || max_bytes.is_some_and(|b| wire_bytes >= b))
+            && pending.iter().any(|h| h.node.is_some())
+        {
+            budget_exhausted = true;
+            let mut kept: VecDeque<PipelineHop> = VecDeque::with_capacity(pending.len());
+            while let Some(remaining) = pending.pop_front() {
+                if remaining.node.is_some() {
+                    degraded.push(DegradedHop {
+                        layers: remaining.layers.clone(),
+                        node: remaining.node.clone(),
+                        reason: format!(
+                            "skipped: {} after {remote_attempts} remote attempts / {wire_bytes}B of caps",
+                            RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON
+                        ),
+                    });
+                } else {
+                    kept.push_back(remaining);
+                }
+            }
+            pending = kept;
+        }
         let Some(hop) = pending.pop_front() else {
             break;
         };
+        let remote = hop.node.is_some();
+        if remote {
+            remote_attempts += 1;
+            wire_bytes = wire_bytes.saturating_add((activation.len() * 4) as u64);
+        }
         let started = std::time::Instant::now();
         let outcome = attempt_one_hop(
             model_id,
@@ -564,6 +670,9 @@ pub async fn execute_route_resilient(
                         measured_ms: elapsed_ms,
                         budget_ms,
                     });
+                }
+                if remote {
+                    wire_bytes = wire_bytes.saturating_add((out.len() * 4) as u64);
                 }
                 activation = out;
                 hops_run += 1;
@@ -1059,6 +1168,7 @@ mod tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             None,
+            None,
             &mut stability,
             reassign,
         )
@@ -1143,6 +1253,7 @@ mod tests {
             |_| 20,
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             None,
             &mut stability,
             |_layers, _dead| None, // nobody alive to take the layers
@@ -1271,6 +1382,7 @@ mod tests {
             |_| 20,
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             None,
             &mut stability,
             |_l, _d| None,
@@ -1407,6 +1519,7 @@ mod tests {
                 }
             }),
             None,
+            None,
             &mut stability,
             |_l, _d| None,
         )
@@ -1461,6 +1574,7 @@ mod tests {
             |_| 10,
             BASE,
             None::<fn(&PipelineHop) -> u64>,
+            None,
             None,
             &mut stability,
             |_l, _d| None,
@@ -1536,6 +1650,7 @@ mod budget_enforcement_tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             Some(250),
+            None,
             &mut stability,
             |_l, _d| None,
         )
@@ -1590,6 +1705,7 @@ mod budget_enforcement_tests {
             BASE,
             None::<fn(&PipelineHop) -> u64>,
             Some(5_000),
+            None,
             &mut stability,
             |_l, _d| None,
         )
@@ -1599,6 +1715,230 @@ mod budget_enforcement_tests {
         assert_eq!(
             result.hops_run, 4,
             "the whole route ran inside the envelope"
+        );
+    }
+
+    /// §1 per-request budget: the hop cap stops the DIALS, not the
+    /// latency — a walk that would issue more remote attempts than its
+    /// cap degrades the tail with the typed reason. Deterministic (no
+    /// timing involved: the cap is a count).
+    #[tokio::test]
+    async fn request_hop_cap_degrades_the_tail_without_dialing() {
+        let mut stability = RouteStability::new();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let route = remote_route(4);
+        let remote_run = {
+            let dials = dials.clone();
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                let dials = dials.clone();
+                Box::pin(async move {
+                    dials.fetch_add(1, Ordering::SeqCst);
+                    Ok((activation, None))
+                })
+            }
+        };
+        let budget = RequestBudget {
+            max_remote_attempts: Some(2),
+            max_wire_bytes: None,
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "req-hop-cap",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&budget),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        assert!(result.budget_exhausted, "the hop cap ran out mid-walk");
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            2,
+            "no dial may be issued past the attempt cap"
+        );
+        assert_eq!(result.hops_run, 2, "the two in-cap attempts landed");
+        assert_eq!(result.degraded.len(), 2, "the tail was named, not dialed");
+        assert!(
+            result.degraded.iter().all(|d| d
+                .reason
+                .contains(RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON)),
+            "degraded with the per-request reason: {:?}",
+            result.degraded
+        );
+    }
+
+    /// §1 per-request budget: the wire-byte cap counts exactly what the
+    /// walk ships (4 B per f32, in + out) — with 8-float activations that
+    /// is 64 B per completed hop, so a 64 B cap finishes precisely one
+    /// hop and stops the flood.
+    #[tokio::test]
+    async fn request_wire_cap_stops_the_flood() {
+        let mut stability = RouteStability::new();
+        let route = remote_route(4);
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move {
+                    // Output same size as the input: 8 floats = 32 B.
+                    Ok((activation, None))
+                })
+            };
+        let budget = RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: Some(64),
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "req-wire-cap",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&budget),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        assert!(result.budget_exhausted, "the wire cap ran out mid-walk");
+        assert_eq!(
+            result.hops_run, 1,
+            "64 B = exactly one 8-float hop (32 B in + 32 B out)"
+        );
+        assert_eq!(result.degraded.len(), 3);
+        assert!(
+            result.degraded[0].reason.contains("64B of caps"),
+            "the reason names the byte ledger: {:?}",
+            result.degraded[0].reason
+        );
+    }
+
+    /// The DEFAULT budget exists to stop unbounded speculative replay,
+    /// never to squeeze an honest walk: default caps fit a full
+    /// REASSIGN_BUDGET storm plus a four-hop route with room to spare.
+    #[tokio::test]
+    async fn default_request_budget_never_squeezes_an_honest_walk() {
+        assert_eq!(DEFAULT_MAX_REMOTE_ATTEMPTS, 64);
+        assert_eq!(
+            DEFAULT_REQUEST_WIRE_BYTES,
+            256 * 1024 * 1024,
+            "the flood guard is not a squeeze"
+        );
+        let mut stability = RouteStability::new();
+        let route = remote_route(4);
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move { Ok((activation, None)) })
+            };
+        let result = execute_route_resilient(
+            "mod",
+            "req-default",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&RequestBudget::default()),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        assert!(!result.budget_exhausted, "no cap trips on an honest walk");
+        assert!(result.degraded.is_empty(), "{:?}", result.degraded);
+        assert_eq!(result.hops_run, 4);
+    }
+
+    /// Local hops spend nothing on the mesh: past a tripped cap the walk
+    /// still finishes its LOCAL hops and refuses only the remote tail
+    /// (the caps bound mesh spend, not local compute).
+    #[tokio::test]
+    async fn tripped_cap_leaves_local_hops_free() {
+        let mut stability = RouteStability::new();
+        // Route: local, remote, remote, local, remote — the cap trips
+        // after the two middle hops; the trailing local hop still runs,
+        // while the trailing REMOTE hop is refused by name.
+        let route = vec![
+            PipelineHop {
+                layers: vec![0],
+                node: None,
+            },
+            PipelineHop {
+                layers: vec![1],
+                node: Some("peer-1".into()),
+            },
+            PipelineHop {
+                layers: vec![2],
+                node: Some("peer-2".into()),
+            },
+            PipelineHop {
+                layers: vec![3],
+                node: None,
+            },
+            PipelineHop {
+                layers: vec![4],
+                node: Some("peer-4".into()),
+            },
+        ];
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move { Ok((activation, None)) })
+            };
+        let budget = RequestBudget {
+            max_remote_attempts: Some(2),
+            max_wire_bytes: None,
+        };
+        let result = execute_route_resilient(
+            "mod",
+            "req-local-free",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&budget),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+
+        assert!(result.budget_exhausted, "the cap tripped mid-walk");
+        assert_eq!(
+            result.hops_run, 4,
+            "local =1, the two remote hops, then the trailing local = 4"
+        );
+        assert_eq!(
+            result.degraded.len(),
+            1,
+            "only the trailing remote was refused: {:?}",
+            result.degraded
+        );
+        assert_eq!(
+            result.degraded[0].node.as_deref(),
+            Some("peer-4"),
+            "the trailing remote was refused by name"
+        );
+        assert!(
+            result.degraded[0]
+                .reason
+                .contains(RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON)
         );
     }
 }
