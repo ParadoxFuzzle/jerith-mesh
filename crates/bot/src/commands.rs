@@ -93,6 +93,37 @@ pub async fn read(
     Ok(())
 }
 
+/// Send a Tenor GIF for a topic (search is `TENOR_API_KEY`-gated, skip-loud).
+#[poise::command(slash_command, prefix_command)]
+pub async fn gif(
+    ctx: Ctx<'_>,
+    #[description = "What the GIF should show"] query: String,
+) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    let gifs = match crate::gifs::tenor_search(&query).await {
+        Ok(g) => g,
+        Err(e) => {
+            ctx.say(format!("🎭 {e}")).await?;
+            return Ok(());
+        }
+    };
+    if gifs.is_empty() {
+        ctx.say(format!(
+            "🎭 tenor found nothing for “{query}” — try different words"
+        ))
+        .await?;
+        return Ok(());
+    }
+    // Deterministic-ish variety: the same query picks the same gif, but
+    // different queries rotate through the results.
+    let chosen = &gifs[query.len() % gifs.len()].clone();
+    ctx.say(chosen.render()).await?;
+    Ok(())
+}
+
 /// Ask the mesh a question (inherits the gateway's mesh-peer fallback).
 #[poise::command(slash_command, prefix_command, broadcast_typing)]
 pub async fn ask(

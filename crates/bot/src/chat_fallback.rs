@@ -54,6 +54,66 @@ pub async fn handle(
     let leading = strip_leading_bot_mention(&msg.content, bot_id).is_some();
     let contacted = leading || msg.mentions.iter().any(|u| u.id.get() == bot_id);
 
+    // Tenor/GIF ack (§ gifs): a message that carries a gif AND reaches
+    // the bot (a DM, or a mention) earns a deterministic emoji reaction.
+    // A message that is ONLY gif links is acknowledged INSTEAD of
+    // becoming a chat prompt — a bare tenor URL is not a question, and
+    // the pipeline has no eyes for gif bytes anyway.
+    let gif_attachments: Vec<(Option<&str>, &str)> = msg
+        .attachments
+        .iter()
+        .map(|a| (a.content_type.as_deref(), a.filename.as_str()))
+        .collect();
+    let gif_embed_parts: Vec<String> = msg
+        .embeds
+        .iter()
+        .flat_map(|e| {
+            [
+                e.url.as_deref().map(|s| s.to_string()),
+                e.description.clone(),
+                e.video.as_ref().map(|v| v.url.clone()),
+                e.image.as_ref().map(|i| i.url.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        })
+        .collect();
+    let gif_parts: Vec<&str> = gif_embed_parts.iter().map(String::as_str).collect();
+    let gif_hit = crate::gifs::message_is_gif(&msg.content, &gif_attachments, &gif_parts);
+    if gif_hit && (contacted || is_dm) {
+        let reaction = crate::gifs::pick_reaction(msg.id.get());
+        match msg
+            .react(
+                ctx.serenity_context,
+                serenityall::ReactionType::Unicode(reaction.to_string()),
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!(target: "bot", message_id = msg.id.get(), reaction, "gif recognized — reacted")
+            }
+            Err(e) => {
+                tracing::debug!(target: "bot", error = %e, "gif reaction failed (missing perms is normal)")
+            }
+        }
+        let gif_urls: Vec<&str> = msg
+            .content
+            .split_whitespace()
+            .filter(|t| crate::gifs::is_gif_url(t))
+            .collect();
+        if crate::gifs::content_is_gif_only(&msg.content, &gif_urls) {
+            let _ = msg
+                .channel_id
+                .say(
+                    ctx.serenity_context,
+                    format!("{reaction} nice GIF! Ask me for one anytime — `gif <topic>`"),
+                )
+                .await;
+            return Ok(());
+        }
+    }
+
     let prompt = if !contacted {
         if is_dm {
             // Bare DM text (no mention possible medium-less): fully

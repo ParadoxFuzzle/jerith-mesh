@@ -18,6 +18,7 @@ mod commands;
 mod config;
 mod converse;
 mod external;
+mod gifs;
 mod hooks;
 mod mailbox;
 mod monitor;
@@ -224,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::mine(),
                 commands::leaderboard(),
                 commands::myjercraft(),
+                commands::gif(),
                 // Guild-admin lever — deliberately unclassified in
                 // owner.rs's USER_COMMANDS: the default-deny gate makes
                 // it owner-DM only (system-level action).
