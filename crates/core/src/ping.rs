@@ -1658,113 +1658,147 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
     let client = crate::http::mesh_http();
     let my_id = state.identity.node_id();
 
-    let mut failed: Vec<String> = Vec::new();
-    for (node_id, url) in targets {
+    // Concurrent ping batch: the tick used to pay N x RTT serially
+    // (fleet growth would have linearly stretched every tick before
+    // any other work ran). Each leg is self-contained — own stamp,
+    // own signed-send, own verify + evidence accounting — and the
+    // post-batch deprecation machinery below only wants the
+    // failures, so the join re-collects exactly those.
+    let failed: Vec<String> = {
+        let legs: Vec<_> = targets
+            .into_iter()
+            .map(|(node_id, url)| {
+                let my_id = my_id.clone();
+                let client = client.clone();
+                async move { ping_one(state, bootstrap, &client, &my_id, node_id, url).await }
+            })
+            .collect();
+        futures_util::future::join_all(legs)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+
+/// One ping leg of the concurrent batch (see ping_all): sign, send,
+/// verify the signed health reply, account evidence. Returns the
+/// node_id for the post-batch failure machinery when the leg did
+/// NOT count the peer alive; None when it did.
+async fn ping_one(
+    state: &Arc<MeshState>,
+    bootstrap: &BootstrapClient,
+    client: &reqwest::Client,
+    my_id: &str,
+    node_id: String,
+    url: String,
+) -> Option<String> {
         let started = std::time::Instant::now();
         let stamp = now_ms();
-        let payload = crate::signing::ping_payload(&my_id, &node_id, stamp);
+        let payload = crate::signing::ping_payload(my_id, &node_id, stamp);
         // Freeze the stamp: the payload embeds it, so the header stamp and
         // the signed bytes must come from the SAME clock read (ms-boundary
         // races under load made pings intermittently rejected).
         let auth = crate::signing::WireAuth::with_stamp(&state.identity, stamp, payload.as_bytes());
         let result = client
-            .get(&url)
-            .header("x-jerith-pubkey", &auth.pubkey)
-            .header("x-jerith-stamp", auth.stamp_ms.to_string())
-            .header("x-jerith-sig", &auth.sig)
-            .header("x-jerith-from", &my_id)
-            .timeout(Duration::from_secs(4))
-            .send()
-            .await;
+        .get(&url)
+        .header("x-jerith-pubkey", &auth.pubkey)
+        .header("x-jerith-stamp", auth.stamp_ms.to_string())
+        .header("x-jerith-sig", &auth.sig)
+        .header("x-jerith-from", my_id)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await;
         match result {
-            Ok(resp) if resp.status().is_success() => {
-                // Verify the signed health reply attributes it to the peer.
-                let rtt = started.elapsed().as_millis() as u64;
-                let (ok, meas) = verify_health_reply(state, &node_id, resp).await;
-                if ok {
-                    let mut reg = state.registry.lock().await;
-                    reg.record_ping_ok(&node_id, rtt);
-                    drop(reg);
-                    // FEATURES §2: tally the peer's signed measurement
-                    // verdicts — tampered blocks and demonstrated
-                    // declared-vs-measured shortfalls queue Leeching
-                    // evidence through the same flush cadence as every
-                    // other fraud layer (verified here locally, signed by
-                    // the peer's own key, so the bootstrap can weigh it).
-                    let (verified, targets): (Option<VerifiedMeasurement>, Vec<String>) = match meas
-                    {
-                        Some(Ok(block)) => {
-                            let flagged = state
-                                .contrib_ledger
-                                .lock()
-                                .await
-                                .record_verified(
-                                    &node_id,
-                                    block.declared_percent,
-                                    block.measured_percent,
-                                );
-                            (Some(block), flagged)
-                        }
-                        Some(Err(())) => {
-                            let flagged = state
-                                .contrib_ledger
-                                .lock()
-                                .await
-                                .record_tampered(&node_id);
-                            (None, flagged)
-                        }
-                        None => (None, Vec::new()),
-                    };
-                    if !targets.is_empty() {
-                        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-                        state
-                            .verify
-                            .flag_fraud(crate::bootstrap_server::FraudKind::Leeching, &refs)
-                            .await;
+        Ok(resp) if resp.status().is_success() => {
+            // Verify the signed health reply attributes it to the peer.
+            let rtt = started.elapsed().as_millis() as u64;
+            let (ok, meas) = verify_health_reply(state, &node_id, resp).await;
+            if ok {
+                let mut reg = state.registry.lock().await;
+                reg.record_ping_ok(&node_id, rtt);
+                drop(reg);
+                // FEATURES §2: tally the peer's signed measurement
+                // verdicts — tampered blocks and demonstrated
+                // declared-vs-measured shortfalls queue Leeching
+                // evidence through the same flush cadence as every
+                // other fraud layer (verified here locally, signed by
+                // the peer's own key, so the bootstrap can weigh it).
+                let (verified, targets): (Option<VerifiedMeasurement>, Vec<String>) = match meas
+                {
+                    Some(Ok(block)) => {
+                        let flagged = state
+                            .contrib_ledger
+                            .lock()
+                            .await
+                            .record_verified(
+                                &node_id,
+                                block.declared_percent,
+                                block.measured_percent,
+                            );
+                        (Some(block), flagged)
                     }
-                    // §2 QUORUM: the verified block itself is FORWARDED to
-                    // the bootstrap under both signatures — the subject's
-                    // own signature anchors the figures (a biased pinger
-                    // cannot change them), ours attests it verified exactly
-                    // this block. Off the inference hot path (one POST per
-                    // verified ping); failures log at debug and count for
-                    // nothing else.
-                    if let Some(block) = &verified {
-                        let obs = crate::bootstrap_server::MeasureObservation {
-                            reporter: my_id.clone(),
-                            subject: block.subject.clone(),
-                            subject_pubkey: block.subject_pubkey.clone(),
-                            subject_sig: block.subject_sig.clone(),
-                            block_stamp_ms: block.block_stamp_ms,
-                            window_secs: block.window_secs,
-                            tokens_served: block.tokens_served,
-                            tokens_consumed: block.tokens_consumed,
-                            declared_percent: block.declared_percent,
-                            measured_percent: block.measured_percent,
-                        };
-                        match bootstrap.report_measure(&obs, &state.identity).await {
-                            Ok(()) => tracing::debug!(
-                                target: "mesh",
-                                subject = %obs.subject,
-                                "measurement block forwarded for the quorum tally"
-                            ),
-                            Err(e) => tracing::debug!(
-                                target: "mesh",
-                                error = %e,
-                                "measurement quorum upload skipped (bootstrap unavailable?)"
-                            ),
-                        }
+                    Some(Err(())) => {
+                        let flagged = state
+                            .contrib_ledger
+                            .lock()
+                            .await
+                            .record_tampered(&node_id);
+                        (None, flagged)
                     }
-                } else {
-                    tracing::warn!(peer = %node_id, "health reply signature invalid — not counted alive");
-                    failed.push(node_id);
+                    None => (None, Vec::new()),
+                };
+                if !targets.is_empty() {
+                    let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+                    state
+                        .verify
+                        .flag_fraud(crate::bootstrap_server::FraudKind::Leeching, &refs)
+                        .await;
                 }
-            }
-            _ => {
-                failed.push(node_id);
+                // §2 QUORUM: the verified block itself is FORWARDED to
+                // the bootstrap under both signatures — the subject's
+                // own signature anchors the figures (a biased pinger
+                // cannot change them), ours attests it verified exactly
+                // this block. Off the inference hot path (one POST per
+                // verified ping); failures log at debug and count for
+                // nothing else.
+                if let Some(block) = &verified {
+                    let obs = crate::bootstrap_server::MeasureObservation {
+                        reporter: my_id.to_string(),
+                        subject: block.subject.clone(),
+                        subject_pubkey: block.subject_pubkey.clone(),
+                        subject_sig: block.subject_sig.clone(),
+                        block_stamp_ms: block.block_stamp_ms,
+                        window_secs: block.window_secs,
+                        tokens_served: block.tokens_served,
+                        tokens_consumed: block.tokens_consumed,
+                        declared_percent: block.declared_percent,
+                        measured_percent: block.measured_percent,
+                    };
+                    match bootstrap.report_measure(&obs, &state.identity).await {
+                        Ok(()) => tracing::debug!(
+                            target: "mesh",
+                            subject = %obs.subject,
+                            "measurement block forwarded for the quorum tally"
+                        ),
+                        Err(e) => tracing::debug!(
+                            target: "mesh",
+                            error = %e,
+                            "measurement quorum upload skipped (bootstrap unavailable?)"
+                        ),
+                    }
+                }
+            } else {
+                tracing::warn!(peer = %node_id, "health reply signature invalid — not counted alive");
+                    return Some(node_id);
             }
         }
-    }
+        _ => {
+            return Some(node_id);
+        }
+        }
+
+    None
+}
 
     if !failed.is_empty() {
         let (report_evidence, my_id) = {
