@@ -360,14 +360,18 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
             // §10 anti-sybil live half: the bootstrap weights reporter
             // establishment by registry age OR visible locked stake —
             // pass the chain base when this node runs on Jerithchain; a
-            // broken/absent config degrades to the age rule alone.
+            // broken/absent config degrades to the age rule alone. The
+            // resolver is the same one the `chain`/`stake` CLI commands
+            // use ($JERITH_CHAIN_URL → config `chain_url` → the
+            // co-hosted :8322) — /stake lives on the chain NODE api, not
+            // on the miner-facing wallet endpoint chain_rpc_url picks.
             let chain_base = jerith_mesh_core::config::NodeConfig::load()
                 .ok()
                 .flatten()
                 .filter(|cfg| {
                     cfg.crypto.chain == jerith_mesh_core::config::CryptoChain::Jerithchain
                 })
-                .map(|cfg| jerith_mesh_core::economics::chain_rpc_url(&cfg.crypto));
+                .map(|cfg| chain_base(Some(&cfg)));
             jerith_mesh_core::bootstrap_server::serve(
                 jerith_mesh_core::bootstrap_server::BootstrapOptions {
                     port,

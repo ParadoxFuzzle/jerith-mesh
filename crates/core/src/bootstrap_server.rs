@@ -84,6 +84,12 @@ struct Registry {
     /// (a reporter with visible locked stake is established without the
     /// registry-age wait). None = age-only, the offline default.
     chain_base: Option<String>,
+    /// §10 sybil-pressure counter: fraud reports recorded this process
+    /// run with zero score weight (the reporter was not established —
+    /// registry age < the line and no visible chain stake). Registry-
+    /// owned rather than a process static so parallel test servers (and
+    /// multiple bootstraps) each report their own tally exactly.
+    young_fraud_reports: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Registry {
@@ -93,6 +99,7 @@ impl Default for Registry {
             max_entries: MAX_REGISTRY_ENTRIES,
             measures: RwLock::new(MeasureTally::default()),
             chain_base: None,
+            young_fraud_reports: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -463,15 +470,21 @@ fn router_with_limiters(
 
 type Shared = (Arc<Registry>, u64);
 
-async fn bootstrap_health() -> Json<serde_json::Value> {
+async fn bootstrap_health(State((registry, _)): State<Shared>) -> Json<serde_json::Value> {
     // `security` carries this process's reject counters (429s from the
-    // limiter + oversize ad/registry refusals). Additive-only fields:
-    // existing health consumers may ignore unknown keys.
+    // limiter + oversize ad/registry refusals). `sybil` carries the §10
+    // anti-sybil weighting's zero-weight-report tally. Additive-only
+    // fields: existing health consumers may ignore unknown keys.
     Json(serde_json::json!({
         "ok": true,
         "service": "jerith-bootstrap",
         "security": serde_json::to_value(crate::metrics::security_snapshot())
             .expect("security counters serialize"),
+        "sybil": {
+            "young_fraud_reports": registry
+                .young_fraud_reports
+                .load(std::sync::atomic::Ordering::Relaxed),
+        },
     }))
 }
 
@@ -1156,6 +1169,24 @@ async fn report_fraud(
         score,
         "fraud report recorded"
     );
+    // §10 operator signal: a NEW claim from a non-established reporter —
+    // recorded, counted, but carrying zero score weight. Flood-dedup
+    // refreshes (same reporter repeats) are NOT counted, so the counter
+    // tracks distinct young slash attempts, not replays.
+    if !established && !already_reported_by_this_reporter {
+        registry
+            .young_fraud_reports
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            node = %rep.node_id,
+            reporter = %rep.reporter,
+            kind = ?rep.kind,
+            "fraud report carries ZERO score weight: reporter not established \
+             (registry age < the line and no visible chain stake) — counted for \
+             corroboration shape only; mass-minted slash attempts are the sybil \
+             shape the weighting exists to expose"
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2090,6 +2121,7 @@ mod tests {
             entries: RwLock::new(HashMap::new()),
             max_entries: 1,
             chain_base: None,
+            young_fraud_reports: std::sync::atomic::AtomicU64::new(0),
         });
         let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2620,6 +2652,23 @@ mod tests {
     /// one's later claims).
     #[tokio::test]
     async fn young_reporter_holds_no_score_weight_until_established() {
+        // §10 observability: /health's `sybil` section carries the
+        // bootstrap-side zero-weight counter (Registry-owned — exact even
+        // with sibling test servers bumping their own registries).
+        async fn counter_at(base: String, client: &reqwest::Client) -> u64 {
+            let h: serde_json::Value = client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            h["sybil"]["young_fraud_reports"]
+                .as_u64()
+                .unwrap_or_default()
+        }
+
         let registry = Arc::new(Registry::default());
         let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2627,6 +2676,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
         let client = crate::http::mesh_http();
+        let before = counter_at(base.clone(), &client).await;
 
         let accused = crate::signing::SigningIdentity::generate();
         let reporter = crate::signing::SigningIdentity::generate();
@@ -2672,8 +2722,16 @@ mod tests {
         assert_eq!(v["score"], -20, "established corroboration subtracts: {v}");
         assert_eq!(v["reporter_established"], true, "{v}");
         assert_eq!(v["penalty_applied"], true, "{v}");
-    }
 
+        // Exactly ONE new zero-weight claim was recorded (leg 1); the
+        // flood-dedup refresh and the established corroboration add none.
+        let after = counter_at(base, &client).await;
+        assert_eq!(
+            after - before,
+            1,
+            "zero-weight counter counts distinct young claims only: before={before} after={after}"
+        );
+    }
     /// The LIVE half of the weighting: visible locked stake on the chain
     /// establishes a reporter even at registry age zero (skin in the game
     /// beats the calendar). One stub chain serves `GET /stake` per
