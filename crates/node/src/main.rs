@@ -961,7 +961,14 @@ async fn stake_cmd(cmd: StakeCmd) -> anyhow::Result<()> {
         );
     }
     let identity = cfg.identity()?;
-    let stake = jerith_mesh_core::stake::StakeManager::new(&cfg.crypto, Some(identity));
+    let stake = jerith_mesh_core::stake::StakeManager::new(
+        &cfg.crypto,
+        Some(identity),
+        // Same operator resolver as `chain_base(Some(&cfg))`: /stake/*
+        // lives on the chain node's api (:8322 co-hosted), not the
+        // miner-facing wallet endpoint.
+        Some(chain_base(Some(&cfg))),
+    );
     match cmd {
         StakeCmd::Status => {
             stake.refresh_from_chain().await;

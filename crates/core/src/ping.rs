@@ -250,7 +250,14 @@ impl MeshState {
     pub fn new(config: NodeConfig) -> anyhow::Result<(Arc<Self>, watch::Receiver<bool>)> {
         let (tx, rx) = watch::channel(true);
         let identity = config.identity()?;
-        let stake = crate::stake::StakeManager::new(&config.crypto, Some(identity.clone()));
+        let stake = crate::stake::StakeManager::new(
+            &config.crypto,
+            Some(identity.clone()),
+            // The operator resolver half: /stake/* lives on the chain
+            // node api (config `chain_url`), not the miner endpoint.
+            Some(config.chain_url.trim().trim_end_matches('/').to_string())
+                .filter(|u| !u.is_empty()),
+        );
         // Built BEFORE `config` moves into the RwLock below.
         let peer_block = crate::ratelimit::BlockedPeers::from_list(&config.peers.blocked);
         // Discovery rotation: restore the learned set + last-good from the

@@ -1015,7 +1015,7 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
             },
             ..Default::default()
         };
-        let mut stake = jerith_mesh_core::stake::StakeManager::new(&crypto, None);
+        let mut stake = jerith_mesh_core::stake::StakeManager::new(&crypto, None, None);
         let ledger_path = dir.join(format!(
             "stake-{}.json",
             primed_uj.map(|v| v.to_string()).unwrap_or_else(|| "empty".into())

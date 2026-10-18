@@ -173,14 +173,23 @@ impl Default for StakeConfig {
 
 impl StakeManager {
     /// Build from config; derives the slash URL from the chain RPC.
+    ///
+    /// `chain_base_override` carries the operator resolver half — the
+    /// config's `chain_url` ($JERITH_CHAIN_URL → config → co-hosted
+    /// :8322), where `/stake/*` actually lives. `None` falls back to the
+    /// legacy miner-facing wallet endpoint (economics::chain_rpc_url),
+    /// the shape tests and token-less readers see.
     pub fn new(
         crypto: &CryptoConfig,
         identity: Option<crate::signing::SigningIdentity>,
+        chain_base_override: Option<String>,
     ) -> Arc<Self> {
         let config = crypto.stake;
         let chain_base =
             if config.chain_slash && crypto.chain == crate::config::CryptoChain::Jerithchain {
-                Some(crate::economics::chain_rpc_url(crypto))
+                Some(chain_base_override.unwrap_or_else(|| {
+                    crate::economics::chain_rpc_url(crypto)
+                }))
             } else {
                 None
             };
@@ -851,7 +860,7 @@ mod tests {
     fn manager_with_stub(stub: &ChainStub) -> Arc<StakeManager> {
         let mut crypto = crypto(1_000_000);
         crypto.wallet_endpoint = Some(format!("http://{}", stub.addr));
-        let mut mgr = StakeManager::new(&crypto, Some(crate::signing::SigningIdentity::generate()));
+        let mut mgr = StakeManager::new(&crypto, Some(crate::signing::SigningIdentity::generate()), None);
         if let Some(m) = Arc::get_mut(&mut mgr) {
             m.token = Some("test-token".into());
             m.rearm_ledger(fresh_ledger_path());
@@ -973,7 +982,7 @@ mod tests {
             c
         };
         let identity = crate::signing::SigningIdentity::generate();
-        let mut mgr = StakeManager::new(&crypto, Some(identity.clone()));
+        let mut mgr = StakeManager::new(&crypto, Some(identity.clone()), None);
         // Private fresh ledger: otherwise this notice's escrow/slash
         // markers land in the shared production stake.json — polluting the
         // live node's dataset and short-circuiting sibling tests' flows.

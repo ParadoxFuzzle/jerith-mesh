@@ -700,8 +700,12 @@ gotchas surfaced while building the finished parts.
   (`first_seen_ms` ≥ 24h; a never-advertised identity reads as age zero)
   OR visible locked stake on the chain (> 0 µJ via the token-authed
   `GET /stake`, the skin-in-the-game half beating the calendar for
-  freshly-minted but staked operators; chain unreachable = age rule
-  only, no fake grace). Young/unstaked reports are still RECORDED (they
+  freshly-minted but  staked operators; chain unreachable = age rule only, no fake grace).
+  Zero-weight reports are visible: /health's `sybil.young_fraud_reports`
+  counter (Registry-owned) plus an operator log line name the mass-mint
+  shape the weighting exists to expose. The stake resolver speaks the
+  operator's `chain_url` (the :8322 chain-node api) on every path now
+  \u2014 run loop, stake CLI, bootstrap live half \u2014 not just the CLI.. Young/unstaked reports are still RECORDED (they
   count toward the corroboration shape and the per-reporter flood
   dedup) but subtract nothing — minting identities to slash a peer's
   score is the shape removed. The report response now carries
@@ -766,10 +770,32 @@ gotchas surfaced while building the finished parts.
   statistics only) and the escrow half (§2's staking entry, landed
   2026-10-18: the join gate is behavioral — with `required_uj` set and
   a short escrow, the node's RPC server typed-refuses work-carrying
-  requests while pings keep flowing). What remains inside this line:
-  live drills of the gate + demotion + slash loop on an actual staked
-  deployment (anti-sybil weighting itself landed 2026-10-18, see the
-  §10 entry above).
+  requests while pings keep flowing). The anti-sybil weighting itself
+  landed 2026-10-18 (see the §10 entry above).
+- ✅ **Live drill: gate + demotion + slash loop on a real staked second
+  node** (landed 2026-10-18): two scratch identities (drill-victim node
+  + drill-reporter, drill_fraud example driver) against the real
+  bootstrap and the real chain. Gate half: with `required_uj` above the
+  wallet the boot escrow was chain-typed-rejected ("insufficient
+  funds: 500000 < 5100000") and `/status.stake` read `gate_clear:
+  false`; at a coverable 0.2 JER the boot lock landed on-chain and the
+  gate opened (`staked 200000 µJ \u2265 required`). Demotion half: two
+  fresh-mint reports recorded with ZERO weight while the stake-
+  established reporter's claim subtracted \u221230 \u2192 halted \u2192 the victim
+  stood WITHHELD from `/v1/peers` (and `/health.sybil
+  .young_fraud_reports` moved 0 \u2192 2 live). Slash half: the reporter's
+  wire-signed `/stake/slash` moved 0.05 JER escrow \u2192 treasury, the
+  chain view read back `staked 150000 | slashed 50000`, and the
+  victim's gate honestly CLOSED again (150k < 200k required) \u2014 the
+  full interlock: slash below the requirement shuts the same gate that
+  opened it. Cleanup: both drill escrows unlocked back to the wallets
+  (0.05 JER slash + audit trail is the drill's permanent residue),
+  drill node stopped. Drill residue: `sybil.young_fraud_reports = 2`
+  counts the two zero-weight drill claims, by design. Wiring found by
+  the drill and fixed: the stake resolver now uses the operator's
+  `chain_url` (:8322, where /stake* lives) everywhere \u2014 run loop,
+  stake CLI, and the bootstrap's live half \u2014 and the co-hosted token
+  had drifted from the chain node's key again (resynced).
 - **TEE attestation & selective ZK proofs (research-grade §10)**. Honest
   ground truth today is the commitment layer + spot-check ringer + signed
   measurement blocks — hardware attestation arrives later, gated on a
