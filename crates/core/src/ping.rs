@@ -1635,11 +1635,17 @@ async fn run_loop(
 /// Ping all connectable peers with a minimal-resource, signed request.
 /// The reply must carry a valid Ed25519 health signature from the peer's
 /// own key before we count it as alive — spoofed liveness is rejected.
+/// Our own echoed ad is skipped: the bootstrap lists us back into the
+/// peer set, and self-dialing just wastes the tick — worse, a busy
+/// gateway that fails its own health check would rack up self-failures
+/// toward its own deprecation line.
 async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
+    let my_id = state.identity.node_id();
     let targets: Vec<(String, String)> = {
         let reg = state.registry.lock().await;
         reg.connectable()
             .into_iter()
+            .filter(|(ad, _)| ad.node_id != my_id)
             .map(|(ad, _)| (ad.node_id.clone(), format!("http://{}/health", ad.address)))
             .collect()
     };
@@ -1648,7 +1654,6 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
     }
 
     let client = crate::http::mesh_http();
-    let my_id = state.identity.node_id();
 
     // Concurrent ping batch: the tick used to pay N x RTT serially
     // (fleet growth would have linearly stretched every tick before

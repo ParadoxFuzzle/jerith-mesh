@@ -709,12 +709,57 @@ fn aggregate_fleet_census(
     })
 }
 
+/// The operator-facing peer roster (PeerRegistry → JSON). Every peer except
+/// SELF — the bootstrap echoes our own advertisement back into the peer
+/// set, and this node is not its own peer; counting it inflated
+/// `peer_count`/`peers_alive` and would put a self-row in operator tools.
+/// Sorted by node id so a dashboard isn't reordered by HashMap iteration.
+fn peers_roster(reg: &crate::bootstrap::PeerRegistry, own_id: &str) -> serde_json::Value {
+    let ads: Vec<crate::bootstrap::PeerAd> = reg.all_ads();
+    let mut rows: Vec<&crate::bootstrap::PeerAd> =
+        ads.iter().filter(|ad| ad.node_id != own_id).collect();
+    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|ad| {
+            let health = reg.health_of(&ad.node_id);
+            let state = health
+                .map(|h| h.state)
+                .unwrap_or(crate::bootstrap::PeerState::Unknown);
+            let state = match state {
+                crate::bootstrap::PeerState::Unknown => "unknown",
+                crate::bootstrap::PeerState::Alive => "alive",
+                crate::bootstrap::PeerState::Deprecated => "deprecated",
+            };
+            json!({
+                "node_id": ad.node_id,
+                "address": ad.address,
+                "rpc_address": ad.rpc_address,
+                "model": ad.model_id,
+                "quant": ad.quant,
+                "role": ad.role,
+                "contribution_percent": ad.contribution_percent,
+                "state": state,
+                "last_rtt_ms": health.and_then(|h| h.last_rtt_ms),
+                "consecutive_failures": health.map(|h| h.consecutive_failures).unwrap_or(0),
+                "hosted_experts": ad.hosted_experts.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
 /// Human/CLI-facing status snapshot.
 async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     let cfg = gw.state.config.read().await;
     let reg = gw.state.registry.lock().await;
     let meters = gw.state.meters.lock().await;
-    let alive = reg.connectable().len();
+    let roster = peers_roster(&reg, &cfg.node_id);
+    let peer_count = roster.as_array().map(|a| a.len()).unwrap_or(0);
+    let peers_alive = roster
+        .as_array()
+        .map(|a| a.iter().filter(|r| r["state"] != "deprecated").count())
+        .unwrap_or(0);
     // Hoisted: json! cannot host statement blocks.
     let verify = gw.state.verify.stats().await;
     let verify_value = json!({
@@ -975,8 +1020,9 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "contribution": contribution_value,
         // Local memory (FEATURES §6): the backend actually live-served.
         "memory_store": memory_store_value,
-        "peer_count": reg.len(),
-        "peers_alive": alive,
+        "peer_count": peer_count,
+        "peers_alive": peers_alive,
+        "peers": roster,
         "meters": {
             "tokens_served": meters.tokens_served,
             "expert_activations": meters.expert_activations,
@@ -1812,6 +1858,63 @@ mod tests {
             .map(|n| n["node_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["self-node", "jetson-peer"], "{v}");
+    }
+
+    /// The peer roster excludes the self-ad (the bootstrap echoes our own
+    /// ad back — we are not our own peer), carries liveness + routing
+    /// facts, and is sorted by node id for stable dashboards.
+    #[test]
+    fn peers_roster_excludes_self_and_sorts_by_node_id() {
+        let mk = |node_id: &str| crate::bootstrap::PeerAd {
+            node_id: node_id.into(),
+            address: "127.0.0.1:9001".into(),
+            rpc_address: "127.0.0.1:9101".into(),
+            model_id: "qwen3:8b".into(),
+            quant: "int4".into(),
+            contribution_percent: 40,
+            role: crate::config::NodeRole::Hybrid,
+            last_seen_ms: 0,
+            resources: None,
+            hosted_experts: Some(vec!["exp.a".into()]),
+            hosted_expert_count: Some(1),
+            discovery_servers: Vec::new(),
+            gossip_reputations: None,
+        };
+        let gate = crate::models::ModelId {
+            id: "qwen3:8b".into(),
+            quant: "int4".into(),
+            source: crate::models::ModelSource::Curated,
+        };
+        let mut reg = crate::bootstrap::PeerRegistry::new(Some(gate.clone()));
+        reg.upsert(mk("self-node"));
+        reg.upsert(mk("zz-peer"));
+        reg.upsert(mk("aa-peer"));
+        reg.record_ping_ok("aa-peer", 12);
+        reg.record_ping_fail("zz-peer");
+        reg.record_ping_fail("zz-peer");
+        reg.record_ping_fail("zz-peer");
+        let v = peers_roster(&reg, "self-node");
+        let rows = v.as_array().unwrap();
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r["node_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["aa-peer", "zz-peer"],
+            "sorted, self excluded: {v}"
+        );
+        assert_eq!(rows[0]["state"], "alive");
+        assert_eq!(rows[0]["last_rtt_ms"], 12);
+        assert_eq!(rows[0]["hosted_experts"][0], "exp.a");
+        assert_eq!(rows[1]["state"], "deprecated");
+        assert_eq!(rows[1]["consecutive_failures"], 3);
+        // Untested ad without health entry → unknown, no invented rtt.
+        let mut lone = crate::bootstrap::PeerRegistry::new(Some(gate));
+        lone.upsert(mk("fresh-peer"));
+        let v = peers_roster(&lone, "someone-else");
+        assert_eq!(v[0]["state"], "unknown");
+        assert!(v[0]["last_rtt_ms"].is_null());
     }
 
     /// Peers without advertised resources are census-absent (unknown ≠

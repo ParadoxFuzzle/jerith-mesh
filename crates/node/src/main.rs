@@ -2435,9 +2435,82 @@ async fn status_cmd() -> anyhow::Result<()> {
 
 async fn peers_cmd() -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?.context("no config — run setup first")?;
-    let Some(model) = cfg.model.as_ref() else {
-        bail!("no model configured — run setup");
-    };
+    let model = cfg
+        .model
+        .clone()
+        .context("no model configured — run setup")?;
+    // Prefer the LOCAL node's live roster (ping-verified liveness + RTT +
+    // hosted experts from /status); the bootstrap advertisement list is
+    // the fallback for remote-node operators (or a node that is down —
+    // its ad view is TTL-based, not ping-verified).
+    let gateway = format!("http://127.0.0.1:{}", cfg.gateway_port);
+    let resp = jerith_mesh_core::http::mesh_http()
+        .get(format!("{gateway}/status"))
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await;
+    let resp_ok = matches!(&resp, Ok(r) if r.status().is_success());
+    if resp_ok {
+        let resp = resp.unwrap();
+        match resp.json::<serde_json::Value>().await {
+            Ok(status) => {
+                // No `peers` key = an older gateway binary without the
+                // roster — fall through to the bootstrap advertisement view.
+                let Some(peers) = status.get("peers").and_then(|p| p.as_array()).cloned() else {
+                    return bootstrap_peer_view(cfg, &model).await;
+                };
+                if peers.is_empty() {
+                    println!(
+                        "No peers for {} {} (this node's view)",
+                        model.id, model.quant
+                    );
+                    return Ok(());
+                }
+                println!("this node's roster (ping-verified): {gateway}/status");
+                println!(
+                    "{:<22} {:<10} {:>8} {:<20} {:>4}  hosted",
+                    "node", "state", "rtt_ms", "model", "contrib"
+                );
+                for p in &peers {
+                    let rtt = match &p["last_rtt_ms"] {
+                        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0).to_string(),
+                        _ => "-".into(),
+                    };
+                    let hosted = p["hosted_experts"]
+                        .as_array()
+                        .map(|a| {
+                            if a.is_empty() {
+                                "-".into()
+                            } else {
+                                a.iter()
+                                    .filter_map(|e| e.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            }
+                        })
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "{:<22} {:<10} {:>8} {:<20} {:>3}%  {}",
+                        p["node_id"].as_str().unwrap_or("?"),
+                        p["state"].as_str().unwrap_or("?"),
+                        rtt,
+                        p["model"].as_str().unwrap_or("?"),
+                        p["contribution_percent"].as_u64().unwrap_or(0),
+                        hosted
+                    );
+                }
+                return Ok(());
+            }
+            Err(_) => {} // fall through to the bootstrap ad view
+        }
+    }
+    bootstrap_peer_view(cfg, &model).await
+}
+
+/// The bootstrap advertisement view: who is ADVERTISED in the model's
+/// mesh (TTL-based, not ping-verified). The fallback for operators of a
+/// remote node, or when the local gateway is down.
+async fn bootstrap_peer_view(cfg: NodeConfig, model: &ModelId) -> anyhow::Result<()> {
     let client = BootstrapClient::new(&cfg.bootstrap_url);
     match client.fetch_peers(&model.id).await {
         Ok(peers) => {
@@ -2446,8 +2519,12 @@ async fn peers_cmd() -> anyhow::Result<()> {
                 .filter(|p| p.model_id == model.id && p.quant == model.quant)
                 .collect();
             if same.is_empty() {
-                println!("No live peers for {} {}", model.id, model.quant);
+                println!("No advertised peers for {} {}", model.id, model.quant);
             } else {
+                println!(
+                    "bootstrap advertisement view: {} (TTL-based, not ping-verified)",
+                    cfg.bootstrap_url
+                );
                 println!(
                     "{:<22} {:<24} {:<8} {:>6}  role",
                     "node", "model", "quant", "contrib"
