@@ -1680,6 +1680,64 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             .collect()
     };
 
+    if !failed.is_empty() {
+        let (report_evidence, my_id) = {
+            let reg = state.registry.lock().await;
+            let evidence: Vec<(String, u32)> = failed
+                .iter()
+                .filter_map(|id| {
+                    let h = reg.health_of(id)?;
+                    // Submit evidence only on the deprecating (3rd) failure.
+                    (h.consecutive_failures == 3).then_some((id.clone(), h.consecutive_failures))
+                })
+                .collect();
+            (evidence, state.identity.node_id())
+        };
+        let mut reg = state.registry.lock().await;
+        for node_id in &failed {
+            let was_alive = matches!(reg.state_of(node_id), Some(PeerState::Alive));
+            reg.record_ping_fail(node_id);
+            if was_alive && reg.state_of(node_id) == Some(PeerState::Deprecated) {
+                tracing::warn!(node = %node_id, "peer deprecated");
+                // Signed report (bootstrap now requires wire auth to count
+                // eviction votes).
+                let _ = bootstrap
+                    .report_dead(node_id, &state.identity.node_id(), &state.identity)
+                    .await;
+            }
+        }
+        drop(reg);
+        // Failed-worker evidence to the bootstrap (signed, dedup'd server
+        // side). Only for transitions to Deprecated (3rd failure).
+        for (node_id, fails) in report_evidence {
+            if fails == 3 {
+                match bootstrap
+                    .report_fraud(
+                        crate::bootstrap_server::FraudKind::FailedWorker,
+                        &node_id,
+                        &my_id,
+                        &state.identity,
+                    )
+                    .await
+                {
+                    Ok(v) => tracing::info!(
+                        target: "mesh",
+                        node = %node_id,
+                        reply = %v,
+                        "failed-worker evidence submitted"
+                    ),
+                    Err(e) => tracing::debug!(
+                        target: "mesh",
+                        node = %node_id,
+                        error = %e,
+                        "fraud evidence submission failed"
+                    ),
+                }
+            }
+        }
+    }
+}
+
 /// One ping leg of the concurrent batch (see ping_all): sign, send,
 /// verify the signed health reply, account evidence. Returns the
 /// node_id for the post-batch failure machinery when the leg did
@@ -1798,64 +1856,6 @@ async fn ping_one(
         }
 
     None
-}
-
-    if !failed.is_empty() {
-        let (report_evidence, my_id) = {
-            let reg = state.registry.lock().await;
-            let evidence: Vec<(String, u32)> = failed
-                .iter()
-                .filter_map(|id| {
-                    let h = reg.health_of(id)?;
-                    // Submit evidence only on the deprecating (3rd) failure.
-                    (h.consecutive_failures == 3).then_some((id.clone(), h.consecutive_failures))
-                })
-                .collect();
-            (evidence, state.identity.node_id())
-        };
-        let mut reg = state.registry.lock().await;
-        for node_id in &failed {
-            let was_alive = matches!(reg.state_of(node_id), Some(PeerState::Alive));
-            reg.record_ping_fail(node_id);
-            if was_alive && reg.state_of(node_id) == Some(PeerState::Deprecated) {
-                tracing::warn!(node = %node_id, "peer deprecated");
-                // Signed report (bootstrap now requires wire auth to count
-                // eviction votes).
-                let _ = bootstrap
-                    .report_dead(node_id, &state.identity.node_id(), &state.identity)
-                    .await;
-            }
-        }
-        drop(reg);
-        // Failed-worker evidence to the bootstrap (signed, dedup'd server
-        // side). Only for transitions to Deprecated (3rd failure).
-        for (node_id, fails) in report_evidence {
-            if fails == 3 {
-                match bootstrap
-                    .report_fraud(
-                        crate::bootstrap_server::FraudKind::FailedWorker,
-                        &node_id,
-                        &my_id,
-                        &state.identity,
-                    )
-                    .await
-                {
-                    Ok(v) => tracing::info!(
-                        target: "mesh",
-                        node = %node_id,
-                        reply = %v,
-                        "failed-worker evidence submitted"
-                    ),
-                    Err(e) => tracing::debug!(
-                        target: "mesh",
-                        node = %node_id,
-                        error = %e,
-                        "fraud evidence submission failed"
-                    ),
-                }
-            }
-        }
-    }
 }
 
 /// Phase 4 ringer spot-check: with `ringer_percent` probability per tick,
@@ -2699,5 +2699,183 @@ mod tests {
     #[test]
     fn min_contribution_is_25() {
         assert_eq!(MIN_CONTRIBUTION_PERCENT, 25);
+    }
+
+    /// One fleet peer for the drill below: a real axum server answering
+    /// the SIGNED /health contract, after a fixed modeled RTT. Fresh stamp
+    /// per request (the verifier stamps-age-checks the reply).
+    async fn spawn_health_peer(rtt_ms: u64) -> (String /*node_id*/, String /*url*/) {
+        let identity = crate::signing::SigningIdentity::generate();
+        let node_id = identity.node_id();
+        let pubkey = identity.pubkey_hex();
+        // Handler copies: the route owns its own captures per request call.
+        let (h_id, h_pub, h_identity) = (node_id.clone(), pubkey.clone(), identity.clone());
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let node_id = h_id.clone();
+                let pubkey = h_pub.clone();
+                let identity = h_identity.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(rtt_ms)).await;
+                    let stamp = now_ms();
+                    let uptime = 10u64;
+                    let contribution = 40u64;
+                    let payload =
+                        crate::signing::health_payload(&node_id, stamp, uptime, contribution);
+                    axum::Json(serde_json::json!({
+                        "node_id": node_id,
+                        "pubkey": pubkey,
+                        "stamp_ms": stamp,
+                        "sig": identity.sign(payload.as_bytes()),
+                        "uptime_seconds": uptime,
+                        "contribution_percent": contribution,
+                        "measurement": serde_json::Value::Null,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        (node_id, format!("http://{addr}/health"))
+    }
+
+    fn median(v: &mut [u64]) -> u64 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    /// Fleet load drill (release, `#[ignore]`d like the memory benches):
+    /// quantify the concurrent ping batch (was N × RTT serial per tick),
+    /// N peers. Real HTTP fleet shape: N signed /health stub servers, each
+    /// adding a fixed modeled RTT (a LAN run gives ~0 ms, which makes the
+    /// serial-vs-batch gap invisible; the delay models the WAN hop the
+    /// change is about). The A/B runs the SHIPPED batch (`ping_all`) and
+    /// the pre-optimizer serial round-robin (the very same `ping_one`
+    /// legs awaited one at a time: own stamp, own verify, same client
+    /// pool, same state) over the same targets, alternating order per
+    /// pass, medians reported.
+    ///
+    ///   cargo test --release -p jerith-mesh-core \
+    ///     -- --ignored fleet_ping_drill --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "release-mode fleet load drill (dev numbers)"]
+    async fn fleet_ping_drill_batch_vs_serial() {
+        const PEERS: usize = 30;
+        const MODELED_RTT_MS: u64 = 25;
+        const PASSES: usize = 7;
+
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("mesh state");
+
+        // The registry's model gate locks ads out until it has a model —
+        // pin one and make every ad match (the shipped flow does this
+        // when the node's model initializes the gate each tick).
+        let drill_model = crate::models::ModelId {
+            id: "drill-fleet".into(),
+            quant: "drill".into(),
+            source: crate::models::ModelSource::Curated,
+        };
+        let mut reg = PeerRegistry::new(Some(drill_model));
+        let mut targets: Vec<(String, String)> = Vec::new();
+        for _ in 0..PEERS {
+            let (node_id, url) = spawn_health_peer(MODELED_RTT_MS).await;
+            // Expose the same targets the shipped path derives from the
+            // registry: host:port address + /health.
+            let address = url
+                .trim_start_matches("http://")
+                .trim_end_matches("/health")
+                .to_string();
+            reg.upsert(crate::bootstrap::PeerAd {
+                node_id: node_id.clone(),
+                address: address.clone(),
+                rpc_address: address,
+                model_id: "drill-fleet".into(),
+                quant: "drill".into(),
+                contribution_percent: 40,
+                last_seen_ms: now_ms(),
+                role: crate::config::NodeRole::Hybrid,
+                resources: None,
+                hosted_experts: None,
+                hosted_expert_count: None,
+                discovery_servers: Vec::new(),
+                gossip_reputations: None,
+            });
+            targets.push((node_id, url));
+        }
+        *state.registry.lock().await = reg;
+
+        // Deliberately unreachable: every peer answers, so the post-batch
+        // failure machinery (the only bootstrap caller in ping_all) must
+        // never dial it — if the drill regresses into failure accounting,
+        // the timing sample is polluted and the client connection errors
+        // become the tell.
+        let bootstrap = BootstrapClient::new("http://127.0.0.1:1");
+        let client = crate::http::mesh_http();
+        let my_id = state.identity.node_id();
+
+        let mut batch_ms = Vec::new();
+        let mut serial_ms = Vec::new();
+        for pass in 0..PASSES {
+            // Alternate the A/B order so pass position can't favor either.
+            let targets_now: Vec<(String, String)> = {
+                let reg = state.registry.lock().await;
+                reg.connectable()
+                    .into_iter()
+                    .map(|(ad, _)| {
+                        (
+                            ad.node_id.clone(),
+                            format!("http://{}/health", ad.address),
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(targets_now.len(), PEERS, "fleet size drifted");
+
+            if pass % 2 == 0 {
+                let started = std::time::Instant::now();
+                ping_all(&state, &bootstrap).await;
+                batch_ms.push(started.elapsed().as_millis() as u64);
+
+                let started = std::time::Instant::now();
+                for (node_id, url) in targets_now {
+                    let _ = ping_one(&state, &bootstrap, &client, &my_id, node_id, url).await;
+                }
+                serial_ms.push(started.elapsed().as_millis() as u64);
+            } else {
+                let started = std::time::Instant::now();
+                for (node_id, url) in targets_now {
+                    let _ = ping_one(&state, &bootstrap, &client, &my_id, node_id, url).await;
+                }
+                serial_ms.push(started.elapsed().as_millis() as u64);
+
+                let started = std::time::Instant::now();
+                ping_all(&state, &bootstrap).await;
+                batch_ms.push(started.elapsed().as_millis() as u64);
+            }
+        }
+
+        let bm = median(&mut batch_ms);
+        let sm = median(&mut serial_ms);
+        println!("fleet drill: {PEERS} peers, modeled RTT {MODELED_RTT_MS} ms, {PASSES} passes");
+        println!("  batched (shipped):  median {bm} ms  (all samples: {batch_ms:?})");
+        println!("  serial (old):       median {sm} ms  (all samples: {serial_ms:?})");
+        println!("  tick saving: {} ms (-{}%)", sm - bm, 100 * (sm - bm) / sm);
+
+        // The line the change was made on: a batched tick must cost about
+        // ONE modeled RTT (plus overhead), not N of them.
+        assert!(
+            bm <= 4 * MODELED_RTT_MS,
+            "batched tick must be ~one RTT, got {bm} ms"
+        );
+        // And it must not merely be a little faster: with N={PEERS}, the
+        // serial tick is ~N×RTT. A >2× cut is the conservative half of
+        // the expected ~{PEERS}×.
+        assert!(
+            sm >= 2 * bm,
+            "serial must pay many RTTs, got serial {sm} vs batched {bm} ms"
+        );
     }
 }
