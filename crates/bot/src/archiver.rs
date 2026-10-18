@@ -258,11 +258,18 @@ impl Ledger {
 /// Discord REST client bits — a slim reqwest wrapper (the bot already
 /// speaks OpenAI-ish JSON everywhere; here it's Discord's API).
 pub(crate) fn discord_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .use_rustls_tls()
-        .user_agent("jerith-mesh-bot/0.1 (thread-archiver)")
-        .build()
-        .expect("static reqwest client config")
+    // One pooled Discord-REST client per process (the two call sites
+    // used to build a fresh TLS stack per archive operation).
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .user_agent("jerith-mesh-bot/0.1 (thread-archiver)")
+                .build()
+                .expect("static reqwest client config")
+        })
+        .clone()
 }
 
 /// Resolve `#{name} ({id})` for the summary header plus the owning guild

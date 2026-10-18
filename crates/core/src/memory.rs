@@ -423,17 +423,14 @@ impl MemoryStore {
 
 async fn ollama_embed(cfg: &EmbedConfig, text: &str) -> anyhow::Result<Vec<f32>> {
     let url = format!("{}/api/embeddings", cfg.ollama_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?;
     #[derive(serde::Deserialize)]
     struct Resp {
         embedding: Vec<f32>,
     }
-    let resp = client
+    let resp = crate::http::mesh_http()
         .post(&url)
         .json(&serde_json::json!({ "model": cfg.model, "prompt": text }))
+        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?
         .error_for_status()?;

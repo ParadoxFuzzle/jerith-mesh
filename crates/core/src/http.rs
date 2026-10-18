@@ -17,17 +17,27 @@
 //! code is unaffected — this is about the mesh's *outgoing* clients.
 
 /// The mesh's outgoing HTTP client: rustls TLS, pinned against feature
-/// unification. Construction cost matches `Client::new()` (a small
-/// connection pool per call), so reuse the returned client where the
-/// surrounding code already did.
+/// unification.
+///
+/// Returns a cheap CLONE of ONE process-wide pooled client: every
+/// `mesh_http()` call — historical per-call semantics unchanged — now
+/// shares the same connection pool (an Arc bump, no fresh TLS stack),
+/// so hot paths reusing the client per request stop paying handshakes
+/// for the same peered services. Per-request budgets stay free:
+/// `.timeout(...)` on the request where a site needs its own.
 ///
 /// Panics like `Client::new()` does if TLS client setup fails — the
 /// previous behavior of every site this replaces.
 pub fn mesh_http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .use_rustls_tls()
-        .build()
-        .expect("mesh HTTP client with the pinned rustls TLS backend")
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .build()
+                .expect("mesh HTTP client with the pinned rustls TLS backend")
+        })
+        .clone()
 }
 
 /// The shared PROBE client: process-wide, lazily built once, rustls

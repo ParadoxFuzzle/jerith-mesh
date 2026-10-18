@@ -2056,11 +2056,9 @@ impl RuntimeExpert {
         api_key: Option<&str>,
     ) -> anyhow::Result<Self> {
         let url = format!("{}/v1/models", runtime_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-        let mut req = client.get(&url);
+        let mut req = crate::http::mesh_http()
+            .get(&url)
+            .timeout(Duration::from_secs(10));
         if let Some(k) = api_key {
             req = req.bearer_auth(k);
         }
@@ -2090,7 +2088,7 @@ impl RuntimeExpert {
             api_key: api_key.map(|k| k.to_string()),
             vision_model: None,
             deep_model: None,
-            client,
+            client: crate::http::mesh_http(),
         })
     }
 }

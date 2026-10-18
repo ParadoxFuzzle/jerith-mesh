@@ -611,13 +611,10 @@ async fn stake_post(
     body: &serde_json::Value,
 ) -> anyhow::Result<(u16, serde_json::Value)> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let resp = client
+    let resp = crate::http::mesh_http()
         .post(url)
         .bearer_auth(token)
+        .timeout(Duration::from_secs(5))
         .json(body)
         .send()
         .await?;
@@ -629,11 +626,12 @@ async fn stake_post(
 
 /// GET variant for the /stake read view.
 pub(crate) async fn stake_get(url: &str, token: &str) -> anyhow::Result<(u16, serde_json::Value)> {
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
+    let resp = crate::http::mesh_http()
+        .get(url)
+        .bearer_auth(token)
         .timeout(Duration::from_secs(5))
-        .build()?;
-    let resp = client.get(url).bearer_auth(token).send().await?;
+        .send()
+        .await?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);

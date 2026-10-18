@@ -55,11 +55,19 @@ fn model_from_status(body: &Value) -> Option<String> {
 }
 
 pub(crate) fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(TIMEOUT)
-        .build()
-        .expect("static reqwest client config")
+    // One pooled process bot client (the 12+ per-message callers used to
+    // each build a fresh TLS stack; the pool is shared, the 90s contract
+    // unchanged via the client-level timeout).
+    static SHARED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .timeout(TIMEOUT)
+                .build()
+                .expect("static reqwest client config")
+        })
+        .clone()
 }
 
 // ---------------------------------------------------------------------------

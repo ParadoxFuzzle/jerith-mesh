@@ -217,12 +217,10 @@ pub async fn wallet_balance(card: &WalletCard) -> anyhow::Result<ChainBalance> {
         card.rpc_url.trim_end_matches('/'),
         card.balance_query()
     );
-    let resp = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(5))
-        .build()?
+    let resp = crate::http::mesh_http()
         .get(&url)
         .bearer_auth(token)
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .context("chain balance unreachable")?;
@@ -357,12 +355,10 @@ impl OptionalChainWallet {
         }
     }
 
-    /// One client with the probe timeout (per call, like wallet_balance).
-    fn http(&self) -> anyhow::Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
-            .use_rustls_tls()
-            .timeout(Duration::from_secs(5))
-            .build()?)
+    /// The pooled mesh client (probe budget applied per request inside
+    /// core_rpc/jsonrpc — the client is shared pool-wide now).
+    fn http(&self) -> reqwest::Client {
+        crate::http::mesh_http()
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -385,6 +381,7 @@ impl OptionalChainWallet {
                 "method": method,
                 "params": params,
             }))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("chain RPC unreachable")?;
@@ -413,6 +410,7 @@ impl OptionalChainWallet {
                 "method": method,
                 "params": params,
             }))
+            .timeout(Duration::from_secs(5))
             .send()
             .await
             .context("chain RPC unreachable")?;
@@ -435,7 +433,7 @@ impl OptionalChainWallet {
     /// reason — the caller must never guess a balance.
     pub async fn balance(&self) -> anyhow::Result<OptionalBalance> {
         let unit = self.unit();
-        let client = self.http()?;
+        let client = self.http();
         match self.chain {
             CryptoChain::Bitcoin | CryptoChain::Dogecoin => {
                 // An address watches exactly that one; no address asks the
@@ -540,18 +538,14 @@ pub async fn optional_chain_probe(
 /// GET /balance?discord_id=<identity> → µJER credited balance.
 /// (The chain keys wallets by identity strings; a node identity behaves
 /// like any other account handle for this purpose.)
-pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u64> {
-    let url = format!(
+pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u64> {    let url = format!(
         "{}/balance?discord_id={}",
         rpc_url.trim_end_matches('/'),
         identity
     );
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let resp = client
+    let resp = crate::http::mesh_http()
         .get(&url)
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .context("chain balance unreachable")?;
@@ -657,13 +651,10 @@ pub async fn attempt_mine(
     })?;
     let message_id = format!("{node_id}:{attempt}:{}", crate::bootstrap::now_ms());
     let url = format!("{}/mine", config.rpc_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(15))
-        .build()?;
-    let resp = client
+    let resp = crate::http::mesh_http()
         .post(&url)
         .bearer_auth(token)
+        .timeout(Duration::from_secs(15))
         .json(&serde_json::json!({
             "discord_id": config.identity,
             "source": "passive",

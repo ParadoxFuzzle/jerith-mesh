@@ -577,10 +577,6 @@ async fn chain_get(
         "no chain api token — stage ~/.jerith-mesh/keys/api.token (see docs/RUNBOOK.md) \\
          or set $JERITH_TOKEN",
     )?;
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(15))
-        .build()?;
     let mut url = format!("{base}{path}");
     if !query.is_empty() {
         url.push('?');
@@ -592,9 +588,10 @@ async fn chain_get(
                 .join("&"),
         );
     }
-    let resp = client
+    let resp = jerith_mesh_core::http::mesh_http()
         .get(&url)
         .bearer_auth(token)
+        .timeout(Duration::from_secs(15))
         .send()
         .await
         .with_context(|| format!("chain node unreachable at {url}"))?;

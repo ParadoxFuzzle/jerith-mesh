@@ -1638,11 +1638,7 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
         return;
     }
 
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(4))
-        .build()
-        .expect("reqwest client");
+    let client = crate::http::mesh_http();
     let my_id = state.identity.node_id();
 
     let mut failed: Vec<String> = Vec::new();
@@ -1660,6 +1656,7 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
             .header("x-jerith-stamp", auth.stamp_ms.to_string())
             .header("x-jerith-sig", &auth.sig)
             .header("x-jerith-from", &my_id)
+            .timeout(Duration::from_secs(4))
             .send()
             .await;
         match result {
