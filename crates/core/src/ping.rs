@@ -1324,10 +1324,14 @@ impl MeshLoop {
         Arc::clone(&self.state)
     }
 
-    /// Signal the loop to stop cleanly, then abort the task.
-    pub fn shutdown(self) {
+    /// Signal the loop to stop cleanly, then AWAIT its exit. The stop
+    /// arm's graceful suffix (the §5 escrow return on shutdown) must
+    /// complete before the process goes away — the older send-then-abort
+    /// shape cancelled the unlock mid-await (the exit bug the §13
+    /// exit drill exposed), so stopping now means waiting.
+    pub async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
-        self._handle.abort();
+        let _ = self._handle.await;
     }
 
     /// Spawn the loop. Call `shutdown()` (or drop) to stop it.

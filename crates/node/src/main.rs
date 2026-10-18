@@ -2074,8 +2074,36 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     }
 
     // Spawn the mesh loop (discovery + pings + meters).
-    let _loop_handle =
-        jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
+    let mesh_loop = jerith_mesh_core::ping::MeshLoop::spawn(state.clone(), Duration::from_secs(10));
+    // §13 graceful exit: SIGINT/SIGTERM stop the mesh loop and WAIT for
+    // it — the stop arm returns the escrow on the way out, and the
+    // await means the unlock completes BEFORE the process exits. The
+    // gateway serve below never returns on its own, so this task is
+    // the process's exit path (the abrupt-cut alternative — leaving a
+    // marker behind for the next boot's chain-view recovery — stays
+    // honest too; the SIGKILL drill proved it).
+    tokio::spawn({
+        let mesh_loop = mesh_loop;
+        async move {
+            // Either terminate signal stops the mesh loop and waits for
+            // its graceful suffix (the escrow return) before exiting.
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = term.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+            tracing::info!("graceful exit: stopping the mesh loop (escrow return runs inside)");
+            mesh_loop.stop().await;
+            tracing::info!("mesh loop stopped — exiting");
+            std::process::exit(0);
+        }
+    });
 
     // Mesh fallback for chat: a QUIC client endpoint + router, wired into
     // the gateway so /v1/chat/completions can fail over to runtime-backed

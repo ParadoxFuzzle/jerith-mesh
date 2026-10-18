@@ -735,6 +735,17 @@ mod tests {
         /// The GET /stake view, stateful: a successful lock/unlock moves
         /// it, so the stub simulates a chain with persisting truth.
         view_value: Arc<StdMutex<u64>>,
+        /// Failure mode for `POST /stake/unlock` (the exit-drill edge
+        /// cases): Ok replies 200 and zeroes the view, ServerError
+        /// replies 500 with the view UNMOVED (a refused accept is not an
+        /// accepted unlock — no chain state may change).
+        unlock_mode: Arc<StdMutex<UnlockMode>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum UnlockMode {
+        Ok,
+        ServerError,
     }
 
     impl ChainStub {
@@ -752,6 +763,8 @@ mod tests {
                 Arc::new(StdMutex::new(Vec::new()));
             let view_hits = hits.clone();
             let view_value: Arc<StdMutex<u64>> = Arc::new(StdMutex::new(initial_view));
+            let unlock_mode: Arc<StdMutex<UnlockMode>> = Arc::new(StdMutex::new(UnlockMode::Ok));
+            let unlock_mode_handler = unlock_mode.clone();
             let app = axum::Router::new()
                 .route(
                     "/stake",
@@ -809,13 +822,28 @@ mod tests {
                                 .lock()
                                 .unwrap()
                                 .push(("POST /stake/unlock".into(), body.clone()));
-                            *view.lock().unwrap() = 0;
-                            (
-                                axum::http::StatusCode::OK,
-                                axum::Json(serde_json::json!({
-                                    "ok": true, "staked_uj": 0, "slashed_total_uj": 0,
-                                })),
-                            )
+                            match *unlock_mode_handler.lock().unwrap() {
+                                UnlockMode::Ok => {
+                                    *view.lock().unwrap() = 0;
+                                    (
+                                        axum::http::StatusCode::OK,
+                                        axum::Json(serde_json::json!({
+                                            "ok": true, "staked_uj": 0, "slashed_total_uj": 0,
+                                        })),
+                                    )
+                                }
+                                // A refused accept leaves the chain state
+                                // untouched: the marker's conservatism
+                                // (keep escrowed until the chain confirms)
+                                // is what this stub failure exists to prove.
+                                UnlockMode::ServerError => (
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    axum::Json(serde_json::json!({
+                                        "ok": false,
+                                        "error": "chain refusing unlocks right now",
+                                    })),
+                                ),
+                            }
                         }
                     }),
                 )
@@ -872,6 +900,7 @@ mod tests {
                 addr,
                 hits,
                 view_value,
+                unlock_mode,
             }
         }
 
@@ -889,6 +918,12 @@ mod tests {
         /// the chain actually holds.
         fn view(&self) -> u64 {
             *self.view_value.lock().unwrap()
+        }
+
+        /// Flip the unlock endpoint's failure mode (the exit-drill edge
+        /// cases).
+        fn set_unlock_mode(&self, mode: UnlockMode) {
+            *self.unlock_mode.lock().unwrap() = mode;
         }
     }
 
@@ -966,6 +1001,180 @@ mod tests {
         let ledger = mgr.snapshot();
         assert_eq!(ledger.escrowed_uj, 0);
         assert_eq!(ledger.staked_uj, 0);
+    }
+
+    // ---- §13 exit drills: payout/escrow edge cases on node exit ----------
+
+    /// The full graceful-exit cycle: exit returns exactly what boot
+    /// escrowed, and the NEXT boot re-locks exactly once. Two process
+    /// lifetimes over one shared ledger — the honest invariant is one
+    /// POST /stake/lock per boot and one POST /stake/unlock per exit,
+    /// never compounding.
+    /// StakeManager pointed at an explicit http base with an explicit
+    /// ledger path — the exit-drill harness: a "process lifetime" is a
+    /// manager + ledger file (boot 2 = a fresh manager on the same file).
+    fn manager_at(http_base: &str, ledger_path: &std::path::Path) -> Arc<StakeManager> {
+        let mut crypto = crypto(1_000_000);
+        crypto.wallet_endpoint = Some(http_base.to_string());
+        let mut mgr = StakeManager::new(
+            &crypto,
+            Some(crate::signing::SigningIdentity::generate()),
+            None,
+        );
+        if let Some(m) = Arc::get_mut(&mut mgr) {
+            m.token = Some("test-token".into());
+            m.rearm_ledger(ledger_path.to_path_buf());
+        }
+        mgr
+    }
+
+    #[tokio::test]
+    async fn exit_cycle_relocks_once_per_boot_and_unlocks_once_per_exit() {
+        // Boot 1: escrow, then graceful exit (unlock).
+        let stub = ChainStub::spawn(Some(1_000_000)).await;
+        let ledger = fresh_ledger_path();
+        let mgr = manager_at(&format!("http://{}", stub.addr), &ledger);
+        assert!(mgr.lock_required().await, "boot escrow lands");
+        assert_eq!(stub.view(), 1_000_000, "chain holds the escrow");
+        assert!(mgr.unlock_all().await, "graceful exit returns it");
+        assert_eq!(stub.view(), 0, "chain returned the escrow");
+        let locks_after_boot1 = stub
+            .path_hits()
+            .iter()
+            .filter(|p| *p == "POST /stake/lock")
+            .count();
+        let unlocks_after_boot1 = stub
+            .path_hits()
+            .iter()
+            .filter(|p| *p == "POST /stake/unlock")
+            .count();
+        assert_eq!(locks_after_boot1, 1);
+        assert_eq!(unlocks_after_boot1, 1);
+
+        // Boot 2: a FRESH manager loading the SAME ledger file — the
+        // cleaned-exit machine's marker is 0, the chain is 0 — re-escrows
+        // exactly once (never compounding across lives).
+        drop(mgr);
+        let mgr2 = manager_at(&format!("http://{}", stub.addr), &ledger);
+        assert!(mgr2.lock_required().await, "boot 2 re-escrows");
+        assert_eq!(
+            stub.path_hits()
+                .iter()
+                .filter(|p| *p == "POST /stake/lock")
+                .count(),
+            locks_after_boot1 + 1,
+            "exactly one lock per boot"
+        );
+        assert_eq!(stub.view(), 1_000_000, "the chain truth moved back up");
+        // Exit 2 unlocks again — the marker followed boot 2's escrow.
+        assert!(mgr2.unlock_all().await);
+        assert_eq!(
+            stub.path_hits()
+                .iter()
+                .filter(|p| *p == "POST /stake/unlock")
+                .count(),
+            unlocks_after_boot1 + 1,
+            "exactly one unlock per exit"
+        );
+    }
+
+    /// Chain down at exit: the unlock fails, and the escrow marker MUST
+    /// survive in the persisted ledger — the next boot's chain-view
+    /// reconciliation is the recovery path, and it only works if the
+    /// marker/local ledger kept saying the escrow exists.
+    #[tokio::test]
+    async fn chain_down_at_exit_keeps_the_marker() {
+        // Seed the ledger exactly as the failed-exit machine would have
+        // persisted it: escrowed (marker) and staked still at the lock.
+        let ledger_path = fresh_ledger_path();
+        std::fs::write(
+            &ledger_path,
+            serde_json::json!({
+                "staked_uj": 1_000_000u64,
+                "slashed_total_uj": 0u64,
+                "escrowed_uj": 1_000_000u64,
+                "slash_events": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A closed port: the chain is DOWN (transport error, not a
+        // chain answer).
+        let dead = manager_at("http://127.0.0.1:1", &ledger_path);
+        assert_eq!(dead.snapshot().escrowed_uj, 1_000_000, "marker loaded");
+        assert!(!dead.unlock_all().await, "chain down = no unlock");
+        // The marker survived: next boot sees the escrow exists.
+        assert_eq!(
+            dead.snapshot().escrowed_uj,
+            1_000_000,
+            "a failed exit must NOT clobber the escrow marker"
+        );
+        assert_eq!(dead.snapshot().staked_uj, 1_000_000);
+    }
+
+    /// A refused accept (chain answers 500) keeps everything exactly as
+    /// the chain had it: no unlock, no ledger cleanup — and the marker's
+    /// conservatism is PROVEN productive by the immediate retry with the
+    /// chain healthy (the next-stop-window or next boot lands the same
+    /// unlock again, because nothing was falsely cleared).
+    #[tokio::test]
+    async fn refused_unlock_keeps_the_marker_then_retry_succeeds() {
+        let stub = ChainStub::spawn(Some(1_000_000)).await;
+        stub.set_unlock_mode(UnlockMode::ServerError);
+        let mgr = manager_with_stub(&stub);
+        assert!(
+            mgr.lock_required().await,
+            "boot escrow dodges the broken unlock"
+        );
+        assert_eq!(stub.view(), 1_000_000);
+        assert!(!mgr.unlock_all().await, "500 = not unlocked");
+        assert_eq!(
+            mgr.snapshot().escrowed_uj,
+            1_000_000,
+            "a refused exit does not clear the marker"
+        );
+        assert_eq!(
+            stub.view(),
+            1_000_000,
+            "a refused exit does not lie about chain state"
+        );
+        // The chain heals; the SAME process's next attempt succeeds —
+        // conservatism buys the retry, it never costs the funds.
+        stub.set_unlock_mode(UnlockMode::Ok);
+        assert!(mgr.unlock_all().await);
+        assert_eq!(mgr.snapshot().escrowed_uj, 0);
+        assert_eq!(stub.view(), 0);
+    }
+
+    /// A restart after a FAILED exit must not escrow twice: the boot's
+    /// chain-view reconciliation sees the (still-held) escrow and the
+    /// gate opens with ZERO new lock POSTs.
+    #[tokio::test]
+    async fn restart_after_failed_exit_never_needs_a_new_lock() {
+        let stub = ChainStub::spawn_with_view(Some(1_000_000), 1_000_000).await;
+        // The restart perspective: chain STILL holds the escrow (the exit
+        // failed), and the fresh process loads a marker saying so (the
+        // failed-exit machine persisted it).
+        let mut crypto = crypto(1_000_000);
+        crypto.wallet_endpoint = Some(format!("http://{}", stub.addr));
+        let mut mgr = StakeManager::new(
+            &crypto,
+            Some(crate::signing::SigningIdentity::generate()),
+            None,
+        );
+        if let Some(m) = Arc::get_mut(&mut mgr) {
+            m.token = Some("test-token".into());
+        }
+        assert!(mgr.lock_required().await, "the gate opens");
+        assert_eq!(
+            stub.path_hits()
+                .iter()
+                .filter(|p| *p == "POST /stake/lock")
+                .count(),
+            0,
+            "chain truth already covers the requirement — no re-escrow"
+        );
+        assert_eq!(mgr.snapshot().escrowed_uj, 1_000_000);
     }
 
     #[tokio::test]
