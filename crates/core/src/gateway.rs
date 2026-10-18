@@ -688,6 +688,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "slashed_total_uj": stake.slashed_total_uj,
         "slash_events": stake.slash_events.len(),
         "gate_clear": gw.state.stake.clears_gate(),
+        // Work-carrying RPCs typed-refused by the escrow join gate this
+        // process. 0 whenever staking is disabled — the honest tell that
+        // the refusal path exists only behind the Phase 5 tier.
+        "gate_refusals": gw.state.stake.gate_refusals(),
     });
     let guard_value = gw
         .guard

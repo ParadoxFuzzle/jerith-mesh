@@ -438,9 +438,8 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
         let node_id = node_id.clone();
-        tokio::spawn(async move {
-            let _ =
-                jerith_mesh_core::quic::serve_with_peer_block(server, serving, node_id, rx, block)
+        tokio::spawn(async move {            let _ =
+                jerith_mesh_core::quic::serve_with_peer_block(server, serving, node_id, rx, block, None)
                     .await;
         });
     }
@@ -969,4 +968,194 @@ async fn replica_manager_persists_demand_without_any_fetch() {
     manager.shutdown().await;
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Phase 5 escrow join gate, on the wire: with `[crypto.stake]
+/// required_uj` set and an unprimed ledger, work-carrying requests
+/// (ExpertQuery) get the honest typed refusal naming the stake numbers
+/// (counted for /status) while Ping keeps flowing — a live-but-
+/// unqualified node, never a vanished one. Once the escrow lands
+/// (ledger primed to the line), the same request serves numerically
+/// exact. The gate flips on ledger truth only; reputation (§10's
+/// placement demotion) stays statistics — this is the escrow half of
+/// the interlock, the only refusal path.
+#[tokio::test]
+async fn stake_gate_refuses_work_until_the_escrow_lands() {
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+    use jerith_mesh_core::quic::{
+        call, pinned_client_endpoint_dyn, server_endpoint_for, ExpertRouter, ExpertServing,
+        NodeRpcReply, NodeRpcRequest, RouterOptions, SharedPinMap,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("jerith-stakegate-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(ExpertStore::new(&dir, 8).expect("store"));
+    let weights = ExpertWeights::synthetic("L3.E17", 8, 6);
+    store.put(&weights).expect("publish expert");
+
+    // One gate server per phase: staking ON (1000 µJ line) with an
+    // empty (absent-file) or primed ledger, hosting the real expert so
+    // "refused" can never be confused with "not hosted".
+    async fn gate_server(
+        dir: &std::path::Path,
+        store: Arc<ExpertStore>,
+        primed_uj: Option<u64>,
+    ) -> anyhow::Result<(
+        std::net::SocketAddr,
+        String,
+        Arc<jerith_mesh_core::stake::StakeManager>,
+        SharedPinMap,
+    )> {
+        let crypto = jerith_mesh_core::config::CryptoConfig {
+            stake: jerith_mesh_core::stake::StakeConfig {
+                required_uj: 1_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut stake = jerith_mesh_core::stake::StakeManager::new(&crypto, None);
+        let ledger_path = dir.join(format!(
+            "stake-{}.json",
+            primed_uj.map(|v| v.to_string()).unwrap_or_else(|| "empty".into())
+        ));
+        if let Some(staked) = primed_uj {
+            std::fs::write(
+                &ledger_path,
+                serde_json::json!({
+                    "staked_uj": staked, "slashed_total_uj": 0,
+                    "escrowed_uj": 0, "slash_events": []
+                })
+                .to_string(),
+            )
+            .expect("prime ledger");
+        }
+        Arc::get_mut(&mut stake)
+            .expect("manager unshared at construction time")
+            .rearm_ledger(ledger_path);
+
+        let identity = SigningIdentity::generate();
+        let server = server_endpoint_for(&identity, "127.0.0.1:0".parse().unwrap())?;
+        let addr = server.local_addr().unwrap();
+        let node_id = identity.node_id();
+        let serving = Arc::new(ExpertServing {
+            store: Some(store),
+            runtime: None,
+            tensors_only: true,
+            stats: None,
+            isolate: None,
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let block = jerith_mesh_core::ratelimit::BlockedPeers::from_list(&[] as &[String]);
+        let st = stake.clone();
+        let nid = node_id.clone();
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve_with_peer_block(
+                server, serving, nid, rx, block, Some(st),
+            )
+            .await;
+        });
+        let mut pins: jerith_mesh_core::quic::PinMap = HashMap::new();
+        pins.insert(node_id.clone(), addr);
+        let pins: SharedPinMap = Arc::new(tokio::sync::RwLock::new(pins));
+        Ok((addr, node_id, stake, pins))
+    }
+
+    let router = ExpertRouter::new(RouterOptions {
+        nearby_rtt_ms: 50,
+        dispatch_timeout: Duration::from_secs(10),
+        ..Default::default()
+    });
+    let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
+
+    // ---- Phase 1: empty ledger — work refused, ping answered -----------
+    let (addr, node_id, stake, pins) = gate_server(&dir, store.clone(), None).await.unwrap();
+    let client = pinned_client_endpoint_dyn(pins).expect("client endpoint");
+    let mut peer_addrs: HashMap<String, std::net::SocketAddr> = HashMap::new();
+    peer_addrs.insert(node_id.clone(), addr);
+    let peers = vec![(node_id.clone(), 5u64, true, true, None, None)];
+
+    let refused = router
+        .execute_over_quic_speculative_attributed(
+            &client,
+            &SigningIdentity::generate(),
+            &peer_addrs,
+            "stakegate-1",
+            "L3.E17",
+            &input,
+            &peers,
+            &mut HashMap::new(),
+            |_: &[f32]| anyhow::bail!("no local weights here"),
+            &mut None,
+        )
+        .await
+        .expect_err("the gate must refuse with an empty escrow");
+    let msg = format!("{refused:#}");
+    assert!(
+        msg.contains("stake join gate not clear"),
+        "refusal must name the gate, not masquerade as 'not hosted': {msg}"
+    );
+    assert!(
+        msg.contains("1000 µJ"),
+        "refusal must carry the required line and the staked number: {msg}"
+    );
+    assert_eq!(stake.gate_refusals(), 1, "the refusal is counted for /status");
+
+    // Ping keeps flowing: the mesh watches a LIVE-but-unqualified node.
+    let me = SigningIdentity::generate();
+    let mut ping = NodeRpcRequest::Ping {
+        from_node_id: me.node_id(),
+        stamp_ms: 0,
+        sig: String::new(),
+    };
+    jerith_mesh_core::quic::sign_request(&mut ping, &me);
+    let reply = call(
+        &client,
+        addr,
+        &node_id,
+        &ping,
+        &me,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("ping survives the gate");
+    assert!(
+        matches!(reply, NodeRpcReply::Pong { .. }),
+        "pings must answer while the gate is closed: {reply:?}"
+    );
+
+    // ---- Phase 2: the escrow lands — the same request serves -----------
+    let (addr_b, node_id_b, _stake_b, pins_b) =
+        gate_server(&dir, store.clone(), Some(1_000)).await.unwrap();
+    let client_b = pinned_client_endpoint_dyn(pins_b).expect("client endpoint");
+    let mut peer_addrs_b: HashMap<String, std::net::SocketAddr> = HashMap::new();
+    peer_addrs_b.insert(node_id_b.clone(), addr_b);
+    let peers_b = vec![(node_id_b.clone(), 5u64, true, true, None, None)];
+
+    let mut served_by: Option<String> = None;
+    let out = router
+        .execute_over_quic_speculative_attributed(
+            &client_b,
+            &me,
+            &peer_addrs_b,
+            "stakegate-2",
+            "L3.E17",
+            &input,
+            &peers_b,
+            &mut HashMap::new(),
+            |_: &[f32]| anyhow::bail!("no local weights here"),
+            &mut served_by,
+        )
+        .await
+        .expect("a primed escrow opens the gate");
+    assert_eq!(served_by.as_deref(), Some(node_id_b.as_str()));
+    let want = reference_swiglu(&weights, &input);
+    for (got, expected) in out.iter().zip(&want) {
+        assert!((got - expected).abs() < 1e-6, "served result wrong");
+    }
+
+    let _ = client;
+    let _ = client_b;
+    std::fs::remove_dir_all(&dir).ok();
 }

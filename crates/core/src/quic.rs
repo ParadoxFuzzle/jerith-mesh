@@ -1612,6 +1612,7 @@ pub async fn serve(
         shutdown,
         MAX_CONCURRENT_QUIC_CONNECTIONS,
         None,
+        None,
     )
     .await
 }
@@ -1625,6 +1626,7 @@ pub async fn serve_with_peer_block(
     server_node_id: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
     peer_block: Arc<crate::ratelimit::BlockedPeers>,
+    stake: Option<std::sync::Arc<crate::stake::StakeManager>>,
 ) -> anyhow::Result<()> {
     serve_with_limit(
         endpoint,
@@ -1633,6 +1635,7 @@ pub async fn serve_with_peer_block(
         shutdown,
         MAX_CONCURRENT_QUIC_CONNECTIONS,
         Some(peer_block),
+        stake,
     )
     .await
 }
@@ -1654,6 +1657,7 @@ pub async fn serve_with_limit(
     shutdown: tokio::sync::watch::Receiver<bool>,
     max_concurrent_connections: usize,
     peer_block: Option<Arc<crate::ratelimit::BlockedPeers>>,
+    stake: Option<std::sync::Arc<crate::stake::StakeManager>>,
 ) -> anyhow::Result<()> {
     let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_connections));
     let mut shutdown = shutdown;
@@ -1673,10 +1677,11 @@ pub async fn serve_with_limit(
                 let handler = Arc::clone(&handler);
                 let server_node_id = server_node_id.clone();
                 let block = peer_block.clone();
+                let stake = stake.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Ok(connection) = conn.await {
-                        handle_connection(connection, handler, server_node_id, block).await;
+                        handle_connection(connection, handler, server_node_id, block, stake).await;
                     }
                 });
             }
@@ -1699,6 +1704,7 @@ async fn handle_connection(
     handler: Arc<dyn ExpertHandler>,
     server_node_id: String,
     peer_block: Option<Arc<crate::ratelimit::BlockedPeers>>,
+    stake: Option<std::sync::Arc<crate::stake::StakeManager>>,
 ) {
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         match read_frame(&mut recv).await {
@@ -1715,6 +1721,27 @@ async fn handle_connection(
                     {
                         block.refuse(&requester, "rpc");
                         let reply = build_blocked_reply(&req);
+                        if send_reply(&mut send, reply).await {
+                            let _ = send.finish();
+                        }
+                        continue;
+                    }
+                    // Escrow join gate (Phase 5's behavioral half): while
+                    // staking is enabled and the ledger doesn't clear the
+                    // required line, WORK-CARRYING requests get an honest
+                    // typed refusal (counted for /status). Pings keep
+                    // flowing, so the mesh sees a live-but-unqualified
+                    // node rather than a vanished one.
+                    let work_carrying = !matches!(req, NodeRpcRequest::Ping { .. });
+                    if let Some(stake) = &stake
+                        && work_carrying
+                        && !stake.serves_remotely()
+                    {
+                        stake.record_gate_refusal();
+                        let reply = Outbound::Json(NodeRpcReply::Error {
+                            req_id: request_req_id(&req).to_string(),
+                            message: stake.gate_message(),
+                        });
                         if send_reply(&mut send, reply).await {
                             let _ = send.finish();
                         }
@@ -3236,6 +3263,7 @@ mod tests {
                 server_node,
                 rx,
                 1,
+                None,
                 None,
             )
             .await;

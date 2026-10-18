@@ -2291,6 +2291,11 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
                         node_id,
                         rpc_rx,
                         state.peer_block.clone(),
+                        // Phase 5: the stake escrow join gate — while
+                        // required_uj > 0 and the ledger doesn't clear,
+                        // work-carrying RPC gets the honest typed refusal
+                        // (pings keep flowing; see stake.rs §5).
+                        Some(state.stake.clone()),
                     )
                     .await
                     {

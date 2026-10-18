@@ -376,7 +376,17 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   bootstrap-verified offense — recorded in the persisted slash ledger
   (`data/stake.json`, audit ring + totals in `/status`) and POSTed as an
   Ed25519-signed `stake/slash` notice; `jerith stake status|lock|unlock`
-  drives the same escrow by hand
+  drives the same escrow by hand;
+  ✅ **the join gate is behavioral** (landed 2026-10-18): with
+  `required_uj` > 0 and the gate not clear, the node's QUIC RPC server
+  refuses work-carrying requests (expert/chat) with an honest typed
+  message naming the numbers (`stake join gate not clear: …`) and
+  counts them (`/status.crypto.stake.gate_refusals`) — while Ping keeps
+  flowing so the mesh watches a live-but-unqualified node rather than a
+  vanished one. This is the escrow half of §10's interlock (the only
+  refusal path — reputation demotion stays statistics); wire test:
+  gate closed refuses ExpertQuery + answers Ping, escrow-primed ledger
+  serves the same request numerically exact
 
 ## 10. Contribution Proof & Anti-Fraud
 Phased — see ARCHITECTURE.md §8 for the full layered plan:
@@ -736,12 +746,15 @@ gotchas surfaced while building the finished parts.
 ### Phase 5+ — trust, attestation, scale
 
 - **Reputation-weighted placement + slashing interlock (§10's Phase 5
-  work)**: the stake tier exists and is live against the escrow contract,
-  and the placement half of the interlock LANDED (§10 above —
-  verified-offense peers drop to the back of the dispatch plan). What
-  remains is the economics bite: tying verified thresholds to the
-  escrow-driven typed refusals, so demotion escalates once a peer is
-  actually holding stake.
+  work)**: LANDED, both halves — the placement half (§10 above:
+  verified-offense peers drop to the back of the dispatch plan,
+  statistics only) and the escrow half (§2's staking entry, landed
+  2026-10-18: the join gate is behavioral — with `required_uj` set and
+  a short escrow, the node's RPC server typed-refuses work-carrying
+  requests while pings keep flowing). What remains inside this line:
+  anti-sybil weighting (identity age + stake before reputation scores
+  count) and live drills of the gate + demotion loop on an actual
+  staked deployment.
 - **TEE attestation & selective ZK proofs (research-grade §10)**. Honest
   ground truth today is the commitment layer + spot-check ringer + signed
   measurement blocks — hardware attestation arrives later, gated on a

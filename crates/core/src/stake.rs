@@ -32,6 +32,13 @@
 //!    payload: jerith-slash1|{reporter}|{target}|{amount_uj}|{stamp}
 //!    Failure to submit is degraded to a log entry — the ledger keeps the
 //!    record either way, so nothing rides on the endpoint responding.
+//! 5. **The gate is behavioral** — while `required_uj` > 0 and the gate
+//!    is not clear, the node's QUIC RPC server refuses WORK-CARRYING
+//!    requests (expert/chat) with a typed message naming the numbers;
+//!    pings keep flowing so the mesh watches a live-but-unqualified
+//!    node rather than a vanished one. Refusals count for /status.
+//!    Reputation (§10's placement demotion) stays statistics — this is
+//!    the escrow half of the interlock, the only refusal path.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -138,6 +145,9 @@ pub struct StakeManager {
     ledger_path: std::path::PathBuf,
     /// One escrow attempt per process (restarts reset the flag and verify).
     lock_attempted: std::sync::atomic::AtomicBool,
+    /// Work-carrying RPCs the gate refused this process (process-local
+    /// observability, like the rate-limit counters — never persisted).
+    gate_refusals: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,18 +197,24 @@ impl StakeManager {
             token: crate::economics::read_token(),
             ledger_path,
             lock_attempted: std::sync::atomic::AtomicBool::new(false),
+            gate_refusals: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
-    /// Point the ledger at a private path with fresh state (tests/dev):
-    /// cross-test and cross-process pollution of the shared production
-    /// ledger otherwise lets one run's escrow/slash markers short-circuit
-    /// another's lock flows and even slash-journals fake offenses into the
-    /// live node's dataset.
+    /// Point the ledger at a private path with the state that path
+    /// carries (tests/dev): cross-test and cross-process pollution of
+    /// the shared production ledger otherwise lets one run's
+    /// escrow/slash markers short-circuit another's lock flows and even
+    /// slash-journals fake offenses into the live node's dataset.
+    /// An absent file loads fresh (default), a primed one loads primed
+    /// — the loaded ledger REPLACES the in-memory one; the previous
+    /// implementation only re-pointed the file, leaving the freshly
+    /// loaded state unread (a primed ledger silently read back empty).
     pub fn rearm_ledger(&mut self, path: std::path::PathBuf) {
         let ledger = StakeLedger::load_from(&path);
+        *self.ledger.lock().expect("ledger lock") = ledger;
         self.ledger_path = path;
-        self.save_ledger(&ledger);
+        self.save_ledger(&self.ledger.lock().expect("ledger lock"));
     }
 
     /// Ledger snapshot for /status and the dashboard.
@@ -217,6 +233,34 @@ impl StakeManager {
     /// The configured requirement (µJER; 0 = staking off).
     pub fn required_uj(&self) -> u64 {
         self.config.required_uj
+    }
+
+    /// Whether work-carrying remote RPC may be served: staking disabled
+    /// or the ledger clears the required escrow line.
+    pub fn serves_remotely(&self) -> bool {
+        self.required_uj() == 0 || self.clears_gate()
+    }
+
+    pub fn record_gate_refusal(&self) {
+        self.gate_refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn gate_refusals(&self) -> u64 {
+        self.gate_refusals
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The typed message a refused work request sees — the same numbers
+    /// /status renders, so an operator can act on either surface.
+    pub fn gate_message(&self) -> String {
+        let snap = self.snapshot();
+        format!(
+            "stake join gate not clear: {} µJ required for Contributor participation, {} µJ staked, {} µJ escrowed — refusing remote RPC work until the escrow lands (staking enabled, chain down or short)",
+            self.required_uj(),
+            snap.staked_uj,
+            snap.escrowed_uj
+        )
     }
 
     /// Persist the ledger. Failures are warned, never fatal — in-memory
