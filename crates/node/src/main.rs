@@ -2241,7 +2241,14 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         // shows config `wallet_address`'s balance or the miner's default
         // credit identity (the node id). /status probes it live.
         wallet: {
-            let card = jerith_mesh_core::economics::WalletCard::from_crypto(&cfg.crypto, &cfg.node_id)
+            // Operator chain base (chain_url → co-hosted :8322) so the
+            // card probes the chain this node actually mines on.
+            let card =
+                jerith_mesh_core::economics::WalletCard::from_crypto(
+                    &cfg.crypto,
+                    &cfg.node_id,
+                    Some(&chain_base(Some(&cfg))),
+                )
                 .map(std::sync::Arc::new);
             if let Some(w) = &card {
                 match jerith_mesh_core::economics::wallet_balance(w).await {

@@ -128,7 +128,8 @@ pub fn optional_chain_note(chain: CryptoChain) -> Option<&'static str> {
 /// and which identity/address answers as "this node's wallet".
 #[derive(Debug, Clone)]
 pub struct WalletCard {
-    /// Chain RPC base (config `[crypto] wallet_endpoint`, default :8300).
+    /// Chain RPC base (config `[crypto] wallet_endpoint`, else the chain
+    /// base the card builder was handed, else the legacy :8300).
     pub rpc_url: String,
     /// The node api token — the chain node token-gates /balance.
     pub token: Option<String>,
@@ -142,17 +143,40 @@ pub struct WalletCard {
     pub address: Option<String>,
 }
 
-impl WalletCard {
-    /// Build from the crypto section: a card exists only on JerithChain.
+impl WalletCard {    /// Build from the crypto section: a card exists only on JerithChain.
     /// The payout address comes from config `[crypto] wallet_address`; the
     /// default wallet card follows the miner's credit identity (node id).
-    pub fn from_crypto(crypto: &CryptoConfig, node_id: &str) -> Option<Self> {
+    ///
+    /// `chain_base` carries the operator resolver half — the config's
+    /// `chain_url` ($JERITH_CHAIN_URL → config → co-hosted :8322), the
+    /// same precedence StakeManager uses. When `[crypto] wallet_endpoint`
+    /// is unset the card probes THERE (the chain the miner credits), not
+    /// the legacy miner-facing :8300 default — the two chain instances
+    /// token-gate independently, so asking the wrong one is a guaranteed
+    /// 401 at startup.
+    pub fn from_crypto(crypto: &CryptoConfig, node_id: &str, chain_base: Option<&str>) -> Option<Self> {
         if crypto.chain != CryptoChain::Jerithchain {
             return None;
         }
-        let address = crypto.wallet_address.clone().filter(|a| !a.trim().is_empty());        let identity = address.clone().unwrap_or_else(|| node_id.to_string());
+        let address = crypto.wallet_address.clone().filter(|a| !a.trim().is_empty());
+        let identity = address.clone().unwrap_or_else(|| node_id.to_string());
+        // wallet_endpoint set → honor it; unset → prefer the operator's
+        // chain base (the chain the miner credits), else the legacy :8300.
+        let rpc_url = match crypto
+            .wallet_endpoint
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+        {
+            Some(u) => u,
+            None => match chain_base {
+                Some(base) if !base.trim().is_empty() => {
+                    base.trim().trim_end_matches('/').to_string()
+                }
+                _ => DEFAULT_JERITH_RPC_URL.to_string(),
+            },
+        };
         Some(Self {
-            rpc_url: chain_rpc_url(crypto),
+            rpc_url,
             token: read_token(),
             identity,
             address,
@@ -1106,18 +1130,37 @@ mod tests {
         let mut crypto = cfg(120);
         crypto.wallet_endpoint = Some("http://127.0.0.1:9999".into());
         // Default: the card follows the miner's credit identity (node id).
-        let c = WalletCard::from_crypto(&crypto, "nodeid1").unwrap();
+        let c = WalletCard::from_crypto(&crypto, "nodeid1", None).unwrap();
         assert_eq!(c.rpc_url, "http://127.0.0.1:9999");
         assert_eq!(c.identity, "nodeid1");
         assert_eq!(c.address, None);
         // A config payout address becomes the card's identity.
         crypto.wallet_address = Some("jer1pay".into());
-        let c = WalletCard::from_crypto(&crypto, "nodeid1").unwrap();
+        let c = WalletCard::from_crypto(&crypto, "nodeid1", None).unwrap();
         assert_eq!(c.identity, "jer1pay");
         assert_eq!(c.address.as_deref(), Some("jer1pay"));
         // Non-JerithChain: no card.
         crypto.chain = CryptoChain::Bitcoin;
-        assert!(WalletCard::from_crypto(&crypto, "n1").is_none());
+        assert!(WalletCard::from_crypto(&crypto, "n1", None).is_none());
+    }
+
+    #[test]
+    fn wallet_card_unset_endpoint_prefers_operator_chain_base() {
+        let crypto = cfg(120);
+        // No `[crypto] wallet_endpoint`: the card must probe the operator's
+        // chain base (the chain the miner credits), not the legacy :8300 —
+        // the two instances token-gate independently, so the old fallback
+        // guaranteed a 401 against a :8322 co-host.
+        let c = WalletCard::from_crypto(&crypto, "nodeid1", Some("http://127.0.0.1:8322")).unwrap();
+        assert_eq!(c.rpc_url, "http://127.0.0.1:8322");
+        // An explicit endpoint still wins over the chain base.
+        let mut crypto = crypto;
+        crypto.wallet_endpoint = Some("http://127.0.0.1:9999".into());
+        let c = WalletCard::from_crypto(&crypto, "nodeid1", Some("http://127.0.0.1:8322")).unwrap();
+        assert_eq!(c.rpc_url, "http://127.0.0.1:9999");
+        // Legacy default preserved when neither is set.
+        let c = WalletCard::from_crypto(&cfg(120), "nodeid1", None).unwrap();
+        assert_eq!(c.rpc_url, "http://127.0.0.1:8300");
     }
 
     #[tokio::test]
