@@ -1913,28 +1913,70 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     cfg.validate()?;
 
     // Phase 5 stake join gate: a Contributor/Hybrid with `required_uj` > 0
-    // must show a chain balance ≥ the requirement, or it runs this session
-    // demoted to Requester (can consume compute, never offered work). Config
-    // is not modified — the node self-restores its role on the next start.
+    // must show the gate clearing, or it runs this session demoted to
+    // Requester (can consume compute, never offered work). Config is not
+    // modified — the node self-restores its role on the next start.
+    //
+    // The verdict input is the SAME chain truth the gate reads: escrowed
+    // stake (the boot auto-escrow covers a funded wallet), or a wallet
+    // balance that will fund it. The RPC is the operator resolver the
+    // gate itself uses — $JERITH_CHAIN_URL → config `chain_url` → the
+    // co-hosted :8322 — NOT the legacy miner-facing chain_rpc_url port,
+    // whose /balance is a different ledger (the 2026-10-18 production
+    // boot demoted hybrid → requester off that mismatch despite a live
+    // 1 JER escrow).
     if cfg.crypto.stake.required_uj > 0 && cfg.role != NodeRole::Requester {
-        let rpc = jerith_mesh_core::economics::chain_rpc_url(&cfg.crypto);
-        match jerith_mesh_core::economics::chain_balance_uj(&rpc, &cfg.node_id).await {
-            Ok(balance) if balance >= cfg.crypto.stake.required_uj => {
+        let required = cfg.crypto.stake.required_uj;
+        let rpc = chain_base(Some(&cfg));
+        let stake = match cfg.identity() {
+            Ok(id) => Some(jerith_mesh_core::stake::StakeManager::new(
+                &cfg.crypto,
+                Some(id),
+                Some(rpc.clone()),
+            )),
+            Err(_) => None, // no usable identity — balance view still may probe
+        };
+        let staked = match stake.as_ref() {
+            Some(s) => s
+                .chain_view()
+                .await
+                .and_then(|v| v.get("staked_uj").and_then(|x| x.as_u64())),
+            None => None,
+        };
+        // The balance view is only evidence when the escrow view cannot
+        // clear the gate on its own (a funded wallet the boot escrow will
+        // lock, or chain truth still syncing). A live escrow skips it —
+        // no noise on the happy path.
+        let balance = if staked.is_none_or(|s| s < required) {
+            match jerith_mesh_core::economics::chain_balance_uj(&rpc, &cfg.node_id).await {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    println!(
+                        "   stake       balance probe unavailable ({e}) — escrow view governs"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match (staked, balance) {
+            (Some(s), _) if s >= required => {
                 println!(
-                    "   stake       {} µJER locked (required {})",
-                    balance, cfg.crypto.stake.required_uj
+                    "   stake       escrow live: {} µJER staked (required {}) — gate clears",
+                    s, required
                 );
             }
-            Ok(balance) => {
+            (staked, Some(b)) if b >= required => {
                 println!(
-                    "   stake       XXX insufficient: {} µJER < required {} — demoting to requester for this session",
-                    balance, cfg.crypto.stake.required_uj
+                    "   stake       {} µJER wallet (required {}; escrow view: {:?}) — boot auto-escrow will land",
+                    b, required, staked
                 );
-                cfg.role = NodeRole::Requester;
             }
-            Err(e) => {
+            (staked, balance) => {
                 println!(
-                    "   stake       chain balance unavailable ({e}) — demoting to requester for this session"
+                    "   stake       XXX insufficient: escrow {:?} / balance {:?} < required {} — demoting to requester for this session",
+                    staked, balance, required
                 );
                 cfg.role = NodeRole::Requester;
             }

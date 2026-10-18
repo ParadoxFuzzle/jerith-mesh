@@ -143,6 +143,7 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Expert activations</h2><p id="acts">—</p><div class="fine">loads served to peers</div></div>
   <div class="card"><h2>Phase 4 verification</h2><p id="ccommit">—</p><div class="fine" id="ccommitfine">commitment checks</div></div>
   <div class="card"><h2>Jerith Guard</h2><p id="guard">—</p><div class="fine" id="guardfine">outbound screens</div></div>
+  <div class="card"><h2>Sybil fence</h2><p id="sybil">—</p><div class="fine" id="sybilfine">zero-weight slash attempts (§10)</div></div>
   <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div></div>
   <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
   <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
@@ -221,6 +222,21 @@ async function refresh() {
     document.getElementById('pipelinefine').textContent = pj
       ? `routes walked · over-budget hops ${pj.over_budget_hops ?? 0} · last walk ${pj.last_route_ms ?? 0} ms`
       : 'no route data yet';
+    // §10 anti-sybil fence: OUR bootstrap's live zero-weight tally
+    // (/status.bootstrap mirror). "—" = probe failed; "off" = none.
+    const bs = j.bootstrap;
+    if (bs && bs.reachable) {
+      document.getElementById('sybil').textContent = bs.young_fraud_reports ?? 0;
+      document.getElementById('sybilfine').textContent =
+        `zero-weight slash attempts · bootstrap ${bs.url ?? '—'}`;
+    } else if (bs) {
+      document.getElementById('sybil').textContent = '—';
+      document.getElementById('sybilfine').textContent =
+        `bootstrap probe failed (${bs.error ?? 'status ' + (bs.status ?? '—')}) · zero-weight slashes unseen`;
+    } else {
+      document.getElementById('sybil').textContent = 'off';
+      document.getElementById('sybilfine').textContent = 'no bootstrap URL configured';
+    }
     // Earnings view: chain-truthful JER balance when the wallet card is
     // live (Phase 4); the local mines-won count stays the honest fallback
     // whenever the chain RPC is down or this node isn't a JerithChain one.

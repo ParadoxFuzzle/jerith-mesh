@@ -66,6 +66,41 @@ its auth and introspects it:
   (height/tip/circulating/wallet counts; `reachable:false` with the error
   when the chain node is down — never a failed status page).
 
+### Chain API token rotation (drill-proven procedure)
+
+The chain node token-gates `/stake*`, `/balance`, `/transfer` with its own
+`keys/api.token`; the mesh's chain probes derive theirs from
+`$JERITH_TOKEN` → `~/.jerith-mesh/keys/api.token`. When they drift, probes
+read `401 {"detail":"invalid or missing API token"}` and the damage is
+silent — both directions, drill-proven (2026-10-17 discovery drill, again
+2026-10-18 during the §10 drill): the anti-sybil stake half degrades to
+the age rule (a young but staked reporter loses its weight), stake
+lock/unlock fails, the wallet card empties.
+
+Rotation procedure:
+
+1. Write the new token into the chain repo:
+   `~/Documents/Projects/jerithchain/keys/api.token` — the chain node
+   loads it once at boot (`API_TOKEN = sec.load_or_create_api_token`),
+   so it must restart to adopt it.
+2. Mirror it into the mesh home, restricted:
+   `cp <chain repo>/keys/api.token ~/.jerith-mesh/keys/api.token && chmod 600`
+   (repeat for any `JERITH_TOKEN_FILE` location a co-hosted process uses).
+3. Restart the token-cachers: `systemctl --user restart jerith-chain-node`
+   (loads the new token) and `systemctl --user restart jerith-node` —
+   the StakeManager caches the token at boot, so the node's stake flows
+   will keep the old secret until restarted. The standalone bootstrap
+   probes the token fresh per citizenship check, but restart
+   `jerith-bootstrap` too to keep the fleet symmetric.
+4. Verify from the mesh side (the drill's exact check):
+   ```
+   curl -s -H "Authorization: Bearer $(cat ~/.jerith-mesh/keys/api.token)" \
+        "http://127.0.0.1:8322/stake?discord_id=<node_id>"
+   ```
+   → 200 JSON (`staked_uj`, escrow address) is the sync proof; 401 means
+   a copy is stale. Then `/status` (`wallet.reachable`) and the
+   bootstrap's `/health` (still 200).
+
 ## Post-deploy verification (in order)
 
 ```bash

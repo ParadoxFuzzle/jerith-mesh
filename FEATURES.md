@@ -800,6 +800,25 @@ gotchas surfaced while building the finished parts.
   `chain_url` (:8322, where /stake* lives) everywhere \u2014 run loop,
   stake CLI, and the bootstrap's live half \u2014 and the co-hosted token
   had drifted from the chain node's key again (resynced).
+- ✅ **Join gate ENFORCED on the production node** (landed 2026-10-18):
+  the production node's chain wallet was created + funded (1.5 JER from
+  the owner wallet) and `[crypto.stake] required_uj` set to 1 JER — the
+  next boot auto-escrowed exactly that (`stake escrowed on chain
+  escrowed_uj=1000000`), `/status.stake` reads `gate_clear: true,
+  staked 1000000 µJ, gate_refusals 0`, and the node serves as `hybrid`
+  with real stake behind it now. Two fixes landed with it: the boot
+  pre-flight was REWRITTEN — the legacy version probed the legacy
+  miner-facing chain RPC's /balance as its only evidence and DEMOTED
+  the freshly-gated hybrid to `requester` on the very first enforced
+  boot despite a live 1 JER escrow — now it reads the same chain truth
+  the gate does (the /stake escrow view via the config `chain_url`
+  resolver first; the wallet balance only as fallback evidence when
+  the escrow view can't clear the gate; demotion only when neither
+  clears the requirement), and the dashboard gained a **Sybil fence**
+  card rendering the /status.bootstrap sybil mirror (live counter,
+  probe-failed and unconfigured states; the page's CSP re-pins to the
+  new digests automatically). The runbook (docs/RUNBOOK.md) gained the
+  drill-proven chain API token rotation procedure.
 - **TEE attestation & selective ZK proofs (research-grade §10)**. Honest
   ground truth today is the commitment layer + spot-check ringer + signed
   measurement blocks — hardware attestation arrives later, gated on a
