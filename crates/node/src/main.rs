@@ -2452,56 +2452,53 @@ async fn peers_cmd() -> anyhow::Result<()> {
     let resp_ok = matches!(&resp, Ok(r) if r.status().is_success());
     if resp_ok {
         let resp = resp.unwrap();
-        match resp.json::<serde_json::Value>().await {
-            Ok(status) => {
-                // No `peers` key = an older gateway binary without the
-                // roster — fall through to the bootstrap advertisement view.
-                let Some(peers) = status.get("peers").and_then(|p| p.as_array()).cloned() else {
-                    return bootstrap_peer_view(cfg, &model).await;
-                };
-                if peers.is_empty() {
-                    println!(
-                        "No peers for {} {} (this node's view)",
-                        model.id, model.quant
-                    );
-                    return Ok(());
-                }
-                println!("this node's roster (ping-verified): {gateway}/status");
+        if let Ok(status) = resp.json::<serde_json::Value>().await {
+            // No `peers` key = an older gateway binary without the
+            // roster — fall through to the bootstrap advertisement view.
+            let Some(peers) = status.get("peers").and_then(|p| p.as_array()).cloned() else {
+                return bootstrap_peer_view(cfg, &model).await;
+            };
+            if peers.is_empty() {
                 println!(
-                    "{:<22} {:<10} {:>8} {:<20} {:>4}  hosted",
-                    "node", "state", "rtt_ms", "model", "contrib"
+                    "No peers for {} {} (this node's view)",
+                    model.id, model.quant
                 );
-                for p in &peers {
-                    let rtt = match &p["last_rtt_ms"] {
-                        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0).to_string(),
-                        _ => "-".into(),
-                    };
-                    let hosted = p["hosted_experts"]
-                        .as_array()
-                        .map(|a| {
-                            if a.is_empty() {
-                                "-".into()
-                            } else {
-                                a.iter()
-                                    .filter_map(|e| e.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            }
-                        })
-                        .unwrap_or_else(|| "-".into());
-                    println!(
-                        "{:<22} {:<10} {:>8} {:<20} {:>3}%  {}",
-                        p["node_id"].as_str().unwrap_or("?"),
-                        p["state"].as_str().unwrap_or("?"),
-                        rtt,
-                        p["model"].as_str().unwrap_or("?"),
-                        p["contribution_percent"].as_u64().unwrap_or(0),
-                        hosted
-                    );
-                }
                 return Ok(());
             }
-            Err(_) => {} // fall through to the bootstrap ad view
+            println!("this node's roster (ping-verified): {gateway}/status");
+            println!(
+                "{:<22} {:<10} {:>8} {:<20} {:>4}  hosted",
+                "node", "state", "rtt_ms", "model", "contrib"
+            );
+            for p in &peers {
+                let rtt = match &p["last_rtt_ms"] {
+                    serde_json::Value::Number(n) => n.as_u64().unwrap_or(0).to_string(),
+                    _ => "-".into(),
+                };
+                let hosted = p["hosted_experts"]
+                    .as_array()
+                    .map(|a| {
+                        if a.is_empty() {
+                            "-".into()
+                        } else {
+                            a.iter()
+                                .filter_map(|e| e.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        }
+                    })
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<22} {:<10} {:>8} {:<20} {:>3}%  {}",
+                    p["node_id"].as_str().unwrap_or("?"),
+                    p["state"].as_str().unwrap_or("?"),
+                    rtt,
+                    p["model"].as_str().unwrap_or("?"),
+                    p["contribution_percent"].as_u64().unwrap_or(0),
+                    hosted
+                );
+            }
+            return Ok(());
         }
     }
     bootstrap_peer_view(cfg, &model).await
