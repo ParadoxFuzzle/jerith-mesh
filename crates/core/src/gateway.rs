@@ -663,6 +663,52 @@ async fn health(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
     .into_response()
 }
 
+/// The fleet resource census (Phase 1): our live sample + whatever
+/// connectable peers advertised inside their PeerAd. The bootstrap lists
+/// OUR OWN advertisement back in the peer set, so a self-ad is a duplicate
+/// of the live sample and is skipped — otherwise the census counts this
+/// node twice and its RAM/VRAM inflates every fleet sum. Unknown amounts
+/// are excluded from sums (unknown ≠ zero — the placement rule).
+fn aggregate_fleet_census(
+    own_id: &str,
+    own: Option<crate::hw::ResourceSample>,
+    peer_ads: impl IntoIterator<Item = (String, Option<crate::hw::ResourceSample>)>,
+) -> serde_json::Value {
+    let mut samples: Vec<(String, crate::hw::ResourceSample)> = Vec::new();
+    if let Some(own) = own {
+        samples.push((own_id.to_string(), own));
+    }
+    for (node_id, res) in peer_ads {
+        if node_id == own_id {
+            continue; // self-ad duplicate — see above
+        }
+        if let Some(res) = res {
+            samples.push((node_id, res));
+        }
+    }
+    let ram_total_bytes: u64 = samples.iter().map(|(_, s)| s.ram_total_bytes).sum();
+    let ram_available_bytes: u64 = samples.iter().map(|(_, s)| s.ram_available_bytes).sum();
+    let vram_free_known: Vec<u64> = samples
+        .iter()
+        .filter_map(|(_, s)| s.vram_free_total())
+        .collect();
+    let vram_total_known: Vec<u64> = samples
+        .iter()
+        .filter_map(|(_, s)| s.vram_total_total())
+        .collect();
+    json!({
+        "reporting_nodes": samples.len(),
+        "ram_total_bytes": ram_total_bytes,
+        "ram_available_bytes": ram_available_bytes,
+        "vram_free_bytes": vram_free_known.first().map(|_| vram_free_known.iter().sum::<u64>()),
+        "vram_total_bytes": vram_total_known.first().map(|_| vram_total_known.iter().sum::<u64>()),
+        "nodes": samples
+            .iter()
+            .map(|(id, s)| json!({"node_id": id, "census": s.census()}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// Human/CLI-facing status snapshot.
 async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     let cfg = gw.state.config.read().await;
@@ -722,36 +768,13 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     // amounts are excluded from sums (unknown ≠ zero — same rule as the
     // placement ordering).
     let own_sample = gw.state.resources.lock().await.clone();
-    let mut samples: Vec<(String, crate::hw::ResourceSample)> = Vec::new();
-    if let Some(own) = &own_sample {
-        samples.push((cfg.node_id.clone(), own.clone()));
-    }
-    for (ad, _) in reg.connectable() {
-        if let Some(res) = &ad.resources {
-            samples.push((ad.node_id.clone(), res.clone()));
-        }
-    }
-    let ram_total_bytes: u64 = samples.iter().map(|(_, s)| s.ram_total_bytes).sum();
-    let ram_available_bytes: u64 = samples.iter().map(|(_, s)| s.ram_available_bytes).sum();
-    let vram_free_known: Vec<u64> = samples
-        .iter()
-        .filter_map(|(_, s)| s.vram_free_total())
-        .collect();
-    let vram_total_known: Vec<u64> = samples
-        .iter()
-        .filter_map(|(_, s)| s.vram_total_total())
-        .collect();
-    let fleet_value = json!({
-        "reporting_nodes": samples.len(),
-        "ram_total_bytes": ram_total_bytes,
-        "ram_available_bytes": ram_available_bytes,
-        "vram_free_bytes": vram_free_known.first().map(|_| vram_free_known.iter().sum::<u64>()),
-        "vram_total_bytes": vram_total_known.first().map(|_| vram_total_known.iter().sum::<u64>()),
-        "nodes": samples
-            .iter()
-            .map(|(id, s)| json!({"node_id": id, "census": s.census()}))
-            .collect::<Vec<_>>(),
-    });
+    let fleet_value = aggregate_fleet_census(
+        &cfg.node_id,
+        own_sample,
+        reg.connectable()
+            .into_iter()
+            .map(|(ad, _)| (ad.node_id.clone(), ad.resources.clone())),
+    );
     // Phase 2 tensor transport: what this node serves from its expert
     // store, and how the on-demand cache is doing (hosted / resident /
     // hit-miss-load-eviction counters). Null when no store is attached.
@@ -1745,6 +1768,71 @@ fn sanitize_choices(body: &mut Value) {
 mod tests {
     use super::*;
     use axum_test::TestServer;
+
+    fn fleet_sample(ram_total: u64, ram_avail: u64) -> crate::hw::ResourceSample {
+        crate::hw::ResourceSample {
+            ram_total_bytes: ram_total,
+            ram_available_bytes: ram_avail,
+            swap_total_bytes: 0,
+            cpu_logical_cores: 4,
+            gpus: Vec::new(),
+            sampled_at_ms: 0,
+        }
+    }
+
+    /// The bootstrap echoes our own advertisement back into the peer set:
+    /// the census must count SELF once (the live sample), not twice, and
+    /// the fleet sums must not double-book this machine.
+    #[test]
+    fn fleet_census_counts_self_once_and_skips_self_ad() {
+        // self: 32/20 GiB; the echo of our own ad says 32/20 too; a real
+        // peer: 8/6 GiB. Honest census = 40 total / 26 available.
+        let own = Some(fleet_sample(
+            32 * 1024 * 1024 * 1024,
+            20 * 1024 * 1024 * 1024,
+        ));
+        let echo = Some(fleet_sample(
+            32 * 1024 * 1024 * 1024,
+            20 * 1024 * 1024 * 1024,
+        ));
+        let peer = Some(fleet_sample(8 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024));
+        let ads = vec![
+            ("self-node".to_string(), echo),
+            ("jetson-peer".to_string(), peer),
+        ];
+        let v = aggregate_fleet_census("self-node", own, ads);
+        assert_eq!(v["reporting_nodes"], 2, "self + one peer: {v}");
+        let g: u64 = 1024 * 1024 * 1024;
+        assert_eq!(v["ram_total_bytes"], 40u64 * g, "{v}");
+        assert_eq!(v["ram_available_bytes"], 26u64 * g, "{v}");
+        let ids: Vec<&str> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["node_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["self-node", "jetson-peer"], "{v}");
+    }
+
+    /// Peers without advertised resources are census-absent (unknown ≠
+    /// zero), same rule as placement.
+    #[test]
+    fn fleet_census_excludes_unknown_resource_ads() {
+        let ads = vec![
+            (
+                "rich-peer".to_string(),
+                Some(fleet_sample(
+                    10 * 1024 * 1024 * 1024,
+                    5 * 1024 * 1024 * 1024,
+                )),
+            ),
+            ("shy-peer".to_string(), None),
+        ];
+        let v = aggregate_fleet_census("self-node", None, ads);
+        assert_eq!(v["reporting_nodes"], 1, "{v}");
+        assert_eq!(v["ram_available_bytes"], 5u64 * 1024 * 1024 * 1024, "{v}");
+        assert_eq!(v["ram_total_bytes"], 10u64 * 1024 * 1024 * 1024, "{v}");
+    }
 
     #[test]
     fn loopback_detection_covers_localhost_forms_and_refuses_remote() {
