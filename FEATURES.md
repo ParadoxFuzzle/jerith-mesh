@@ -694,7 +694,23 @@ gotchas surfaced while building the finished parts.
   consistent, tampered-figure refusal (the subject's own sig catches a
   colluding falsifier) and forged-reporter refusal; live-deployed 2026-
   10-17 with the node's uploads tallied on the real bootstrap
-- ✅ **Gossiped signed reputation (§10)** (landed 2026-10-17): the bootstrap
+- ✅ **Anti-sybil fraud-report weighting (§10)** (landed 2026-10-18): a
+  fraud report only carries score weight once its REPORTER is
+  established — identity age in the bootstrap registry
+  (`first_seen_ms` ≥ 24h; a never-advertised identity reads as age zero)
+  OR visible locked stake on the chain (> 0 µJ via the token-authed
+  `GET /stake`, the skin-in-the-game half beating the calendar for
+  freshly-minted but staked operators; chain unreachable = age rule
+  only, no fake grace). Young/unstaked reports are still RECORDED (they
+  count toward the corroboration shape and the per-reporter flood
+  dedup) but subtract nothing — minting identities to slash a peer's
+  score is the shape removed. The report response now carries
+  `reporter_established` + `penalty_applied` so operators can see the
+  weighting acting live. Wire-tested three ways: young-then-aged
+  (zero weight until established, penalty only via established
+  corroboration), flood-dedup still holding for a re-reporting young
+  reporter, and a stub-chain leg where a fresh reporter with visible
+  stake lands the full penalty that its zero-stake neighbor cannot
   publishes its own signing identity + per-subject signed score stamps in
   `/v1/peers`; nodes pin the origin key trust-on-first-use from the
   operator-configured URL (rotation journaled) and re-verify every stamp —
@@ -703,8 +719,7 @@ gotchas surfaced while building the finished parts.
   path lands in a bounded newest-per-subject cache riding ads fleet-wide
   WITHOUT trusting the advertiser. The no-statistics-slash boundary kept:
   thresholds act through the Phase 5 stake tier, not reputation alone.
-  Anti-sybil (identity age + stake weighting before scores count) remains
-  Phase 5.
+  Anti-sybil weighting landed the same day (its own entry below).
 - ✅ **Reputation-weighted placement (§10, the statistics half)** (landed
   2026-10-17): pin-wall-verified negative scores now feed the dispatch
   planner. Semantics: a verified score ≤ 0 (0 = clean, negatives =
@@ -752,9 +767,9 @@ gotchas surfaced while building the finished parts.
   2026-10-18: the join gate is behavioral — with `required_uj` set and
   a short escrow, the node's RPC server typed-refuses work-carrying
   requests while pings keep flowing). What remains inside this line:
-  anti-sybil weighting (identity age + stake before reputation scores
-  count) and live drills of the gate + demotion loop on an actual
-  staked deployment.
+  live drills of the gate + demotion + slash loop on an actual staked
+  deployment (anti-sybil weighting itself landed 2026-10-18, see the
+  §10 entry above).
 - **TEE attestation & selective ZK proofs (research-grade §10)**. Honest
   ground truth today is the commitment layer + spot-check ringer + signed
   measurement blocks — hardware attestation arrives later, gated on a

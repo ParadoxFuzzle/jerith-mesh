@@ -43,6 +43,11 @@ const ANON_READ_LIMIT_PER_MIN: u32 = 240;
 pub struct BootstrapOptions {
     pub port: u16,
     pub advertise_ttl_ms: u64,
+    /// JerithChain RPC base for the §10 anti-sybil weighting's live half
+    /// (a reporter with visible locked stake is established without the
+    /// registry-age wait). None (default) = the age rule alone; the node
+    /// binary passes its configured chain when it runs on Jerithchain.
+    pub chain_base: Option<String>,
 }
 
 impl Default for BootstrapOptions {
@@ -50,6 +55,7 @@ impl Default for BootstrapOptions {
         Self {
             port: 8901,
             advertise_ttl_ms: DEFAULT_ADVERTISE_TTL_MS,
+            chain_base: None,
         }
     }
 }
@@ -74,6 +80,10 @@ struct Registry {
     /// blocks, tallied per subject (see `MeasureTally`). Bounded per the
     /// same registry cap discipline as `entries`.
     measures: RwLock<MeasureTally>,
+    /// JerithChain RPC base — the live half of the anti-sybil weighting
+    /// (a reporter with visible locked stake is established without the
+    /// registry-age wait). None = age-only, the offline default.
+    chain_base: Option<String>,
 }
 
 impl Default for Registry {
@@ -82,6 +92,7 @@ impl Default for Registry {
             entries: RwLock::new(HashMap::new()),
             max_entries: MAX_REGISTRY_ENTRIES,
             measures: RwLock::new(MeasureTally::default()),
+            chain_base: None,
         }
     }
 }
@@ -266,6 +277,10 @@ fn validate_ad_fields(ad: &PeerAd) -> Result<(), Box<Response>> {
 struct Entry {
     ad: PeerAd,
     last_refresh_ms: u64,
+    /// First time this identity was SEEN in this registry — the anti-
+    /// sybil age half (established = age ≥ MIN_REPORTER_AGE_MS or
+    /// visible chain stake; young identities hold no score weight).
+    first_seen_ms: u64,
     /// Peer-submitted death reports; >= threshold evicts immediately.
     dead_votes: u32,
     /// Reputation: 0 at join, decremented by corroborated fraud reports,
@@ -295,6 +310,17 @@ const MAX_REGISTRY_ENTRIES: usize = 20_000;
 const REPUTATION_FLOOR: i32 = -100;
 /// Reports beyond this many distinct peers count double (corroboration).
 const MIN_CORROBORATORS: u32 = 2;
+/// Anti-sybil (§10's "identity age + stake before scores count"): a fraud
+/// REPORTER subtracts score only once ESTABLISHED — visible in this
+/// registry for `MIN_REPORTER_AGE_MS`, or carrying visible locked stake
+/// on the chain (> 0 µJ; skin in the game beats the calendar). Young,
+/// zero-stake reports are recorded (dedupe + corroboration counting
+/// survive) but never subtract score by themselves: identities are free
+/// to mint, and minting them to slash a peer's score is the sybil shape
+/// this weighting removes. Both halves degrade honestly: a down chain
+/// leaves the age rule alone; a fresh bootstrap leaves everyone at age
+/// zero until they've advertised for a day (conservative by design).
+const MIN_REPORTER_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Fraud reasons — peers report observed failures, not opinions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -332,6 +358,7 @@ fn entry_default_fields(ad: PeerAd) -> Entry {
     Entry {
         ad,
         last_refresh_ms: now_ms(),
+        first_seen_ms: now_ms(),
         dead_votes: 0,
         score: 0,
         fraud_reports: HashMap::new(),
@@ -478,6 +505,38 @@ async fn sweep_live_scored(registry: &Registry, ttl_ms: u64) -> Vec<Entry> {
         })
         .collect();
     live
+}
+
+/// Whether the reporter's fraud report carries score weight (§10 anti-
+/// sybil): established identity in this registry (age ≥
+/// MIN_REPORTER_AGE_MS; a never-advertised identity reads as age zero)
+/// OR visible locked stake on the chain (> 0 µJ via the token-authed
+/// `GET /stake`). The chain half is a quiet no-op without a configured
+/// chain base, token, or a reachable chain — the age rule stands alone.
+async fn reporter_established(registry: &Registry, reporter: &str, now: u64) -> bool {
+    let aged = {
+        let entries = registry.entries.read().await;
+        entries.get(reporter).is_some_and(|e| {
+            let first = if e.first_seen_ms == 0 { e.last_refresh_ms } else { e.first_seen_ms };
+            now.saturating_sub(first) >= MIN_REPORTER_AGE_MS
+        })
+    };
+    if aged {
+        return true;
+    }
+    let Some(base) = registry.chain_base.as_deref() else { return false };
+    let Some(token) = crate::economics::read_token() else { return false };
+    let url = format!(
+        "{}/stake?discord_id={}",
+        base.trim_end_matches('/'),
+        reporter
+    );
+    match crate::stake::stake_get(&url, &token).await {
+        Ok((status, body)) if (200..300).contains(&status) => {
+            body.get("staked_uj").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+        }
+        _ => false, // chain unavailable = age rule only — no fake grace
+    }
 }
 
 /// One background-sweep pass: drop entries stale beyond `ttl_ms`.
@@ -1025,10 +1084,25 @@ async fn report_fraud(
             Json(serde_json::json!({"error": "unknown node"})),
         )
             .into_response();
-    };
-
-    apply_recovery(entry, now_ms());
+    };    apply_recovery(entry, now_ms());
+    drop(entries);
     let now = now_ms();
+
+    // §10 anti-sybil weighting: subtract score only for ESTABLISHED
+    // reporters (identity age or visible chain stake); everyone else's
+    // report is recorded and counts as corroboration shape, never as its
+    // own penalty. Check happens BEFORE the scoring write-lock (the
+    // chain probe awaits).
+    let established = reporter_established(&registry, &rep.reporter, now).await;
+
+    let mut entries = registry.entries.write().await;
+    let Some(entry) = entries.get_mut(&rep.node_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown node"})),
+        )
+            .into_response();
+    };
 
     // Was this kind already reported by someone else before this report?
     let kind_already_seen = entry.fraud_reports.values().any(|(k, _)| k == &rep.kind);
@@ -1041,26 +1115,35 @@ async fn report_fraud(
 
     let already_reported_by_this_reporter = entry.fraud_reports.contains_key(&rep.reporter);
 
+    let mut penalty_applied = false;
     if already_reported_by_this_reporter {
+
         // First claim by a reporter wins; later reports only refresh the
         // timestamp (cheap report-flood defense). No penalty change.
         if let Some(record) = entry.fraud_reports.get_mut(&rep.reporter) {
             record.1 = now;
         }
     } else if !kind_already_seen {
-        // New (reporter, kind) pair, kind not seen before: single penalty.
+        // New (reporter, kind) pair, kind not seen before: single penalty
+        // from an ESTABLISHED reporter (the anti-sybil weighting).
         entry
             .fraud_reports
             .insert(rep.reporter.clone(), (rep.kind.clone(), now));
-        entry.score = (entry.score - penalty_for(&rep.kind)).max(REPUTATION_FLOOR);
+        if established {
+            entry.score = (entry.score - penalty_for(&rep.kind)).max(REPUTATION_FLOOR);
+            penalty_applied = true;
+        }
     } else {
         // Corroboration: this kind was already reported by someone else.
-        // Penalize each additional distinct reporter (≥MIN_CORROBORATORS).
+        // Each additional distinct ESTABLISHED reporter penalizes
+        // (≥MIN_CORROBORATORS); young/zero-stake ones only count toward
+        // the corroboration shape, never the score.
         entry
             .fraud_reports
             .insert(rep.reporter.clone(), (rep.kind.clone(), now));
-        if prior_kind_reporters + 1 >= MIN_CORROBORATORS {
+        if established && prior_kind_reporters + 1 >= MIN_CORROBORATORS {
             entry.score = (entry.score - penalty_for(&rep.kind)).max(REPUTATION_FLOOR);
+            penalty_applied = true;
         }
     }
     let score = entry.score;
@@ -1069,6 +1152,7 @@ async fn report_fraud(
         node = %rep.node_id,
         reporter = %rep.reporter,
         kind = ?rep.kind,
+        established,
         score,
         "fraud report recorded"
     );
@@ -1078,6 +1162,8 @@ async fn report_fraud(
             "recorded": true,
             "score": score,
             "halted": score <= HALT_SCORE_THRESHOLD,
+            "reporter_established": established,
+            "penalty_applied": penalty_applied,
         })),
     )
         .into_response()
@@ -1129,7 +1215,10 @@ async fn model_counts(State((registry, ttl_ms)): State<Shared>) -> Response {
 
 /// Serve the bootstrap node until the process exits.
 pub async fn serve(options: BootstrapOptions) -> anyhow::Result<()> {
-    let registry = Arc::new(Registry::default());
+    let registry = Arc::new(Registry {
+        chain_base: options.chain_base.clone(),
+        ..Default::default()
+    });
     let app = router(registry.clone(), options.advertise_ttl_ms);
     // §10: load-or-generate the reputation signing identity FIRST — a
     // failure downgrades to stamps-off (registry still runs) rather than
@@ -2000,6 +2089,7 @@ mod tests {
             measures: Default::default(),
             entries: RwLock::new(HashMap::new()),
             max_entries: 1,
+            chain_base: None,
         });
         let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2062,6 +2152,7 @@ mod tests {
             Entry {
                 ad: ad_fresh,
                 last_refresh_ms: now_ms(),
+                first_seen_ms: now_ms(),
                 dead_votes: 0,
                 score: 0,
                 fraud_reports: HashMap::new(),
@@ -2074,6 +2165,7 @@ mod tests {
             Entry {
                 ad: ad_stale,
                 last_refresh_ms: now_ms().saturating_sub(DEFAULT_ADVERTISE_TTL_MS + 1_000),
+                first_seen_ms: now_ms(),
                 dead_votes: 0,
                 score: 0,
                 fraud_reports: HashMap::new(),
@@ -2267,6 +2359,42 @@ mod tests {
         a.node_id
     }
 
+    /// Make a reporter ESTABLISHED for the §10 weighting without chain
+    /// involvement: materialize its registry entry with first_seen far
+    /// enough back — exactly what a day-old operator looks like on a
+    /// live bootstrap (never-advertised = absent entry = age zero).
+    async fn establish_reporter(
+        registry: &Registry,
+        identity: &crate::signing::SigningIdentity,
+    ) {
+        let a = PeerAd {
+            node_id: identity.node_id(),
+            address: "127.0.0.1:9000".into(),
+            model_id: "glm-5.3".into(),
+            quant: "int4".into(),
+            contribution_percent: 30,
+            rpc_address: String::new(),
+            last_seen_ms: now_ms(),
+            role: NodeRole::Hybrid,
+            resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
+            discovery_servers: Vec::new(),
+            gossip_reputations: None,
+        };
+        registry.entries.write().await.insert(
+            identity.node_id(),
+            Entry {
+                ad: a,
+                last_refresh_ms: now_ms(),
+                first_seen_ms: now_ms().saturating_sub(MIN_REPORTER_AGE_MS + 1_000),
+                dead_votes: 0,
+                score: 0,
+                fraud_reports: HashMap::new(),
+            },
+        );
+    }
+
     /// POST a fraud report with the reporter's wire-auth headers. The
     /// server now verifies signatures, so tests (and the real client in
     /// bootstrap.rs) must sign `jerith-fraud1|stamp|{kind}|{reporter}|{target}`.
@@ -2310,6 +2438,10 @@ mod tests {
         let r1 = crate::signing::SigningIdentity::generate();
         let r2 = crate::signing::SigningIdentity::generate();
         let target = seed_live_peer(&registry, &base, &client, &accused).await;
+        // §10 anti-sybil weighting: a claim only carries score weight
+        // once its reporter is established (age ≥ the line here).
+        establish_reporter(&registry, &r1).await;
+        establish_reporter(&registry, &r2).await;
 
         async fn post(
             client: &reqwest::Client,
@@ -2362,7 +2494,10 @@ mod tests {
         assert_eq!(v["score"], -60);
         assert_eq!(v["halted"], true);
 
-        // Halted node no longer appears in the public peer list.
+        // Halted node no longer appears in the public peer list. The
+        // §10-primed reporters are healthy glm-5.3 entries of their own
+        // (127.0.0.1:9000 placeholder) — they must stay visible while the
+        // penalized target disappears.
         let list: PeerListResponse = client
             .get(format!("{base}/v1/peers?model=glm-5.3"))
             .send()
@@ -2371,10 +2506,19 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(list.peers.is_empty(), "halted peer must be withheld");
+        assert_eq!(
+            list.peers.len(),
+            2,
+            "established reporters stay visible: {list:?}"
+        );
+        assert!(
+            list.peers.iter().all(|p| p.node_id != target),
+            "halted peer must be withheld, got: {list:?}"
+        );
 
         // Different fraud kind adds a separate penalty once.
         let r3 = crate::signing::SigningIdentity::generate();
+        establish_reporter(&registry, &r3).await;
         let v: serde_json::Value = post_fraud(&client, &base, &r3, "dishonest_results", &target)
             .await
             .json()
@@ -2405,12 +2549,19 @@ mod tests {
         let reporter = crate::signing::SigningIdentity::generate();
         let target = seed_live_peer(&registry, &base, &client, &accused).await;
 
-        // One fraud report → -30.
-        let _: serde_json::Value = post_fraud(&client, &base, &reporter, "leeching", &target)
+        // Both reporters are ESTABLISHED first (registration age ≥ the
+        // line) — the §10 weighting demands it for score weight.
+        establish_reporter(&registry, &reporter).await;
+
+        // One fraud report → -20 (leeching, single-claim penalty).
+        let v: serde_json::Value = post_fraud(&client, &base, &reporter, "leeching", &target)
             .await
             .json()
             .await
             .unwrap();
+        assert_eq!(v["score"], -20, "established single-claim penalizes: {v}");
+        assert_eq!(v["reporter_established"], true, "{v}");
+        assert_eq!(v["penalty_applied"], true, "{v}");
 
         // Node re-advertises (e.g., restart) → score/history must persist.
         let a = PeerAd {
@@ -2438,9 +2589,11 @@ mod tests {
             .unwrap();
         assert!(r.status().is_success());
 
-        // Another report from a distinct peer: coroutine applies -20 on top
-        // of -20 (decay is 0 immediately) → -40.
+        // Another report from a distinct (also established) peer:
+        // corroboration applies -20 on top of -20 (decay is 0
+        // immediately) → -40.
         let corroborator = crate::signing::SigningIdentity::generate();
+        establish_reporter(&registry, &corroborator).await;
         let v: serde_json::Value = post_fraud(&client, &base, &corroborator, "leeching", &target)
             .await
             .json()
@@ -2458,8 +2611,139 @@ mod tests {
         assert_eq!(v["score"], -40);
     }
 
+    /// §10 anti-sybil: a YOUNG reporter (fresh mint, never advertised,
+    /// no stake) is recorded but subtracts NOTHING — minting identities
+    /// to slash a peer's score is the shape removed. Its zero-weight
+    /// claim still counts toward the corroboration shape: a second,
+    /// aged reporter corroborating the same kind lands the full
+    /// penalty (and the per-reporter flood dedup holds for the young
+    /// one's later claims).
+    #[tokio::test]
+    async fn young_reporter_holds_no_score_weight_until_established() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = crate::http::mesh_http();
+
+        let accused = crate::signing::SigningIdentity::generate();
+        let reporter = crate::signing::SigningIdentity::generate();
+        let target = seed_live_peer(&registry, &base, &client, &accused).await;
+
+        // Young: recorded, penalty NOT applied, score untouched.
+        let v: serde_json::Value = post_fraud(&client, &base, &reporter, "leeching", &target)
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], 0, "young report holds no score weight: {v}");
+        assert_eq!(v["reporter_established"], false, "{v}");
+        assert_eq!(v["penalty_applied"], false, "{v}");
+
+        // The SAME reporter ages past the line — its first claim was
+        // already recorded, so per-reporter flood dedup means later
+        // kinds only refresh the timestamp, never a new penalty.
+        establish_reporter(&registry, &reporter).await;
+        let v: serde_json::Value =
+            post_fraud(&client, &base, &reporter, "dishonest_results", &target)
+                .await
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            v["score"], 0,
+            "flood dedup: same reporter's later kinds never subtract: {v}"
+        );
+        assert_eq!(v["reporter_established"], true, "{v}");
+        assert_eq!(v["penalty_applied"], false, "{v}");
+
+        // Corroboration: the young claim already sits in the record, so
+        // one aged reporter corroborating the same kind reaches
+        // MIN_CORROBORATORS and lands the full penalty.
+        let corroborator = crate::signing::SigningIdentity::generate();
+        establish_reporter(&registry, &corroborator).await;
+        let v: serde_json::Value = post_fraud(&client, &base, &corroborator, "leeching", &target)
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -20, "established corroboration subtracts: {v}");
+        assert_eq!(v["reporter_established"], true, "{v}");
+        assert_eq!(v["penalty_applied"], true, "{v}");
+    }
+
+    /// The LIVE half of the weighting: visible locked stake on the chain
+    /// establishes a reporter even at registry age zero (skin in the game
+    /// beats the calendar). One stub chain serves `GET /stake` per
+    /// reporter — staked for the known identity, zero for anyone else;
+    /// both legs run against the same shim registry.
+    #[tokio::test]
+    async fn visible_chain_stake_establishes_a_fresh_reporter() {
+        use axum::extract::Query as AQuery;
+
+        // The staked reporter is generated FIRST so the chain shim can
+        // key on its actual node id (ids are minted, not chosen).
+        let staked_reporter = crate::signing::SigningIdentity::generate();
+        let known_id = staked_reporter.node_id();
+        let chain_app = axum::Router::new().route(
+            "/stake",
+            axum::routing::get(move |AQuery(q): AQuery<HashMap<String, String>>| {
+                let known_id = known_id.clone();
+                async move {
+                    let id = q.get("discord_id").cloned().unwrap_or_default();
+                    let staked = if id == known_id { 50 } else { 0 };
+                    axum::Json(serde_json::json!({ "staked_uj": staked }))
+                }
+            }),
+        );
+        let chain_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chain_addr = chain_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(chain_listener, chain_app).await.unwrap() });
+
+        // A registry pointed AT the shim chain (the live half configured).
+        let registry = Arc::new(Registry {
+            chain_base: Some(format!("http://{chain_addr}")),
+            ..Default::default()
+        });
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = crate::http::mesh_http();
+
+        let accused = crate::signing::SigningIdentity::generate();
+        let target = seed_live_peer(&registry, &base, &client, &accused).await;
+
+        // Leg 1: the STAKED fresh reporter (never advertised here — age
+        // zero) is established by its locked stake → full penalty.
+        let v: serde_json::Value =
+            post_fraud(&client, &base, &staked_reporter, "leeching", &target)
+                .await
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(v["score"], -20, "stake weight beats the calendar: {v}");
+        assert_eq!(v["reporter_established"], true, "{v}");
+        assert_eq!(v["penalty_applied"], true, "{v}");
+
+        // Leg 2: another fresh identity — the shim reports zero stake and
+        // no age exists → recorded, no score change.
+        let unstaked = crate::signing::SigningIdentity::generate();
+        let v: serde_json::Value = post_fraud(&client, &base, &unstaked, "leeching", &target)
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["score"], -20, "unestablished report never subtracts");
+        assert_eq!(v["reporter_established"], false, "{v}");
+        assert_eq!(v["penalty_applied"], false, "{v}");
+    }
+
     #[test]
-    fn reputation_recovery_calculates_decayed_scores() {
+    fn decay_recalculates_from_report_age() {
         let mut e = Entry {
             ad: PeerAd {
                 node_id: "x".into(),
@@ -2477,6 +2761,7 @@ mod tests {
                 gossip_reputations: None,
             },
             last_refresh_ms: 0,
+            first_seen_ms: 0,
             dead_votes: 0,
             score: -60,
             fraud_reports: HashMap::new(),

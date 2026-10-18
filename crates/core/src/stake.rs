@@ -619,7 +619,7 @@ async fn stake_post(
 }
 
 /// GET variant for the /stake read view.
-async fn stake_get(url: &str, token: &str) -> anyhow::Result<(u16, serde_json::Value)> {
+pub(crate) async fn stake_get(url: &str, token: &str) -> anyhow::Result<(u16, serde_json::Value)> {
     let client = reqwest::Client::builder()
         .use_rustls_tls()
         .timeout(Duration::from_secs(5))
