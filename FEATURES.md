@@ -78,7 +78,34 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   cold-expert sharding), and the QUIC dispatch planner prefers the owning peer for
   each layer group. Placement-only today: the multi-hop residual-pipeline runtime is
   the remaining part and stays on the Phase 3 list (§13)
-- 🔄 Speculative decoding + expert budgeting + prefetching (Phase 3)
+- ✅ Speculative **prefetching** over measured demand (Phase 3, landed
+  2026-10-18; shape below):
+  - After this node serves (or dispatches) expert `L<k>.E<n>`, a
+    background walk preloads the most-demanded **locally-hosted**
+    experts of `L<k+1>` (then `L<k+2>`…, `[experts].prefetch_horizon`,
+    default 1) into the byte-budgeted LRU while the requester still
+    consumes the current layer's output — the activation pipeline walks
+    layer by layer, so the next layer is the natural prediction target.
+  - Demand-ranked via `expert_stats.prefetch_candidates` (count desc,
+    ties by id — deterministic everywhere); only experts already on
+    disk are touched (`prefetch` warms the cache, it never pulls mesh
+    weights); `prefetch_per_layer` (default 2) caps candidates.
+  - Politeness is structural: one background walk per node at a time
+    (`prefetching` guard; a skipped activation costs nothing — the next
+    restates demand), the walk is spawned so serve paths never block on
+    a disk read, and disabled configs cost one atomic swap.
+  - Honest counters: `prefetches` / `prefetch_errors` in the store's
+    own stats (hits/misses stay serving-only — a warmed expert's first
+    real query shows as an honest cache HIT, the prefetch paid the disk
+    cost), surfaced in `/status.experts` with the knobs and on the
+    dashboard's expert hit-rate fine line.
+  - Knobs are hot-reloadable: `[experts].prefetch_enabled /
+    prefetch_per_layer / prefetch_horizon` classify hot in the reload
+    plan (`experts.prefetch`) — the hook re-reads live config each walk.
+  - Tests: layer parsing + candidate ranking (pure), prefetch counters
+    never disturbing the serving counters, and a MeshState-level test
+    proving a serve of `L0.*` makes the hosted `L1.*` candidate
+    resident with the guard reset afterwards.
 - 🔄 Asynchronous, timeout-tolerant forward passes; graceful degradation (Phase 3)
 - ✅ Dedicated local specialist models:
   - Vision: MiniCPM-V 4.6:1b (never leaves the node unless the user opts in)
@@ -638,10 +665,15 @@ gotchas surfaced while building the finished parts.
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.
 - **Speculative decoding + expert budgeting + prefetching (§1)**. The
+  prefetching half LANDED 2026-10-18 (see §1 for the full shape): the
   measured-demand store (`expert_stats`, activation counts, hot/cold split)
-  is the prefetch oracle: predicted next experts preload into the LRU while
-  the current layer runs. Open design point: a per-request expert budget
-  so one huge speculative run cannot starve other askers.
+  is the prefetch oracle and the layer-walk prediction (`L<k> served →
+  `L<k+1>` preloaded) popped out of it with no new exchange — experts were
+  already advertised per layer. Still open: speculative decoding, and the
+  per-request expert budget so one huge speculative run cannot starve
+  other askers (current prefetch is 1 bounded background walk per node,
+  local-hosted candidates only — the budget question does not arise for
+  that shape, it appears when real speculative runs start).
 - **Asynchronous, timeout-tolerant forward passes + graceful degradation
   (§1)**. Today's dispatch is plan-ordered with fallbacks but synchronous
   per attempt; mesh hops need per-hop timeouts, retry walks that respect

@@ -628,6 +628,30 @@ pub struct ExpertStoreConfig {
     /// available to peers either way).
     #[serde(default = "default_replication_enabled")]
     pub replication_enabled: bool,
+    /// Phase 3 speculative prefetch (FEATURES §13): after this node
+    /// serves (or dispatches) an expert, preload the most-demanded
+    /// locally-hosted experts of the following layer(s) into the LRU
+    /// while the requester still consumes the current layer's output.
+    /// Prefetching touches only experts this node already hosts on disk
+    /// — it warms the resident cache; it never pulls mesh weights.
+    #[serde(default = "default_true")]
+    pub prefetch_enabled: bool,
+    /// How many of the next layer's observed experts to consider,
+    /// ranked by measured demand (ties by expert id).
+    #[serde(default = "default_prefetch_per_layer")]
+    pub prefetch_per_layer: usize,
+    /// How many layers ahead to look. The MoE pipeline walks layer by
+    /// layer, so 1 is the natural horizon.
+    #[serde(default = "default_prefetch_horizon")]
+    pub prefetch_horizon: u32,
+}
+
+fn default_prefetch_per_layer() -> usize {
+    2
+}
+
+fn default_prefetch_horizon() -> u32 {
+    1
 }
 
 fn default_hot_percent() -> u32 {
@@ -669,6 +693,9 @@ impl Default for ExpertStoreConfig {
             replication_interval_secs: default_replication_interval_secs(),
             replication_max_actions_per_round: default_replication_max_actions(),
             replication_enabled: default_replication_enabled(),
+            prefetch_enabled: default_true(),
+            prefetch_per_layer: default_prefetch_per_layer(),
+            prefetch_horizon: default_prefetch_horizon(),
         }
     }
 }

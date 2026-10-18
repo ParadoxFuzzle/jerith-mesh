@@ -873,6 +873,13 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
                 "loads": s.loads,
                 "evictions": s.evictions,
                 "load_errors": s.load_errors,
+                // Phase 3 speculative prefetch: warm-up actions + failures,
+                // plus the knobs that drive them (hot-reloadable).
+                "prefetches": s.prefetches,
+                "prefetch_errors": s.prefetch_errors,
+                "prefetch_enabled": cfg.experts.prefetch_enabled,
+                "prefetch_per_layer": cfg.experts.prefetch_per_layer,
+                "prefetch_horizon": cfg.experts.prefetch_horizon,
                 // Demand signal + placement policy (Phase 2 replication).
                 "activations_total": stats.total(),
                 "activations_distinct": stats.distinct(),

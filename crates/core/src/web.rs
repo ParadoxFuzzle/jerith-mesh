@@ -192,7 +192,7 @@ async function refresh() {
       const hr = Math.round(100 * ex.hits / (ex.hits + ex.misses));
       document.getElementById('hit').textContent = hr + '%';
       document.getElementById('hitfine').textContent =
-        `cache hits/misses ${ex.hits}/${ex.misses} · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts · hot ${Array.isArray(ex.hot) ? ex.hot.length : '?'} / cold ${ex.cold ?? '?'}`;
+        `cache hits/misses ${ex.hits}/${ex.misses} · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts · hot ${Array.isArray(ex.hot) ? ex.hot.length : '?'} / cold ${ex.cold ?? '?'} · prefetch ${ex.prefetches ?? 0}`;
     } else if (ex) {
       document.getElementById('hit').textContent = '—';
       document.getElementById('hitfine').textContent =

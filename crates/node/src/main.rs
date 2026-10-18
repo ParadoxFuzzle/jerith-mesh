@@ -2331,6 +2331,9 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             stats: Some(state.expert_stats.clone()),
             // Kill switch: peer-facing serving closes when the governor trips.
             isolate: Some(state.isolate.clone()),
+            // Phase 3 speculative prefetch: next-layer demand-ranked locals
+            // preload into the LRU after every real tensor serve.
+            prefetch: Some(state.clone()),
         };
         let banner = serving.describe();
         // Identity-bound QUIC cert: the transport cert key IS the node's

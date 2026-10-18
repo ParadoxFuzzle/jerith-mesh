@@ -2109,6 +2109,10 @@ pub struct ExpertServing {
     /// traffic (the gateway + WebUI) is untouched; only mesh work stops.
     /// None (tests) = the gate is simply absent.
     pub isolate: Option<Arc<crate::isolate::IsolateState>>,
+    /// Phase 3 speculative prefetch hook (FEATURES §13): after a real
+    /// tensor serve, the state triggers a background preload of the next
+    /// layer's demand-ranked locals. None (tests) = no prefetching.
+    pub prefetch: Option<Arc<crate::ping::MeshState>>,
 }
 
 impl ExpertServing {
@@ -2166,6 +2170,12 @@ impl ExpertHandler for ExpertServing {
                 && let Ok(mut stats) = stats.lock()
             {
                 stats.record(expert_id);
+            }
+            // Speculative prefetch (Phase 3): the next layer's
+            // demand-ranked locals preload while the requester consumes
+            // this output.
+            if let Some(state) = &self.prefetch {
+                state.spawn_prefetch_after_serve(expert_id);
             }
             return Ok(out);
         }

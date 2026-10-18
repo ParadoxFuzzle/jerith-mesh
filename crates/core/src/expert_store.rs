@@ -276,6 +276,12 @@ pub struct StoreStats {
     pub loads: AtomicU64,
     pub evictions: AtomicU64,
     pub load_errors: AtomicU64,
+    /// Speculative preloads (Phase 3): one per `prefetch` that ended with
+    /// the expert resident (already-resident prefetches count too —
+    /// the request was served by the cache either way).
+    pub prefetches: AtomicU64,
+    /// Prefetch attempts whose load failed (unhosted/corrupt expert).
+    pub prefetch_errors: AtomicU64,
 }
 
 /// Point-in-time copy of [`StoreStats`] (cheap to render).
@@ -286,6 +292,8 @@ pub struct StoreStatsSnapshot {
     pub loads: u64,
     pub evictions: u64,
     pub load_errors: u64,
+    pub prefetches: u64,
+    pub prefetch_errors: u64,
 }
 
 struct CacheEntry {
@@ -439,6 +447,8 @@ impl ExpertStore {
             loads: self.stats.loads.load(Ordering::Relaxed),
             evictions: self.stats.evictions.load(Ordering::Relaxed),
             load_errors: self.stats.load_errors.load(Ordering::Relaxed),
+            prefetches: self.stats.prefetches.load(Ordering::Relaxed),
+            prefetch_errors: self.stats.prefetch_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -457,6 +467,15 @@ impl ExpertStore {
             }
         }
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        self.load_from_disk_and_cache(expert_id)
+    }
+
+    /// Shared disk-load path of `get` and `prefetch`: read the container,
+    /// re-check the header id against the filename (a misnamed file never
+    /// serves the wrong expert), count the load, and insert into the LRU
+    /// (properly evicting when over budget; an expert bigger than the
+    /// whole budget is returned uncached rather than thrashing the set).
+    fn load_from_disk_and_cache(&self, expert_id: &str) -> Result<Arc<ExpertWeights>> {
         let path = self.path_for(expert_id);
         let weights = Arc::new(ExpertWeights::read_from(&path).inspect_err(|_| {
             self.stats.load_errors.fetch_add(1, Ordering::Relaxed);
@@ -495,6 +514,30 @@ impl ExpertStore {
             }
         }
         Ok(weights)
+    }
+
+    /// Speculative prefetch (Phase 3): bring one expert into the LRU
+    /// *without* a serving request behind it. The served hits/misses that
+    /// measure the cache belong to serving — a prefetch is booked under
+    /// its own counters, and a success later shows up as an honest cache
+    /// hit when the real query arrives. Callers must already know the
+    /// expert is hosted (prefetch warms, it never fetches mesh weights).
+    pub fn prefetch(&self, expert_id: &str) -> Result<()> {
+        if self.is_resident(expert_id) {
+            // Nothing to load; still a completed prefetch action.
+            self.stats.prefetches.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        match self.load_from_disk_and_cache(expert_id) {
+            Ok(_) => {
+                self.stats.prefetches.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.prefetch_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     /// Store one expert (atomic write, then a fresh load path).
@@ -814,6 +857,45 @@ mod tests {
         let (dir, store) = tmp_store(4);
         assert!(store.hosted().is_empty());
         assert_eq!(store.stats(), StoreStatsSnapshot::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prefetch_warms_the_lru_without_touching_serving_counters() {
+        let (dir, store) = tmp_store(16);
+        store.put(&ExpertWeights::synthetic("L0.E1", 4, 3)).unwrap();
+        store.put(&ExpertWeights::synthetic("L1.E2", 4, 3)).unwrap();
+        assert_eq!(store.stats(), StoreStatsSnapshot::default());
+
+        // Prefetch: the expert is resident afterwards, but NO serving
+        // counter moved — hits/misses belong to real queries.
+        store.prefetch("L1.E2").unwrap();
+        assert!(store.is_resident("L1.E2"));
+        let s = store.stats();
+        assert_eq!(s.prefetches, 1);
+        assert_eq!((s.hits, s.misses), (0, 0));
+        assert_eq!(s.loads, 1, "a prefetch on a cold expert is a disk load");
+
+        // The warmed expert's first REAL query is an honest cache hit —
+        // the prefetch paid the disk cost instead of the requester.
+        assert_eq!(store.get("L1.E2").unwrap().id, "L1.E2");
+        assert_eq!(store.stats().hits, 1);
+
+        // Prefetch of an already-resident expert: counted, zero loads.
+        store.prefetch("L1.E2").unwrap();
+        assert_eq!(store.stats().prefetches, 2);
+        assert_eq!(store.stats().loads, 1);
+
+        // Prefetch of something unhosted: typed error + its own counter.
+        // The shared load path records its load_errors too (exactly what
+        // a get() of the same id would show) — but no hit, no miss, and
+        // no serving-side counter pretends a query happened.
+        let err = format!("{:#}", store.prefetch("L9.E9").unwrap_err());
+        assert!(err.contains("L9.E9"), "got {err}");
+        let s = store.stats();
+        assert_eq!(s.prefetch_errors, 1);
+        assert_eq!(s.misses, 0, "no serving miss was counted by prefetch");
+        assert_eq!(s.hits, 1, "only the serve's own hit remains");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

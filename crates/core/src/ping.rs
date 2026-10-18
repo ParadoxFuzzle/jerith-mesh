@@ -89,6 +89,11 @@ pub struct MeshState {
     /// (served here, or dispatched from here). The hot/cold split and the
     /// shard ring both read it.
     pub expert_stats: crate::expert_stats::SharedExpertStats,
+    /// Phase 3 speculative prefetch guard: at most ONE background
+    /// prefetch walk at a time (activations can arrive faster than a
+    /// disk can read — the guard keeps prefetch polite; a skipped
+    /// activation costs nothing, the next one restates demand).
+    pub prefetching: std::sync::atomic::AtomicBool,
     /// Resource isolation (Phase 1): the kill-switch state the governor
     /// trips and everything mesh-facing consults before doing real work.
     pub isolate: std::sync::Arc<crate::isolate::IsolateState>,
@@ -283,6 +288,7 @@ impl MeshState {
                 crate::expert_stats::ExpertStats::load(&crate::expert_stats::default_stats_path()),
             )),
             expert_stats_path: std::sync::Mutex::new(crate::expert_stats::default_stats_path()),
+            prefetching: std::sync::atomic::AtomicBool::new(false),
             compat: tokio::sync::RwLock::new(None),
             isolate: std::sync::Arc::new(crate::isolate::IsolateState::default()),
             peer_block,
@@ -317,6 +323,86 @@ impl MeshState {
         if let Ok(mut stats) = self.expert_stats.lock() {
             stats.record(expert_id);
         }
+    }
+
+    /// Phase 3 speculative prefetch (FEATURES §13): the MoE pipeline
+    /// walks layer by layer, so the layer AFTER the one just served is
+    /// the natural prediction target. Warm the LRU with this node's
+    /// most-demanded, locally-hosted experts of the following layer(s)
+    /// while the requester still consumes the current layer's output.
+    ///
+    /// Guarded and honest by construction:
+    /// - config knobs read live (`[experts].prefetch_*` — hot-reloadable);
+    /// - one background walk at a time (the `prefetching` guard; the
+    ///   skipped activation costs nothing, the next one restates demand);
+    /// - only experts already hosted locally are touched — prefetch
+    ///   warms the resident cache, it never pulls mesh weights;
+    /// - the walk runs detached (spawned) so the serve path never waits
+    ///   on a disk read — the call itself is sync, safe from both the
+    ///   QUIC serve handler and the dispatch path.
+    pub fn spawn_prefetch_after_serve(self: &Arc<Self>, served_expert: &str) {
+        // One background walk at a time; activations arrive faster than a
+        // disk can read, so the guard keeps prefetch polite (a skipped
+        // activation costs nothing — the next one restates demand). The
+        // knob check rides INSIDE the walk so a disabled config only
+        // costs one atomic swap.
+        if self
+            .prefetching
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return; // a walk is already in flight; this activation restates demand
+        }
+        let state = Arc::clone(self);
+        let served = served_expert.to_string();
+        tokio::spawn(async move {
+            let (enabled, per_layer, horizon) = {
+                let cfg = state.config.read().await;
+                (
+                    cfg.experts.prefetch_enabled,
+                    cfg.experts.prefetch_per_layer,
+                    cfg.experts.prefetch_horizon,
+                )
+            };
+            let reset = || {
+                state
+                    .prefetching
+                    .store(false, std::sync::atomic::Ordering::SeqCst)
+            };
+            if !enabled || per_layer == 0 || horizon == 0 {
+                reset();
+                return;
+            }
+            let Some(store) = state.experts.lock().await.clone() else {
+                reset();
+                return; // no expert store attached (config-only node)
+            };
+            let candidates = {
+                match state.expert_stats.lock() {
+                    Ok(stats) => stats.prefetch_candidates(&served, horizon, per_layer),
+                    Err(_) => Vec::new(), // poisoned lock: skip this walk
+                }
+            };
+            for id in candidates {
+                if !store.contains(&id) {
+                    continue; // prefetch warms local weights only
+                }
+                match store.prefetch(&id) {
+                    Ok(()) => tracing::debug!(
+                        target: "mesh",
+                        expert = %id,
+                        after = %served,
+                        "speculative prefetch: next-layer expert preloaded"
+                    ),
+                    Err(e) => tracing::debug!(
+                        target: "mesh",
+                        expert = %id,
+                        error = %e,
+                        "speculative prefetch load failed"
+                    ),
+                }
+            }
+            reset();
+        });
     }
 
     /// A copy of the activation counters.
@@ -672,6 +758,9 @@ impl MeshFallbackChat {
         }
         // Demand signal: this node wants this expert.
         state.record_activation(expert_id);
+        // Speculative prefetch (Phase 3): the requester already knows which
+        // layer it is on — warm the next layer's demand-ranked locals now.
+        state.spawn_prefetch_after_serve(expert_id);
         self.refresh_pins(state).await;
         let req_id = format!("expert-{}-{}", expert_id, crate::bootstrap::now_ms());
         let store = state.expert_store().await;
@@ -983,6 +1072,14 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
     // choke point re-reads state.config each attempt.
     if disk.privacy != live.privacy {
         plan.hot.push("privacy");
+    }
+    // Phase 3 speculative prefetch knobs: read at every serve/dispatch
+    // attempt, the same hot-path shape as privacy above.
+    if disk.experts.prefetch_enabled != live.experts.prefetch_enabled
+        || disk.experts.prefetch_per_layer != live.experts.prefetch_per_layer
+        || disk.experts.prefetch_horizon != live.experts.prefetch_horizon
+    {
+        plan.hot.push("experts.prefetch");
     }
     let mem_key = |c: &NodeConfig| {
         (
@@ -2629,6 +2726,72 @@ mod tests {
             1,
             "latch made the leave one-shot"
         );
+    }
+
+    /// Phase 3 speculative prefetch: after a serve/dispatch of a layer-k
+    /// expert, the state's background walk preloads the next layer's
+    /// demand-ranked LOCAL experts into the LRU (config knobs respected;
+    /// hosting honored; no mesh fetches).
+    #[tokio::test]
+    async fn prefetch_after_serve_warms_the_next_layer_demand_ranked() {
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let dir = std::env::temp_dir().join(format!(
+            "jerith-prefetch-test-{}-{}",
+            std::process::id(),
+            crate::bootstrap::now_ms()
+        ));
+        let store = Arc::new(crate::expert_store::ExpertStore::new(&dir, 16).expect("test store"));
+        store
+            .put(&crate::expert_store::ExpertWeights::synthetic(
+                "L1.E5", 4, 3,
+            ))
+            .unwrap();
+        state.set_expert_store(store.clone()).await;
+        // Demand: layer 0 is being served now; layer 1 has been observed
+        // before (the node hosts L1.E5, so earlier traffic recorded it).
+        {
+            let mut stats = state.expert_stats.lock().expect("stats");
+            stats.record("L1.E5");
+        }
+        state.spawn_prefetch_after_serve("L0.E0");
+        // The walk is spawned; give it a beat, then check the resident set.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::time::sleep(std::time::Duration::from_millis(150)),
+        )
+        .await
+        .expect("sleep");
+        assert!(
+            store.is_resident("L1.E5"),
+            "the hosted next-layer demand candidate must be preloaded"
+        );
+        assert_eq!(store.stats().prefetches, 1); // two candidates
+        // A hosted expert on an observed-but-colder layer-out position: with
+        // per_layer = 2 L1.E5 is the only layer-1 candidate this node hosts.
+        // Not-hosted candidates are skipped without touching the mesh.
+        std::fs::remove_dir_all(&dir).ok();
+        // The guard resets: a second walk is allowed afterwards.
+        assert!(
+            !state.prefetching.load(std::sync::atomic::Ordering::SeqCst),
+            "the in-flight guard must clear after the walk"
+        );
+    }
+
+    #[test]
+    fn config_reload_plan_prefetch_knobs_are_hot() {
+        let live = NodeConfig::default();
+        let mut disk = NodeConfig::default();
+        disk.experts.prefetch_enabled = false;
+        let plan = plan_config_reload(&disk, &live);
+        assert!(plan.hot.contains(&"experts.prefetch"));
+        let mut disk = NodeConfig::default();
+        disk.experts.prefetch_per_layer = 5;
+        let plan = plan_config_reload(&disk, &live);
+        assert!(plan.hot.contains(&"experts.prefetch"));
+        // Identical configs stay silent.
+        assert!(plan_config_reload(&live, &live).hot.is_empty());
     }
 
     #[test]

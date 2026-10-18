@@ -163,6 +163,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
         tensors_only: true,
         stats: None,
         isolate: None,
+        prefetch: None,
     });
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
@@ -310,6 +311,7 @@ async fn kill_switch_tripped_refuses_serving_honestly_over_quic() {
         tensors_only: true,
         stats: None,
         isolate: Some(iso.clone()),
+        prefetch: None,
     });
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
@@ -434,6 +436,7 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
         tensors_only: true,
         stats: None,
         isolate: None,
+        prefetch: None,
     });
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
@@ -577,6 +580,7 @@ async fn hot_expert_replication_pulls_a_replica_over_quic() {
         tensors_only: true,
         stats: None,
         isolate: None,
+        prefetch: None,
     });
     let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
     {
@@ -826,6 +830,7 @@ async fn replica_manager_pulls_a_hot_expert_on_its_own_interval() {
         tensors_only: true,
         stats: None,
         isolate: None,
+        prefetch: None,
     });
     let (_tx_b, rx_b) = tokio::sync::watch::channel(false);
     {
@@ -1049,6 +1054,7 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
             tensors_only: true,
             stats: None,
             isolate: None,
+            prefetch: None,
         });
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let block = jerith_mesh_core::ratelimit::BlockedPeers::from_list(&[] as &[String]);
@@ -1164,4 +1170,142 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
     let _ = client;
     let _ = client_b;
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Phase 3 speculative prefetch over the real QUIC serving path
+/// (FEATURES §13): node B serves `L0.E1` from its store; a background
+/// walk must then preload B's hosted, demand-ranked `L1.*` experts into
+/// the LRU — with no extra wire request — while the serving path's own
+/// counters stay honest (prefetch books its own counters).
+#[tokio::test]
+async fn prefetch_after_serve_preloads_the_next_layer_over_quic() {
+    use jerith_mesh_core::config::{NodeConfig, NodeRole};
+    use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
+    use jerith_mesh_core::ping::MeshState;
+    use jerith_mesh_core::quic::{ExpertHandler, ExpertRouter, ExpertServing, RouterOptions};
+    use jerith_mesh_core::signing::SigningIdentity;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir = std::env::temp_dir().join(format!("jerith-prefetch-quic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(ExpertStore::new(&dir, 8).expect("store"));
+    store.put(&ExpertWeights::synthetic("L0.E1", 8, 6)).unwrap();
+    store.put(&ExpertWeights::synthetic("L1.E1", 8, 6)).unwrap();
+    store.put(&ExpertWeights::synthetic("L1.E2", 8, 6)).unwrap();
+    store.put(&ExpertWeights::synthetic("L9.E9", 8, 6)).unwrap();
+
+    // Node B's state: a real MeshState so the serve-side hook is the one
+    // production uses. Demand history: L1.E1 asked twice, L1.E2 once —
+    // the walk must rank them in that order and never touch L9.E9.
+    let cfg = NodeConfig {
+        node_id: "prefetch-node".into(),
+        secret_key_hex: Some(SigningIdentity::generate().secret_bytes().to_vec()),
+        model: Some(jerith_mesh_core::config::default_model("glm-5.3")),
+        role: NodeRole::Hybrid,
+        contribution_percent: 40,
+        ..NodeConfig::default()
+    };
+    let (state, _rx) = MeshState::new(cfg).unwrap();
+    state.set_expert_store(store.clone()).await;
+    let stats_path = std::env::temp_dir().join(format!(
+        "jerith-prefetch-quic-stats-{}.json",
+        std::process::id()
+    ));
+    let stats = {
+        let mut s = jerith_mesh_core::expert_stats::ExpertStats::new();
+        s.record("L1.E1");
+        s.record("L1.E1");
+        s.record("L1.E2");
+        s
+    };
+    state.set_expert_stats(stats, stats_path);
+
+    let identity = SigningIdentity::generate();
+    let server =
+        jerith_mesh_core::quic::server_endpoint_for(&identity, "127.0.0.1:0".parse().unwrap())
+            .expect("server endpoint");
+    let addr = server.local_addr().unwrap();
+    let serving: Arc<dyn ExpertHandler> = Arc::new(ExpertServing {
+        store: Some(store.clone()),
+        runtime: None,
+        tensors_only: true,
+        stats: Some(state.expert_stats.clone()),
+        isolate: None,
+        prefetch: Some(state.clone()),
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    {
+        let node_id = identity.node_id();
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve(server, serving, node_id, rx).await;
+        });
+    }
+
+    // A peer's router dispatches one real expert query to B — the same
+    // helper every other drill uses, so the serve fast-path (store hit →
+    // run → stats.record → spawn prefetch) is the production one.
+    let mut pins: HashMap<String, SocketAddr> = HashMap::new();
+    pins.insert(identity.node_id(), addr);
+    let pins: Arc<tokio::sync::RwLock<HashMap<String, SocketAddr>>> =
+        Arc::new(tokio::sync::RwLock::new(pins));
+    let client = jerith_mesh_core::quic::pinned_client_endpoint_dyn(pins).expect("client endpoint");
+    let router = ExpertRouter::new(RouterOptions {
+        nearby_rtt_ms: 50,
+        dispatch_timeout: Duration::from_secs(10),
+        ..Default::default()
+    });
+    let requester = SigningIdentity::generate();
+    let mut peer_addrs: HashMap<String, SocketAddr> = HashMap::new();
+    peer_addrs.insert(identity.node_id(), addr);
+    // B is a live candidate holding the expert (unreported resource
+    // sample and no reputation score — the pre-pooling shape).
+    let peers = vec![(identity.node_id(), 5u64, true, true, None, None)];
+    let input = vec![0.5f32, -0.25, 1.0, 0.0, -1.5, 2.0, 0.75, -0.5];
+    let mut completed = HashMap::new();
+    let mut served_by = None;
+    let out = router
+        .execute_over_quic_speculative_attributed(
+            &client,
+            &requester,
+            &peer_addrs,
+            "prefetch-1",
+            "L0.E1",
+            &input,
+            &peers,
+            &mut completed,
+            move |_: &[f32]| anyhow::bail!("requester holds no local weights"),
+            &mut served_by,
+        )
+        .await
+        .expect("expert query served over the wire");
+    assert_eq!(served_by.as_deref(), Some(identity.node_id().as_str()));
+    assert!(!out.is_empty());
+
+    // The prefetch walk is spawned, not awaited; give it a moment, then
+    // prove the outcome on the store.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = store.stats();
+    assert_eq!(s.prefetches, 2, "L1.E1 then L1.E2 preloaded (demand-rank)");
+    assert!(store.is_resident("L1.E1"));
+    assert!(store.is_resident("L1.E2"));
+    // The observed-but-unhosted expert never existed here; nothing with
+    // zero demand was touched.
+    assert!(!store.is_resident("L9.E9"));
+    // The serving path's own counters stay honest: exactly one miss (the
+    // cold L0.E1 the wire query itself paid for), zero load errors.
+    assert_eq!(s.misses, 1);
+    assert_eq!(s.load_errors, 0);
+    // And the walk released its one-at-a-time guard.
+    assert!(
+        !state.prefetching.load(std::sync::atomic::Ordering::SeqCst),
+        "the in-flight guard must clear after the walk"
+    );
+    let _ = store.hosted();
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_file(std::env::temp_dir().join(format!(
+        "jerith-prefetch-quic-stats-{}.json",
+        std::process::id()
+    )))
+    .ok();
 }

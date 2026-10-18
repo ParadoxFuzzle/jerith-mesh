@@ -120,6 +120,7 @@ async fn spin_node() -> anyhow::Result<(String, SocketAddr, Arc<ExpertStore>)> {
         tensors_only: true,
         stats: None,
         isolate: None,
+        prefetch: None,
     });
     let (_kill_tx, rx) = tokio::sync::watch::channel(false);
     {

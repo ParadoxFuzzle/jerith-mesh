@@ -212,6 +212,52 @@ pub enum ExpertClass {
     Cold,
 }
 
+/// The layer index of a conventional `L<k>.E<n>` expert id. Ids that do
+/// not carry the shape (builtin/ringer ids, hostile strings) have no
+/// layer and never participate in prefetching.
+pub fn expert_layer(expert_id: &str) -> Option<u32> {
+    let rest = expert_id.strip_prefix('L')?;
+    let dot = rest.find('.')?;
+    rest[..dot].parse::<u32>().ok()
+}
+
+impl ExpertStats {
+    /// Phase 3 speculative prefetch (FEATURES §13): the activation
+    /// pipeline walks the model layer by layer, so the layer *after* the
+    /// one just served is the natural prediction target. This returns
+    /// the observed experts of layers `layer+1 ..= layer+horizon`, each
+    /// ranked by demand (desc, ties by id — the same deterministic order
+    /// every node derives), at most `limit` per layer. The caller decides
+    /// which of these this node actually hosts — prefetch warms the
+    /// local cache, it never pulls mesh weights.
+    pub fn prefetch_candidates(
+        &self,
+        served_expert: &str,
+        horizon: u32,
+        limit: usize,
+    ) -> Vec<String> {
+        if horizon == 0 || limit == 0 {
+            return Vec::new();
+        }
+        let start = match expert_layer(served_expert) {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+        let ranked = self.ranked(); // count desc, id asc
+        let mut out = Vec::new();
+        for l in start.saturating_add(1)..=start.saturating_add(horizon) {
+            out.extend(
+                ranked
+                    .iter()
+                    .filter(|(id, _)| expert_layer(id) == Some(l))
+                    .take(limit)
+                    .map(|(id, _)| id.clone()),
+            );
+        }
+        out
+    }
+}
+
 /// `~/.jerith-mesh/data/expert-stats.json` — beside the memory db, so a
 /// node's whole local state lives under one directory.
 pub fn default_stats_path() -> PathBuf {
@@ -333,6 +379,63 @@ mod tests {
         assert_eq!(loaded.ranked(), s.ranked());
         assert_eq!(loaded.hot_set(15), s.hot_set(15));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn expert_layer_parses_the_conventional_shape() {
+        assert_eq!(expert_layer("L3.E17"), Some(3));
+        assert_eq!(expert_layer("L0.E0"), Some(0));
+        assert_eq!(expert_layer("L12.E100"), Some(12));
+        // Everything else: None, never a panic — builtin/ringer ids and
+        // hostile strings carry no layer and stay out of prefetching.
+        assert_eq!(expert_layer("jerith-builtin/reverse2"), None);
+        assert_eq!(expert_layer("E17"), None);
+        assert_eq!(expert_layer("L..E1"), None);
+        assert_eq!(expert_layer("L-1.E1"), None);
+        assert_eq!(expert_layer(""), None);
+    }
+
+    #[test]
+    fn prefetch_candidates_rank_the_next_layers_by_demand() {
+        let mut s = ExpertStats::new();
+        // Layer 0..3 demand: L2.E1 hottest, then L1.E2, L1.E1, tail.
+        for _ in 0..6 {
+            s.record("L2.E1");
+        }
+        for _ in 0..4 {
+            s.record("L1.E2");
+        }
+        for _ in 0..3 {
+            s.record("L1.E1");
+        }
+        for _ in 0..2 {
+            s.record("L3.E9");
+        }
+        s.record("L0.E0");
+        // Serving a layer-2 expert looks exactly one layer ahead: the two
+        // observed layer-3 experts, demand-ranked, tie-broken by id.
+        assert_eq!(s.prefetch_candidates("L2.E0", 1, 10), vec!["L3.E9"]);
+        // Layer-0 expert, horizon 1: the top TWO layer-1 experts per layer
+        // limit.
+        assert_eq!(s.prefetch_candidates("L0.E0", 1, 2), vec!["L1.E2", "L1.E1"]);
+        // Wider horizon walks further: layer 1 then layer 2, ranked each.
+        assert_eq!(
+            s.prefetch_candidates("L0.E0", 2, 10),
+            vec!["L1.E2", "L1.E1", "L2.E1"]
+        );
+        // Layer limit truncates honestly.
+        assert_eq!(s.prefetch_candidates("L0.E0", 1, 1), vec!["L1.E2"]);
+        // A non-layer id has no prediction target.
+        assert!(
+            s.prefetch_candidates("jerith-builtin/reverse2", 1, 2)
+                .is_empty()
+        );
+        // Zero knobs are an instant empty answer.
+        assert!(s.prefetch_candidates("L0.E0", 0, 2).is_empty());
+        assert!(s.prefetch_candidates("L0.E0", 1, 0).is_empty());
+        // Empty stats likewise.
+        let empty = ExpertStats::new();
+        assert!(empty.prefetch_candidates("L0.E0", 1, 2).is_empty());
     }
 
     #[test]
