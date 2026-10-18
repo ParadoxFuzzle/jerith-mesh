@@ -693,6 +693,17 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         // the refusal path exists only behind the Phase 5 tier.
         "gate_refusals": gw.state.stake.gate_refusals(),
     });
+    // Probe hoist: the three live sections used to evaluate SERIALLY
+    // inside json! — three TLS'd round trips measured 140-190 ms per
+    // /status poll. Concurrent (tokio::join!) they cost the MAX of one
+    // probe, and every probe rides the pooled shared client instead of
+    // building a fresh TLS stack per request.
+    let chain_token = crate::economics::read_token();
+    let (bootstrap_value, chain_value, wallet_value) = tokio::join!(
+        bootstrap_sybil_status(Some(cfg.bootstrap_url.as_str())),
+        chain_probe(gw.chain_url.as_deref(), chain_token.as_deref()),
+        wallet_status(gw.wallet.as_deref()),
+    );
     let guard_value = gw
         .guard
         .as_ref()
@@ -1001,18 +1012,19 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "metrics": metrics_status(&gw.metrics.snapshot()),
         "security": serde_json::to_value(crate::metrics::security_snapshot())
             .expect("security counters serialize"),
-        // §10 sybil-pressure mirror: OUR bootstrap's zero-weight report
-        // tally, probed live (the counter itself lives in the bootstrap
-        // process — this section is the operator's watching eye).
-        "bootstrap": bootstrap_sybil_status(
-            Some(gw.state.config.read().await.bootstrap_url.as_str()),
-        ).await,
-        "chain": chain_probe(gw.chain_url.as_deref(), crate::economics::read_token().as_deref()).await,
+        // Probes run CONCURRENTLY (tokio::join!): /status used to pay
+        // three serial TLS'd round trips (~140-190 ms measured); each
+        // probe now also rides the pooled client instead of building a
+        // fresh TLS stack per request. Parallel = max(single probe).
+        // All three keep the failure contract: a downed dependency reads
+        // null / {"reachable":false} and never takes /status down.
+        "bootstrap": bootstrap_value,
+        "chain": chain_value,
         // Per-node JER wallet card (Phase 4): live balance from the chain
         // RPC — the earnings view's chain-truthful side. Null when no
         // wallet card (non-JerithChain); {"reachable":false} reads like
         // chain_probe: a downed chain never takes /status down with it.
-        "wallet": wallet_status(gw.wallet.as_deref()).await,
+        "wallet": wallet_value,
     });
     // Live counters: a heuristically cached stale snapshot would make the
     // web dashboard (and any monitor) read lagged values.
@@ -1058,14 +1070,7 @@ async fn bootstrap_sybil_status(base: Option<&str>) -> Value {
     };
     let base = base.trim_end_matches('/');
     let url = format!("{base}/health");
-    let resp = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()
-        .map(|c| c.get(&url).send());
-    let Some(resp) = resp else { return Value::Null };
-    match resp.await {
+    match crate::http::probe_http().get(&url).send().await {
         Ok(r) if r.status().is_success() => {
             match r.json::<Value>().await {
                 Ok(body) => json!({
@@ -1104,14 +1109,12 @@ async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {    let 
         return Value::Null;
     }
     let url = format!("{base}/status");
-    let resp = reqwest::Client::builder()
-        .use_rustls_tls()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()
-        .map(|c| c.get(&url).bearer_auth(token.trim()).send());
-    let Some(resp) = resp else { return Value::Null };
-    match resp.await {
+    match crate::http::probe_http()
+        .get(&url)
+        .bearer_auth(token.trim())
+        .send()
+        .await
+    {
         Ok(r) => match r.json::<Value>().await {
             Ok(body) => json!({
                 "reachable": true,

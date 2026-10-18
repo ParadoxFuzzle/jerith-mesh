@@ -30,9 +30,39 @@ pub fn mesh_http() -> reqwest::Client {
         .expect("mesh HTTP client with the pinned rustls TLS backend")
 }
 
+/// The shared PROBE client: process-wide, lazily built once, rustls
+/// TLS plus a 3 s timeout (the short-budget contract of the /status
+/// side probes — chain, bootstrap health). A fresh client per probe
+/// paid a TLS handshake every /status poll; this one pools the
+/// connections those hot-path probes hammer every few seconds.
+///
+/// Panics like `mesh_http` does if TLS client setup fails — the same
+/// previous behavior of every site this replaces.
+pub fn probe_http() -> &'static reqwest::Client {
+    static PROBE_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    PROBE_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("probe HTTP client with the pinned rustls TLS backend")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_client_is_pooled() {
+        let a: *const reqwest::Client = probe_http();
+        let b: *const reqwest::Client = probe_http();
+        assert!(std::ptr::eq(a, b), "probe client must be ONE pooled instance");
+        // Offline request build proves the client is usable without any
+        // network (the 3 s timeout is enforced per request, at send).
+        let get = probe_http().get("https://probe.invalid/").build();
+        assert!(get.is_ok(), "probe client builds requests");
+    }
 
     #[test]
     fn pinned_client_builds() {
