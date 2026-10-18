@@ -202,14 +202,23 @@ async fn main() -> anyhow::Result<()> {
             crypto.stake.slash_percent_per_offense = pct;
             crypto.stake.chain_slash = true;
             let reporter_id_for_log = id.node_id();
-            let mgr =
-                jerith_mesh_core::stake::StakeManager::new(&crypto, Some(id), Some(chain_base.clone()));
-            mgr.notice(&target, &reason, "drill-sandbox-evidence-payload").await;
-            println!("slash notice submitted: reporter={reporter_id_for_log} target={target} amount={}µJ (probable)", required_uj * pct as u64 / 100);
+            let mgr = jerith_mesh_core::stake::StakeManager::new(
+                &crypto,
+                Some(id),
+                Some(chain_base.clone()),
+            );
+            mgr.notice(&target, &reason, "drill-sandbox-evidence-payload")
+                .await;
+            println!(
+                "slash notice submitted: reporter={reporter_id_for_log} target={target} amount={}µJ (probable)",
+                required_uj * pct as u64 / 100
+            );
             if let Some(v) = mgr.chain_view().await {
                 println!("chain /stake view for target: {v}");
             } else {
-                println!("chain /stake view unavailable (see node-side stake.json for the journal)");
+                println!(
+                    "chain /stake view unavailable (see node-side stake.json for the journal)"
+                );
             }
         }
     }

@@ -438,9 +438,11 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
     let (_tx, rx) = tokio::sync::watch::channel(false);
     {
         let node_id = node_id.clone();
-        tokio::spawn(async move {            let _ =
-                jerith_mesh_core::quic::serve_with_peer_block(server, serving, node_id, rx, block, None)
-                    .await;
+        tokio::spawn(async move {
+            let _ = jerith_mesh_core::quic::serve_with_peer_block(
+                server, serving, node_id, rx, block, None,
+            )
+            .await;
         });
     }
     let mut pins: jerith_mesh_core::quic::PinMap = HashMap::new();
@@ -983,8 +985,8 @@ async fn replica_manager_persists_demand_without_any_fetch() {
 async fn stake_gate_refuses_work_until_the_escrow_lands() {
     use jerith_mesh_core::expert_store::{ExpertStore, ExpertWeights};
     use jerith_mesh_core::quic::{
-        call, pinned_client_endpoint_dyn, server_endpoint_for, ExpertRouter, ExpertServing,
-        NodeRpcReply, NodeRpcRequest, RouterOptions, SharedPinMap,
+        ExpertRouter, ExpertServing, NodeRpcReply, NodeRpcRequest, RouterOptions, SharedPinMap,
+        call, pinned_client_endpoint_dyn, server_endpoint_for,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1018,7 +1020,9 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
         let mut stake = jerith_mesh_core::stake::StakeManager::new(&crypto, None, None);
         let ledger_path = dir.join(format!(
             "stake-{}.json",
-            primed_uj.map(|v| v.to_string()).unwrap_or_else(|| "empty".into())
+            primed_uj
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "empty".into())
         ));
         if let Some(staked) = primed_uj {
             std::fs::write(
@@ -1052,7 +1056,12 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
         let nid = node_id.clone();
         tokio::spawn(async move {
             let _ = jerith_mesh_core::quic::serve_with_peer_block(
-                server, serving, nid, rx, block, Some(st),
+                server,
+                serving,
+                nid,
+                rx,
+                block,
+                Some(st),
             )
             .await;
         });
@@ -1100,7 +1109,11 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
         msg.contains("1000 µJ"),
         "refusal must carry the required line and the staked number: {msg}"
     );
-    assert_eq!(stake.gate_refusals(), 1, "the refusal is counted for /status");
+    assert_eq!(
+        stake.gate_refusals(),
+        1,
+        "the refusal is counted for /status"
+    );
 
     // Ping keeps flowing: the mesh watches a LIVE-but-unqualified node.
     let me = SigningIdentity::generate();
@@ -1110,16 +1123,9 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
         sig: String::new(),
     };
     jerith_mesh_core::quic::sign_request(&mut ping, &me);
-    let reply = call(
-        &client,
-        addr,
-        &node_id,
-        &ping,
-        &me,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("ping survives the gate");
+    let reply = call(&client, addr, &node_id, &ping, &me, Duration::from_secs(5))
+        .await
+        .expect("ping survives the gate");
     assert!(
         matches!(reply, NodeRpcReply::Pong { .. }),
         "pings must answer while the gate is closed: {reply:?}"

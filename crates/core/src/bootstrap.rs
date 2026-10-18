@@ -440,7 +440,6 @@ impl BootstrapClient {
         Ok(self.fetch_peers_signed_full(model, identity).await?.peers)
     }
 
-
     /// Peer peers + reputation surfaces: the signed stamps (§10) and the
     /// bootstrap's own key (for pinning) travel with the list, so callers
     /// can verify without a second round trip.
@@ -529,7 +528,8 @@ impl BootstrapClient {
             obs.measured_percent,
             stamp,
         );
-        let auth = crate::signing::WireAuth::with_stamp(reporter_identity, stamp, payload.as_bytes());
+        let auth =
+            crate::signing::WireAuth::with_stamp(reporter_identity, stamp, payload.as_bytes());
         let url = format!("{}/v1/report-measure", self.base_url.trim_end_matches('/'));
         self.inner
             .post(&url)
@@ -567,7 +567,10 @@ impl BootstrapClient {
             .error_for_status()?
             .json()
             .await?;
-        Ok(body.get("left").and_then(serde_json::Value::as_bool).unwrap_or(false))
+        Ok(body
+            .get("left")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
     }
 
     /// Report that a peer is dead (so the bootstrap deprecates it globally).

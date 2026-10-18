@@ -2008,9 +2008,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         None => {
             // §9 typed refusal: a configured-but-unimplemented optional
             // chain says WHY it is off, in the banner as everywhere else.
-            if let Some(note) =
-                jerith_mesh_core::economics::optional_chain_note(cfg.crypto.chain)
-            {
+            if let Some(note) = jerith_mesh_core::economics::optional_chain_note(cfg.crypto.chain) {
                 println!("   economics   off — {note}");
             } else {
                 println!("   economics   off");
@@ -2243,25 +2241,19 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         wallet: {
             // Operator chain base (chain_url → co-hosted :8322) so the
             // card probes the chain this node actually mines on.
-            let card =
-                jerith_mesh_core::economics::WalletCard::from_crypto(
-                    &cfg.crypto,
-                    &cfg.node_id,
-                    Some(&chain_base(Some(&cfg))),
-                )
-                .map(std::sync::Arc::new);
+            let card = jerith_mesh_core::economics::WalletCard::from_crypto(
+                &cfg.crypto,
+                &cfg.node_id,
+                Some(&chain_base(Some(&cfg))),
+            )
+            .map(std::sync::Arc::new);
             if let Some(w) = &card {
                 match jerith_mesh_core::economics::wallet_balance(w).await {
-                    Ok(b) if b.exists => println!(
-                        "   wallet      {} · {:.6} JER",
-                        w.identity,
-                        b.balance_jer
-                    ),
-                    Ok(_) => println!(
-                        "   wallet      {} · no wallet on the chain yet",
-                        w.identity
-                    ),
-                    Err(e) => println!("   wallet      unreachable: {e:#}") ,
+                    Ok(b) if b.exists => {
+                        println!("   wallet      {} · {:.6} JER", w.identity, b.balance_jer)
+                    }
+                    Ok(_) => println!("   wallet      {} · no wallet on the chain yet", w.identity),
+                    Err(e) => println!("   wallet      unreachable: {e:#}"),
                 }
             }
             card
@@ -2281,10 +2273,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
                         b.amount,
                         b.unit
                     ),
-                    Err(e) => println!(
-                        "   wallet(oc)  {} · ({e:#})",
-                        w.unit()
-                    ),
+                    Err(e) => println!("   wallet(oc)  {} · ({e:#})", w.unit()),
                 }
             }
             card

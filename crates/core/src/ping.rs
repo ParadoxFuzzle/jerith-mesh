@@ -17,9 +17,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::bootstrap::{
-    BootstrapClient, FetchedPeers, PeerAd, PeerRegistry, PeerState, now_ms,
-};
+use crate::bootstrap::{BootstrapClient, FetchedPeers, PeerAd, PeerRegistry, PeerState, now_ms};
 use crate::config::{NodeConfig, PrivacyLevel};
 use serde::Serialize;
 
@@ -169,11 +167,7 @@ pub fn compat_verdict(
         .find(|row| row.model_id == local.id)
         .cloned()
         .unwrap_or_default();
-    let peers_same_quant = mine
-        .quants
-        .get(&local.quant)
-        .copied()
-        .unwrap_or(0);
+    let peers_same_quant = mine.quants.get(&local.quant).copied().unwrap_or(0);
     let other_quants: Vec<(String, u64)> = mine
         .quants
         .iter()
@@ -217,8 +211,7 @@ pub fn compat_verdict(
         v.verdict = "wrong_quant".into();
         v.message = format!(
             "same model, wrong quant — the mesh runs {} on quant(s) [{list}]; you run '{}', which no peer admits (peers match id+quant exactly). `jerith config set model.quant <theirs>` is the fix",
-            local.id,
-            local.quant,
+            local.id, local.quant,
         );
         return v;
     }
@@ -519,10 +512,7 @@ impl MeshFallbackChat {
         &self,
         state: &Arc<MeshState>,
         expert_id: Option<&str>,
-    ) -> (
-        Vec<crate::quic::MeshCandidate>,
-        HashMap<String, SocketAddr>,
-    ) {
+    ) -> (Vec<crate::quic::MeshCandidate>, HashMap<String, SocketAddr>) {
         let (peers, addrs, _, _) = self.mesh_view_detailed(state, expert_id).await;
         (peers, addrs)
     }
@@ -558,8 +548,8 @@ impl MeshFallbackChat {
                     (ad.node_id.clone(), rtt)
                 })
                 .collect();
-            let peers: Vec<crate::quic::MeshCandidate> =
-                ads.iter()
+            let peers: Vec<crate::quic::MeshCandidate> = ads
+                .iter()
                 .filter_map(|ad| {
                     let health = reg.health_of(&ad.node_id)?;
                     let alive = health.state != PeerState::Deprecated;
@@ -636,8 +626,7 @@ impl MeshFallbackChat {
         // ONE registry lock for the whole view (candidates + dial addrs +
         // the ad snapshot the cold-shard ring needs — the second
         // registry pass this used to pay is gone).
-        let (mut peers, addrs, ads, rtts) =
-            self.mesh_view_detailed(state, Some(expert_id)).await;
+        let (mut peers, addrs, ads, rtts) = self.mesh_view_detailed(state, Some(expert_id)).await;
         // Cold-expert sharding (Phase 2): when nobody *advertises* this
         // expert, the deterministic shard ring says which node owns it. We
         // ask that owner rather than giving up — it either has the weights
@@ -1381,8 +1370,7 @@ async fn run_loop(
                     // NOTE: the `reg` guard is held in this scope — use it
                     // instead of re-locking (a second registry lock on the
                     // same task deadlocks the loop AND /status's mutex).
-                    if reg.is_empty() && state.compat.read().await.is_none()
-                    {
+                    if reg.is_empty() && state.compat.read().await.is_none() {
                         match BootstrapClient::new(used.clone())
                             .fetch_model_census()
                             .await
@@ -1516,7 +1504,11 @@ async fn run_loop(
                 gossip_reputations: {
                     let cache = state.reputation_cache.lock().await;
                     (!cache.is_empty()).then(|| {
-                        cache.iter().take(crate::bootstrap::REPUTATION_GOSSIP_AD_MAX).cloned().collect()
+                        cache
+                            .iter()
+                            .take(crate::bootstrap::REPUTATION_GOSSIP_AD_MAX)
+                            .cloned()
+                            .collect()
                     })
                 },
             };
@@ -1750,14 +1742,14 @@ async fn ping_one(
     node_id: String,
     url: String,
 ) -> Option<String> {
-        let started = std::time::Instant::now();
-        let stamp = now_ms();
-        let payload = crate::signing::ping_payload(my_id, &node_id, stamp);
-        // Freeze the stamp: the payload embeds it, so the header stamp and
-        // the signed bytes must come from the SAME clock read (ms-boundary
-        // races under load made pings intermittently rejected).
-        let auth = crate::signing::WireAuth::with_stamp(&state.identity, stamp, payload.as_bytes());
-        let result = client
+    let started = std::time::Instant::now();
+    let stamp = now_ms();
+    let payload = crate::signing::ping_payload(my_id, &node_id, stamp);
+    // Freeze the stamp: the payload embeds it, so the header stamp and
+    // the signed bytes must come from the SAME clock read (ms-boundary
+    // races under load made pings intermittently rejected).
+    let auth = crate::signing::WireAuth::with_stamp(&state.identity, stamp, payload.as_bytes());
+    let result = client
         .get(&url)
         .header("x-jerith-pubkey", &auth.pubkey)
         .header("x-jerith-stamp", auth.stamp_ms.to_string())
@@ -1766,7 +1758,7 @@ async fn ping_one(
         .timeout(Duration::from_secs(4))
         .send()
         .await;
-        match result {
+    match result {
         Ok(resp) if resp.status().is_success() => {
             // Verify the signed health reply attributes it to the peer.
             let rtt = started.elapsed().as_millis() as u64;
@@ -1781,26 +1773,17 @@ async fn ping_one(
                 // evidence through the same flush cadence as every
                 // other fraud layer (verified here locally, signed by
                 // the peer's own key, so the bootstrap can weigh it).
-                let (verified, targets): (Option<VerifiedMeasurement>, Vec<String>) = match meas
-                {
+                let (verified, targets): (Option<VerifiedMeasurement>, Vec<String>) = match meas {
                     Some(Ok(block)) => {
-                        let flagged = state
-                            .contrib_ledger
-                            .lock()
-                            .await
-                            .record_verified(
-                                &node_id,
-                                block.declared_percent,
-                                block.measured_percent,
-                            );
+                        let flagged = state.contrib_ledger.lock().await.record_verified(
+                            &node_id,
+                            block.declared_percent,
+                            block.measured_percent,
+                        );
                         (Some(block), flagged)
                     }
                     Some(Err(())) => {
-                        let flagged = state
-                            .contrib_ledger
-                            .lock()
-                            .await
-                            .record_tampered(&node_id);
+                        let flagged = state.contrib_ledger.lock().await.record_tampered(&node_id);
                         (None, flagged)
                     }
                     None => (None, Vec::new()),
@@ -1847,13 +1830,13 @@ async fn ping_one(
                 }
             } else {
                 tracing::warn!(peer = %node_id, "health reply signature invalid — not counted alive");
-                    return Some(node_id);
+                return Some(node_id);
             }
         }
         _ => {
             return Some(node_id);
         }
-        }
+    }
 
     None
 }
@@ -2091,10 +2074,7 @@ async fn verify_health_reply(
 /// cache is already bounded, never a scan.
 async fn verified_scores(state: &Arc<MeshState>) -> std::collections::HashMap<String, i32> {
     let cache = state.reputation_cache.lock().await.clone();
-    cache
-        .iter()
-        .map(|s| (s.subject.clone(), s.score))
-        .collect()
+    cache.iter().map(|s| (s.subject.clone(), s.score)).collect()
 }
 
 /// §10 quotient — how old a reputation stamp may be and still ride
@@ -2285,11 +2265,14 @@ mod tests {
 
     #[test]
     fn compat_verdict_healthy_when_our_exact_quant_is_live() {
-        let v = compat_verdict(&local("glm-5.3", "int4"), &census(&[
-            ("glm-5.3", "int4", 3),
-            ("glm-5.3", "fp8", 1),
-            ("qwen3:8b", "default", 2),
-        ]));
+        let v = compat_verdict(
+            &local("glm-5.3", "int4"),
+            &census(&[
+                ("glm-5.3", "int4", 3),
+                ("glm-5.3", "fp8", 1),
+                ("qwen3:8b", "default", 2),
+            ]),
+        );
         assert_eq!(v.verdict, "healthy", "{}", v.message);
         assert_eq!(v.peers_on_model, 4);
         assert_eq!(v.peers_same_quant, 3);
@@ -2297,12 +2280,16 @@ mod tests {
 
     #[test]
     fn compat_verdict_wrong_quant_names_the_live_quants() {
-        let v = compat_verdict(&local("glm-5.3", "default"), &census(&[
-            ("glm-5.3", "int4", 2),
-            ("glm-5.3", "fp8", 1),
-        ]));
+        let v = compat_verdict(
+            &local("glm-5.3", "default"),
+            &census(&[("glm-5.3", "int4", 2), ("glm-5.3", "fp8", 1)]),
+        );
         assert_eq!(v.verdict, "wrong_quant");
-        assert!(v.message.contains("same model, wrong quant"), "{}", v.message);
+        assert!(
+            v.message.contains("same model, wrong quant"),
+            "{}",
+            v.message
+        );
         assert!(v.message.contains("int4 (2 nodes)"), "{}", v.message);
         assert!(v.message.contains("fp8 (1 node"), "{}", v.message);
         assert!(v.message.contains("'default'"), "{}", v.message);
@@ -2311,11 +2298,16 @@ mod tests {
 
     #[test]
     fn compat_verdict_no_peers_names_live_alternatives() {
-        let v = compat_verdict(&local("made-up", "default"), &census(&[
-            ("glm-5.3", "int4", 2),
-        ]));
+        let v = compat_verdict(
+            &local("made-up", "default"),
+            &census(&[("glm-5.3", "int4", 2)]),
+        );
         assert_eq!(v.verdict, "no_peers_on_model");
-        assert!(v.message.contains("models live on this mesh"), "{}", v.message);
+        assert!(
+            v.message.contains("models live on this mesh"),
+            "{}",
+            v.message
+        );
         assert!(v.message.contains("glm-5.3 (2)"), "{}", v.message);
     }
 
@@ -2503,10 +2495,7 @@ mod tests {
             .iter()
             .find(|(id, ..)| id == "unscored-peer")
             .expect("peer present");
-        assert_eq!(
-            unscored.5, None,
-            "no stamp ⇒ no placement word at all"
-        );
+        assert_eq!(unscored.5, None, "no stamp ⇒ no placement word at all");
     }
 
     /// §12 privacy tiers are policy: changing them is a HOT reload
@@ -2518,7 +2507,10 @@ mod tests {
         disk.privacy.level = PrivacyLevel::LocalOnly;
         disk.privacy.trusted_nodes = vec!["aa".to_string()];
         let plan = plan_config_reload(&disk, &live);
-        assert!(plan.hot.contains(&"privacy"), "tiers must bind within one tick");
+        assert!(
+            plan.hot.contains(&"privacy"),
+            "tiers must bind within one tick"
+        );
         assert!(plan.cold.is_empty());
         assert!(!plan.memory_changed);
         assert!(plan.identity_violations.is_empty());
@@ -2586,16 +2578,14 @@ mod tests {
         let hits_ref = hits.clone();
         let app = axum::Router::new().route(
             "/v1/leave",
-            axum::routing::post(
-                move |axum::Json(body): axum::Json<serde_json::Value>| {
-                    let hits = hits_ref.clone();
-                    async move {
-                        hits.fetch_add(1, AtomicOrdering::SeqCst);
-                        let _ = body;
-                        axum::Json(serde_json::json!({"left": true}))
-                    }
-                },
-            ),
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = hits_ref.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    let _ = body;
+                    axum::Json(serde_json::json!({"left": true}))
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2610,18 +2600,16 @@ mod tests {
             d.last_good = None;
         }
 
-        graceful_model_exit(
-            &state,
-            Some("newmodel (bogquant)".to_string()),
-        )
-        .await;
+        graceful_model_exit(&state, Some("newmodel (bogquant)".to_string())).await;
         assert_eq!(
             hits.load(AtomicOrdering::SeqCst),
             1,
             "exactly one leave fired"
         );
         assert!(
-            state.left_mesh_latch.load(std::sync::atomic::Ordering::SeqCst),
+            state
+                .left_mesh_latch
+                .load(std::sync::atomic::Ordering::SeqCst),
             "advertise latch closed"
         );
         assert_eq!(
@@ -2631,11 +2619,7 @@ mod tests {
         );
         // Idempotence: the reload executor runs every tick — the second
         // invocation (any pending value) must not re-fire the leave.
-        graceful_model_exit(
-            &state,
-            Some("newmodel (bogquant)".to_string()),
-        )
-        .await;
+        graceful_model_exit(&state, Some("newmodel (bogquant)".to_string())).await;
         assert_eq!(
             hits.load(AtomicOrdering::SeqCst),
             1,
@@ -2735,7 +2719,9 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         (node_id, format!("http://{addr}/health"))
@@ -2824,12 +2810,7 @@ mod tests {
                 let reg = state.registry.lock().await;
                 reg.connectable()
                     .into_iter()
-                    .map(|(ad, _)| {
-                        (
-                            ad.node_id.clone(),
-                            format!("http://{}/health", ad.address),
-                        )
-                    })
+                    .map(|(ad, _)| (ad.node_id.clone(), format!("http://{}/health", ad.address)))
                     .collect()
             };
             assert_eq!(targets_now.len(), PEERS, "fleet size drifted");

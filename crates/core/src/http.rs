@@ -67,7 +67,10 @@ mod tests {
     fn probe_client_is_pooled() {
         let a: *const reqwest::Client = probe_http();
         let b: *const reqwest::Client = probe_http();
-        assert!(std::ptr::eq(a, b), "probe client must be ONE pooled instance");
+        assert!(
+            std::ptr::eq(a, b),
+            "probe client must be ONE pooled instance"
+        );
         // Offline request build proves the client is usable without any
         // network (the 3 s timeout is enforced per request, at send).
         let get = probe_http().get("https://probe.invalid/").build();

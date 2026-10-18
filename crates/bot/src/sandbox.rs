@@ -84,7 +84,12 @@ pub async fn read_attachments(
     if !cfg.enabled {
         return files
             .iter()
-            .map(|f| (f.label.clone(), Err("sandbox disabled by config".to_string())))
+            .map(|f| {
+                (
+                    f.label.clone(),
+                    Err("sandbox disabled by config".to_string()),
+                )
+            })
             .collect();
     }
     match stage_and_run(cfg, files).await {
@@ -228,14 +233,16 @@ async fn stage_and_run(
             Spawn(String),
             Exit(String, std::process::Output),
         }
-        let outcome = match
-            tokio::time::timeout(Duration::from_secs(cfg.timeout_secs), cmd.output()).await
-        {
-            Err(_) => Err(BatchFailure::Timeout),
-            Ok(Err(e)) => Err(BatchFailure::Spawn(e.to_string())),
-            Ok(Ok(o)) if o.status.success() => Ok(o),
-            Ok(Ok(o)) => Err(BatchFailure::Exit(String::from_utf8_lossy(&o.stderr).into_owned(), o)),
-        };
+        let outcome =
+            match tokio::time::timeout(Duration::from_secs(cfg.timeout_secs), cmd.output()).await {
+                Err(_) => Err(BatchFailure::Timeout),
+                Ok(Err(e)) => Err(BatchFailure::Spawn(e.to_string())),
+                Ok(Ok(o)) if o.status.success() => Ok(o),
+                Ok(Ok(o)) => Err(BatchFailure::Exit(
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                    o,
+                )),
+            };
         match outcome {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
@@ -298,9 +305,7 @@ fn tail(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
-        s.chars()
-            .skip(s.chars().count() - n)
-            .collect::<String>()
+        s.chars().skip(s.chars().count() - n).collect::<String>()
     }
 }
 
@@ -312,13 +317,19 @@ fn parse_output(stdout: &str) -> Vec<(String, Result<String, String>)> {
     let mut rest = stdout;
     while let Some(bidx) = rest.find("===BEGIN ") {
         let after = &rest[bidx + "===BEGIN ".len()..];
-        let Some(key_end) = after.find('\n') else { break };
+        let Some(key_end) = after.find('\n') else {
+            break;
+        };
         let key = after[..key_end].trim().to_string();
         let after_key = &after[key_end + 1..];
         // status line: `status: <code>[:<why>]`
-        let Some(sline_end) = after_key.find('\n') else { break };
+        let Some(sline_end) = after_key.find('\n') else {
+            break;
+        };
         let sline = after_key[..sline_end].trim();
-        let Some(marker_end) = after_key.find("---CONTENT---\n") else { break };
+        let Some(marker_end) = after_key.find("---CONTENT---\n") else {
+            break;
+        };
         let content_start = marker_end + "---CONTENT---\n".len();
         let end_marker = format!("===END {key}\n");
         let (content, remainder) = match after_key[content_start..].find(&end_marker) {
@@ -488,7 +499,10 @@ mod tests {
         assert_eq!(out[0].0, "f0_notes.txt");
         assert_eq!(out[0].1.as_ref().unwrap(), "hello\nworld");
         assert!(out[1].1.as_ref().unwrap_err().contains("pdftotext"));
-        assert_eq!(out[2].1.as_ref().unwrap(), "(binary file, 7777 bytes — no text extracted)");
+        assert_eq!(
+            out[2].1.as_ref().unwrap(),
+            "(binary file, 7777 bytes — no text extracted)"
+        );
         assert_eq!(out[3].1.as_ref().unwrap(), "(empty file)");
         // truncated block (container killed mid-write): degrades to the
         // partial content, never a panic.
@@ -509,12 +523,24 @@ mod tests {
     /// docker; skips rather than fails where it doesn't).
     #[tokio::test]
     async fn live_sandbox_reads_text_and_flags_binary() {
+        // Two gates: a reachable daemon AND the sandbox image built (CI has
+        // Docker but never builds jerith-sandbox — exit 125 'repository does
+        // not exist' is an environment gap, not a test failure).
+        let image = cfg().image;
         let probe = tokio::process::Command::new("docker")
             .arg("info")
             .output()
             .await;
-        if !probe.map(|p| p.status.success()).unwrap_or(false) || cfg().image.is_empty() {
-            eprintln!("docker not available — skipping live sandbox test");
+        if !probe.map(|p| p.status.success()).unwrap_or(false)
+            || image.is_empty()
+            || !tokio::process::Command::new("docker")
+                .args(["image", "inspect", &image])
+                .output()
+                .await
+                .map(|p| p.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("docker or sandbox image {image:?} unavailable — skipping live sandbox test");
             return;
         }
         // a text file and a true binary, both served by a stub
@@ -553,7 +579,11 @@ mod tests {
         let results = read_attachments(&cfg(), &files).await;
         assert_eq!(results.len(), 2);
         assert!(
-            results[0].1.as_ref().unwrap().contains("hello from the sandbox probe"),
+            results[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .contains("hello from the sandbox probe"),
             "text result: {:?}",
             results[0]
         );
@@ -574,9 +604,11 @@ mod tests {
         }];
         let results = read_attachments(&cfg(), &files).await;
         match &results[0].1 {
-            Err(e) => assert!(e.contains("download failed: ") || e.contains("HTTP"), "why: {e}"),
+            Err(e) => assert!(
+                e.contains("download failed: ") || e.contains("HTTP"),
+                "why: {e}"
+            ),
             Ok(t) => panic!("unreachable file must not read: {t}"),
         }
     }
-
 }

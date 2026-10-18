@@ -46,9 +46,7 @@ pub fn reputation_payload(
     score: i32,
     stamp_ms: u64,
 ) -> String {
-    format!(
-        "{REPUTATION_PREFIX}|{stamp_ms}|{origin_node_id}|{subject}|{score}"
-    )
+    format!("{REPUTATION_PREFIX}|{stamp_ms}|{origin_node_id}|{subject}|{score}")
 }
 
 /// One bootstrap-signed score stamp: `origin` names the signing bootstrap
@@ -373,15 +371,19 @@ mod tests {
         let payload = leave_payload(&id.node_id(), stamp);
         assert!(payload.starts_with("jerith-leave1|"), "{payload}");
         // The leaver's OWN key validates against its own node id...
-        assert!(WireAuth::with_stamp(&id, stamp, payload.as_bytes())
-            .validate(payload.as_bytes(), &id.node_id())
-            .is_ok());
+        assert!(
+            WireAuth::with_stamp(&id, stamp, payload.as_bytes())
+                .validate(payload.as_bytes(), &id.node_id())
+                .is_ok()
+        );
         // ...and a DIFFERENT identity cannot undeclare somebody else —
         // the payload binds the node id, so a forged leave fails id check.
         let other = SigningIdentity::generate();
-        assert!(WireAuth::with_stamp(&other, stamp, payload.as_bytes())
-            .validate(payload.as_bytes(), &id.node_id())
-            .is_err());
+        assert!(
+            WireAuth::with_stamp(&other, stamp, payload.as_bytes())
+                .validate(payload.as_bytes(), &id.node_id())
+                .is_err()
+        );
     }
 
     #[test]
@@ -401,16 +403,23 @@ mod tests {
             stamp,
         );
         assert!(payload.starts_with("measure-rept1|"), "{payload}");
-        assert!(payload.contains("|25|80"), "declared and measured in the payload");
-        assert!(WireAuth::with_stamp(&reporter, stamp, payload.as_bytes())
-            .validate(payload.as_bytes(), &claimed_reporter)
-            .is_ok());
+        assert!(
+            payload.contains("|25|80"),
+            "declared and measured in the payload"
+        );
+        assert!(
+            WireAuth::with_stamp(&reporter, stamp, payload.as_bytes())
+                .validate(payload.as_bytes(), &claimed_reporter)
+                .is_ok()
+        );
         // Any other identity cannot attest AS the claimed reporter (the
         // pubkey fingerprint binding catches it).
         let other = SigningIdentity::generate();
-        assert!(WireAuth::with_stamp(&other, stamp, payload.as_bytes())
-            .validate(payload.as_bytes(), &claimed_reporter)
-            .is_err());
+        assert!(
+            WireAuth::with_stamp(&other, stamp, payload.as_bytes())
+                .validate(payload.as_bytes(), &claimed_reporter)
+                .is_err()
+        );
     }
 
     #[test]

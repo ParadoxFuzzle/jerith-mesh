@@ -353,17 +353,10 @@ impl ExpertRouter {
             plan.push(ExpertLocation::Local);
         }
         // Reported-with-capacity peers first, then unreported by RTT.
-        let mut remotes: Vec<(
-            String,
-            u64,
-            Option<crate::hw::ResourceSample>,
-            Option<i32>,
-        )> = peers
+        let mut remotes: Vec<(String, u64, Option<crate::hw::ResourceSample>, Option<i32>)> = peers
             .iter()
             .filter(|(_, _, has, alive, _, _)| *has && *alive)
-            .map(|(id, rtt, _, _, res, rep)| {
-                (id.clone(), *rtt, res.clone(), *rep)
-            })
+            .map(|(id, rtt, _, _, res, rep)| (id.clone(), *rtt, res.clone(), *rep))
             .collect();
         remotes.sort_by_key(|(id, rtt, res, rep)| {
             (
@@ -545,17 +538,10 @@ impl ExpertRouter {
         // most free RAM, RTT as tiebreak; peers without a report sink behind
         // reported ones and order by RTT among themselves (an all-unreported
         // mesh — pre-pooling peers — keeps the pure-RTT behaviour).
-        let mut remotes: Vec<(
-            String,
-            u64,
-            Option<crate::hw::ResourceSample>,
-            Option<i32>,
-        )> = peers
+        let mut remotes: Vec<(String, u64, Option<crate::hw::ResourceSample>, Option<i32>)> = peers
             .iter()
             .filter(|(_, _, has, alive, _, _)| *has && *alive)
-            .map(|(id, rtt, _, _, res, rep)| {
-                (id.clone(), *rtt, res.clone(), *rep)
-            })
+            .map(|(id, rtt, _, _, res, rep)| (id.clone(), *rtt, res.clone(), *rep))
             .collect();
         remotes.sort_by_key(|(id, rtt, res, rep)| {
             (
@@ -2833,7 +2819,11 @@ mod tests {
     fn reputation_tier_thresholds_are_negative_s_only() {
         assert_eq!(reputation_tier(None), 0, "unverified stays default tier");
         assert_eq!(reputation_tier(Some(0)), 0, "clean ledger stays default");
-        assert_eq!(reputation_tier(Some(-1)), 1, "any verified offense penalizes");
+        assert_eq!(
+            reputation_tier(Some(-1)),
+            1,
+            "any verified offense penalizes"
+        );
         assert_eq!(reputation_tier(Some(-100)), 1, "floor offense penalizes");
     }
 

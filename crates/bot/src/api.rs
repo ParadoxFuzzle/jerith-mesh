@@ -813,8 +813,7 @@ pub const EMPTY_ANSWER_REFUSAL: &str =
 /// answers the degenerate gate refuses. This single line, chat-local (it
 /// never persists into caller history), converts those rounds back into
 /// plain-prose attempts.
-pub const PROSE_ANSWER_NUDGE: &str =
-    "You must now answer the user in plain readable prose. Do not use any tools, and do not output JSON or object syntax — reply with the answer text itself.";
+pub const PROSE_ANSWER_NUDGE: &str = "You must now answer the user in plain readable prose. Do not use any tools, and do not output JSON or object syntax — reply with the answer text itself.";
 
 pub fn answer_is_degenerate(content: &str) -> bool {
     let t = content.trim();
@@ -1011,10 +1010,7 @@ pub async fn fetch_vision_image(url: &str, label: &str) -> Result<VisionImage> {
         mime
     );
     let bytes = resp.bytes().await.context("image body read failed")?;
-    anyhow::ensure!(
-        !bytes.is_empty(),
-        "image download: {label} arrived empty"
-    );
+    anyhow::ensure!(!bytes.is_empty(), "image download: {label} arrived empty");
     anyhow::ensure!(
         bytes.len() <= MAX_IMAGE_BYTES,
         "image too large: {} bytes (cap {})",
@@ -2219,10 +2215,7 @@ mod tests {
         // rounds fire NOTHING live; the answer text is never typed live
         // (its round carried tools attached), so the tap stays silent and
         // the full reply arrives via the sink's finish.
-        assert_eq!(
-            *events.lock().expect("test tap"),
-            Vec::<String>::new()
-        );
+        assert_eq!(*events.lock().expect("test tap"), Vec::<String>::new());
     }
 
     /// Regression for the tool-round suppression: intent JSON + echoed
@@ -2306,7 +2299,11 @@ mod tests {
         // fired RoundStart then typed its answer — the only typing a tool
         // chat ever surfaces.
         let seen = events.lock().expect("test tap");
-        assert_eq!(*seen, vec!["⇆round".to_string(), "Real reply.".to_string()], "tap: {seen:?}");
+        assert_eq!(
+            *seen,
+            vec!["⇆round".to_string(), "Real reply.".to_string()],
+            "tap: {seen:?}"
+        );
     }
 
     /// The “double response” fix, toolless side: a landing round whose
@@ -2355,7 +2352,10 @@ mod tests {
                             s1, s2, fin
                         )
                     };
-                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2377,10 +2377,14 @@ mod tests {
                 LiveEvent::Text(f) => guard.push(f.to_string()),
             }
         };
-        let (reply, _served_by, _tokens) =
-            chat_with_usage_live(&cfg, "say hi", &[json!({"role": "user", "content": "earlier"})], Some(&live))
-                .await
-                .expect("json-hold chat");
+        let (reply, _served_by, _tokens) = chat_with_usage_live(
+            &cfg,
+            "say hi",
+            &[json!({"role": "user", "content": "earlier"})],
+            Some(&live),
+        )
+        .await
+        .expect("json-hold chat");
         // The retry round's prose is the only thing ever typed. RoundStart
         // fires per TOOLLESS round (round 0 held its JSON and typed nothing
         // after it; the retry RoundStart + prose) — the user-visible surface

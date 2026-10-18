@@ -187,9 +187,7 @@ impl StakeManager {
         let config = crypto.stake;
         let chain_base =
             if config.chain_slash && crypto.chain == crate::config::CryptoChain::Jerithchain {
-                Some(chain_base_override.unwrap_or_else(|| {
-                    crate::economics::chain_rpc_url(crypto)
-                }))
+                Some(chain_base_override.unwrap_or_else(|| crate::economics::chain_rpc_url(crypto)))
             } else {
                 None
             };
@@ -858,7 +856,11 @@ mod tests {
     fn manager_with_stub(stub: &ChainStub) -> Arc<StakeManager> {
         let mut crypto = crypto(1_000_000);
         crypto.wallet_endpoint = Some(format!("http://{}", stub.addr));
-        let mut mgr = StakeManager::new(&crypto, Some(crate::signing::SigningIdentity::generate()), None);
+        let mut mgr = StakeManager::new(
+            &crypto,
+            Some(crate::signing::SigningIdentity::generate()),
+            None,
+        );
         if let Some(m) = Arc::get_mut(&mut mgr) {
             m.token = Some("test-token".into());
             m.rearm_ledger(fresh_ledger_path());

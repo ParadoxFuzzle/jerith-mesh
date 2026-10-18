@@ -77,8 +77,7 @@ pub struct Gateway {
     /// monero} AND `wallet_endpoint` is configured. /status carries it in
     /// the crypto section as `optional_wallet` — mined balance by their
     /// own node, typed refusal on error, never a fake number.
-    pub optional_wallet:
-        Option<std::sync::Arc<crate::economics::OptionalChainWallet>>,
+    pub optional_wallet: Option<std::sync::Arc<crate::economics::OptionalChainWallet>>,
     /// Perf/cost meters (model-performance-benchmark + session-cost-tracker
     /// ports): per-model latency/success/tokens from live traffic.
     pub metrics: Arc<crate::metrics::Metrics>,
@@ -1071,23 +1070,21 @@ async fn bootstrap_sybil_status(base: Option<&str>) -> Value {
     let base = base.trim_end_matches('/');
     let url = format!("{base}/health");
     match crate::http::probe_http().get(&url).send().await {
-        Ok(r) if r.status().is_success() => {
-            match r.json::<Value>().await {
-                Ok(body) => json!({
-                    "reachable": true,
-                    "url": base,
-                    "young_fraud_reports": body
-                        .pointer("/sybil/young_fraud_reports")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                }),
-                Err(_) => json!({
-                    "reachable": false,
-                    "url": base,
-                    "error": "non-JSON bootstrap health",
-                }),
-            }
-        }
+        Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+            Ok(body) => json!({
+                "reachable": true,
+                "url": base,
+                "young_fraud_reports": body
+                    .pointer("/sybil/young_fraud_reports")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            }),
+            Err(_) => json!({
+                "reachable": false,
+                "url": base,
+                "error": "non-JSON bootstrap health",
+            }),
+        },
         Ok(r) => json!({
             "reachable": false,
             "url": base,
@@ -1101,7 +1098,8 @@ async fn bootstrap_sybil_status(base: Option<&str>) -> Value {
     }
 }
 
-async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {    let (Some(base), Some(token)) = (base, token) else {
+async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {
+    let (Some(base), Some(token)) = (base, token) else {
         return Value::Null;
     };
     let base = base.trim().trim_end_matches('/');
@@ -1809,24 +1807,26 @@ mod tests {
         // Stub chain node: token-gated /balance answering the card's query.
         let app = axum::Router::new().route(
             "/balance",
-            axum::routing::get(|uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
-                if headers.get("authorization").and_then(|v| v.to_str().ok())
-                    != Some("Bearer tok")
-                {
-                    return axum::http::StatusCode::UNAUTHORIZED.into_response();
-                }
-                if uri.query().unwrap_or("").contains("address=jer1pay") {
-                    return axum::Json(json!({
-                        "exists": true,
-                        "address": "jer1pay",
-                        "balance_uj": 7_500_000,
-                        "balance_jer": 7.5,
-                        "available_jer": 7.0,
-                    }))
-                    .into_response();
-                }
-                axum::http::StatusCode::NOT_FOUND.into_response()
-            }),
+            axum::routing::get(
+                |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok())
+                        != Some("Bearer tok")
+                    {
+                        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if uri.query().unwrap_or("").contains("address=jer1pay") {
+                        return axum::Json(json!({
+                            "exists": true,
+                            "address": "jer1pay",
+                            "balance_uj": 7_500_000,
+                            "balance_jer": 7.5,
+                            "available_jer": 7.0,
+                        }))
+                        .into_response();
+                    }
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2020,10 +2020,15 @@ mod tests {
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let body: Value = server.get("/status").await.json();
-        let ow = body["crypto"]["optional_wallet"].as_object().expect("card present");
+        let ow = body["crypto"]["optional_wallet"]
+            .as_object()
+            .expect("card present");
         assert_eq!(ow["ok"], json!(false));
         assert!(
-            ow["error"].as_str().unwrap_or_default().contains("unreachable"),
+            ow["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unreachable"),
             "typed transport error: {ow:?}"
         );
         assert!(ow.get("amount").is_none(), "no fake balance on error");
@@ -2040,15 +2045,17 @@ mod tests {
         };
         cfg.ensure_identity().expect("test identity");
         let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
-        state.reputation_cache.lock().await.push(
-            crate::signing::ReputationStamp {
+        state
+            .reputation_cache
+            .lock()
+            .await
+            .push(crate::signing::ReputationStamp {
                 origin: "47bb0d50e3de1009".to_string(),
                 subject: "scored-node".to_string(),
                 score: -25,
                 stamp_ms: 1_234,
                 sig: "sig".to_string(),
-            },
-        );
+            });
         let gw = Gateway {
             state,
             runtime_url: "http://127.0.0.1:1".to_string(),
@@ -2073,7 +2080,11 @@ mod tests {
         assert_eq!(rep.len(), 1);
         assert_eq!(rep[0]["subject"], json!("scored-node"));
         assert_eq!(rep[0]["score"], json!(-25));
-        assert_eq!(rep[0]["penalized"], json!(true), "negative ⇒ penalized tier");
+        assert_eq!(
+            rep[0]["penalized"],
+            json!(true),
+            "negative ⇒ penalized tier"
+        );
     }
 
     /// §12 privacy tiers ride /status: the live level + allowlist size
@@ -2631,10 +2642,17 @@ mod tests {
                 }
             }]
         });
-        let res = server.post("/v1/chat/completions").json(&tool_request).await;
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&tool_request)
+            .await;
         assert_eq!(res.status_code(), 200);
         let forwarded: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
-        assert_eq!(forwarded["model"], json!("qwen3:8b"), "no-op rewrite keeps the model id");
+        assert_eq!(
+            forwarded["model"],
+            json!("qwen3:8b"),
+            "no-op rewrite keeps the model id"
+        );
         assert_eq!(
             forwarded["think"],
             json!(false),
@@ -2787,7 +2805,10 @@ mod tests {
         assert_eq!(res.status_code(), axum::http::StatusCode::OK);
         let body: Value = res.json();
         let boot = body.get("bootstrap").expect("bootstrap section in /status");
-        assert_eq!(boot["reachable"], true, "stub bootstrap must read reachable");
+        assert_eq!(
+            boot["reachable"], true,
+            "stub bootstrap must read reachable"
+        );
         assert_eq!(
             boot["young_fraud_reports"], 7,
             "zero-weight tally must mirror the bootstrap: {boot}"

@@ -740,10 +740,12 @@ mod tests {
         assert!(none.chat.is_none());
         let set = toml::from_str::<FileConfig>("[chat]\nmax_tool_rounds = 4\n").unwrap();
         assert_eq!(set.chat.as_ref().unwrap().max_tool_rounds, Some(4));
-        let cfg =
-            BotConfig::from_parts("http://gateway", "http://chain");
+        let cfg = BotConfig::from_parts("http://gateway", "http://chain");
         // Default budget: 2 rounds (web_search + answer), not the old 3.
-        assert_eq!(cfg.chat_max_tool_rounds, 2, "remote-only routing sized default");
+        assert_eq!(
+            cfg.chat_max_tool_rounds, 2,
+            "remote-only routing sized default"
+        );
         assert_eq!(cfg.chat_timeout_secs, DEFAULT_CHAT_TIMEOUT_SECS);
     }
 }

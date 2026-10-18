@@ -33,10 +33,11 @@ pub async fn handle(
     // Never react to other bots. But ANY attachment IS content: image-
     // only mentions/DMs are describable prompts (the 2026-10-17 deploy
     // dropped them), and file-only ones are sandbox-readable ones.
-    let has_image_attachment = msg
-        .attachments
-        .iter()
-        .any(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")));
+    let has_image_attachment = msg.attachments.iter().any(|a| {
+        a.content_type
+            .as_deref()
+            .is_some_and(|t| t.starts_with("image/"))
+    });
     let has_file_attachment = !msg.attachments.is_empty();
     if msg.author.bot || (msg.content.is_empty() && !has_file_attachment) {
         return Ok(());
@@ -125,7 +126,11 @@ pub async fn handle(
             .map(|a| crate::converse::AttSpec {
                 url: a.url.clone(),
                 label: a.filename.clone(),
-                kind: if a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")) {
+                kind: if a
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("image/"))
+                {
                     crate::converse::AttKind::Image
                 } else {
                     crate::converse::AttKind::Other
@@ -149,17 +154,13 @@ pub async fn handle(
         // be slow; the typing indicator already covers the wait):
         // failures land as honest bracketed lines inside the prompt, never
         // a silent drop.
-        let prompt = match crate::converse::attachments_context(
-            &cfg,
-            &state,
-            &attachments,
-            Some(&prompt),
-        )
-        .await
-        {
-            Some(ctx) => format!("{ctx}\n{prompt}"),
-            None => prompt,
-        };
+        let prompt =
+            match crate::converse::attachments_context(&cfg, &state, &attachments, Some(&prompt))
+                .await
+            {
+                Some(ctx) => format!("{ctx}\n{prompt}"),
+                None => prompt,
+            };
         // Live typing ([chat] stream, default on): the answer streams
         // through the gateway's SSE passthrough and edits into Discord
         // while tokens land. The sink degrades on its own — a failed

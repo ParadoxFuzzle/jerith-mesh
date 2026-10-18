@@ -475,9 +475,18 @@ mod tests {
         // A live surface was in play when the session started.
         let mut boxed = Some(Arc::new(MemorySink::new(true)) as Arc<dyn ConversationSink>);
         let had_live_sink = boxed.is_some();
-        run_session(&cfg, &state, Session { user: 7, prompt: "ping".into() }, "", &mut boxed)
-            .await
-            .unwrap();
+        run_session(
+            &cfg,
+            &state,
+            Session {
+                user: 7,
+                prompt: "ping".into(),
+            },
+            "",
+            &mut boxed,
+        )
+        .await
+        .unwrap();
         // The pipeline consumed the sink — this is exactly why reading
         // `sink.is_none()` after the call is the bug shape:
         assert!(boxed.is_none(), "run_session consumed the sink");
@@ -517,14 +526,20 @@ mod tests {
             ),
         ];
         let ctx = assemble_attachment_context(&lines).unwrap();
-        assert!(ctx.starts_with("[attachment context follows]"), "header: {ctx}");
+        assert!(
+            ctx.starts_with("[attachment context follows]"),
+            "header: {ctx}"
+        );
         assert!(ctx.contains("- [kiln.png] a brick kiln, fired"), "{ctx}");
         assert!(
             ctx.contains("- [ghost.png] (could not read: vision skill failed: 503)"),
             "{ctx}"
         );
         assert!(ctx.contains("- [mute.png] (no readable content)"), "{ctx}");
-        assert!(ctx.contains("- [notes.txt] (binary file, 42 bytes"), "{ctx}");
+        assert!(
+            ctx.contains("- [notes.txt] (binary file, 42 bytes"),
+            "{ctx}"
+        );
         // No attachments, no block (and the transports skip the plainly).
         assert_eq!(assemble_attachment_context(&[]), None);
     }
@@ -599,7 +614,10 @@ mod tests {
             ctx.contains("[attachment context follows]") && ctx.contains(ok_line),
             "ctx: {ctx}"
         );
-        assert!(ctx.contains("- [ghost.png] (could not read: image download"), "{ctx}");
+        assert!(
+            ctx.contains("- [ghost.png] (could not read: image download"),
+            "{ctx}"
+        );
         // The user's question — not the describe default — rode the
         // vision skill's prompt.
         let skill_reqs = seen.lock().await;
@@ -619,9 +637,27 @@ mod tests {
     /// has docker; skips rather than fails where it doesn't).
     #[tokio::test]
     async fn attachments_context_reads_files_in_the_sandbox() {
-        let probe = tokio::process::Command::new("docker").arg("info").output().await;
+        // Two gates: a reachable daemon AND the sandbox image built (CI has
+        // Docker but never builds jerith-sandbox — exit 125 'repository does
+        // not exist' is an environment gap, not a test failure).
+        let probe = tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await;
         if !probe.map(|p| p.status.success()).unwrap_or(false) {
             eprintln!("docker not available — skipping live sandbox test");
+            return;
+        }
+        let image = cfg().sandbox.image;
+        if image.is_empty()
+            || !tokio::process::Command::new("docker")
+                .args(["image", "inspect", &image])
+                .output()
+                .await
+                .map(|p| p.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("sandbox image {image:?} not built here — skipping live sandbox test");
             return;
         }
         // a text attachment and a binary one, served by the stub gateway

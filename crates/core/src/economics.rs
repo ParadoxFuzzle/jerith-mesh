@@ -143,7 +143,8 @@ pub struct WalletCard {
     pub address: Option<String>,
 }
 
-impl WalletCard {    /// Build from the crypto section: a card exists only on JerithChain.
+impl WalletCard {
+    /// Build from the crypto section: a card exists only on JerithChain.
     /// The payout address comes from config `[crypto] wallet_address`; the
     /// default wallet card follows the miner's credit identity (node id).
     ///
@@ -154,11 +155,18 @@ impl WalletCard {    /// Build from the crypto section: a card exists only on Je
     /// the legacy miner-facing :8300 default — the two chain instances
     /// token-gate independently, so asking the wrong one is a guaranteed
     /// 401 at startup.
-    pub fn from_crypto(crypto: &CryptoConfig, node_id: &str, chain_base: Option<&str>) -> Option<Self> {
+    pub fn from_crypto(
+        crypto: &CryptoConfig,
+        node_id: &str,
+        chain_base: Option<&str>,
+    ) -> Option<Self> {
         if crypto.chain != CryptoChain::Jerithchain {
             return None;
         }
-        let address = crypto.wallet_address.clone().filter(|a| !a.trim().is_empty());
+        let address = crypto
+            .wallet_address
+            .clone()
+            .filter(|a| !a.trim().is_empty());
         let identity = address.clone().unwrap_or_else(|| node_id.to_string());
         // wallet_endpoint set → honor it; unset → prefer the operator's
         // chain base (the chain the miner credits), else the legacy :8300.
@@ -283,17 +291,12 @@ pub async fn wallet_balance(card: &WalletCard) -> anyhow::Result<ChainBalance> {
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .or_else(|| card.address.clone()),
-        balance_uj: body
-            .get("balance_uj")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
+        balance_uj: body.get("balance_uj").and_then(|v| v.as_u64()).unwrap_or(0),
         balance_jer: body
             .get("balance_jer")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0),
-        available_jer: body
-            .get("available_jer")
-            .and_then(|v| v.as_f64()),
+        available_jer: body.get("available_jer").and_then(|v| v.as_f64()),
     })
 }
 
@@ -310,9 +313,7 @@ pub async fn wallet_balance(card: &WalletCard) -> anyhow::Result<ChainBalance> {
 /// and monerod-style RPC auth embed in the URL — no new config fields).
 /// Upper-case schemes accepted; anything without an http(s):// scheme is
 /// None (a typed config error, never a silent guess).
-pub fn split_endpoint(
-    url: &str,
-) -> Option<(String, Option<String>, Option<String>)> {
+pub fn split_endpoint(url: &str) -> Option<(String, Option<String>, Option<String>)> {
     let (scheme, rest) = url.split_once("://")?;
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
         return None;
@@ -361,7 +362,10 @@ impl OptionalChainWallet {
                     rpc_url,
                     user,
                     pass,
-                    address: crypto.wallet_address.clone().filter(|a| !a.trim().is_empty()),
+                    address: crypto
+                        .wallet_address
+                        .clone()
+                        .filter(|a| !a.trim().is_empty()),
                 })
             }),
             CryptoChain::Jerithchain | CryptoChain::None => None,
@@ -396,7 +400,12 @@ impl OptionalChainWallet {
     /// POST one Core-style JSON-RPC call (Bitcoin/Dogecoin), returning the
     /// `result` member. The RPC's own error member is surfaced as an Err —
     /// the chain said no, and the card must show that, not a fake zero.
-    async fn core_rpc(&self, client: &reqwest::Client, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    async fn core_rpc(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let resp = self
             .auth(client.post(&self.rpc_url))
             .json(&serde_json::json!({
@@ -418,14 +427,18 @@ impl OptionalChainWallet {
         if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
             anyhow::bail!("chain RPC error: {err}");
         }
-        body
-            .get("result")
+        body.get("result")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("chain RPC answer missing result"))
     }
 
     /// POST one EIP-1474 style JSON-RPC call (Ethereum, monero-wallet-rpc).
-    async fn jsonrpc(&self, client: &reqwest::Client, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    async fn jsonrpc(
+        &self,
+        client: &reqwest::Client,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let resp = self
             .auth(client.post(&self.rpc_url))
             .json(&serde_json::json!({
@@ -490,11 +503,15 @@ impl OptionalChainWallet {
                     anyhow::bail!("wallet_address must be a 0x-prefixed 20-byte address");
                 }
                 let hex = self
-                    .jsonrpc(&client, "eth_getBalance", serde_json::json!([addr, "latest"]))
+                    .jsonrpc(
+                        &client,
+                        "eth_getBalance",
+                        serde_json::json!([addr, "latest"]),
+                    )
                     .await?;
-                let hexs = hex
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("eth_getBalance returned a non-string result"))?;
+                let hexs = hex.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("eth_getBalance returned a non-string result")
+                })?;
                 let digits = hexs.strip_prefix("0x").unwrap_or(hexs);
                 if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
                     anyhow::bail!("eth_getBalance returned {hexs:?} — not hex");
@@ -512,7 +529,9 @@ impl OptionalChainWallet {
                 })
             }
             CryptoChain::Monero => {
-                let result = self.jsonrpc(&client, "get_balance", serde_json::json!({})).await?;
+                let result = self
+                    .jsonrpc(&client, "get_balance", serde_json::json!({}))
+                    .await?;
                 let atomic = result
                     .get("balance")
                     .and_then(|v| v.as_u64())
@@ -553,16 +572,15 @@ pub struct OptionalBalance {
 
 /// Live probe wrapper for one optional-chain wallet card: Ok(numbers) or
 /// Err(reason) — /status turns Err into `{ok:false, error}`.
-pub async fn optional_chain_probe(
-    card: &OptionalChainWallet,
-) -> anyhow::Result<OptionalBalance> {
+pub async fn optional_chain_probe(card: &OptionalChainWallet) -> anyhow::Result<OptionalBalance> {
     card.balance().await
 }
 
 /// GET /balance?discord_id=<identity> → µJER credited balance.
 /// (The chain keys wallets by identity strings; a node identity behaves
 /// like any other account handle for this purpose.)
-pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u64> {    let url = format!(
+pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u64> {
+    let url = format!(
         "{}/balance?discord_id={}",
         rpc_url.trim_end_matches('/'),
         identity
@@ -872,7 +890,9 @@ mod tests {
             pass: None,
             address: None,
         };
-        let e = optional_chain_probe(&w).await.expect_err("unreachable errs");
+        let e = optional_chain_probe(&w)
+            .await
+            .expect_err("unreachable errs");
         assert!(e.to_string().contains("unreachable"), "{e}");
     }
 
@@ -934,7 +954,9 @@ mod tests {
             ..CryptoConfig::default()
         };
         let w = OptionalChainWallet::from_crypto(&crypto).unwrap();
-        let e = optional_chain_probe(&w).await.expect_err("bad address errs");
+        let e = optional_chain_probe(&w)
+            .await
+            .expect_err("bad address errs");
         assert!(e.to_string().contains("0x-prefixed"), "{e}");
     }
 
@@ -1073,42 +1095,48 @@ mod tests {
     /// Stub chain node (jerith_node.py-shaped /balance): token-gated,
     /// and the tests read back what it was asked (query + auth) from a
     /// shared slot. 404 on `address-DNE`, full shape otherwise.
-    async fn stub_chain(
-        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    ) -> String {
+    async fn stub_chain(seen: std::sync::Arc<std::sync::Mutex<Option<String>>>) -> String {
         use axum::response::IntoResponse as _;
         let seen_chat = seen.clone();
         let app = axum::Router::new().route(
             "/balance",
-            axum::routing::get(move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
-                let seen = seen_chat.clone();
-                async move {
-                    seen.lock().unwrap().replace(format!(
-                        "{}|{}",
-                        uri.query().unwrap_or(""),
-                        headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("")
-                    ));
-                    if headers.get("authorization").and_then(|v| v.to_str().ok())
-                        != Some("Bearer tok")
-                    {
-                        return axum::http::StatusCode::UNAUTHORIZED
-                            .into_response();
+            axum::routing::get(
+                move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                    let seen = seen_chat.clone();
+                    async move {
+                        seen.lock().unwrap().replace(format!(
+                            "{}|{}",
+                            uri.query().unwrap_or(""),
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                        ));
+                        if headers.get("authorization").and_then(|v| v.to_str().ok())
+                            != Some("Bearer tok")
+                        {
+                            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        let q = uri.query().unwrap_or("");
+                        if q.contains("address=addr-broke") {
+                            return axum::http::StatusCode::NOT_FOUND.into_response();
+                        }
+                        let bal: u64 = if q.contains("balance=55") {
+                            5_500_000
+                        } else {
+                            1_234_567
+                        };
+                        axum::Json(json!({
+                            "exists": true,
+                            "address": "jer1abc",
+                            "balance_uj": bal,
+                            "balance_jer": bal as f64 / 1e6,
+                            "available_jer": bal as f64 / 1e6 - 0.5,
+                        }))
+                        .into_response()
                     }
-                    let q = uri.query().unwrap_or("");
-                    if q.contains("address=addr-broke") {
-                        return axum::http::StatusCode::NOT_FOUND.into_response();
-                    }
-                    let bal: u64 = if q.contains("balance=55") { 5_500_000 } else { 1_234_567 };
-                    axum::Json(json!({
-                        "exists": true,
-                        "address": "jer1abc",
-                        "balance_uj": bal,
-                        "balance_jer": bal as f64 / 1e6,
-                        "available_jer": bal as f64 / 1e6 - 0.5,
-                    }))
-                    .into_response()
-                }
-            }),
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1195,9 +1223,7 @@ mod tests {
         // A dedicated stub: 404 → the typed not-a-wallet answer.
         let app = axum::Router::new().route(
             "/balance",
-            axum::routing::get(
-                || async { axum::http::StatusCode::NOT_FOUND },
-            ),
+            axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

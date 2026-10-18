@@ -247,9 +247,13 @@ impl BotStateInner {
             order.push_back(key);
         }
         // Expired entries prune first; the cap evicts by insertion order.
-        order.retain(|k| matches!(entries.get(k), Some((_, at)) if at.elapsed() < SANDBOX_CACHE_TTL));
+        order.retain(
+            |k| matches!(entries.get(k), Some((_, at)) if at.elapsed() < SANDBOX_CACHE_TTL),
+        );
         while order.len() > SANDBOX_CACHE_CAP {
-            let Some(evict) = order.pop_front() else { break };
+            let Some(evict) = order.pop_front() else {
+                break;
+            };
             entries.remove(&evict);
         }
     }
@@ -400,10 +404,17 @@ mod tests {
                 Ok(format!("body {i}")),
             );
         }
-        assert!(s.sandbox_cache_get(None, "f0.txt", Some(0)).is_none(), "oldest evicted");
         assert!(
-            s.sandbox_cache_get(None, &format!("f{}.txt", total - 1), Some((total - 1) as u64))
-                .is_some(),
+            s.sandbox_cache_get(None, "f0.txt", Some(0)).is_none(),
+            "oldest evicted"
+        );
+        assert!(
+            s.sandbox_cache_get(
+                None,
+                &format!("f{}.txt", total - 1),
+                Some((total - 1) as u64)
+            )
+            .is_some(),
             "newest cached"
         );
     }

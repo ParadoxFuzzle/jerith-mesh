@@ -383,15 +383,14 @@ impl MemoryStore {
             let mut stmt = conn
                 .prepare("SELECT dim, provider, LENGTH(embedding), created_ms FROM memories")
                 .context("preparing stats scan")?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
             for row in rows {
                 let (dim, provider, bytes, created) = row?;
                 *dims.entry(dim).or_default() += 1;
@@ -586,10 +585,7 @@ fn select_top_k(rows: &mut [ScoredRow], top_k: usize) -> Vec<ScoredRow> {
 /// Second pass: text + created_ms for the top-k winners by primary key,
 /// after the pure-score scan. A row deleted underneath the scan is skipped
 /// (it is no longer in the store).
-fn fetch_hit_rows(
-    conn: &Connection,
-    rows: &[ScoredRow],
-) -> anyhow::Result<Vec<MemoryHit>> {
+fn fetch_hit_rows(conn: &Connection, rows: &[ScoredRow]) -> anyhow::Result<Vec<MemoryHit>> {
     let mut hits: Vec<MemoryHit> = Vec::with_capacity(rows.len());
     for row in rows {
         let got: Option<(String, i64)> = conn
@@ -1533,7 +1529,7 @@ pub fn migration_guidance(old_label: &str, new_label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-use super::*;
+    use super::*;
 
     /// Tests pin the deterministic offline embedder: aiming Ollama at a
     /// refused port sends every `embed_with` call down the hash-fallback
@@ -1550,8 +1546,7 @@ use super::*;
     }
 
     fn store() -> MemoryStore {
-        MemoryStore::open_in_memory(offline_embed(64))
-        .unwrap()
+        MemoryStore::open_in_memory(offline_embed(64)).unwrap()
     }
 
     #[tokio::test]
@@ -1630,8 +1625,7 @@ use super::*;
         assert_eq!(st.providers.len(), 1);
         assert!(st.newest_created_ms.is_some());
         // Empty store: zeroed stats, no newest timestamp.
-        let empty = MemoryStore::open_in_memory(offline_embed(64))
-        .unwrap();
+        let empty = MemoryStore::open_in_memory(offline_embed(64)).unwrap();
         let st = empty.stats().await.unwrap();
         assert_eq!(st.count, 0);
         assert!(st.newest_created_ms.is_none());
@@ -1747,7 +1741,11 @@ use super::*;
             let bytes = pack_vector(&v);
             // Packed corpus scan: same result as unpack cosine.
             assert_eq!(cosine(&v, &v), cosine_bytes(&v, &bytes));
-            assert_eq!(cosine(&a, &v), cosine_bytes(&a, &bytes), "mismatched a-length");
+            assert_eq!(
+                cosine(&a, &v),
+                cosine_bytes(&a, &bytes),
+                "mismatched a-length"
+            );
             // Trailing partial chunk: unpack drops it; blob scan must too.
             let mut tailed = bytes.clone();
             tailed.push(0x7f);
@@ -1878,13 +1876,8 @@ use super::*;
         let dir = std::env::temp_dir().join(format!("jerith-migrate-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let source_path = dir.join("mem.sqlite");
-        let source = MemoryHandle::Sqlite(
-            MemoryStore::open(
-                &source_path,
-                offline_embed(64),
-            )
-            .unwrap(),
-        );
+        let source =
+            MemoryHandle::Sqlite(MemoryStore::open(&source_path, offline_embed(64)).unwrap());
         for t in [
             "sourdough baking guide",
             "quantum computing notes",
@@ -1892,10 +1885,7 @@ use super::*;
         ] {
             source.embed_and_store(t).await.unwrap();
         }
-        let target = MemoryHandle::Sqlite(
-            MemoryStore::open_in_memory(offline_embed(64))
-            .unwrap(),
-        );
+        let target = MemoryHandle::Sqlite(MemoryStore::open_in_memory(offline_embed(64)).unwrap());
 
         // Copy: all 3 rows land, verbatim (no re-embedding — providers
         // and created_ms survive exactly as stored).
@@ -1934,13 +1924,8 @@ use super::*;
             std::env::temp_dir().join(format!("jerith-pg-migrate-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let source_path = dir.join("mem.sqlite");
-        let source = MemoryHandle::Sqlite(
-            MemoryStore::open(
-                &source_path,
-                offline_embed(64),
-            )
-            .unwrap(),
-        );
+        let source =
+            MemoryHandle::Sqlite(MemoryStore::open(&source_path, offline_embed(64)).unwrap());
         source
             .embed_and_store("how to bake sourdough bread at home")
             .await
@@ -1951,13 +1936,9 @@ use super::*;
             .unwrap();
         let schema = format!("memtest_{}_migrate", std::process::id());
         let target = MemoryHandle::Pg(
-            PgMemoryStore::connect(
-                &dsn,
-                offline_embed(64),
-                Some(&schema),
-            )
-            .await
-            .expect("connect target pgvector store"),
+            PgMemoryStore::connect(&dsn, offline_embed(64), Some(&schema))
+                .await
+                .expect("connect target pgvector store"),
         );
 
         let report = target
@@ -1998,13 +1979,9 @@ use super::*;
             return;
         };
         let schema = format!("memtest_{}_vecmode", std::process::id());
-        let s = PgMemoryStore::connect(
-            &dsn,
-            offline_embed(64),
-            Some(&schema),
-        )
-        .await
-        .expect("connect pgvector store");
+        let s = PgMemoryStore::connect(&dsn, offline_embed(64), Some(&schema))
+            .await
+            .expect("connect pgvector store");
         assert!(s.pgvector, "this DSN must have the vector extension");
 
         // Store and recover-by-similar (no re-embedding needed).
@@ -2113,13 +2090,9 @@ use super::*;
             return;
         };
         let schema = format!("memtest_{}_polyfill", std::process::id());
-        let s = PgMemoryStore::connect(
-            &dsn,
-            offline_embed(64),
-            Some(&schema),
-        )
-        .await
-        .expect("connect polyfill store");
+        let s = PgMemoryStore::connect(&dsn, offline_embed(64), Some(&schema))
+            .await
+            .expect("connect polyfill store");
         assert!(!s.pgvector, "this DSN must lack the extension");
         s.embed_and_store("how to bake sourdough bread at home")
             .await
@@ -2182,23 +2155,15 @@ use super::*;
         // Two stores over ONE dimension-free table, with different
         // truncation dims — the mixed-dim situation the scan path
         // exists for.
-        let s64 = PgMemoryStore::connect(
-            &dsn,
-            offline_embed(64),
-            Some(&schema),
-        )
-        .await
-        .expect("connect 64");
+        let s64 = PgMemoryStore::connect(&dsn, offline_embed(64), Some(&schema))
+            .await
+            .expect("connect 64");
         s64.embed_and_store("how to bake sourdough bread at home")
             .await
             .unwrap();
-        let s32 = PgMemoryStore::connect(
-            &dsn,
-            offline_embed(32),
-            Some(&schema),
-        )
-        .await
-        .expect("connect 32");
+        let s32 = PgMemoryStore::connect(&dsn, offline_embed(32), Some(&schema))
+            .await
+            .expect("connect 32");
         s32.embed_and_store("quantum computing stock price forecast")
             .await
             .unwrap();
@@ -2233,12 +2198,9 @@ use super::*;
     async fn bench_corpus(s: &MemoryStore) -> std::time::Duration {
         let start = std::time::Instant::now();
         for i in 0..BENCH_ROWS {
-            s.embed_and_store(&format!(
-                "alpha kiln note entry {i}{}",
-                " x".repeat(i % 97)
-            ))
-            .await
-            .unwrap();
+            s.embed_and_store(&format!("alpha kiln note entry {i}{}", " x".repeat(i % 97)))
+                .await
+                .unwrap();
         }
         start.elapsed()
     }

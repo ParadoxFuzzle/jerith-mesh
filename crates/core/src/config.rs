@@ -1229,7 +1229,10 @@ mod tests {
         let d = NodeConfig::default();
         assert_eq!(d.privacy.level, PrivacyLevel::FullMesh);
         assert!(d.privacy.trusted_nodes.is_empty());
-        assert!(d.privacy.hop_allowlist().is_none(), "full_mesh must not restrict");
+        assert!(
+            d.privacy.hop_allowlist().is_none(),
+            "full_mesh must not restrict"
+        );
 
         // Parse + allowlist at trusted_peers (the table parses on its own
         // type; a NodeConfig-level snippet would collide with the [privacy]

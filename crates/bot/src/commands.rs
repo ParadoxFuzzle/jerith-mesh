@@ -60,14 +60,13 @@ pub async fn read(
         id: Some(file.id.get()),
         size: Some(file.size as u64),
     };
-    let block = match
-        crate::converse::attachments_context(
-            &ctx.data().cfg,
-            &ctx.data().state,
-            std::slice::from_ref(&spec),
-            None,
-        )
-        .await
+    let block = match crate::converse::attachments_context(
+        &ctx.data().cfg,
+        &ctx.data().state,
+        std::slice::from_ref(&spec),
+        None,
+    )
+    .await
     {
         Some(b) => b,
         None => format!("- [{}] (no readable content)", file.filename),

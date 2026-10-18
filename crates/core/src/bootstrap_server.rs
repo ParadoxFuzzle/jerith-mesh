@@ -530,15 +530,23 @@ async fn reporter_established(registry: &Registry, reporter: &str, now: u64) -> 
     let aged = {
         let entries = registry.entries.read().await;
         entries.get(reporter).is_some_and(|e| {
-            let first = if e.first_seen_ms == 0 { e.last_refresh_ms } else { e.first_seen_ms };
+            let first = if e.first_seen_ms == 0 {
+                e.last_refresh_ms
+            } else {
+                e.first_seen_ms
+            };
             now.saturating_sub(first) >= MIN_REPORTER_AGE_MS
         })
     };
     if aged {
         return true;
     }
-    let Some(base) = registry.chain_base.as_deref() else { return false };
-    let Some(token) = crate::economics::read_token() else { return false };
+    let Some(base) = registry.chain_base.as_deref() else {
+        return false;
+    };
+    let Some(token) = crate::economics::read_token() else {
+        return false;
+    };
     let url = format!(
         "{}/stake?discord_id={}",
         base.trim_end_matches('/'),
@@ -624,12 +632,10 @@ async fn peers(
     // node-to-node inside ads (receivers verify against the pin they made
     // from `bootstrap` here). Score range [REPUTATION_FLOOR, 0]:
     // fraud-decremented, time-recovered; 0 = neutral.
-    let bootstrap = REPUTATION_ID
-        .get()
-        .map(|id| BootstrapKeyInfo {
-            node_id: id.node_id(),
-            pubkey: id.pubkey_hex(),
-        });
+    let bootstrap = REPUTATION_ID.get().map(|id| BootstrapKeyInfo {
+        node_id: id.node_id(),
+        pubkey: id.pubkey_hex(),
+    });
     let reputations = match REPUTATION_ID.get() {
         Some(id) => {
             let mut m = std::collections::HashMap::new();
@@ -945,7 +951,11 @@ async fn report_measure(
         obs.declared_percent,
         obs.measured_percent,
     );
-    if !crate::signing::verify(&obs.subject_pubkey, subject_payload.as_bytes(), &obs.subject_sig) {
+    if !crate::signing::verify(
+        &obs.subject_pubkey,
+        subject_payload.as_bytes(),
+        &obs.subject_sig,
+    ) {
         tracing::warn!(subject = %obs.subject, "tampered/forged subject block refused");
         return unauthorized("subject block signature invalid");
     }
@@ -984,7 +994,11 @@ async fn report_measure(
             },
         )
     };
-    (StatusCode::OK, Json(serde_json::json!({"tallied": fresh, "ring": depth}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"tallied": fresh, "ring": depth})),
+    )
+        .into_response()
 }
 
 /// Graceful self-retraction (§2 model-switch machinery): a node leaves
@@ -1097,7 +1111,8 @@ async fn report_fraud(
             Json(serde_json::json!({"error": "unknown node"})),
         )
             .into_response();
-    };    apply_recovery(entry, now_ms());
+    };
+    apply_recovery(entry, now_ms());
     drop(entries);
     let now = now_ms();
 
@@ -1130,7 +1145,6 @@ async fn report_fraud(
 
     let mut penalty_applied = false;
     if already_reported_by_this_reporter {
-
         // First claim by a reporter wins; later reports only refresh the
         // timestamp (cheap report-flood defense). No penalty change.
         if let Some(record) = entry.fraud_reports.get_mut(&rep.reporter) {
@@ -1421,11 +1435,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{addr}");
         let client = crate::http::mesh_http();
-        for (model, quant) in [
-            ("glm-5.3", "int4"),
-            ("glm-5.3", "int4"),
-            ("glm-5.3", "fp8"),
-        ] {
+        for (model, quant) in [("glm-5.3", "int4"), ("glm-5.3", "int4"), ("glm-5.3", "fp8")] {
             let (mut id, mut a) = make_peer(model);
             a.quant = quant.into();
             let r = client
@@ -1615,12 +1625,10 @@ mod tests {
         // Headers for one leave, with the stamped payload and the header
         // stamp frozen to the SAME clock read (avoids the 1 ms cross-tick
         // flake the two-clock pattern has under load).
-        let leave_headers = |id: &crate::signing::SigningIdentity,
-                             node_id: &str| {
+        let leave_headers = |id: &crate::signing::SigningIdentity, node_id: &str| {
             let stamp = now_ms();
             let payload = crate::signing::leave_payload(node_id, stamp);
-            let auth =
-                crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
+            let auth = crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
             let mut h = axum::http::HeaderMap::new();
             h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
             h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
@@ -1711,13 +1719,25 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(r.status().is_success(), "double-signed observation accepted");
+        assert!(
+            r.status().is_success(),
+            "double-signed observation accepted"
+        );
         let body: serde_json::Value = r.json().await.unwrap();
         assert_eq!(body["tallied"], serde_json::json!(true));
 
         // One report alone is UNQUORUMED — statistics, not a verdict.
-        let body: serde_json::Value = client.get(&peers_url).send().await.unwrap().json().await.unwrap();
-        let q = body["measurements"][&obs1.subject].as_object().expect("aggregate present");
+        let body: serde_json::Value = client
+            .get(&peers_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let q = body["measurements"][&obs1.subject]
+            .as_object()
+            .expect("aggregate present");
         assert_eq!(q["distinct_reporters"], serde_json::json!(1));
         assert_eq!(q["consistent"], serde_json::Value::Null);
 
@@ -1736,8 +1756,17 @@ mod tests {
             .await
             .unwrap();
         assert!(r.status().is_success());
-        let body: serde_json::Value = client.get(&peers_url).send().await.unwrap().json().await.unwrap();
-        let q = body["measurements"][&obs1.subject].as_object().expect("aggregate present");
+        let body: serde_json::Value = client
+            .get(&peers_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let q = body["measurements"][&obs1.subject]
+            .as_object()
+            .expect("aggregate present");
         assert_eq!(q["distinct_reporters"], serde_json::json!(2));
         assert_eq!(q["consistent"], serde_json::json!(true));
 
@@ -1769,9 +1798,22 @@ mod tests {
             .await
             .unwrap();
         assert!(r.status().is_success());
-        let body: serde_json::Value = client.get(&peers_url).send().await.unwrap().json().await.unwrap();
-        let q = body["measurements"][&obs1.subject].as_object().expect("aggregate present");
-        assert_eq!(q["distinct_reporters"], serde_json::json!(2), "deduped reporter");
+        let body: serde_json::Value = client
+            .get(&peers_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let q = body["measurements"][&obs1.subject]
+            .as_object()
+            .expect("aggregate present");
+        assert_eq!(
+            q["distinct_reporters"],
+            serde_json::json!(2),
+            "deduped reporter"
+        );
 
         // TAMPERED figures: flip the measured share without re-signing the
         // subject block → 401, subject's signature catches it.
@@ -1793,13 +1835,24 @@ mod tests {
             obs_t.measured_percent,
             stamp,
         );
-        let auth = crate::signing::WireAuth::with_stamp(&reporter, stamp, falsified_attest.as_bytes());
+        let auth =
+            crate::signing::WireAuth::with_stamp(&reporter, stamp, falsified_attest.as_bytes());
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
         h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
         h.insert("x-jerith-sig", auth.sig.parse().unwrap());
-        let r = client.post(&url).headers(h).json(&obs_t).send().await.unwrap();
-        assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "tampered figures refused");
+        let r = client
+            .post(&url)
+            .headers(h)
+            .json(&obs_t)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "tampered figures refused"
+        );
 
         // FORGED reporter: headers signed by a DIFFERENT key than the
         // claimed reporter → identity binding refuses.
@@ -1821,8 +1874,18 @@ mod tests {
         h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
         h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
         h.insert("x-jerith-sig", auth.sig.parse().unwrap());
-        let r = client.post(&url).headers(h).json(&obs2).send().await.unwrap();
-        assert_eq!(r.status(), axum::http::StatusCode::UNAUTHORIZED, "forged reporter refused");
+        let r = client
+            .post(&url)
+            .headers(h)
+            .json(&obs2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "forged reporter refused"
+        );
     }
 
     /// Builds a well-formed observation: the SUBJECT signs its own
@@ -1872,8 +1935,7 @@ mod tests {
             stamp,
         );
         let headers = {
-            let auth =
-                crate::signing::WireAuth::with_stamp(reporter, stamp, attest.as_bytes());
+            let auth = crate::signing::WireAuth::with_stamp(reporter, stamp, attest.as_bytes());
             let mut h = axum::http::HeaderMap::new();
             h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
             h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
@@ -2395,10 +2457,7 @@ mod tests {
     /// involvement: materialize its registry entry with first_seen far
     /// enough back — exactly what a day-old operator looks like on a
     /// live bootstrap (never-advertised = absent entry = age zero).
-    async fn establish_reporter(
-        registry: &Registry,
-        identity: &crate::signing::SigningIdentity,
-    ) {
+    async fn establish_reporter(registry: &Registry, identity: &crate::signing::SigningIdentity) {
         let a = PeerAd {
             node_id: identity.node_id(),
             address: "127.0.0.1:9000".into(),
@@ -2740,6 +2799,14 @@ mod tests {
     #[tokio::test]
     async fn visible_chain_stake_establishes_a_fresh_reporter() {
         use axum::extract::Query as AQuery;
+
+        // The chain half is token-gated by design (read_token's env wins):
+        // CI has no ~/.jerith-mesh/keys/api.token, so plant the env token
+        // or the chain leg is a no-op and the establishment never fires.
+        // Never removed: no other test asserts token absence.
+        unsafe {
+            std::env::set_var("JERITH_TOKEN", "drill-token");
+        }
 
         // The staked reporter is generated FIRST so the chain shim can
         // key on its actual node id (ids are minted, not chosen).

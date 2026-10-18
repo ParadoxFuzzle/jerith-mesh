@@ -275,9 +275,7 @@ pub fn auto_tool_tier_merge(
         return false;
     }
     let requested = requested.unwrap_or_default().trim();
-    requested.is_empty()
-        || requested == "jerith-mesh"
-        || base_model.is_some_and(|b| requested == b)
+    requested.is_empty() || requested == "jerith-mesh" || base_model.is_some_and(|b| requested == b)
 }
 
 #[cfg(test)]
@@ -492,7 +490,12 @@ mod tests {
             &pinned,
             true
         ));
-        assert!(auto_tool_tier_merge(Some("jerith-mesh"), Some("qwen3:8b"), &pinned, true));
+        assert!(auto_tool_tier_merge(
+            Some("jerith-mesh"),
+            Some("qwen3:8b"),
+            &pinned,
+            true
+        ));
         assert!(auto_tool_tier_merge(None, Some("qwen3:8b"), &pinned, true));
         // No tools → nothing engages (basic chat keeps its thinking).
         assert!(!auto_tool_tier_merge(
