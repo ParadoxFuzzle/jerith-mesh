@@ -741,6 +741,7 @@ fn peers_roster(reg: &crate::bootstrap::PeerRegistry, own_id: &str) -> serde_jso
                 "contribution_percent": ad.contribution_percent,
                 "state": state,
                 "last_rtt_ms": health.and_then(|h| h.last_rtt_ms),
+                "smoothed_rtt_ms": health.and_then(|h| h.smoothed_rtt_ms),
                 "consecutive_failures": health.map(|h| h.consecutive_failures).unwrap_or(0),
                 "hosted_experts": ad.hosted_experts.clone().unwrap_or_default(),
             })
@@ -1906,6 +1907,7 @@ mod tests {
         );
         assert_eq!(rows[0]["state"], "alive");
         assert_eq!(rows[0]["last_rtt_ms"], 12);
+        assert_eq!(rows[0]["smoothed_rtt_ms"], 12);
         assert_eq!(rows[0]["hosted_experts"][0], "exp.a");
         assert_eq!(rows[1]["state"], "deprecated");
         assert_eq!(rows[1]["consecutive_failures"], 3);
@@ -1915,6 +1917,7 @@ mod tests {
         let v = peers_roster(&lone, "someone-else");
         assert_eq!(v[0]["state"], "unknown");
         assert!(v[0]["last_rtt_ms"].is_null());
+        assert!(v[0]["smoothed_rtt_ms"].is_null());
     }
 
     /// Peers without advertised resources are census-absent (unknown ≠

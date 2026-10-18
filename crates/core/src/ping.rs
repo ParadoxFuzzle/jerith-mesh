@@ -541,10 +541,7 @@ impl MeshFallbackChat {
             let rtts: HashMap<String, u64> = ads
                 .iter()
                 .map(|ad| {
-                    let rtt = reg
-                        .health_of(&ad.node_id)
-                        .and_then(|h| h.last_rtt_ms)
-                        .unwrap_or(u64::MAX >> 2);
+                    let rtt = reg.routing_rtt_of(&ad.node_id).unwrap_or(u64::MAX >> 2);
                     (ad.node_id.clone(), rtt)
                 })
                 .collect();
@@ -553,7 +550,12 @@ impl MeshFallbackChat {
                 .filter_map(|ad| {
                     let health = reg.health_of(&ad.node_id)?;
                     let alive = health.state != PeerState::Deprecated;
-                    let rtt = health.last_rtt_ms.unwrap_or(u64::MAX >> 2);
+                    // Routing-grade RTT: EWMA-smoothed when available, raw
+                    // last sample before the second ping lands.
+                    let rtt = health
+                        .smoothed_rtt_ms
+                        .or(health.last_rtt_ms)
+                        .unwrap_or(u64::MAX >> 2);
                     // Expert dispatch only counts peers that advertise
                     // holding THIS expert (legacy/unadvertised peers stay
                     // candidates). Chat fallback is expert-agnostic, so it
@@ -764,10 +766,7 @@ impl MeshFallbackChat {
             })
             .map(|ad| crate::replication::ReplicaPeer {
                 node_id: ad.node_id.clone(),
-                rtt_ms: reg
-                    .health_of(&ad.node_id)
-                    .and_then(|h| h.last_rtt_ms)
-                    .unwrap_or(u64::MAX >> 2),
+                rtt_ms: reg.routing_rtt_of(&ad.node_id).unwrap_or(u64::MAX >> 2),
                 hosted_experts: ad.hosted_experts.clone(),
                 alive: true,
             })

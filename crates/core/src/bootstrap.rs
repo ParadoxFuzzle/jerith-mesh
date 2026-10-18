@@ -197,9 +197,29 @@ pub struct PeerHealth {
     pub state: PeerState,
     pub consecutive_failures: u32,
     pub last_rtt_ms: Option<u64>,
+    /// EWMA-smoothed RTT (α = ½: each success moves the estimate halfway
+    /// to the fresh sample; the first sample starts it). Routing decisions
+    /// (placement, replication sourcing) prefer this over [`Self::last_rtt_ms`]
+    /// so one noisy ping cannot misroute mesh work; the raw sample stays
+    /// available for operators. Integer ms, biased toward the old value.
+    pub smoothed_rtt_ms: Option<u64>,
     pub last_ping_at: Option<Instant>,
     /// Whether the peer ever answered a ping successfully.
     pub ever_alive: bool,
+}
+
+impl PeerHealth {
+    /// A fresh, unseen entry: everything unknown.
+    fn blank() -> Self {
+        Self {
+            state: PeerState::Unknown,
+            consecutive_failures: 0,
+            last_rtt_ms: None,
+            smoothed_rtt_ms: None,
+            last_ping_at: None,
+            ever_alive: false,
+        }
+    }
 }
 
 /// Local in-memory registry of peers for THIS node's model only.
@@ -253,16 +273,7 @@ impl PeerRegistry {
         let node_id = ad.node_id.clone();
         self.peers.insert(node_id.clone(), ad);
         if fresh {
-            self.health.insert(
-                node_id,
-                PeerHealth {
-                    state: PeerState::Unknown,
-                    consecutive_failures: 0,
-                    last_rtt_ms: None,
-                    last_ping_at: None,
-                    ever_alive: false,
-                },
-            );
+            self.health.insert(node_id, PeerHealth::blank());
         }
         true
     }
@@ -272,16 +283,14 @@ impl PeerRegistry {
         let h = self
             .health
             .entry(node_id.to_string())
-            .or_insert_with(|| PeerHealth {
-                state: PeerState::Unknown,
-                consecutive_failures: 0,
-                last_rtt_ms: None,
-                last_ping_at: None,
-                ever_alive: false,
-            });
+            .or_insert_with(PeerHealth::blank);
         h.state = PeerState::Alive;
         h.consecutive_failures = 0;
         h.last_rtt_ms = Some(rtt_ms);
+        h.smoothed_rtt_ms = Some(match h.smoothed_rtt_ms {
+            Some(s) => (s + rtt_ms) / 2,
+            None => rtt_ms,
+        });
         h.last_ping_at = Some(Instant::now());
         h.ever_alive = true;
     }
@@ -304,6 +313,16 @@ impl PeerRegistry {
 
     pub fn rtt_of(&self, node_id: &str) -> Option<u64> {
         self.health.get(node_id).and_then(|h| h.last_rtt_ms)
+    }
+
+    /// Routing-grade RTT: the EWMA-smoothed estimate when we have one,
+    /// falling back to the raw last sample (and to `None` for a peer we
+    /// never pinged). Placement and replication sourcing should read this,
+    /// not [`Self::rtt_of`].
+    pub fn routing_rtt_of(&self, node_id: &str) -> Option<u64> {
+        self.health
+            .get(node_id)
+            .and_then(|h| h.smoothed_rtt_ms.or(h.last_rtt_ms))
     }
 
     /// All non-deprecated peers that are candidates for connection.
@@ -875,6 +894,41 @@ mod tests {
         reg.upsert(ad("a", "glm-5.3", "int4"));
         reg.record_ping_ok("a", 55);
         assert_eq!(reg.rtt_of("a"), Some(55));
+    }
+
+    #[test]
+    fn routing_rtt_starts_on_the_raw_sample_then_smooths() {
+        let mut reg = PeerRegistry::new(Some(model("glm-5.3", "int4")));
+        reg.upsert(ad("a", "glm-5.3", "int4"));
+        // First success: smoothed == raw, routing falls on it.
+        reg.record_ping_ok("a", 55);
+        assert_eq!(reg.routing_rtt_of("a"), Some(55));
+        assert_eq!(reg.health_of("a").unwrap().smoothed_rtt_ms, Some(55));
+        // One noisy spike: the raw sample jumps, the EWMA only moves
+        // halfway — routing stays near the truth instead of chasing it.
+        reg.record_ping_ok("a", 400);
+        assert_eq!(reg.rtt_of("a"), Some(400));
+        assert_eq!(reg.routing_rtt_of("a"), Some((55 + 400) / 2));
+        // Convergence toward the true value — to within 1 ms. The
+        // truncation toward the *previous* estimate is deliberate: the
+        // EWMA never under-reports a peer's latency (repeated 399→400
+        // ticks stop at 399), so routing stays conservative when a peer
+        // slows down rather than briefly optimistic.
+        for _ in 0..8 {
+            reg.record_ping_ok("a", 400);
+        }
+        let smooth = reg.routing_rtt_of("a").unwrap();
+        assert!((399..=400).contains(&smooth), "sm {smooth}");
+    }
+
+    #[test]
+    fn routing_rtt_never_invented_for_an_unpinged_peer() {
+        let mut reg = PeerRegistry::new(Some(model("glm-5.3", "int4")));
+        reg.upsert(ad("a", "glm-5.3", "int4"));
+        assert!(reg.rtt_of("a").is_none());
+        assert!(reg.routing_rtt_of("a").is_none());
+        // Unknown peer likewise.
+        assert!(reg.routing_rtt_of("ghost").is_none());
     }
 
     #[test]

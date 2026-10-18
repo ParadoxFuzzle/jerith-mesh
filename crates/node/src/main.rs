@@ -2467,13 +2467,21 @@ async fn peers_cmd() -> anyhow::Result<()> {
             }
             println!("this node's roster (ping-verified): {gateway}/status");
             println!(
-                "{:<22} {:<10} {:>8} {:<20} {:>4}  hosted",
+                "{:<22} {:<10} {:>13} {:<20} {:>4}  hosted",
                 "node", "state", "rtt_ms", "model", "contrib"
             );
             for p in &peers {
-                let rtt = match &p["last_rtt_ms"] {
-                    serde_json::Value::Number(n) => n.as_u64().unwrap_or(0).to_string(),
-                    _ => "-".into(),
+                // Raw + EWMA-smoothed RTT. When they differ, show both:
+                // the smoothed value is what placement orders by (an EWMA,
+                // so one noisy ping cannot misroute mesh work), the raw is
+                // the last single sample.
+                let raw = p["last_rtt_ms"].as_u64();
+                let smoothed = p["smoothed_rtt_ms"].as_u64();
+                let rtt = match (raw, smoothed) {
+                    (Some(r), Some(s)) if r != s => format!("{r} (sm {s})"),
+                    (Some(r), _) => r.to_string(),
+                    (None, Some(s)) => format!("sm {s}"),
+                    (None, None) => "-".into(),
                 };
                 let hosted = p["hosted_experts"]
                     .as_array()
@@ -2489,7 +2497,7 @@ async fn peers_cmd() -> anyhow::Result<()> {
                     })
                     .unwrap_or_else(|| "-".into());
                 println!(
-                    "{:<22} {:<10} {:>8} {:<20} {:>3}%  {}",
+                    "{:<22} {:<10} {:>13} {:<20} {:>3}%  {}",
                     p["node_id"].as_str().unwrap_or("?"),
                     p["state"].as_str().unwrap_or("?"),
                     rtt,
