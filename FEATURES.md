@@ -741,11 +741,18 @@ gotchas surfaced while building the finished parts.
   pipeline side) when real pipeline transport goes live, and a
   metadata-tier verdict if the meter blocks ever grow prompt-derived
   payloads.
-- **Compatibility check for quantization / context length / tokenizer
-  version (§12)**. Model identity already hashes quantization and context
-  length; the remaining piece is a pre-join validation against live peers
-  with typed, readable refusals ("same model, wrong quant, this many nodes
-  could still take you").
+- ✅ **Compatibility check for quantization / context length / tokenizer
+  version (§12)** — LANDED (the pre-join half): the mesh loop's first
+  successful signed peer fetch takes a live model census from the
+  bootstrap and verdicts OUR identity against it once per process
+  (`ping::compat_verdict`). Typed, readable shapes: `healthy` (exact
+  id+quant peers live), `wrong_quant` — the spec's refusal text lives
+  here: "same model, wrong quant — the mesh runs <model> on quant(s)
+  [int8 (2 nodes), …]; you run 'x', which no peer admits (peers match
+  id+quant exactly)" — and `no_peers_on_model` ("you ARE the mesh" or
+  the live alternatives with counts). The verdict journals (WARN on the
+  two drift shapes) and renders live on `/status.compat`. The 4 unit
+  tests pin each shape.
 - **Plugin SDK surfaces (§7): Telegram / WhatsApp / others.** The shape to
   copy already exists: the bot crate's SkillSpec registry + signed webhook
   hooks are the SDK; an adapter only plugs a different transport in front

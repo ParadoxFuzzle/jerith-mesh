@@ -1484,16 +1484,19 @@ async fn run_loop(
                         "peer list refreshed from bootstrap"
                     );
                     // Pre-join mesh compat (FEATURES §12), once per
-                    // process: if the registry admitted NOTHING so far,
-                    // compare OUR identity against the bootstrap census
-                    // so "mesh looks empty" always has a typed answer —
+                    // process: compare OUR identity against the bootstrap
+                    // census so the operator always has a typed answer —
                     // especially "same model, wrong quant, N nodes
-                    // could still take you". A healthy node overwrites
-                    // nothing interesting; verdicts surface in /status.
-                    // NOTE: the `reg` guard is held in this scope — use it
-                    // instead of re-locking (a second registry lock on the
-                    // same task deadlocks the loop AND /status's mutex).
-                    if reg.is_empty() && state.compat.read().await.is_none() {
+                    // could still take you". The gate used to ALSO fence
+                    // on an empty registry, which left a failed first
+                    // census permanently null once any ad ingested (the
+                    // live /status.compat: null audit finding); the
+                    // census is universal (all models), so the once-flag
+                    // IS the gate. Verdicts surface in /status.
+                    // NOTE: the `reg` guard is held in this scope — do
+                    // NOT re-lock the registry here (a second lock on
+                    // the same task deadlocks the loop AND /status).
+                    if state.compat.read().await.is_none() {
                         match BootstrapClient::new(used.clone())
                             .fetch_model_census()
                             .await
