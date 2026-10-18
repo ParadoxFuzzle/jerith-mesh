@@ -702,8 +702,12 @@ gotchas surfaced while building the finished parts.
   `GET /stake`, the skin-in-the-game half beating the calendar for
   freshly-minted but  staked operators; chain unreachable = age rule only, no fake grace).
   Zero-weight reports are visible: /health's `sybil.young_fraud_reports`
-  counter (Registry-owned) plus an operator log line name the mass-mint
-  shape the weighting exists to expose. The stake resolver speaks the
+  counter  (Registry-owned) plus an operator log line name the mass-mint
+  shape the weighting exists to expose — and the node's `/status`
+  mirrors OUR bootstrap's tally live (`bootstrap` section:
+  `reachable` + `young_fraud_reports`; a downed bootstrap reads
+  `reachable:false` and never takes /status down with it, chain_probe
+  contract). The stake resolver speaks the
   operator's `chain_url` (the :8322 chain-node api) on every path now
   \u2014 run loop, stake CLI, bootstrap live half \u2014 not just the CLI.. Young/unstaked reports are still RECORDED (they
   count toward the corroboration shape and the per-reporter flood

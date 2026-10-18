@@ -1001,6 +1001,12 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         "metrics": metrics_status(&gw.metrics.snapshot()),
         "security": serde_json::to_value(crate::metrics::security_snapshot())
             .expect("security counters serialize"),
+        // §10 sybil-pressure mirror: OUR bootstrap's zero-weight report
+        // tally, probed live (the counter itself lives in the bootstrap
+        // process — this section is the operator's watching eye).
+        "bootstrap": bootstrap_sybil_status(
+            Some(gw.state.config.read().await.bootstrap_url.as_str()),
+        ).await,
         "chain": chain_probe(gw.chain_url.as_deref(), crate::economics::read_token().as_deref()).await,
         // Per-node JER wallet card (Phase 4): live balance from the chain
         // RPC — the earnings view's chain-truthful side. Null when no
@@ -1041,6 +1047,55 @@ fn metrics_status(snap: &crate::metrics::MetricsSnapshot) -> Value {
 /// Live probe of the co-hosted JerithChain node's `/status` (read-only).
 /// Every failure path degrades to Null — a downed chain must never take
 /// the mesh status page with it.
+/// §10 anti-sybil view from OUR configured bootstrap's /health: the
+/// zero-weight fraud-report tally (`sybil.young_fraud_reports`) — the
+/// operator-facing mirror of the weighting acting live. Same contract as
+/// chain_probe: a downed bootstrap reads `{"reachable": false}` and
+/// never takes /status down with it; unconfigured URL = null.
+async fn bootstrap_sybil_status(base: Option<&str>) -> Value {
+    let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) else {
+        return Value::Null;
+    };
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/health");
+    let resp = reqwest::Client::builder()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()
+        .map(|c| c.get(&url).send());
+    let Some(resp) = resp else { return Value::Null };
+    match resp.await {
+        Ok(r) if r.status().is_success() => {
+            match r.json::<Value>().await {
+                Ok(body) => json!({
+                    "reachable": true,
+                    "url": base,
+                    "young_fraud_reports": body
+                        .pointer("/sybil/young_fraud_reports")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                }),
+                Err(_) => json!({
+                    "reachable": false,
+                    "url": base,
+                    "error": "non-JSON bootstrap health",
+                }),
+            }
+        }
+        Ok(r) => json!({
+            "reachable": false,
+            "url": base,
+            "status": r.status().as_u16(),
+        }),
+        Err(_) => json!({
+            "reachable": false,
+            "url": base,
+            "error": "bootstrap health unreachable",
+        }),
+    }
+}
+
 async fn chain_probe(base: Option<&str>, token: Option<&str>) -> Value {    let (Some(base), Some(token)) = (base, token) else {
         return Value::Null;
     };
@@ -2675,6 +2730,98 @@ mod tests {
                 "security.{key} must be a u64 counter, got {sec}"
             );
         }
+    }
+
+    /// §10 observability: /status mirrors OUR bootstrap's /health sybil
+    /// tally (stub bootstrap answers nonzero), and degrades to
+    /// reachable:false when the bootstrap is down — /status itself stays
+    /// 200 either way (same contract as chain_probe).
+    #[tokio::test]
+    async fn status_mirrors_the_bootstrap_sybil_counter() {
+        // Stub bootstrap /health with a nonzero sybil tally.
+        async fn stub_health() -> axum::Json<Value> {
+            axum::Json(json!({
+                "ok": true,
+                "sybil": {"young_fraud_reports": 7},
+            }))
+        }
+        let chain_app = axum::Router::new().route("/health", axum::routing::get(stub_health));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, chain_app).await.unwrap() });
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            bootstrap_url: format!("http://{addr}"),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).unwrap();
+
+        let res = server.get("/status").await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let body: Value = res.json();
+        let boot = body.get("bootstrap").expect("bootstrap section in /status");
+        assert_eq!(boot["reachable"], true, "stub bootstrap must read reachable");
+        assert_eq!(
+            boot["young_fraud_reports"], 7,
+            "zero-weight tally must mirror the bootstrap: {boot}"
+        );
+    }
+
+    /// Same mirror, bootstrap DOWN: /status stays 200 and the section
+    /// reads reachable:false — a downed bootstrap never takes /status
+    /// down with it.
+    #[tokio::test]
+    async fn status_survives_a_downed_bootstrap_probe() {
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            // Port 1 is unassigned — the connect fails fast.
+            bootstrap_url: "http://127.0.0.1:1".to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).unwrap();
+
+        let res = server.get("/status").await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let body: Value = res.json();
+        let boot = body.get("bootstrap").expect("bootstrap section in /status");
+        assert_eq!(boot["reachable"], false, "down bootstrap reads {boot}");
     }
 
     #[tokio::test]
