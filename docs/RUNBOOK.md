@@ -14,6 +14,24 @@ deploy, then how to roll back cleanly. Companion docs:
 | Chain snapshot | `jerith-snapshot.timer` (systemd --user) | publishes a chain snapshot every 5 min |
 | Node | `deploy/systemd/jerith-node.service` (template) | `jerith run` (gateway :8900 + QUIC rpc) |
 
+### Control-plane locality (co-hosted convention)
+
+When the mesh node and its bootstrap share a host (this deployment),
+the node's control plane must speak LOOPBACK, not the public tunnel:
+`config.toml` sets `bootstrap_url = "http://127.0.0.1:8901"` and puts
+`http://127.0.0.1:8901` FIRST in `[discovery] servers` (the tunnel URL
+and the LAN address stay behind it as failover legs). Every ping tick,
+census fetch, fraud flush, `/status` mirror probe and stake
+chain-probe then rides loopback instead of a Cloudflare round trip.
+Measured on the live node 2026-10-18: `/status` 140-190 ms → ~2.4 ms
+end-to-end (probe parallelization + pooled clients + this), and the
+ping tick's peer refresh reads `bootstrap=http://127.0.0.1:8901` in
+the journal. Remote nodes keep the tunnel URL as their primary — the
+ordering is per-host config, not a protocol change. If the learned
+server set (`data/discovery-servers.json`) still pins a remote server
+as last-good after the swap, clear the file once; the node re-pins
+from the config-ordered rotation within one tick.
+
 ## JerithChain node (co-hosted, integrated into the mesh install)
 
 The chain node is part of the mesh stack, not a sidecar — the mesh shares
