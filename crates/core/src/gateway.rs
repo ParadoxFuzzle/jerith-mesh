@@ -1336,14 +1336,19 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body["max_tokens"] = serde_json::json!(cap);
         }
     }
-    let client = reqwest::Client::builder()
-        .use_rustls_tls()
-        // Distinguishes "host down" from "host up but wedged": a dead route
-        // fails fast here, while a slow/hung runtime is caught by the
-        // header-wait bound below instead.
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .expect("gateway runtime client builder");
+    // Chat lane client: ONE pooled instance per process — every chat
+    // message used to build a fresh TLS-pinned client (and socket pool,
+    // and TCP connect) for the runtime lane. The fail-fast contract is
+    // client-level: a dead route refuses at connect fast; a slow/hung
+    // RUNTIME is caught by the header-wait bound below instead.
+    static CHAT_LANE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CHAT_LANE.get_or_init(|| {
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("gateway runtime client builder")
+    });
     let payload = body.to_string();
     if payload.len() > CHAT_FORWARD_CAP_BYTES {
         crate::metrics::bump(&crate::metrics::OVERSIZE_CHAT_REJECTS);

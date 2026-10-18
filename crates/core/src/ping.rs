@@ -513,6 +513,8 @@ impl MeshFallbackChat {
     /// Build inputs for the router from live registry state: connectable
     /// peers (rtt, alive, advertised resources, VERIFIED reputation (§10
     /// / Phase 5)) + their advertised QUIC rpc addresses.
+    /// Dispatch-view wrapper: the (candidates, dial-addrs) pair without
+    /// the detailed ad snapshot.
     async fn mesh_view(
         &self,
         state: &Arc<MeshState>,
@@ -521,58 +523,87 @@ impl MeshFallbackChat {
         Vec<crate::quic::MeshCandidate>,
         HashMap<String, SocketAddr>,
     ) {
-        // Verified reputation map (Phase 5 placement weighting): newest
-        // stamp per subject from OUR pin wall — the cache is already
-        // bounded, so this is two lookups, not a scan.
-        let verified = verified_scores(state).await;
-        let reg = state.registry.lock().await;
-        let peers: Vec<crate::quic::MeshCandidate> =
-            reg
-            .all_ads()
-            .into_iter()
-            .filter_map(|ad| {
-                let health = reg.health_of(&ad.node_id)?;
-                let alive = health.state != PeerState::Deprecated;
-                let rtt = health.last_rtt_ms.unwrap_or(u64::MAX >> 2);
-                // Expert dispatch only counts peers that advertise holding
-                // THIS expert (legacy/unadvertised peers stay candidates).
-                // Chat fallback is expert-agnostic, so it takes every alive
-                // peer.
-                let has_expert = match expert_id {
-                    Some(id) => ad.hosts_expert(id),
-                    None => true,
-                };
-                Some((
-                    ad.node_id.clone(),
-                    rtt,
-                    has_expert,
-                    alive,
-                    ad.resources.clone(),
-                    verified.get(&ad.node_id).copied(),
-                ))
-            })
-            // Per-peer blocking (Phase 3): a blocked peer is never a
-            // placement candidate — sending it work is exactly what it
-            // was blocked to stop. Refusals still happen server-side if
-            // a stale ad slips through; this keeps the router from even
-            // building a plan around it.
-            .filter(|(id, ..)| !state.peer_block.blocked(id))
-            .collect();
-        let addrs: HashMap<String, SocketAddr> = reg
-            .all_ads()
-            .into_iter()
-            .filter(|ad| !ad.rpc_address.is_empty())
-            // Replication dials live here too: a blocked peer is never a
-            // weight source either way.
-            .filter(|ad| !state.peer_block.blocked(&ad.node_id))
-            .filter_map(|ad| {
-                ad.rpc_address
-                    .parse::<SocketAddr>()
-                    .ok()
-                    .map(|a| (ad.node_id.clone(), a))
-            })
-            .collect();
+        let (peers, addrs, _, _) = self.mesh_view_detailed(state, expert_id).await;
         (peers, addrs)
+    }
+
+    /// The FULL dispatch view in ONE registry lock: candidates, dial
+    /// addresses, the raw ad snapshot and per-peer RTTs. The hot path
+    /// (`dispatch_expert` + the cold-shard ring) used to acquire the
+    /// global registry lock TWICE per dispatch and clone the entire ad
+    /// set three times (once per view leg, once again for the ring) —
+    /// every pass now reads one snapshot. Verified reputation (Phase 5)
+    /// looks up the bounded pin-wall cache inside the same pass.
+    async fn mesh_view_detailed(
+        &self,
+        state: &Arc<MeshState>,
+        expert_id: Option<&str>,
+    ) -> (
+        Vec<crate::quic::MeshCandidate>,
+        HashMap<String, SocketAddr>,
+        Vec<PeerAd>,
+        HashMap<String, u64>,
+    ) {
+        let verified = verified_scores(state).await;
+        let (ads, rtts, peers, addrs) = {
+            let reg = state.registry.lock().await;
+            let ads: Vec<PeerAd> = reg.all_ads();
+            let rtts: HashMap<String, u64> = ads
+                .iter()
+                .map(|ad| {
+                    let rtt = reg
+                        .health_of(&ad.node_id)
+                        .and_then(|h| h.last_rtt_ms)
+                        .unwrap_or(u64::MAX >> 2);
+                    (ad.node_id.clone(), rtt)
+                })
+                .collect();
+            let peers: Vec<crate::quic::MeshCandidate> =
+                ads.iter()
+                .filter_map(|ad| {
+                    let health = reg.health_of(&ad.node_id)?;
+                    let alive = health.state != PeerState::Deprecated;
+                    let rtt = health.last_rtt_ms.unwrap_or(u64::MAX >> 2);
+                    // Expert dispatch only counts peers that advertise
+                    // holding THIS expert (legacy/unadvertised peers stay
+                    // candidates). Chat fallback is expert-agnostic, so it
+                    // takes every alive peer.
+                    let has_expert = match expert_id {
+                        Some(id) => ad.hosts_expert(id),
+                        None => true,
+                    };
+                    Some((
+                        ad.node_id.clone(),
+                        rtt,
+                        has_expert,
+                        alive,
+                        ad.resources.clone(),
+                        verified.get(&ad.node_id).copied(),
+                    ))
+                })
+                // Per-peer blocking (Phase 3): a blocked peer is never a
+                // placement candidate — sending it work is exactly what it
+                // was blocked to stop. Refusals still happen server-side if
+                // a stale ad slips through; this keeps the router from even
+                // building a plan around it.
+                .filter(|(id, ..)| !state.peer_block.blocked(id))
+                .collect();
+            let addrs: HashMap<String, SocketAddr> = ads
+                .iter()
+                .filter(|ad| !ad.rpc_address.is_empty())
+                // Replication dials live here too: a blocked peer is never
+                // a weight source either way.
+                .filter(|ad| !state.peer_block.blocked(&ad.node_id))
+                .filter_map(|ad| {
+                    ad.rpc_address
+                        .parse::<SocketAddr>()
+                        .ok()
+                        .map(|a| (ad.node_id.clone(), a))
+                })
+                .collect();
+            (ads, rtts, peers, addrs)
+        };
+        (peers, addrs, ads, rtts)
     }
 
     /// Dispatch one expert tensor query through the mesh (Phase 2 tensor
@@ -602,31 +633,17 @@ impl MeshFallbackChat {
                     .unwrap_or_else(|| "resource ceiling breached".into())
             );
         }
-        let (mut peers, addrs) = self.mesh_view(state, Some(expert_id)).await;
+        // ONE registry lock for the whole view (candidates + dial addrs +
+        // the ad snapshot the cold-shard ring needs — the second
+        // registry pass this used to pay is gone).
+        let (mut peers, addrs, ads, rtts) =
+            self.mesh_view_detailed(state, Some(expert_id)).await;
         // Cold-expert sharding (Phase 2): when nobody *advertises* this
         // expert, the deterministic shard ring says which node owns it. We
         // ask that owner rather than giving up — it either has the weights
         // (and answers) or honestly refuses, which is still better than
         // never trying. The ring is computed from the same ads every node
         // sees, so all nodes pick the same owner.
-        // One registry read for both facts (ads + pings): the ring must be
-        // computed from the same advertisement set every node sees, and the
-        // lock is released before hashing or reading config.
-        let (ads, rtts) = {
-            let reg = state.registry.lock().await;
-            let ads = reg.all_ads();
-            let rtts: HashMap<String, u64> = ads
-                .iter()
-                .map(|ad| {
-                    let rtt = reg
-                        .health_of(&ad.node_id)
-                        .and_then(|h| h.last_rtt_ms)
-                        .unwrap_or(u64::MAX >> 2);
-                    (ad.node_id.clone(), rtt)
-                })
-                .collect();
-            (ads, rtts)
-        };
         let advertised = ads.iter().any(|ad| ad.explicitly_hosts(expert_id));
         if !advertised {
             let own_id = state.config.read().await.node_id.clone();
