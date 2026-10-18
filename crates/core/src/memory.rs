@@ -1432,13 +1432,24 @@ pub fn migration_guidance(old_label: &str, new_label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+use super::*;
+
+    /// Tests pin the deterministic offline embedder: aiming Ollama at a
+    /// refused port sends every `embed_with` call down the hash-fallback
+    /// arm. Without this, tests silently depended on the live local model
+    /// — under load a slow embed hit its timeout and half a store switched
+    /// providers/dims, which is exactly what `stats` assertions caught
+    /// as the flake.
+    fn offline_embed(dim: usize) -> EmbedConfig {
+        EmbedConfig {
+            ollama_url: "http://127.0.0.1:1".into(),
+            model: "nomic-embed-text-v2-moe".into(),
+            dim,
+        }
+    }
 
     fn store() -> MemoryStore {
-        MemoryStore::open_in_memory(EmbedConfig {
-            dim: 64,
-            ..EmbedConfig::default()
-        })
+        MemoryStore::open_in_memory(offline_embed(64))
         .unwrap()
     }
 
@@ -1471,12 +1482,8 @@ mod tests {
         let s = store();
         let (id, provider) = s.embed_and_store("the quick brown fox").await.unwrap();
         assert!(id >= 1);
-        // Provider depends on the environment (nomic via Ollama when it's
-        // running, hash fallback otherwise) — either is valid.
-        assert!(matches!(
-            provider,
-            EmbedProvider::Nomic | EmbedProvider::HashFallback
-        ));
+        // Tests pin the offline hash embedder (see `offline_embed`).
+        assert_eq!(provider, EmbedProvider::HashFallback);
         assert_eq!(s.count().await.unwrap(), 1);
     }
 
@@ -1522,10 +1529,7 @@ mod tests {
         assert_eq!(st.providers.len(), 1);
         assert!(st.newest_created_ms.is_some());
         // Empty store: zeroed stats, no newest timestamp.
-        let empty = MemoryStore::open_in_memory(EmbedConfig {
-            dim: 64,
-            ..EmbedConfig::default()
-        })
+        let empty = MemoryStore::open_in_memory(offline_embed(64))
         .unwrap();
         let st = empty.stats().await.unwrap();
         assert_eq!(st.count, 0);
@@ -1628,11 +1632,11 @@ mod tests {
         let path = dir.join("mem.sqlite");
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let s = MemoryStore::open(&path, EmbedConfig::default()).unwrap();
+            let s = MemoryStore::open(&path, offline_embed(256)).unwrap();
             s.embed_and_store("persistent memory entry").await.unwrap();
         }
         {
-            let s = MemoryStore::open(&path, EmbedConfig::default()).unwrap();
+            let s = MemoryStore::open(&path, offline_embed(256)).unwrap();
             assert_eq!(s.count().await.unwrap(), 1);
             let hits = s.search("persistent memory", 1).await.unwrap();
             assert_eq!(hits.len(), 1);
@@ -1704,10 +1708,7 @@ mod tests {
         let source = MemoryHandle::Sqlite(
             MemoryStore::open(
                 &source_path,
-                EmbedConfig {
-                    dim: 64,
-                    ..EmbedConfig::default()
-                },
+                offline_embed(64),
             )
             .unwrap(),
         );
@@ -1719,10 +1720,7 @@ mod tests {
             source.embed_and_store(t).await.unwrap();
         }
         let target = MemoryHandle::Sqlite(
-            MemoryStore::open_in_memory(EmbedConfig {
-                dim: 64,
-                ..EmbedConfig::default()
-            })
+            MemoryStore::open_in_memory(offline_embed(64))
             .unwrap(),
         );
 
@@ -1766,10 +1764,7 @@ mod tests {
         let source = MemoryHandle::Sqlite(
             MemoryStore::open(
                 &source_path,
-                EmbedConfig {
-                    dim: 64,
-                    ..EmbedConfig::default()
-                },
+                offline_embed(64),
             )
             .unwrap(),
         );
@@ -1785,10 +1780,7 @@ mod tests {
         let target = MemoryHandle::Pg(
             PgMemoryStore::connect(
                 &dsn,
-                EmbedConfig {
-                    dim: 64,
-                    ..EmbedConfig::default()
-                },
+                offline_embed(64),
                 Some(&schema),
             )
             .await
@@ -1835,10 +1827,7 @@ mod tests {
         let schema = format!("memtest_{}_vecmode", std::process::id());
         let s = PgMemoryStore::connect(
             &dsn,
-            EmbedConfig {
-                dim: 64,
-                ..EmbedConfig::default()
-            },
+            offline_embed(64),
             Some(&schema),
         )
         .await
@@ -1924,10 +1913,7 @@ mod tests {
             return;
         };
         let schema = format!("memtest_{}_reconnect", std::process::id());
-        let embed = EmbedConfig {
-            dim: 64,
-            ..EmbedConfig::default()
-        };
+        let embed = offline_embed(64);
         let (first, _) = {
             let s = PgMemoryStore::connect(&dsn, embed.clone(), Some(&schema))
                 .await
@@ -1956,10 +1942,7 @@ mod tests {
         let schema = format!("memtest_{}_polyfill", std::process::id());
         let s = PgMemoryStore::connect(
             &dsn,
-            EmbedConfig {
-                dim: 64,
-                ..EmbedConfig::default()
-            },
+            offline_embed(64),
             Some(&schema),
         )
         .await
@@ -2028,10 +2011,7 @@ mod tests {
         // exists for.
         let s64 = PgMemoryStore::connect(
             &dsn,
-            EmbedConfig {
-                dim: 64,
-                ..EmbedConfig::default()
-            },
+            offline_embed(64),
             Some(&schema),
         )
         .await
@@ -2041,10 +2021,7 @@ mod tests {
             .unwrap();
         let s32 = PgMemoryStore::connect(
             &dsn,
-            EmbedConfig {
-                dim: 32,
-                ..EmbedConfig::default()
-            },
+            offline_embed(32),
             Some(&schema),
         )
         .await
