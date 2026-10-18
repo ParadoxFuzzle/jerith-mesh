@@ -107,7 +107,14 @@ impl MemoryStore {
         let conn = Connection::open(path)
             .with_context(|| format!("opening memory db {}", path.display()))?;
         conn.execute_batch(
+            // WAL's documented operational mode: synchronous=NORMAL keeps
+            // app-crash durability while dropping the per-transaction
+            // fsync — measured here (10k-row corpus build): 60.4 s FULL →
+            // sub-second NORMAL. Only an OS power failure can lose the
+            // most recent checkpoints, an acceptable trade for a
+            // retention-capped chat-memory cache.
             "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS memories (
                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
                  text        TEXT NOT NULL,
@@ -2208,27 +2215,24 @@ use super::*;
     }
 
     // =========================================================================
-    // Release-mode benchmark — `#[ignore]` so the normal battery stays fast.
+    // Release-mode benchmarks — `#[ignore]` so the normal battery stays fast.
     //   cargo test --release -p jerith-mesh-core --lib memory::tests::bench_ \
     //       -- --ignored --nocapture
-    // Numbers are medians over interleaved A/B runs on one shared in-memory
-    // store, so both paths always scan the identical corpus.
+    // Numbers are medians over interleaved A/B runs: each bench rebuilds the
+    // pre-optimizer scan on the SAME store the current path uses, cross-
+    // checks winners/scores, and only then times both. One in-memory, one
+    // file-backed WAL (the shipped deployment shape).
     // =========================================================================
 
-    /// A/B at the MAX_MEMORY_ROWS retention cap: the pre-optimizer scan
-    /// (per-row unpack + full hit list + O(n log n) sort) against the
-    /// current allocation-free scan + O(n) top-k + pk refetch.
-    #[tokio::test]
-    #[ignore = "release-mode benchmark; run with --ignored --nocapture"]
-    async fn bench_sqlite_search_at_retention_cap() {
-        const ROWS: usize = crate::memory::MAX_MEMORY_ROWS as usize;
-        let s = MemoryStore::open_in_memory(offline_embed(256)).unwrap();
+    const BENCH_ROWS: usize = MAX_MEMORY_ROWS as usize;
 
-        let embed_start = std::time::Instant::now();
-        for i in 0..ROWS {
-            // Unique tokens make every row distinct; i%97 extra repeated
-            // tokens change each row's normalized mass, so scores order
-            // strictly (one-hot bags would tie every equal-overlap row).
+    /// Populate the A/B corpus: unique tokens make every row distinct,
+    /// `i % 97` extra repeated tokens change each row's normalized mass —
+    /// scores order strictly (one-hot equal-overlap rows tie exactly, and
+    /// tied rows may lawfully swap spots between selection strategies).
+    async fn bench_corpus(s: &MemoryStore) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        for i in 0..BENCH_ROWS {
             s.embed_and_store(&format!(
                 "alpha kiln note entry {i}{}",
                 " x".repeat(i % 97)
@@ -2236,56 +2240,57 @@ use super::*;
             .await
             .unwrap();
         }
-        let embed_total = embed_start.elapsed();
+        start.elapsed()
+    }
 
+    /// The pre-optimizer scan for comparison, on the same store/query.
+    async fn old_search(
+        s: &MemoryStore,
+        query: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<MemoryHit>> {
+        let (qvec, _) = s.embed_text(query).await?;
+        let conn = s.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT id, text, dim, embedding, provider, created_ms FROM memories")
+            .context("preparing memory query")?;
+        let mut hits: Vec<MemoryHit> = stmt
+            .query_map([], |row| {
+                let bytes: Vec<u8> = row.get(3)?;
+                let provider_s: String = row.get(4)?;
+                let mut hit = MemoryHit {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    score: 0.0,
+                    dim: row.get::<_, i64>(2)? as usize,
+                    provider: provider_from_str(&provider_s),
+                    created_ms: row.get(5)?,
+                };
+                hit.score = cosine(&qvec, &unpack_vector(&bytes));
+                Ok(hit)
+            })
+            .context("scanning memories")?
+            .filter_map(|r| r.ok())
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
+    /// Cross-check + interleaved A/B timing on one shared store, printed.
+    async fn run_search_ab(s: &MemoryStore, top_k: usize, label: &str) {
         let query = "alpha kiln note";
-        let top_k = 5;
 
-        // The old path, replicated with the original helpers so the whole
-        // comparison rides the same connection and corpus.
-        async fn old_search(
-            s: &MemoryStore,
-            query: &str,
-            top_k: usize,
-        ) -> anyhow::Result<Vec<MemoryHit>> {
-            let (qvec, _) = s.embed_text(query).await?;
-            let conn = s.conn.lock().await;
-            let mut stmt = conn
-                .prepare("SELECT id, text, dim, embedding, provider, created_ms FROM memories")
-                .context("preparing memory query")?;
-            let mut hits: Vec<MemoryHit> = stmt
-                .query_map([], |row| {
-                    let bytes: Vec<u8> = row.get(3)?;
-                    let provider_s: String = row.get(4)?;
-                    let mut hit = MemoryHit {
-                        id: row.get(0)?,
-                        text: row.get(1)?,
-                        score: 0.0,
-                        dim: row.get::<_, i64>(2)? as usize,
-                        provider: provider_from_str(&provider_s),
-                        created_ms: row.get(5)?,
-                    };
-                    hit.score = cosine(&qvec, &unpack_vector(&bytes));
-                    Ok(hit)
-                })
-                .context("scanning memories")?
-                .filter_map(|r| r.ok())
-                .collect();
-            hits.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            hits.truncate(top_k);
-            Ok(hits)
+        // Shared corpus now serves both paths; keep it hot before timing.
+        for _ in 0..2 {
+            old_search(s, query, top_k).await.unwrap();
+            s.search(query, top_k).await.unwrap();
         }
-
-        // Correctness cross-check (also keeps both paths un-elidable).
-        // Scores must agree elementwise; winner ids must agree too —
-        // unless exact score ties straddle the kth boundary, where both
-        // the old full-sort-truncate and the new partition may lawfully
-        // pick different members of the tied set.
-        let old_hits = old_search(&s, query, top_k).await.unwrap();
+        let old_hits = old_search(s, query, top_k).await.unwrap();
         let new_hits = s.search(query, top_k).await.unwrap();
         let old_scores: Vec<f32> = old_hits.iter().map(|h| h.score).collect();
         let new_scores: Vec<f32> = new_hits.iter().map(|h| h.score).collect();
@@ -2295,11 +2300,12 @@ use super::*;
         let old_ids: Vec<i64> = old_hits.iter().map(|h| h.id).collect();
         let new_ids: Vec<i64> = new_hits.iter().map(|h| h.id).collect();
         if old_ids != new_ids {
+            // Legal only when exact score ties straddle the kth boundary.
             assert!(
                 old_scores.windows(2).any(|w| (w[0] - w[1]).abs() < 1e-6),
                 "winner ids differ without a boundary tie: old={old_ids:?} new={new_ids:?}"
             );
-            println!("  (note: boundary score tie — tied rows may swap legal spots)");
+            println!("  ({label} note: boundary tie — tied rows swap legal spots)");
         }
 
         let runs = 9;
@@ -2308,7 +2314,7 @@ use super::*;
         for _ in 0..runs {
             old_times.push({
                 let t = std::time::Instant::now();
-                old_search(&s, query, top_k).await.unwrap();
+                old_search(s, query, top_k).await.unwrap();
                 t.elapsed()
             });
             new_times.push({
@@ -2320,11 +2326,32 @@ use super::*;
         old_times.sort_unstable();
         new_times.sort_unstable();
         let median = |v: &[std::time::Duration]| v[v.len() / 2];
-        println!();
         println!(
-            "bench memory::search @ {ROWS} rows, top_k {top_k} — corpus build: {embed_total:?}"
+            "bench memory::search [{label}] @ {BENCH_ROWS} rows, top_k {top_k}:  old {:>10?}  new {:>10?}",
+            median(&old_times),
+            median(&new_times)
         );
-        println!("  old (unpack + full sort):  {:>10?}", median(&old_times));
-        println!("  new (blob-scan top-k):     {:>10?}", median(&new_times));
+    }
+
+    #[tokio::test]
+    #[ignore = "release-mode benchmark; run with --ignored --nocapture"]
+    async fn bench_sqlite_search_in_memory() {
+        let s = MemoryStore::open_in_memory(offline_embed(256)).unwrap();
+        let build = bench_corpus(&s).await;
+        println!("  [in-memory] corpus build: {build:?}");
+        run_search_ab(&s, 5, "in-memory").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "release-mode benchmark; run with --ignored --nocapture"]
+    async fn bench_sqlite_search_file_backed() {
+        let dir = std::env::temp_dir().join(format!("jerith-mem-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = MemoryStore::open(&dir.join("mem.sqlite"), offline_embed(256)).unwrap();
+        let build = bench_corpus(&s).await;
+        println!("  [file-backed WAL] corpus build: {build:?}");
+        run_search_ab(&s, 5, "file-backed WAL").await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
