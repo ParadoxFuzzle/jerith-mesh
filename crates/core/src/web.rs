@@ -147,6 +147,8 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div></div>
   <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
   <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
+  <div class="card"><h2>Trend (5-min buckets)</h2><p id="trend">—</p><div class="fine" id="trendfine">per-bucket load, oldest → newest</div></div>
+  <div class="card"><h2>Mesh peers served</h2><p id="peerlist" style="font-size:.9rem">—</p><div class="fine" id="peerfine">per-peer latency breakdown</div></div>
   <div class="card"><h2>Pipeline routes</h2><p id="pipeline">—</p><div class="fine" id="pipelinefine">multi-hop walks</div></div>
 </div>
 <footer>
@@ -213,6 +215,44 @@ async function refresh() {
       document.getElementById('latency').textContent = '—';
       document.getElementById('latencyfine').textContent =
         'no completions in the window yet';
+    }
+    // Ops observability: 5-minute trend buckets (bounded ring on the
+    // node) rendered as a text sparkline, plus the per-peer latency
+    // breakdown of who actually served the mesh chat for us.
+    if (mj && Array.isArray(mj.history) && mj.history.length) {
+      const hist = mj.history;
+      const counts = hist.map((b) => b.requests ?? 0);
+      const top = Math.max(...counts, 1);
+      document.getElementById('trend').innerHTML =
+        '<svg width="190" height="34" viewBox="0 0 190 34" preserveAspectRatio="none">' +
+        counts.map((c, i) => {
+          const h = Math.round(30 * c / top) + 1;
+          return '<rect x="' + i * 1.55 + '" y="' + (32 - h) + '" width="1.4" height="' + h +
+            " fill='#58a6ff'></rect>";
+        }).join('') + '</svg>';
+      const lastH = hist.slice(-12); // last hour
+      const req = lastH.reduce((s, b) => s + (b.requests ?? 0), 0);
+      const lat = lastH.reduce((s, b) => s + (b.latency_ms_total ?? 0), 0);
+      const mesh = lastH.reduce((s, b) => s + (b.mesh_served ?? 0), 0);
+      document.getElementById('trendfine').textContent =
+        `last hour: ${req} requests · mean ${req ? Math.round(lat / req) : '—'} ms` +
+        ` · mesh-served ${mesh}/${req} · buckets ${hist.length}, 5 min each`;
+    } else {
+      document.getElementById('trend').textContent = '—';
+      document.getElementById('trendfine').textContent = 'no completions recorded yet';
+    }
+    if (mj && Array.isArray(mj.peers) && mj.peers.length) {
+      const short = (id) => (id || '?').slice(0, 10);
+      document.getElementById('peerlist').textContent =
+        mj.peers.map((p) =>
+          `${short(p.peer)} ${p.requests}× ${p.requests ? p.latency_ms_mean ?? '—' : '—'}ms ${p.ok_percent ?? 0}%`
+        ).join(' · ');
+      document.getElementById('peerfine').textContent =
+        `${mj.peers.length} peer${mj.peers.length === 1 ? '' : 's'} this window · id, count, mean ms, ok%`;
+    } else {
+      document.getElementById('peerlist').textContent = '—';
+      document.getElementById('peerfine').textContent =
+        'no mesh-peer completions yet (local runtime only)';
     }
     // M3 pipeline routes: counters exist and are tested; the live
     // producer rides the routing transport (pending the Colibri-side

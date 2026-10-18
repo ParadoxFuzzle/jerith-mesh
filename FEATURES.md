@@ -496,6 +496,21 @@ Phased — see ARCHITECTURE.md §8 for the full layered plan:
   - bandwidth-only ceilings arm the governor (a previously no-op config is
     now a live one); 5 dedicated isolate tests (trip/shed/skip/hold/recover
     + state publication)
+- ✅ Ops observability: metrics history + per-peer latency view (Phase 5+
+  item, landed 2026-10-18) — the metering layer (`core::metrics`) keeps
+  two bounded structures beyond the (shorter) recent-record ring:
+  5-minute trend buckets (`BUCKET_MS` epoch-aligned, 120 retained = 10 h,
+  oldest dropped; a clock-rewound stamp skips the bucket update rather
+  than inserting mid-ring) and a per-peer served breakdown (bounded at
+  128 peers; an unseen peer beyond the cap folds into one honest
+  `_other` row instead of unbounded map growth). Both ride `/v1/metrics`
+  (`history`, `peers` — additive keys), and the dashboard renders them:
+  a sparkline card (`trend` — the bucket bars, fine line carrying
+  last-hour requests / mean latency / mesh share) and a "mesh peers
+  served" card (per-peer id, count, mean ms, ok %). 6 new metrics tests
+  pin the aggregation, the bounds, the overflow fold and the rewound-
+  clock skip; the page's CSP re-pins to the edited script's sha256
+  automatically (digests computed from PAGE at first request).
 - ✅ Backup/restore/migrate full node state (Phase 2) — `jerith backup
   create|verify|restore` over one self-describing checksummed container
   (`core::backup`, magic+version / manifest frame / per-entry sha256+payload
@@ -831,10 +846,13 @@ gotchas surfaced while building the finished parts.
   hnsw-less with exact scans — documented, silent-skip on the index
   build). Postgres connection pooling only when query concurrency
   actually grows — one client is the right default at this size.
-- **Ops observability**: metrics history beyond the single window (ring
-  retention on the node, trend lines on the dashboard), per-peer latency
-  breakdowns, and expert-budget telemetry once budgeting lands
-  (Phase 3).
+- ✅ **Ops observability** (Phase 5+ item, landed 2026-10-18 — see §12 for
+  the full shape): 5-minute trend buckets (bounded 10 h ring) + a
+  per-peer latency breakdown ride `/v1/metrics`, and the dashboard
+  renders both — a sparkline card (last-hour requests/mean/mesh share
+  over the bucket bars) and a "mesh peers served" card (id, count, mean
+  ms, ok % per answering peer).
+- **Expert-budget telemetry once budgeting lands (Phase 3)**:
 - **Testing posture**: the env-gated live-PG tests (`JERITH_TEST_PG_URL`,
   `JERITH_TEST_PG_URL_NOEXT`) are the pattern to copy for any future
   backend (chain node smoke tests are the likely next adopter) — skip

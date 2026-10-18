@@ -294,6 +294,23 @@ async fn metrics_handler(State(gw): State<Arc<Gateway>>) -> impl IntoResponse {
             }),
         );
     }
+    // Per-peer breakdown with the same derived views rendered per row.
+    let peers: Vec<serde_json::Value> = snap
+        .peers
+        .iter()
+        .map(|p| {
+            json!({
+                "peer": p.peer,
+                "requests": p.requests,
+                "ok": p.ok,
+                "failed": p.failed,
+                "ok_percent": p.ok_percent(),
+                "latency_ms_mean": p.latency_ms_mean(),
+                "latency_ms_max": p.latency_ms_max,
+                "tokens_total": p.tokens_total,
+            })
+        })
+        .collect();
     Json(json!({
         "window_started_ms": snap.window_started_ms,
         "requests_total": snap.requests_total,
@@ -302,6 +319,8 @@ async fn metrics_handler(State(gw): State<Arc<Gateway>>) -> impl IntoResponse {
         "tokens_total": snap.tokens_total,
         "models": models,
         "recent": snap.recent,
+        "peers": peers,
+        "history": snap.history,
     }))
 }
 

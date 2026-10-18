@@ -27,6 +27,18 @@ use serde::Serialize;
 /// Ring cap: recent completions retained verbatim (oldest dropped).
 const RING_CAP: usize = 500;
 
+/// History bucket width: the trend view aggregates completed completions
+/// into fixed five-minute buckets (epoch-aligned) so the dashboard can draw
+/// load/latency over time from a bounded structure instead of re-reading
+/// the (shorter) record ring.
+const BUCKET_MS: u64 = 300_000;
+/// Retained buckets: 5 min × 120 = 10 h of history, oldest dropped.
+const HISTORY_CAP: usize = 120;
+/// Cap on the per-peer breakdown. The peer registry is already bounded,
+/// but a hostile alias storm must not balloon /v1/metrics: beyond the cap
+/// an unknown peer folds into a single `_other` row.
+const PEER_CAP: usize = 128;
+
 // ---- Security-reject counters (process-local, monotonic) ----
 //
 // 429s from the shared rate limiter and size-bound rejections (chat
@@ -128,6 +140,48 @@ impl ModelStats {
     }
 }
 
+/// Per-peer served aggregates — who actually answered the mesh for us.
+/// Same shape as the per-model view, keyed by the node id in
+/// `CompletionRecord::served_by`, so ops can see a slow or flaky peer
+/// without grepping ring records.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct PeerStats {
+    pub peer: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub failed: u64,
+    pub latency_ms_total: u64,
+    pub latency_ms_max: u64,
+    pub tokens_total: u64,
+}
+
+impl PeerStats {
+    /// Mean latency in ms (0 when no requests).
+    pub fn latency_ms_mean(&self) -> u64 {
+        self.latency_ms_total
+            .checked_div(self.requests)
+            .unwrap_or(0)
+    }
+    /// Success ratio in percent (0 when no requests).
+    pub fn ok_percent(&self) -> u64 {
+        (self.ok * 100).checked_div(self.requests).unwrap_or(0)
+    }
+}
+
+/// One time slice (BUCKET_MS wide) for the trend view: counts, latency
+/// and the mesh share of the completions that landed inside it.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct HistoryBucket {
+    /// Epoch ms of the bucket start (multiple of BUCKET_MS).
+    pub started_ms: u64,
+    pub requests: u64,
+    pub ok: u64,
+    pub latency_ms_total: u64,
+    pub latency_ms_max: u64,
+    /// Completions served by mesh peers (vs the local runtime).
+    pub mesh_served: u64,
+}
+
 /// Full snapshot — the /v1/metrics body.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct MetricsSnapshot {
@@ -143,6 +197,11 @@ pub struct MetricsSnapshot {
     pub window_started_ms: u64,
     /// M3 pipeline-route counters (see “PipelineMetrics”).
     pub pipeline: PipelineMetrics,
+    /// Per-peer served aggregates (mesh-chat attribution), oldest record
+    /// order aside: sorted by node id (BTreeMap iteration order).
+    pub peers: Vec<PeerStats>,
+    /// 5-minute trend buckets, oldest first (bounded to HISTORY_CAP).
+    pub history: Vec<HistoryBucket>,
 }
 
 /// Pipeline route counters (M3, FEATURES §13): planned and timed route
@@ -168,6 +227,10 @@ pub struct Metrics {
 struct MetricsInner {
     ring: Vec<CompletionRecord>,
     models: BTreeMap<String, ModelStats>,
+    /// Per-peer served breakdown (bounded: see PEER_CAP).
+    peers: BTreeMap<String, PeerStats>,
+    /// 5-minute trend buckets, oldest first (bounded: see HISTORY_CAP).
+    history: Vec<HistoryBucket>,
     requests_total: u64,
     ok_total: u64,
     failed_total: u64,
@@ -201,7 +264,8 @@ impl Metrics {
     pub fn record(&self, rec: CompletionRecord) {
         let mut inner = self.inner.lock().expect("metrics lock");
         inner.requests_total += 1;
-        if rec.status < 400 {
+        let ok = rec.status < 400;
+        if ok {
             inner.ok_total += 1;
         } else {
             inner.failed_total += 1;
@@ -209,7 +273,7 @@ impl Metrics {
         inner.tokens_total += rec.total_tokens;
         let entry = inner.models.entry(rec.model.clone()).or_default();
         entry.requests += 1;
-        if rec.status < 400 {
+        if ok {
             entry.ok += 1;
         } else {
             entry.failed += 1;
@@ -221,6 +285,59 @@ impl Metrics {
         entry.total_tokens += rec.total_tokens;
         if rec.served_by.is_some() {
             entry.mesh_served += 1;
+        }
+        // Per-peer breakdown (bounded). Beyond the cap an unseen peer folds
+        // into `_other` — one honest overflow row instead of unbounded map
+        // growth from a hostile alias storm.
+        if let Some(peer) = rec.served_by.as_deref() {
+            let key = if inner.peers.contains_key(peer) || inner.peers.len() < PEER_CAP {
+                peer.to_string()
+            } else {
+                "_other".to_string()
+            };
+            let p = inner.peers.entry(key.clone()).or_default();
+            p.peer = key;
+            p.requests += 1;
+            if ok {
+                p.ok += 1;
+            } else {
+                p.failed += 1;
+            }
+            p.latency_ms_total += rec.latency_ms;
+            p.latency_ms_max = p.latency_ms_max.max(rec.latency_ms);
+            p.tokens_total += rec.total_tokens;
+        }
+        // Trend buckets (bounded). Records carry a monotonic epoch stamp in
+        // normal operation; a stamp older than the newest bucket (clock
+        // rewound mid-run) skips the bucket update rather than inserting
+        // into the middle of the ring.
+        let idx = rec.at_ms / BUCKET_MS;
+        match inner.history.last_mut() {
+            // The record lands inside the newest bucket: update in place.
+            Some(b) if b.started_ms == idx * BUCKET_MS => {
+                b.requests += 1;
+                b.ok += u64::from(ok);
+                b.latency_ms_total += rec.latency_ms;
+                b.latency_ms_max = b.latency_ms_max.max(rec.latency_ms);
+                b.mesh_served += u64::from(rec.served_by.is_some());
+            }
+            // Older than the newest bucket — skip, never insert mid-ring.
+            Some(b) if b.started_ms > idx * BUCKET_MS => {}
+            // First bucket ever, or a newer epoch: open a new bucket.
+            _ => {
+                inner.history.push(HistoryBucket {
+                    started_ms: idx * BUCKET_MS,
+                    requests: 1,
+                    ok: u64::from(ok),
+                    latency_ms_total: rec.latency_ms,
+                    latency_ms_max: rec.latency_ms,
+                    mesh_served: u64::from(rec.served_by.is_some()),
+                });
+                if inner.history.len() > HISTORY_CAP {
+                    let excess = inner.history.len() - HISTORY_CAP;
+                    inner.history.drain(..excess);
+                }
+            }
         }
         inner.ring.push(rec);
         if inner.ring.len() > RING_CAP {
@@ -285,6 +402,8 @@ impl Metrics {
                 over_budget_hops: inner.pipeline_over_budget_hops,
                 last_route_ms: inner.pipeline_last_route_ms,
             },
+            peers: inner.peers.values().cloned().collect(),
+            history: inner.history.clone(),
         }
     }
 }
@@ -340,6 +459,129 @@ mod tests {
         assert_eq!(snap.requests_total, (RING_CAP + 10) as u64);
         // Oldest dropped: first retained is the 11th record.
         assert_eq!(snap.recent[0].total_tokens, 10);
+    }
+
+    fn rec_at(
+        model: &str,
+        status: u16,
+        latency_ms: u64,
+        peer: Option<&str>,
+        at_ms: u64,
+    ) -> CompletionRecord {
+        CompletionRecord {
+            model: model.to_string(),
+            latency_ms,
+            status,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            served_by: peer.map(str::to_string),
+            at_ms,
+        }
+    }
+
+    #[test]
+    fn per_peer_breakdown_attributes_latency_successfully() {
+        let m = Metrics::new();
+        m.record(rec_at("m", 200, 100, Some("peer-aa"), 1_000));
+        m.record(rec_at("m", 200, 300, Some("peer-aa"), 2_000));
+        m.record(rec_at("m", 502, 40, Some("peer-zz"), 3_000));
+        // Local-runtime completion: never a peer row.
+        m.record(rec_at("m", 200, 50, None, 4_000));
+        let snap = m.snapshot();
+        assert_eq!(snap.peers.len(), 2, "sorted by node id");
+        let (aa, zz) = (&snap.peers[0], &snap.peers[1]);
+        assert_eq!(aa.peer, "peer-aa");
+        assert_eq!(aa.requests, 2);
+        assert_eq!(aa.latency_ms_mean(), 200);
+        assert_eq!(aa.latency_ms_max, 300);
+        assert_eq!(aa.ok_percent(), 100);
+        assert_eq!(zz.peer, "peer-zz");
+        assert_eq!(zz.requests, 1);
+        assert_eq!(zz.ok_percent(), 0);
+    }
+
+    #[test]
+    fn peer_breakdown_overflow_folds_into_other() {
+        let m = Metrics::new();
+        for i in 0..(PEER_CAP + 3) {
+            m.record(rec_at("m", 200, 10, Some(&format!("peer-{i:03}")), 1_000));
+        }
+        let snap = m.snapshot();
+        assert_eq!(snap.peers.len(), PEER_CAP + 1, "cap + _other row");
+        // '_' (0x5F) sorts before 'p' (0x70): the overflow row comes FIRST
+        // in the id-sorted vector, so look it up rather than take last().
+        let other = snap
+            .peers
+            .iter()
+            .find(|p| p.peer == "_other")
+            .expect("_other row exists");
+        assert_eq!(other.requests, 3, "peers beyond the cap fold here");
+        // A known peer stored before the cap keeps filling its own row.
+        m.record(rec_at("m", 200, 10, Some("peer-000"), 1_100));
+        let snap = m.snapshot();
+        assert_eq!(snap.peers.first().unwrap().peer, "_other");
+        let zero = snap
+            .peers
+            .iter()
+            .find(|p| p.peer == "peer-000")
+            .expect("pre-cap peer row");
+        assert_eq!(zero.requests, 2);
+    }
+
+    #[test]
+    fn history_buckets_aggregate_by_epoch_slice_and_bound() {
+        let m = Metrics::new();
+        // Same 5-min bucket: merged in place.
+        m.record(rec_at("m", 200, 100, Some("p"), BUCKET_MS + 1));
+        m.record(rec_at("m", 200, 300, None, BUCKET_MS + 2));
+        // Next bucket: new entry; mesh attribution carried.
+        m.record(rec_at("m", 502, 50, Some("p"), BUCKET_MS * 2 + 1));
+        let snap = m.snapshot();
+        assert_eq!(snap.history.len(), 2);
+        let (b0, b1) = (&snap.history[0], &snap.history[1]);
+        assert_eq!(b0.started_ms, BUCKET_MS);
+        assert_eq!(b0.requests, 2);
+        assert_eq!(b0.ok, 2);
+        assert_eq!(b0.latency_ms_max, 300);
+        assert_eq!(b0.mesh_served, 1);
+        assert_eq!(b1.started_ms, BUCKET_MS * 2);
+        assert_eq!(b1.ok, 0);
+        // Bounded: the bound loop opens BUCKET epochs *40..*(40+241) on
+        // top of the two earlier buckets; only the newest HISTORY_CAP
+        // survive (oldest dropped, 5-min each).
+        for i in 0..(HISTORY_CAP * 2 + 1) {
+            m.record(rec_at(
+                "m",
+                200,
+                10,
+                None,
+                BUCKET_MS * u64::try_from(40 + i).unwrap(),
+            ));
+        }
+        let snap = m.snapshot();
+        assert_eq!(snap.history.len(), HISTORY_CAP);
+        assert_eq!(
+            snap.history.first().unwrap().started_ms,
+            BUCKET_MS * u64::try_from(40 + HISTORY_CAP + 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn history_bucket_skips_a_clock_rewound_record() {
+        let m = Metrics::new();
+        m.record(rec_at("m", 200, 100, None, BUCKET_MS * 5));
+        // A stamp suddenly in the past must not disturb the newest bucket
+        // (monotonic clock contract; a rewound stamp is a broken client),
+        // and must not insert mid-ring either.
+        m.record(rec_at("m", 200, 100, None, 3));
+        let snap = m.snapshot();
+        assert_eq!(snap.history.len(), 1);
+        assert_eq!(snap.history[0].requests, 1);
+        assert_eq!(snap.history[0].started_ms, BUCKET_MS * 5);
+        // The record itself still lands in the aggregates + ring.
+        assert_eq!(snap.requests_total, 2);
+        assert_eq!(snap.recent.len(), 2);
     }
 
     #[test]
