@@ -44,6 +44,29 @@ OOXML = {
 
 MAX_ZIP_XML_BYTES = 32 * 1024 * 1024  # refuse absurd members before decompress
 
+# Archive members: per-member byte cap (a crafted member can't flood the
+# story) and the text-like extensions we dearchivate.
+MAX_MEMBER_BYTES = 256 * 1024
+ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".gz", ".bz2", ".xz", ".7z", ".rar")
+ZIP_TEXT_EXTS = {
+    "txt", "md", "rst", "csv", "tsv", "json", "yaml", "yml", "toml", "ini",
+    "log", "xml", "html", "htm", "svg", "py", "js", "ts", "rs", "go", "c",
+    "cpp", "h", "hpp", "sh", "bat", "sql", "tex", "srt", "vtt",
+}
+
+
+def is_text_like(name):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return ext in ZIP_TEXT_EXTS
+
+
+def cap_listing(names, n=20):
+    return ", ".join(names[:n]) + ("…" if len(names) > n else "")
+
+
+def if_(cond, a, b):
+    return a if cond else b
+
 
 def emit(key, status, content=""):
     """One deterministic per-file block; the bot's Rust parser keys the
@@ -119,15 +142,60 @@ def read_ooxml(path, ext):
 
 
 def read_zip(path):
+    """Listing first, then the text-like members — nested files are the
+    interest, not just the manifest. One level deep, honestly bounded."""
     try:
         with zipfile.ZipFile(path) as zf:
-            names = zf.namelist()
+            names = [n for n in zf.namelist() if not n.endswith("/")]
+            story = ["archive (%d files): %s" % (len(names), cap_listing(names))]
+            text_members = [n for n in names if is_text_like(n)]
+            picked = [m for m in text_members if not m.lower().endswith(ARCHIVE_SUFFIXES)][:6]
+            for m in picked:
+                info = zf.getinfo(m)
+                if info.file_size > MAX_MEMBER_BYTES:
+                    story.append("[%s] (member too large: %d bytes — not extracted)" % (m, info.file_size))
+                    continue
+                body = zf.read(m).decode("utf-8", errors="replace").strip()
+                story.append("[%s] %s" % (m, if_(body == "", "(empty)", cap_text(body))))
+            nested = [n for n in text_members if n.lower().endswith(ARCHIVE_SUFFIXES)]
+            if nested:
+                story.append("(nested archives skipped: %d — %s)" % (len(nested), cap_listing(nested)))
+            skipped = len(text_members) - len(picked) - len(nested)
+            if skipped > 0:
+                story.append("(+%d text members skipped — member cap)" % skipped)
     except zipfile.BadZipFile:
         return ("binary", "not a valid archive")
     except Exception as e:  # noqa: BLE001
         return ("error", str(e)[:120])
-    listing = ", ".join(names[:50])
-    return ("ok", "archive with %d entries: %s%s" % (len(names), listing, "…" if len(names) > 50 else ""))
+    return ("ok", "\n".join(story))
+
+
+def read_tar(path):
+    """tar/tar.gz/tgz/tar.bz2/tar.xz through stdlib tarfile (no unpack to
+    disk — member bodies are read in-memory and bounded)."""
+    import tarfile
+
+    try:
+        with tarfile.open(path, "r:*") as tf:
+            files = [m for m in tf.getmembers() if m.isreg()]
+            story = ["archive (%d files): %s" % (len(files), cap_listing([m.name for m in files]))]
+            text_members = [m for m in files if is_text_like(m.name)]
+            picked = [m for m in text_members if not m.name.lower().endswith(ARCHIVE_SUFFIXES)][:6]
+            for m in picked:
+                if m.size > MAX_MEMBER_BYTES:
+                    story.append("[%s] (member too large: %d bytes — not extracted)" % (m.name, m.size))
+                    continue
+                f = tf.extractfile(m)
+                body = (f.read(1024 * 1024).decode("utf-8", errors="replace").strip() if f else "")
+                story.append("[%s] %s" % (m.name, if_(body == "", "(empty)", cap_text(body))))
+            skipped = len(text_members) - len(picked)
+            if skipped > 0:
+                story.append("(+%d text members skipped — member cap)" % skipped)
+    except tarfile.TarError:
+        return ("binary", "not a valid tar archive")
+    except Exception as e:  # noqa: BLE001
+        return ("error", str(e)[:120])
+    return ("ok", "\n".join(story))
 
 
 def main():
@@ -140,8 +208,10 @@ def main():
                 emit(key, "error:", "file did not stage")
             elif ext == "pdf":
                 emit(key, *read_pdf(path))
-            elif ext in ("zip",):
+            elif label.lower().endswith(".zip"):
                 emit(key, *read_zip(path))
+            elif label.lower().endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+                emit(key, *read_tar(path))
             elif ext in OOXML or ext == "pptx":
                 emit(key, *read_ooxml(path, ext))
             else:

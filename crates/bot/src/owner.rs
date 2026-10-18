@@ -35,8 +35,9 @@ pub const OPENCLAW_CONFIG_PATH: &str = ".openclaw/openclaw.json";
 /// `help`) or confined to the caller's own data (own chat, own memory
 /// notes, own JER wallet via `mine`; chain mining is a per-user wallet
 /// feature, not node/host control).
-pub const USER_COMMANDS: [&str; 12] = [
+pub const USER_COMMANDS: [&str; 13] = [
     "ask",
+    "read",
     "reset",
     "remember",
     "recall",

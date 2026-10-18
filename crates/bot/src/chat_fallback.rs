@@ -130,6 +130,8 @@ pub async fn handle(
                 } else {
                     crate::converse::AttKind::Other
                 },
+                id: Some(a.id.get()),
+                size: Some(a.size as u64),
             })
             .collect()
     } else {
@@ -147,8 +149,13 @@ pub async fn handle(
         // be slow; the typing indicator already covers the wait):
         // failures land as honest bracketed lines inside the prompt, never
         // a silent drop.
-        let prompt = match crate::converse::attachments_context(&cfg, &attachments, Some(&prompt))
-            .await
+        let prompt = match crate::converse::attachments_context(
+            &cfg,
+            &state,
+            &attachments,
+            Some(&prompt),
+        )
+        .await
         {
             Some(ctx) => format!("{ctx}\n{prompt}"),
             None => prompt,

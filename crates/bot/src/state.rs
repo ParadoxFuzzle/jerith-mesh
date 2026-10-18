@@ -4,7 +4,7 @@
 //! keeps no user data on disk beyond what the node's own memory skill
 //! already stores.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,10 +37,34 @@ struct UserState {
     tokens_used: u64,
 }
 
+/// Bounded sandbox-extraction cache: attachment id (and filename+size as
+/// the fallback — forwarded files keep the original attachment id, re-
+/// uploads of the same file keep name+size) → the per-file extraction
+/// result (extracted-text context value, successes only; failures stay
+/// re-runnable on the next ask). In-memory, capped, TTL-bounded: a bot
+/// restart clears it, exactly like the chat history ring.
+const SANDBOX_CACHE_CAP: usize = 64;
+const SANDBOX_CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
+#[derive(Debug, Default)]
+struct SandboxCache {
+    entries: HashMap<String, (Result<String, String>, Instant)>,
+    order: VecDeque<String>,
+}
+
+fn sandbox_cache_keys(id: Option<u64>, label: &str, size: Option<u64>) -> Vec<String> {
+    let name_key = format!("n:{label}:{}", size.unwrap_or(0));
+    match id {
+        Some(i) => vec![format!("a:{i}"), name_key],
+        None => vec![name_key],
+    }
+}
+
 /// Shared bot state: per-user memory + cooldowns.
 #[derive(Debug, Default)]
 pub struct BotStateInner {
     users: Mutex<HashMap<u64, UserState>>,
+    sandbox_cache: Mutex<SandboxCache>,
 }
 
 pub type BotState = Arc<BotStateInner>;
@@ -181,6 +205,55 @@ impl BotStateInner {
         gate(&mut st.last_cmd, CMD_COOLDOWN, "this command")
     }
 
+    /// Hit the sandbox-extraction cache: the attachment id first, the
+    /// filename+size fallback second. TTL-expired entries read as misses.
+    pub fn sandbox_cache_get(
+        &self,
+        id: Option<u64>,
+        label: &str,
+        size: Option<u64>,
+    ) -> Option<Result<String, String>> {
+        let cache = self.sandbox_cache.lock().expect("sandbox cache lock");
+        for key in sandbox_cache_keys(id, label, size) {
+            if let Some((val, at)) = cache.entries.get(&key)
+                && at.elapsed() < SANDBOX_CACHE_TTL
+            {
+                return Some(val.clone());
+            }
+        }
+        None
+    }
+
+    /// Store a fresh extraction under both keys. Bounded: entries beyond
+    /// the cap evict oldest-first (a shared name+size entry losing its
+    /// order slot only costs the id-key lookup, never correctness).
+    pub fn sandbox_cache_put(
+        &self,
+        id: Option<u64>,
+        label: &str,
+        size: Option<u64>,
+        val: Result<String, String>,
+    ) {
+        let mut cache = self.sandbox_cache.lock().expect("sandbox cache lock");
+        let SandboxCache { entries, order } = &mut *cache;
+        let now = Instant::now();
+        for key in sandbox_cache_keys(id, label, size) {
+            if let Some((_, at)) = entries.get(&key)
+                && at.elapsed() < SANDBOX_CACHE_TTL
+            {
+                continue; // keep the original/fresher entry
+            }
+            entries.insert(key.clone(), (val.clone(), now));
+            order.push_back(key);
+        }
+        // Expired entries prune first; the cap evicts by insertion order.
+        order.retain(|k| matches!(entries.get(k), Some((_, at)) if at.elapsed() < SANDBOX_CACHE_TTL));
+        while order.len() > SANDBOX_CACHE_CAP {
+            let Some(evict) = order.pop_front() else { break };
+            entries.remove(&evict);
+        }
+    }
+
     /// Context-squeeze pacing: true at most once per `min_interval_secs`
     /// per user — bounds the mesh-summary round-trips stage 3 can spend.
     pub fn try_gate_squeeze(&self, user: u64, min_interval_secs: u64) -> bool {
@@ -289,6 +362,50 @@ mod tests {
         let s = state();
         assert!(s.gate_cmd(9).is_ok());
         assert!(s.gate_cmd(9).is_err());
+    }
+
+    #[test]
+    fn sandbox_cache_hits_by_id_and_by_name_size_fallback() {
+        let s = state();
+        s.sandbox_cache_put(Some(7), "note.txt", Some(27), Ok("fire at 980".into()));
+        // id key hits (same file forwarded with its id)
+        assert_eq!(
+            s.sandbox_cache_get(Some(7), "note.txt", Some(27)).unwrap(),
+            Ok("fire at 980".to_string())
+        );
+        // name+size fallback: same file re-uploaded without an id
+        assert_eq!(
+            s.sandbox_cache_get(None, "note.txt", Some(27)).unwrap(),
+            Ok("fire at 980".to_string())
+        );
+        // a different file (different size, no id) is a miss — no false
+        // hits. (The id key IS authoritative: one Discord attachment id
+        // is one upload, so a differing label with a known id is an
+        // unreachable state, not something the cache defends against.)
+        assert!(s.sandbox_cache_get(None, "note.txt", Some(99)).is_none());
+        assert!(s.sandbox_cache_get(None, "other.txt", Some(27)).is_none());
+    }
+
+    #[test]
+    fn sandbox_cache_cap_evicts_oldest_first() {
+        let s = state();
+        // id-less files contribute one key each; 3 files beyond the cap
+        // push the first ones out of the bounded window.
+        let total = SANDBOX_CACHE_CAP + 3;
+        for i in 0..total {
+            s.sandbox_cache_put(
+                None,
+                &format!("f{i}.txt"),
+                Some(i as u64),
+                Ok(format!("body {i}")),
+            );
+        }
+        assert!(s.sandbox_cache_get(None, "f0.txt", Some(0)).is_none(), "oldest evicted");
+        assert!(
+            s.sandbox_cache_get(None, &format!("f{}.txt", total - 1), Some((total - 1) as u64))
+                .is_some(),
+            "newest cached"
+        );
     }
 
     #[test]

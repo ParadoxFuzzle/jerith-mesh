@@ -87,14 +87,17 @@ pub const IMAGE_ONLY_PROMPT: &str = "What's in this image? Describe it";
 pub const MAX_IMAGES_PER_MESSAGE: usize = 3;
 
 /// What a transport hands over per attachment: the CDN url, display
-/// label (the filename) and the kind that routes it — images through
+/// label (the filename), the kind that routes it — images through
 /// the gateway's vision skill, everything else through the Docker
-/// sandbox ([sandbox] config, see sandbox.rs).
+/// sandbox ([sandbox] config, see sandbox.rs) — plus the Discord
+/// attachment id and byte size feeding the extraction cache.
 #[derive(Debug, Clone)]
 pub struct AttSpec {
     pub url: String,
     pub label: String,
     pub kind: AttKind,
+    pub id: Option<u64>,
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +137,7 @@ fn assemble_attachment_context(lines: &[(String, Result<String, String>)]) -> Op
 /// say, no block.
 pub async fn attachments_context(
     cfg: &crate::config::BotConfig,
+    state: &crate::state::BotState,
     attachments: &[AttSpec],
     question: Option<&str>,
 ) -> Option<String> {
@@ -146,8 +150,13 @@ pub async fn attachments_context(
         .map(str::trim)
         .filter(|q| !q.is_empty())
         .unwrap_or(IMAGE_ONLY_PROMPT);
-    let mut lines = Vec::with_capacity(attachments.len());
+    // Results land in ATTACHMENT ORDER (lines mirror the iteration; a
+    // sandbox slot is pre-filled with a placeholder that the batch run
+    // overwrites once its value lands).
+    let mut lines: Vec<(String, Result<String, String>)> = Vec::with_capacity(attachments.len());
     let mut file_batch = Vec::new();
+    let mut batch_meta: Vec<(Option<u64>, Option<u64>)> = Vec::new(); // (id, size) per batch entry
+    let mut batch_slots: Vec<usize> = Vec::new(); // line slot per batch entry
     let mut images_used = 0usize;
     for att in attachments {
         match att.kind {
@@ -168,6 +177,13 @@ pub async fn attachments_context(
                 lines.push(entry);
             }
             AttKind::Other => {
+                if let Some(hit) = state.sandbox_cache_get(att.id, &att.label, att.size) {
+                    lines.push((att.label.clone(), hit));
+                    continue;
+                }
+                batch_meta.push((att.id, att.size));
+                batch_slots.push(lines.len());
+                lines.push((att.label.clone(), Err("extraction pending".to_string())));
                 file_batch.push(crate::sandbox::FileAttachment {
                     url: att.url.clone(),
                     label: att.label.clone(),
@@ -175,12 +191,22 @@ pub async fn attachments_context(
             }
         }
     }
-    // One sandbox container reads every file in the batch — capped by
-    // [sandbox] max_files (message order kept), each outcome an honest
-    // line. Images carry their own MAX cap.
+    // One sandbox container reads every un-cached file in the batch —
+    // capped by [sandbox] max_files (message order kept), each outcome
+    // an honest line. Successes feed the extraction cache; failures stay
+    // re-runnable on the next ask.
     file_batch.truncate(cfg.sandbox.max_files);
+    batch_meta.truncate(cfg.sandbox.max_files);
+    batch_slots.truncate(cfg.sandbox.max_files);
     if !file_batch.is_empty() {
-        lines.extend(crate::sandbox::read_attachments(&cfg.sandbox, &file_batch).await);
+        let out = crate::sandbox::read_attachments(&cfg.sandbox, &file_batch).await;
+        for (out_i, (slot, (label, val))) in batch_slots.iter().zip(out).enumerate() {
+            lines[*slot].1 = val;
+            if lines[*slot].1.is_ok() {
+                let (id, size) = batch_meta[out_i];
+                state.sandbox_cache_put(id, &label, size, lines[*slot].1.clone());
+            }
+        }
     }
     assemble_attachment_context(&lines)
 }
@@ -543,18 +569,24 @@ mod tests {
         cfg.gateway_url = format!("http://{addr}");
 
         let url = format!("http://{addr}/img.png");
+        let state = crate::state::new_state();
         let ctx = attachments_context(
             &cfg,
+            &state,
             &[
                 AttSpec {
                     url: url.clone(),
                     label: "kiln.png".into(),
                     kind: AttKind::Image,
+                    id: None,
+                    size: None,
                 },
                 AttSpec {
                     url: "http://127.0.0.1:1/missing.png".into(),
                     label: "ghost.png".into(),
                     kind: AttKind::Image,
+                    id: None,
+                    size: None,
                 },
             ],
             Some("what is it?"),
@@ -617,18 +649,24 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let cfg = cfg();
 
+        let state = crate::state::new_state();
         let ctx = attachments_context(
             &cfg,
+            &state,
             &[
                 AttSpec {
                     url: format!("http://{addr}/note.txt"),
                     label: "note.txt".into(),
                     kind: AttKind::Other,
+                    id: Some(11),
+                    size: Some(27),
                 },
                 AttSpec {
                     url: format!("http://{addr}/blob.bin"),
                     label: "blob.bin".into(),
                     kind: AttKind::Other,
+                    id: Some(12),
+                    size: Some(4),
                 },
             ],
             Some("summarize what was sent"),
@@ -640,5 +678,27 @@ mod tests {
             "sandbox text: {ctx}"
         );
         assert!(ctx.contains("- [blob.bin] (binary file"), "{ctx}");
+        // The extraction landed in the cache: a SECOND pass with live
+        // urls REMOVED (pointing nowhere) still returns the same text —
+        // the note.txt id+name+size keys hit, re-forwarded files are free.
+        let dead = format!("http://{addr}/removed-note.txt");
+        let again = attachments_context(
+            &cfg,
+            &state,
+            &[AttSpec {
+                url: dead,
+                label: "note.txt".into(),
+                kind: AttKind::Other,
+                id: Some(11),
+                size: Some(27),
+            }],
+            Some("summarize what was sent"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            again.contains("- [note.txt] kiln schedule: fire at 980"),
+            "cache hit: {again}"
+        );
     }
 }

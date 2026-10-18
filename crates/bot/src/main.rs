@@ -214,6 +214,10 @@ async fn main() -> anyhow::Result<()> {
                 commands::lore(),
                 commands::status(),
                 commands::peers(),
+                // User-level in owner.rs: reads only attachments the
+                // invoker supplies, through the same Docker sandbox
+                // every chat attachment already rides.
+                commands::read(),
                 // Deliberately unclassified in owner.rs USER_COMMANDS:
                 // inbox contents are owner's eyes only (default-deny gate).
                 commands::mail(),

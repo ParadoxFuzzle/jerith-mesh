@@ -48,8 +48,12 @@ its auth and introspects it:
   "could not read: sandbox …"). Safety contract lives in
   `crates/bot/src/sandbox.rs` (`--network none`, caps dropped, read-only
   rootfs, uid 65534, fresh staging dir per message); knobs in bot.toml
-  `[sandbox]`. Missing docker only degrades files to honest
-  "could not read" lines — images (vision tier) are unaffected.
+  `[sandbox]`. Successful extractions cache per Discord attachment id
+  (+ filename/size fallback; 64 entries, 2 h TTL) — re-forwarded files
+  don't re-run the container, restart clears it. Archives read as a
+  listing plus the nested text members (bounded). `/read <attachment>`
+  shows the extraction on demand; missing docker only degrades files to
+  honest "could not read" lines — images (vision tier) are unaffected.
 - **CLI** (read-only):
   ```
   jerith chain status              # height, supply, wallet counts, mining stats

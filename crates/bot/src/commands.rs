@@ -27,6 +27,73 @@ fn user_id(ctx: &Ctx<'_>) -> u64 {
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Show a file's sandbox-extracted content on demand.
+#[poise::command(slash_command, broadcast_typing)]
+pub async fn read(
+    ctx: Ctx<'_>,
+    #[description = "The file to read (attach it when you send this command)"]
+    file: serenityall::Attachment,
+) -> Result<(), Error> {
+    let user = user_id(&ctx);
+    if let Err(msg) = ctx.data().state.gate_cmd(user) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    ctx.defer().await?;
+    // The same routing the chat context uses: images get the vision
+    // skill's description, other files get the Docker sandbox read —
+    // and the extraction cache means a re-sent file doesn't re-run the
+    // container.
+    let kind = if file
+        .content_type
+        .as_deref()
+        .is_some_and(|t| t.starts_with("image/"))
+    {
+        crate::converse::AttKind::Image
+    } else {
+        crate::converse::AttKind::Other
+    };
+    let spec = crate::converse::AttSpec {
+        url: file.url.clone(),
+        label: file.filename.clone(),
+        kind,
+        id: Some(file.id.get()),
+        size: Some(file.size as u64),
+    };
+    let block = match
+        crate::converse::attachments_context(
+            &ctx.data().cfg,
+            &ctx.data().state,
+            std::slice::from_ref(&spec),
+            None,
+        )
+        .await
+    {
+        Some(b) => b,
+        None => format!("- [{}] (no readable content)", file.filename),
+    };
+    // Body only (drop the block header), Discord-bounded, honest tail
+    // when the extraction ran longer than one message can show.
+    let body = block
+        .lines()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    let (shown, note) = if body.chars().count() > 1600 {
+        let total = body.chars().count();
+        (
+            body.chars().take(1600).collect::<String>(),
+            format!("\n_(…truncated — {} chars extracted in total)_", total),
+        )
+    } else {
+        (body, String::new())
+    };
+    ctx.say(format!("📄 {shown}{note}")).await?;
+    Ok(())
+}
+
 /// Ask the mesh a question (inherits the gateway's mesh-peer fallback).
 #[poise::command(slash_command, prefix_command, broadcast_typing)]
 pub async fn ask(

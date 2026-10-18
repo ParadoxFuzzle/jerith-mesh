@@ -220,12 +220,22 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     baked into the bot binary via include_str! — filenames are data,
     never executed) reads text/code raw (binary-sniffed), .pdf through
     pdftotext (first 10 pages), the OOXML/ODF family through stdlib
-    zipfile+untagging, and .zip as an entry listing. Every per-file
+    zipfile+untagging, and archives (.zip/.tar/.tar.gz/tgz/tar.bz2/
+    tar.xz) as a bounded listing PLUS the nested text-like members'
+    bodies (256 KiB and 6 members per archive; nested archives and
+    oversized members honestly skipped, not dropped). Extractions cache
+    per Discord attachment id (+ filename/size fallback for re-uploads)
+    — a re-forwarded file doesn't re-run the container (BotState cache:
+    64 entries, 2 h TTL, successes only; failures stay re-runnable).
+    `/read` shows a file's sandbox-extracted content on demand (attach
+    with the command; images get their vision description), Discord-
+    bounded with an honest truncation tail. Every per-file
     outcome — extracted text, `(binary file, N bytes)`, or the honest
     `(could not read: …)` line — reaches the prompt; nothing drops
     silently. Tests cover argv construction/label-injection, output
-    parsing, hostile names, and a LIVE container round-trip over an
-    axum stub (text + binary); verified live with a real whitepaper PDF
+    parsing, hostile names, cache hits/eviction, and a LIVE container
+    round-trip over an axum stub (text + binary) plus a second-pass
+    cache hit against dead URLs; verified live with a real whitepaper PDF
   `/reset`, `/remember`, `/recall`, `/status`, `/peers`, `/mine`, `/help`;
   per-user chat history (in-memory, capped) + per-user cooldowns; token via
   `JERITH_DISCORD_TOKEN` or `~/.jerith-mesh/bot.toml`; gateway/chain URLs via
