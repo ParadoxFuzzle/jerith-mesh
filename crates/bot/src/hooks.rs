@@ -39,6 +39,11 @@ pub const MAX_IN_FLIGHT: usize = 8;
 pub const EV_SKILL_INVOKED: &str = "skill_invoked";
 pub const EV_GUARD_VIOLATION: &str = "guard_violation";
 pub const EV_MINE_WON: &str = "mine_won";
+/// Human-in-the-loop bridge events (FEATURES §15, approval.rs). The
+/// requested event carries id + coarse action (never model args); the
+/// resolved event carries id + terminal status.
+pub const EV_APPROVAL_REQUESTED: &str = "approval_requested";
+pub const EV_APPROVAL_RESOLVED: &str = "approval_resolved";
 
 /// `[hooks]` in bot.toml. Empty `urls` (the default) keeps the feature off.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]

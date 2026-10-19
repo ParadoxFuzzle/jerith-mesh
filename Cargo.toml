@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/node", "crates/bot"]
+members = ["crates/node", "crates/bot", "crates/gcp-bridge"]
 resolver = "2"
 
 [workspace.package]
@@ -29,6 +29,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 futures-core = "0.3"
 futures-util = "0.3"
 quinn = "0.11"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["rustls", "connect"] }
 regex = "1"
 base64 = "0.22"
 poise = "0.7"

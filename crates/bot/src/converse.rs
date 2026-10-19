@@ -57,10 +57,15 @@ pub trait ConversationSink: Send + Sync {
 
 /// What a transport hands the pipeline: the per-user routing key plus
 /// the raw prompt (speaker-tagged inside `run_session` in the
-/// model-visible shape the transport provides).
+/// model-visible shape the transport provides) and whether this session
+/// may admit owner-only plugins. Privileged sessions are owner DMs
+/// only (`owner.rs`'s trust model): the transport computes it — a guild
+/// channel is never privileged, a guest's DM never either — and the
+/// pipeline maps it onto the chat registry (`[plugins] owner_only`).
 pub struct Session {
     pub user: u64,
     pub prompt: String,
+    pub owner_privileged: bool,
 }
 
 /// How a transport decides post-session delivery when a chat returns
@@ -224,7 +229,7 @@ pub async fn run_session(
     speaker_prefix: &str,
     sink: &mut Option<Arc<dyn ConversationSink>>,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let Session { user, prompt } = session;
+    let Session { user, prompt, owner_privileged } = session;
 
     let history0 = state.history(user);
     let history = if cfg.squeeze.enabled {
@@ -250,7 +255,7 @@ pub async fn run_session(
     let live: Option<&api::LiveTap> = tap.as_deref();
 
     let (reply, served_by, tokens) =
-        api::chat_with_usage_live(cfg, &prompt, &history, live).await?;
+        api::chat_with_usage_live(cfg, &prompt, &history, live, owner_privileged).await?;
     state.record_usage(user, tokens);
     state.push_turn(user, &prompt, &reply);
     let text = format_reply(&reply, served_by.as_deref());
@@ -398,6 +403,7 @@ mod tests {
             Session {
                 user: 42,
                 prompt: "ping".into(),
+                owner_privileged: false,
             },
             "[Discord user: tester (username tester, id 42)]\n",
             &mut boxed,
@@ -443,6 +449,7 @@ mod tests {
             Session {
                 user: 9,
                 prompt: "ping".into(),
+                owner_privileged: false,
             },
             "",
             &mut boxed,
@@ -481,6 +488,7 @@ mod tests {
             Session {
                 user: 7,
                 prompt: "ping".into(),
+                owner_privileged: false,
             },
             "",
             &mut boxed,

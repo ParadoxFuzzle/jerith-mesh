@@ -1132,3 +1132,98 @@ advisory anywhere in any crate's dependency graph breaks the build;
 the accepted six cannot silently grow. Maintenance rule: whenever a new
 advisory is accepted-with-reason, it gets a runbook paragraph and an
 audit.toml entry in the same commit — never one without the other.
+
+## Telegram approver channel (approval bridge, live 2026-10-19)
+
+The `[approvals]` table in `~/.jerith-mesh/bot.toml` (file is 0600) now
+carries a live Telegram pair — pending approval cards fan out to the
+owner's chat with an inline ✔ Approve / ✕ Deny keyboard, and **only that
+chat id may resolve**. Verified that day: `getMe` ok (@Jerithbot), a real
+card delivered via `sendMessage`, poller long-polling clean in the
+journal (it is silent while armed — it only logs on dispatch failures,
+so absence of `telegram approval notice failed` lines is the healthy
+signature).
+
+```bash
+# Health: config pair present + service active + no dispatch errors
+grep -A3 '\[approvals\]' ~/.jerith-mesh/bot.toml
+systemctl --user is-active jerith-bot
+journalctl --user -u jerith-bot --since "1h ago" | grep -ic 'telegram approval notice failed'
+
+# Token rotation (creds are in bot.toml, keep the file 0600):
+edit ~/.jerith-mesh/bot.toml   # replace telegram_bot_token
+systemctl --user restart jerith-bot
+
+# Store checkpoint state (one 0600 JSON per request):
+ls ~/.jerith-mesh/bot/approvals/        # <id>.json, status per file
+# Sweeper expires pending cards after [approvals] ttl_minutes (default 60).
+```
+
+Round-trip drill (maintenance only): `FEATURES.md §15` documents the
+`#[ignore]`d `approval::tests::live_telegram_roundtrip` harness — fires
+one REAL card (persisted into this real store, Telegram chat gets it,
+the running bot resolves the ✔ press and executes a harmless deferred
+`memory.embed`), then print the id. Never run it from a temp-config
+suite: the card must persist in this store and resolve in the live bot.
+
+## External chat transports (11 platforms, dormant, 2026-10-19)
+
+`crates/bot/src/transports/` ships adapters for IRC, Slack (Socket
+Mode), Twitch, Mattermost, Signal (signal-cli daemon), Nextcloud Talk,
+MS Teams, Google Chat, Feishu/Lark, WhatsApp Cloud, and GG. ALL ARE
+DORMANT: a platform runs only if its `[transports.<platform>]` table
+exists in bot.toml — no table, no task, zero cost (so the bot that
+ships today behaves exactly as before). See FEATURES §17 for the
+per-platform inbound/outbound surface and `transports/<platform>.rs`
+module doc for the setup contract (tokens, endpoints, caps).
+
+```bash
+# Arm a platform: add its table + restart (fail-loud errors explain gaps)
+edit ~/.jerith-mesh/bot.toml   # e.g. [transports.irc] server/channel/nick
+systemctl --user restart jerith-bot
+
+# Health: task is running + which platforms came up
+journalctl --user -u jerith-bot | grep -E 'transports starting|transport '
+
+# The webhook in-box (Teams / Google Chat / WhatsApp / Slack Events):
+# [transports.webinbox] bind = "127.0.0.1:5543" (+ slack_signing_secret,
+# allow_unverified flags; front the public side with your TLS proxy).
+# WhatsApp verification needs [transports.whatsapp] app_secret (fail-closed).
+```
+
+Token hygiene: platform tokens live under `[transports.*]` in bot.toml
+(0600); rotate by edit + restart, same as the Discord lane. All
+platforms write their logs under the shared tracing names
+(`transport = "<platform>"`), and a task that dies repeatedly logs
+`transport failed permanently` only on a config-level fatal — service
+blips fan back internally with backoff.
+
+## MongoDB Atlas lane (native driver, OFF pending credential fix — 2026-10-19)
+
+`crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is
+complete and tested (driver 3.x: rustls + dns-resolver + zlib-compression
++ bson-2/compat-3-3-0): boot validates config, connects, pings the
+cluster's admin db, and installs a shared handle for future features —
+and a failure there is NO fatality (typed log, lane off, bot continues:
+the 2026-10-19 crash-loop from a block_on-inside-runtime calling hole
+was fixed to an awaited async init the same day).
+
+Current blocker: the supplied Atlas pair is rejected by the cluster
+itself — `SCRAM failure: bad auth : Authentication failed (AtlasError
+8000)`. Everything upstream is verified good (SRV DNS, TLS, zlib
+handshake, we reach the cluster). Fix path:
+
+```bash
+# 1. In the Atlas console (cluster0): check the DB user name + reset its
+#    password (or create one) with project access from this host.
+# 2. Update bot.toml:
+edit ~/.jerith-mesh/bot.toml   # [mongo] uri = "mongodb+srv://user:pass@…"
+                               # enabled = false → true
+# 3. Verify BEFORE restarting the service (maintenance harness):
+JERITH_DISCORD_TOKEN=x cargo test -p jerith-mesh-bot \
+  mongo::tests::atlas_ping -- --ignored --exact --nocapture
+# 4. systemctl --user restart jerith-bot   # boot log: "mongodb pinged OK"
+```
+
+Never log or paste the uri with credentials; the journal carries the
+database name and the ping verdict only.

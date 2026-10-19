@@ -10,7 +10,9 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Legacy placeholder some code paths still carry — only used if the
 /// gateway's /status could not tell us the real runtime model.
-const MODEL_PLACEHOLDER: &str = "jerith-mesh";
+/// The gateway's model placeholder — pub(crate) so other bot surfaces
+/// (pipeline.rs summarize leg) ride the same default-routing id.
+pub(crate) const MODEL_PLACEHOLDER: &str = "jerith-mesh";
 
 /// Resolved runtime model per gateway URL, fetched once per URL per
 /// process (a bot's config is fixed at startup; tests run several — the
@@ -356,7 +358,7 @@ pub async fn chat_with_usage(
     prompt: &str,
     raw_history: &[Value],
 ) -> Result<(String, Option<String>, u64)> {
-    chat_with_usage_live(cfg, prompt, raw_history, None).await
+    chat_with_usage_live(cfg, prompt, raw_history, None, false).await
 }
 
 /// Chat with token accounting AND a live tap: when `[chat] stream` is on
@@ -373,6 +375,7 @@ pub async fn chat_with_usage_live(
     prompt: &str,
     raw_history: &[Value],
     live: Option<&LiveTap>,
+    owner_privileged: bool,
 ) -> Result<(String, Option<String>, u64)> {
     // Context squeeze (OpenClaw context-squeeze port): compact the history
     // before it rides the request when it blows the configured budget.
@@ -464,9 +467,19 @@ pub async fn chat_with_usage_live(
     }
 
     let url = format!("{}/v1/chat/completions", cfg.gateway_url);
-    let model = runtime_model(cfg)
+    let mut model = runtime_model(cfg)
         .await
         .unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
+    // Task-enum router (FEATURES §17, router.rs): when `[router]` is
+    // enabled, the tiny constrained classifier picks a specialized LOCAL
+    // lane for code/data-style prompts (the classification is a direct,
+    // schema-frozen ollama call — sample-level grammar, no parse-back).
+    // Disabled, degraded, or a remote-looking lane → no swap, the
+    // runtime's own tiering keeps doing what it did before.
+    if let Some(lane) = crate::router::maybe_lane_model(cfg, prompt).await {
+        tracing::info!(from = %model, to = %lane, "task router swapped the local lane");
+        model = lane;
+    }
 
     // Web access (OpenClaw stack migration): the chat request declares the
     // enabled plugins' skills as OpenAI tools, so a tool-capable runtime can
@@ -474,9 +487,19 @@ pub async fn chat_with_usage_live(
     // registry decides what's summonable; see plugins.rs). Unsupported
     // model/runtimes get exactly one toolless retry below — tools degrade,
     // never fail the chat.
+    // Owner-privileged sessions (owner DMs, see owner.rs): the
+    // `[plugins] owner_only` skills join the registry AND the registry is
+    // marked owner-privileged — the second mark is what dispatch demands
+    // of owner-only gates (external:gcp AND the in-tree coordinator/
+    // workflows plugins), so even a leak of those ids into a plain
+    // enabled set can't invoke them. Non-owner surfaces build the exact
+    // registry they always built.
+    let mut reg = crate::plugins::SkillRegistry::standard(cfg.plugins.enabled.clone());
+    if owner_privileged {
+        reg = reg.join(&cfg.plugins.owner_only).owner_privileged();
+    }
     let registry = std::sync::Arc::new(
-        crate::plugins::SkillRegistry::standard(cfg.plugins.enabled.clone())
-            .with_external(cfg.external_plugins.clone())
+        reg.with_external(cfg.external_plugins.clone())
             .expect("external drops validated at config load"),
     );
     // Tool round budget — `[chat] max_tool_rounds` (default 2): a
@@ -490,7 +513,8 @@ pub async fn chat_with_usage_live(
     // story/paste (long, no question) must not make the model invent a
     // web_search for it — observed live: a user posted a short story and
     // the model web-searched a line out of it, then answered "{}".
-    let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt);
+    let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt)
+        || (owner_privileged && !registry.enabled_skill_names().is_empty());
 
     let mut rounds = 0usize;
     // One retry against a degenerate answer, whichever lane produced it.
@@ -2065,9 +2089,10 @@ mod tests {
                 tap_seen.lock().expect("test tap").push(frag.to_string());
             }
         };
-        let (reply, served_by, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live))
-            .await
-            .expect("streamed chat");
+        let (reply, served_by, tokens) =
+            chat_with_usage_live(&cfg, "say hi", &[], Some(&live), false)
+                .await
+                .expect("streamed chat");
         assert_eq!(reply, "live typed");
         assert!(served_by.is_none());
         assert_eq!(tokens, 7);
@@ -2117,7 +2142,7 @@ mod tests {
                 tap_seen.lock().expect("test tap").push(frag.to_string());
             }
         };
-        let (reply, _s, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live))
+        let (reply, _s, tokens) = chat_with_usage_live(&cfg, "say hi", &[], Some(&live), false)
             .await
             .expect("buffered chat");
         assert_eq!(reply, "buffered");
@@ -2205,6 +2230,7 @@ mod tests {
             "Where is the isopress kiln built?",
             &[],
             Some(&live),
+            false,
         )
         .await
         .expect("tool-streamed chat");
@@ -2290,7 +2316,7 @@ mod tests {
             }
         };
         let (reply, _served_by, _tokens) =
-            chat_with_usage_live(&cfg, "where is the kiln?", &[], Some(&live))
+            chat_with_usage_live(&cfg, "where is the kiln?", &[], Some(&live), false)
                 .await
                 .expect("tool-slop chat");
         // The answer landed and is exactly the toolless round's text.
@@ -2382,6 +2408,7 @@ mod tests {
             "say hi",
             &[json!({"role": "user", "content": "earlier"})],
             Some(&live),
+            false,
         )
         .await
         .expect("json-hold chat");

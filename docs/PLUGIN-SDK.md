@@ -1,11 +1,16 @@
 # Plugin SDK (Phase 3+)
 
-**Status: Phase 3a is implemented** — external skills ship in the bot:
-manifest drops in `~/.jerith-mesh/plugins.d/` parse fail-closed at boot
-(`crates/bot/src/external.rs`), join the skill registry
-(`SkillRegistry::with_external`), gate via `external:<id>` in
-`[plugins] enabled`, and dispatch over the signed HTTP contract below.
-Everything else (transports, packaging) remains design.
+**Status: Phase 3a + 3b + transports are implemented** — external
+skills ship (`crates/bot/src/external.rs`, manifests in
+`~/.jerith-mesh/plugins.d/`), the dialogue core ships
+(`crates/bot/src/converse.rs`, the `ConversationSink` + `run_session`
+seam Role 2 proposed), and the **transports layer now exists**:
+`crates/bot/src/transports/` (FEATURES §17, 2026-10-19) — IRC, Slack,
+Twitch, Mattermost, Signal, Nextcloud Talk, MS Teams, Google Chat,
+Feishu/Lark, WhatsApp, GG as dormant `[transports.*]` adapters over
+the shared core, plus the `webinbox` loopback listener for push-only
+platforms. Packaging (Phase 3d template crates) remains design.
+All dormant until their bot.toml table exists, per the module doc.
 
 This document pre-registers how plugins leave the compiled-in model
 (`crates/bot/src/plugins.rs`, in-tree Rust) so the skills/channels

@@ -185,6 +185,27 @@ fn default_ollama_url() -> String {
     "http://127.0.0.1:11434".to_string()
 }
 
+/// `[coordinator]` in the node config — the mesh coordinator (FEATURES:
+/// named worker registry + hand-off channel + shared memory pool) ships
+/// ON; the kill switch exists for operators who want a smaller surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinatorConfig {
+    #[serde(default = "default_coordinator_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_coordinator_enabled(),
+        }
+    }
+}
+
+fn default_coordinator_enabled() -> bool {
+    true
+}
+
 fn default_embedding_model() -> String {
     crate::toolstack::default_small_model(crate::toolstack::ModelTier::Embedding)
         .name
@@ -345,6 +366,12 @@ pub struct NodeConfig {
     /// a boot-time misconfiguration, not a silent SQLite swap.
     #[serde(default)]
     pub memory_dsn: Option<String>,
+    /// Mesh coordinator (FEATURES — named worker registry + hand-off
+    /// channel + shared memory pool): ON by default with the store at
+    /// `<data>/coordinator.db`; `[coordinator] enabled = false` removes
+    /// the `/v1/coordinator/*` HTTP surface from the gateway port.
+    #[serde(default)]
+    pub coordinator: CoordinatorConfig,
     pub bootstrap_url: String,
     pub crypto: CryptoConfig,
     pub specialists: SpecialistConfig,
@@ -782,6 +809,7 @@ impl Default for NodeConfig {
             contribution_percent: MIN_CONTRIBUTION_PERCENT,
             memory_backend: MemoryBackend::Sqlite,
             memory_dsn: None,
+            coordinator: CoordinatorConfig::default(),
             bootstrap_url: "https://p2p.jerithai.com".to_string(),
             crypto: CryptoConfig::default(),
             specialists: SpecialistConfig::default(),

@@ -118,6 +118,84 @@ pub struct BotConfig {
     /// repo-built `jerith-sandbox` image; missing docker degrades to
     /// honest per-file failure lines, never a silent drop.
     pub sandbox: SandboxConfig,
+    /// Multi-bot coordination (`[coordinator]` in bot.toml, see
+    /// coordinator.rs): named worker loops claiming the mesh hand-off
+    /// channel with per-worker model routing. Default on — loops only
+    /// exist for workers registered by the owner.
+    pub coordinator: CoordinatorBotConfig,
+    /// Workflow recording (`[workflows]` in bot.toml, see workflows.rs):
+    /// chrome binary/display for the owner-driven recorder + replay
+    /// budget. Defaults work on a desktop host with chrome installed.
+    pub workflows: WorkflowsConfig,
+    /// Human-in-the-loop approval bridge (`[approvals]` in bot.toml, see
+    /// approval.rs): deferred critical actions + Approve/Deny channels.
+    pub approvals: crate::approval::ApprovalConfig,
+    /// Local-model task router (`[router]` in bot.toml, see router.rs):
+    /// schema-constrained classification → specialized ollama lane.
+    /// Default OFF (opt-in; the runtime keeps its normal tiering).
+    pub router: crate::router::RouterConfig,
+    /// External chat transports (FEATURES §17): every platform is an
+    /// optional table under `[transports.*]` — absent = dormant, free.
+    pub transports: crate::transports::TransportsConfig,
+    /// MongoDB Atlas connection lane (mongo.rs) — absent table = disabled.
+    pub mongo: crate::mongo::MongoConfig,
+}
+
+/// `[workflows]` in bot.toml — the owner-DM-only browser record/replay
+/// surface (workflows.rs).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkflowsConfig {
+    /// Chrome for the recorder + headless replay.
+    #[serde(default = "default_chrome_binary")]
+    pub chrome_binary: String,
+    /// Display the recorder window opens on (the owner's desktop).
+    #[serde(default = "default_recorder_display")]
+    pub recorder_display: String,
+    /// Wall-clock cap for one replay run (clamped 30–600).
+    #[serde(default = "default_run_budget_secs")]
+    pub run_budget_secs: u64,
+}
+
+impl Default for WorkflowsConfig {
+    fn default() -> Self {
+        Self {
+            chrome_binary: default_chrome_binary(),
+            recorder_display: default_recorder_display(),
+            run_budget_secs: default_run_budget_secs(),
+        }
+    }
+}
+
+fn default_chrome_binary() -> String {
+    "google-chrome".to_string()
+}
+
+fn default_recorder_display() -> String {
+    ":0".to_string()
+}
+
+fn default_run_budget_secs() -> u64 {
+    120
+}
+
+/// `[coordinator] enabled = true` in bot.toml — the named-worker
+/// supervisor (claims + solve loops) rides the mesh coordinator surface.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CoordinatorBotConfig {
+    #[serde(default = "default_coordinator_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for CoordinatorBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_coordinator_enabled(),
+        }
+    }
+}
+
+fn default_coordinator_enabled() -> bool {
+    true
 }
 
 /// Docker-sandboxed attachment reading (`[sandbox]` in bot.toml).
@@ -256,6 +334,8 @@ impl BotConfig {
                     &external_plugins,
                 )
                 .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
+                crate::plugins::SkillRegistry::check_owner_only(&cfg.owner_only, &external_plugins)
+                    .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
                 cfg
             },
             owner_discord_id,
@@ -290,6 +370,23 @@ impl BotConfig {
                 s
             },
             external_plugins,
+            coordinator: file.coordinator.clone().unwrap_or_default(),
+            workflows: {
+                let mut wf = file.workflows.clone().unwrap_or_default();
+                wf.run_budget_secs = wf.run_budget_secs.clamp(30, 600);
+                wf
+            },
+            approvals: {
+                let mut a = file.approvals.unwrap_or_default();
+                a.ttl_minutes = a.ttl_minutes.clamp(1, 2880);
+                a.prune_resolved_hours = a.prune_resolved_hours.clamp(1, 168);
+                a.validate()
+                    .map_err(|e| anyhow::anyhow!("{} (in {})", e, path.display()))?;
+                a
+            },
+            router: file.router.unwrap_or_default(),
+            transports: file.transports.unwrap_or_default(),
+            mongo: file.mongo.unwrap_or_default(),
         })
     }
 
@@ -349,6 +446,12 @@ impl BotConfig {
             chat_stream: true,
             chat_max_tool_rounds: DEFAULT_CHAT_MAX_TOOL_ROUNDS as usize,
             sandbox: SandboxConfig::default(),
+            coordinator: CoordinatorBotConfig::default(),
+            workflows: WorkflowsConfig::default(),
+            approvals: crate::approval::ApprovalConfig::default(),
+            router: crate::router::RouterConfig::default(),
+            transports: crate::transports::TransportsConfig::default(),
+            mongo: crate::mongo::MongoConfig::default(),
         }
     }
 }
@@ -621,23 +724,45 @@ struct FileConfig {
     /// Optional `[sandbox]` table — Docker-sandboxed attachment reading
     /// (see sandbox.rs; on by default with the repo-built image).
     sandbox: Option<SandboxConfig>,
+    /// Optional `[coordinator]` table — named-worker loops (see coordinator.rs).
+    coordinator: Option<CoordinatorBotConfig>,
+    /// Optional `[workflows]` table — browser record/replay (workflows.rs).
+    workflows: Option<WorkflowsConfig>,
+    /// Optional `[approvals]` table — human-in-the-loop bridge (approval.rs).
+    approvals: Option<crate::approval::ApprovalConfig>,
+    /// Optional `[router]` table — local task-enum router (router.rs).
+    router: Option<crate::router::RouterConfig>,
+    /// Optional `[transports]` table — external chat platforms
+    /// (FEATURES §17, see transports/mod.rs + its per-platform files).
+    transports: Option<crate::transports::TransportsConfig>,
+    /// Optional `[mongo]` table — MongoDB Atlas connection lane
+    /// (see mongo.rs). Absent = disabled.
+    mongo: Option<crate::mongo::MongoConfig>,
 }
 
 /// `[plugins] enabled = [...]` — names the pre-packaged plugins that
 /// stay available. Defaults to every plugin on; unknown ids fail the
 /// load (fail-loud config, like the rest of the bot).
+///
+/// `[plugins] owner_only = [...]` — external drops (`external:<id>`, e.g.
+/// the gcp bridge) whose skills join the tool registry ONLY in owner-DM
+/// chat sessions. Never listed in `enabled` (validated apart, fail-loud);
+/// see plugins.rs `OWNER_ONLY_PLUGINS` for why.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PluginsConfig {
     #[serde(default = "default_plugins_enabled")]
     pub enabled: Vec<String>,
+    #[serde(default)]
+    pub owner_only: Vec<String>,
 }
 
 impl Default for PluginsConfig {
     /// All pre-packaged plugins on (empty would mean the bot forgets its
-    /// own web tools — an uninstallable default).
+    /// own web tools — an uninstallable default); no owner-only plugins.
     fn default() -> Self {
         Self {
             enabled: default_plugins_enabled(),
+            owner_only: Vec::new(),
         }
     }
 }

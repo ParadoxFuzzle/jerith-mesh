@@ -23,7 +23,21 @@ hmac = "0.12"
 sha2 = "0.10"
 base64.workspace = true
 futures-util.workspace = true
+# Approval-request ids (40-bit unguessable codes; see approval.rs).
+rand.workspace = true
 tokio-postgres = "0.7"
+# MongoDB (Atlas) native driver — [mongo] in bot.toml (mongo.rs).
+mongodb = { version = "3", default-features = false, features = ["rustls-tls", "bson-2", "compat-3-3-0", "dns-resolver", "zlib-compression"] }
+tokio-tungstenite = { workspace = true }
+futures-channel = "0.3"
+# External chat transports (FEATURES §17): IRC TLS builds its own client
+# config out of tokio-rustls + the webpki root store — both already in
+# the tree through tokio-tungstenite's rustls feature, now direct deps.
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+# Webhook in-box (webinbox.rs): the loopback listener the push-only
+# platforms route through (Teams, Google Chat, WhatsApp, Slack Events).
+axum.workspace = true
 
 [dev-dependencies]
 # Mock gateway for the chat tool-loop test (web skills integration).

@@ -27,7 +27,30 @@ use std::pin::Pin;
 
 /// Pre-packaged plugin ids (`[plugins] enabled = [...]` in bot.toml).
 /// Bare ids gate in-tree plugins; external drops gate as `external:<id>`.
-pub const PREPACKAGED_PLUGINS: [&str; 5] = ["websearch", "memory", "lore", "squeeze", "vision"];
+pub const PREPACKAGED_PLUGINS: [&str; 7] = [
+    "websearch",
+    "memory",
+    "lore",
+    "squeeze",
+    "vision",
+    "approvals",
+    "pipeline",
+];
+
+/// Plugins whose skills may only join a session's tool registry when the
+/// session is an owner DM (owner-DM-only by design; also enforced twice —
+/// at config load and at dispatch):
+/// - `gcp` — external drop; gcloud exec under bot-held credentials.
+/// - `coordinator` — multi-bot workers: spawning named agents + the
+///   hand-off channel + the shared pool (host compute + mesh identities).
+/// - `workflows` — browser record/replay (records the OWNER's browsing
+///   sessions and drives the bot's own Chrome).
+/// Chat is reachable by every Discord user, so a plain `[plugins]
+/// enabled` listing of ANY of these ids — bare or `external:<id>` — is
+/// refused at load. The registry refuses dispatch of their skills from a
+/// registry not constructed in owner-privileged mode (the refusal
+/// contract).
+pub const OWNER_ONLY_PLUGINS: [&str; 3] = ["gcp", "coordinator", "workflows"];
 
 /// Boxed executor future for one model-requested skill call.
 type BoxedSkillFut<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send + 'a>>;
@@ -70,7 +93,7 @@ impl SkillSpec {
 /// All pre-packaged model-facing skills. The bot-side `squeeze` plugin
 /// intentionally has no entries (it registers no skills).
 fn standard_skills() -> Vec<SkillSpec> {
-    vec![
+    let mut v = vec![
         SkillSpec {
             name: "web_search",
             plugin: "websearch",
@@ -169,7 +192,21 @@ fn standard_skills() -> Vec<SkillSpec> {
             }),
             run: vision_analyze_runner,
         },
-    ]
+    ];
+    // Multi-bot coordination (named workers + hand-off + shared pool).
+    // Owner-only: joined at owner-DM sessions via the registry's
+    // owner_mode gate — the plugin id never rides [plugins] enabled.
+    v.extend(crate::coordinator::skills());
+    // Workflow recording (owner-driven browse-and-record playbook).
+    // Owner-only: never rides [plugins] enabled.
+    v.extend(crate::workflows::skills());
+    // Human-in-the-loop approval bridge (FEATURES §15): the model pauses
+    // before critical side effects while the owner keeps the trigger.
+    v.extend(crate::approval::skills());
+    // Rust-native macro-tools (FEATURES §17.2): one model verb wrapping a
+    // compiled sub-pipeline (scrape → strip → chunk → embed → summarize).
+    v.extend(crate::pipeline::skills());
+    v
 }
 
 // --- Runners: thin argument adapters over the gateway skill calls -------
@@ -219,6 +256,18 @@ fn memory_embed_runner<'args>(
         let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
         anyhow::ensure!(!text.trim().is_empty(), "memory.embed: empty text");
         let (id, provider) = crate::api::memory_embed(cfg, text).await?;
+        // Mongo recall mirror (mongo.rs, FEATURES §18): the private note
+        // also lands in the cluster deduped by id — fire-and-forget, a
+        // mirror failure NEVER blocks the tool loop (typed journal only).
+        if crate::mongo::handle().is_some() {
+            let id2 = id.clone();
+            let text = text.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = crate::mongo::mirror_note(&id2, &text).await {
+                    tracing::warn!(error = %e, "memory mirror write skipped");
+                }
+            });
+        }
         Ok(json!({ "id": id, "provider": provider, "ok": true }))
     })
 }
@@ -239,6 +288,24 @@ fn memory_search_runner<'args>(
             .unwrap_or(5)
             .clamp(1, 20);
         let results = crate::api::memory_search(cfg, query, top_k).await?;
+        // Local first: /recall is the node's own embeddings. Empty local
+        // hits fall through to the mongo mirror (provenance-labeled) so
+        // a rebuilt/gapped node still answers from what it once knew.
+        if results.is_empty() {
+            match crate::mongo::search_notes(query, top_k).await {
+                Ok(mirrored) if !mirrored.is_empty() => {
+                    return Ok(json!({
+                        "results": mirrored,
+                        "count": mirrored.len(),
+                        "fallback": "mongo-mirror",
+                    }));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "mongo mirror fallback failed — plain empty result stands");
+                }
+            }
+        }
         Ok(json!({ "results": results, "count": results.len() }))
     })
 }
@@ -365,6 +432,21 @@ pub struct SkillRegistry {
     external: Vec<ExternalSkillEntry>,
     /// Enabled plugin ids; also the dispatch whitelist.
     enabled_plugins: std::collections::BTreeSet<String>,
+    /// Owner-privileged construction (an owner-DM chat session): the only
+    /// mode in which owner-only external skills (`gcp.*`) are advertised
+    /// and dispatchable. Every other surface — guild chats, guest DMs,
+    /// the tool loop of another user — builds the registry WITHOUT this
+    /// flag, so an owner-only skill is refused exactly like a disabled
+    /// one by [`Self::dispatch`] and never reaches a tool declaration.
+    owner_mode: bool,
+}
+
+/// The owner-only plugin id behind a gate id or plug-in name, if any —
+/// both forms (`external:gcp` for drops, bare `coordinator` for in-tree
+/// plugins) resolve through the same [`OWNER_ONLY_PLUGINS`] set.
+fn owner_only_id_of(gate_or_plugin: &str) -> Option<&str> {
+    let id = gate_or_plugin.strip_prefix("external:").unwrap_or(gate_or_plugin);
+    OWNER_ONLY_PLUGINS.contains(&id).then_some(id)
 }
 
 impl SkillRegistry {
@@ -386,7 +468,24 @@ impl SkillRegistry {
                 .into_iter()
                 .map(|p| p.as_ref().to_string())
                 .collect(),
+            owner_mode: false,
         }
+    }
+
+    /// Mark this registry as an owner-DM session (the privileged
+    /// construction): owner-only external gates joined via [`Self::join`]
+    /// become live. Non-owner surfaces never call this.
+    pub fn owner_privileged(mut self) -> Self {
+        self.owner_mode = true;
+        self
+    }
+
+    /// Join extra external gating ids into the enabled set (the
+    /// owner-only plugins list, joined ONLY by the privileged path above
+    /// — config validation refuses to ship them in the plain `enabled`).
+    pub fn join(mut self, ids: &[String]) -> Self {
+        self.enabled_plugins.extend(ids.iter().cloned());
+        self
     }
 
     /// Join parsed external-plugin drops (Phase 3a): each manifest skill
@@ -428,6 +527,12 @@ impl SkillRegistry {
     }
 
     fn external_enabled(&self, e: &ExternalSkillEntry) -> bool {
+        // Owner-only gates are dead unless this registry was built in
+        // owner-privileged mode — even a bug that leaked the owner-only
+        // id into a non-privileged enabled set cannot invoke them.
+        if owner_only_id_of(&e.gate).is_some() && !self.owner_mode {
+            return false;
+        }
         self.enabled_plugins.contains(&e.gate)
     }
 
@@ -442,6 +547,18 @@ impl SkillRegistry {
         external: &[crate::external::ExternalPlugin],
     ) -> anyhow::Result<()> {
         for e in entries {
+            // Owner-only plugins may never ride the shared gate: chat is
+            // reachable by every Discord user, and these skills execute
+            // host-level commands under the bot's own credentials.
+            if e.strip_prefix("external:")
+                .is_some_and(|id| OWNER_ONLY_PLUGINS.contains(&id))
+            {
+                anyhow::bail!(
+                    "plugin `{e}` is owner-only — it may never be listed in [plugins] enabled; \
+                     use [plugins] owner_only = [\"{e}\"] (its skills join the registry only \
+                     for owner-DM sessions)"
+                );
+            }
             if let Some(drop_id) = e.strip_prefix("external:") {
                 let known = if external.is_empty() {
                     "none".to_string()
@@ -458,12 +575,44 @@ impl SkillRegistry {
                      {drop_id:?} in plugins.d (known external: {known})",
                 );
             } else if !PREPACKAGED_PLUGINS.contains(&e.as_str()) {
+                // In-tree owner-only plugins (coordinator, workflows) are
+                // joined at owner-DM sessions automatically — they never
+                // ride the shared enabled list, by config or by typo.
+                if owner_only_id_of(e).is_some() {
+                    anyhow::bail!(
+                        "plugin `{e}` is owner-only — it may never be listed in [plugins] \
+                         enabled; its skills join the registry only for owner-DM sessions"
+                    );
+                }
                 anyhow::bail!(
                     "unknown plugin `{e}` in [plugins] enabled — known: {} (external drops \
                      must be gated as `external:<id>`)",
                     PREPACKAGED_PLUGINS.join(", ")
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the `[plugins] owner_only` list: every entry must be an
+    /// `external:<id>` form naming an existing drop, and (checked by
+    /// [`Self::check_config_enabled`] for the `enabled` list) an
+    /// owner-only id may not appear in both lists.
+    pub fn check_owner_only(
+        entries: &[String],
+        external: &[crate::external::ExternalPlugin],
+    ) -> anyhow::Result<()> {
+        for e in entries {
+            let Some(drop_id) = e.strip_prefix("external:") else {
+                anyhow::bail!(
+                    "invalid owner-only plugin `{e}` — owner-only entries must be external \
+                     drops gated as `external:<id>`"
+                );
+            };
+            anyhow::ensure!(
+                external.iter().any(|p| p.id == drop_id),
+                "unknown owner-only plugin `{e}` — no drop with id {drop_id:?} in plugins.d"
+            );
         }
         Ok(())
     }
@@ -490,6 +639,12 @@ impl SkillRegistry {
     }
 
     fn enabled(&self, skill: &SkillSpec) -> bool {
+        // Owner-only in-tree plugins (coordinator, workflows) are dead
+        // unless this registry was built in owner-privileged mode — the
+        // same boundary external drops go through.
+        if owner_only_id_of(skill.plugin).is_some() && !self.owner_mode {
+            return false;
+        }
         self.enabled_plugins.contains(skill.plugin)
     }
 
@@ -605,6 +760,12 @@ mod tests {
             chat_stream: false,
             chat_max_tool_rounds: 2,
             sandbox: crate::config::SandboxConfig::default(),
+            coordinator: crate::config::CoordinatorBotConfig::default(),
+            workflows: crate::config::WorkflowsConfig::default(),
+            approvals: crate::approval::ApprovalConfig::default(),
+            router: crate::router::RouterConfig::default(),
+            transports: crate::transports::TransportsConfig::default(),
+            mongo: crate::mongo::MongoConfig::default(),
         }
     }
 
@@ -627,12 +788,18 @@ mod tests {
             "lore.search",
             "vision.describe",
             "vision.analyze",
+            "approval.request",
+            "approval.status",
+            "approval.cancel",
+            "pipeline.scrape_summarize",
         ] {
             assert!(names.iter().any(|n| n == expect), "missing {expect}");
         }
-        // 7 model-facing skills; squeeze is bot-side (no tool def anywhere).
-        assert_eq!(names.len(), 7);
+        // 11 model-facing skills; squeeze is bot-side (no tool def
+        // anywhere); coordinator/workflows never appear (owner-only gate).
+        assert_eq!(names.len(), 11);
         assert!(!names.iter().any(|n| n.contains("squeeze")));
+        assert!(!names.iter().any(|n| n.starts_with("workflow.")));
     }
 
     #[test]
@@ -844,5 +1011,93 @@ mod tests {
             .dispatch(&test_cfg(), "weather.now", &json!({"place": "Praha"}))
             .await;
         assert_err_mentions(&refused, "unknown or disabled");
+    }
+
+    /// An owner-only drop (id in OWNER_ONLY_PLUGINS) with args: a gcp
+    /// bridge — proves the owner-mode hard gate: without `owner_privileged`,
+    /// the skills are INVISIBLE (no tool defs) and refused at dispatch
+    /// even if the gating id somehow rode `enabled`; with it, the skills
+    /// advertise and dispatch.
+    fn make_gcp_plugin(endpoint: String) -> crate::external::ExternalPlugin {
+        crate::external::ExternalPlugin {
+            id: "gcp".into(),
+            endpoint,
+            secret: None,
+            timeout_secs: 5,
+            skills: vec![crate::external::ExternalSkill {
+                name: "gcp.status".into(),
+                description: "project + auth status".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_only_skills_refused_without_privileged_mode() {
+        // A deliberately MISROuted config: the owner-only gate id in the
+        // plain enabled list would be caught by check_config_enabled at
+        // load — this test builds the registry that bug would produce, to
+        // prove the second, dispatch-level gate holds regardless.
+        let reg = SkillRegistry::standard(["external:gcp"])
+            .with_external(vec![make_gcp_plugin("http://127.0.0.1:1/rpc".into())])
+            .expect("drop joins");
+        // No tool def reaches the model on any non-owner surface.
+        assert!(reg.tool_defs().is_empty());
+        // And an invoke is refused like any disabled skill.
+        let refused = reg
+            .dispatch(&test_cfg(), "gcp.status", &json!({}))
+            .await;
+        assert_err_mentions(&refused, "unknown or disabled");
+    }
+
+    #[tokio::test]
+    async fn owner_privileged_mode_admits_owner_only_skills() {
+        let reg = SkillRegistry::standard(Vec::<String>::new())
+            .join(&vec!["external:gcp".to_string()])
+            .owner_privileged()
+            .with_external(vec![make_gcp_plugin("http://127.0.0.1:1/rpc".into())])
+            .expect("drop joins");
+        let defs = reg.tool_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["function"]["name"], "gcp.status");
+        // Dispatch reaches the (dead-endpoint) dispatcher — the typed
+        // error proves routing through invoke(), not the refusal path.
+        let err = reg
+            .dispatch(&test_cfg(), "gcp.status", &json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("external:gcp"), "routed: {err}");
+    }
+
+    #[test]
+    fn owner_only_id_may_not_ride_the_plain_enabled_list() {
+        let exterior = make_gcp_plugin("https://10.9.9.9:12345/rpc".into());
+        let err =
+            SkillRegistry::check_config_enabled(&["external:gcp".into()], &[exterior])
+                .expect_err("owner-only id in [plugins] enabled must fail loud");
+        let msg = err.to_string();
+        assert!(msg.contains("owner-only"), "names the boundary: {msg}");
+        assert!(msg.contains("owner_only"), "points at the right key: {msg}");
+    }
+
+    #[test]
+    fn owner_only_list_validates_against_drops() {
+        let exterior = make_gcp_plugin("https://10.9.9.9:12345/rpc".into());
+        assert!(
+            SkillRegistry::check_owner_only(&["external:gcp".into()], &[exterior]).is_ok()
+        );
+        // Bare id: not the external-drop form.
+        let err = SkillRegistry::check_owner_only(&["gcp".into()], &[])  // id never matches anyway
+            .expect_err("bare id must fail");
+        assert!(err.to_string().contains("external:"));
+        // External form but no such drop in plugins.d → fail loud.
+        let err = SkillRegistry::check_owner_only(&["external:gcp".into()], &[])
+            .expect_err("missing drop must fail loud");
+        assert!(err.to_string().contains("plugins.d"));
+        // Unknown plugin family entirely.
+        let err = SkillRegistry::check_owner_only(&["external:weather".into()], &[])
+            .expect_err("unknown drop must fail loud");
+        assert!(err.to_string().contains("external:weather"));
     }
 }

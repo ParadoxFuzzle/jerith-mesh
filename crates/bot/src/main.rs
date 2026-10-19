@@ -12,22 +12,29 @@
 //! overridden with `JERITH_GATEWAY_URL` / `JERITH_CHAIN_URL`.
 
 mod api;
+mod approval;
 mod archiver;
 mod chat_fallback;
 mod commands;
 mod config;
+mod coordinator;
 mod converse;
 mod external;
 mod gifs;
 mod hooks;
 mod mailbox;
 mod monitor;
+mod mongo;
 mod owner;
 mod people;
+mod pipeline;
 mod plugins;
+mod router;
 mod sandbox;
 mod squeeze;
 mod state;
+mod transports;
+mod workflows;
 mod workspace;
 
 /// Shared error type of the framework closures (`command_check`,
@@ -115,6 +122,12 @@ async fn main() -> anyhow::Result<()> {
     if !cfg.hooks.urls.is_empty() {
         tracing::info!(urls = cfg.hooks.urls.len(), "webhook event hooks enabled");
     }
+    // Human-in-the-loop approval bridge (FEATURES §15): the config lands
+    // in approval.rs's singletons here; the Discord http handle joins
+    // during the framework setup below, then the sweeper (TTL expiry,
+    // orphan repair) and — if `[approvals]` has a Telegram pair — the
+    // inline-keyboard poller come up.
+    approval::init(std::sync::Arc::new(cfg.clone()));
     // Persona: composed from the OpenClaw-style workspace canon docs
     // (~/.jerith-mesh/workspace/IDENTITY|SOUL|USER|USER_MODEL|AGENTS|MEMORY.md,
     // staged on first boot from the migrated OpenClaw workspace) when
@@ -186,6 +199,27 @@ async fn main() -> anyhow::Result<()> {
         *p = config::cap_system_prompt(p, config::PERSONA_MAX_CHARS);
     }
     let state = new_state();
+    // External chat transports (FEATURES §17): every platform is its own
+    // supervised task; absent `[transports]` tables cost nothing. They
+    // hold config + state only — independent of the Discord gateway.
+    if !cfg.transports.enabled_platforms().is_empty() {
+        tracing::info!(platforms = cfg.transports.enabled_platforms().join(", "), "external chat transports starting");
+        let cfg2 = std::sync::Arc::new(cfg.clone());
+        let state2 = state.clone();
+        crate::transports::spawn_all(cfg2, state2, cfg.owner_discord_id).await;
+    }
+    // Multi-bot coordination: the supervisor keeps one claim loop per
+    // registered named worker (see coordinator.rs). Disabled config = no
+    // loops, no coordinator tool defs.
+    if cfg.coordinator.enabled {
+        coordinator::start(cfg.clone());
+    }
+    // MongoDB Atlas lane (mongo.rs): the shared client + boot ping of
+    // the cluster's admin db. Absent/disabled [mongo] table = no-op;
+    // a bad connect logs loud and leaves the lane off, never a crash.
+    if cfg.mongo.enabled {
+        crate::mongo::init(&cfg.mongo).await;
+    }
     // Restore the persisted mine tally + chat history (best-effort: a
     // missing or corrupt file means a fresh tally, never a failed startup).
     let path = state::tally_path();
@@ -248,6 +282,12 @@ async fn main() -> anyhow::Result<()> {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
                 tracing::info!("slash commands registered globally");
+                // Approval bridge channels (FEATURES §15): the Discord
+                // approver-DM card needs the gateway's http handle, and
+                // a configured Telegram pair runs its own poller inline.
+                approval::set_discord_http(ctx.http.clone());
+                approval::start_sweeper();
+                approval::start_telegram_poller();
                 // Discord thread archiver (OpenClaw skill port): an
                 // operator-configured background ingest — no commands, no
                 // system-level change; subscribed in bot.toml [archiver].

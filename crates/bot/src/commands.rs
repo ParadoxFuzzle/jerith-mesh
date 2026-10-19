@@ -167,10 +167,15 @@ pub async fn ask(
     // means "no live surface" — testing it post-session re-posted every
     // successful streamed chat (the live 2026-10-17 09:55 double).
     let had_live_sink = sink.is_some();
+    // Privilege (owner-DM trust model, owner.rs): a DM from the owner
+    // admits the `[plugins] owner_only` skills into this session's chat
+    // registry; a guild invocation — even the owner's — does not.
+    let owner_privileged =
+        ctx.guild_id().is_none() && cfg.owner_discord_id.is_some_and(|id| id == user);
     let chat = crate::converse::run_session(
         &cfg,
         &ctx.data().state,
-        crate::converse::Session { user, prompt },
+        crate::converse::Session { user, prompt, owner_privileged },
         &speaker_prefix,
         &mut sink,
     )

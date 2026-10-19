@@ -141,8 +141,9 @@ pub fn normalize_freshness(raw: Option<&str>) -> Result<Option<&'static str>> {
 }
 
 /// SSRF guard: reject non-HTTP(S) targets and private-network host
-/// literals before a byte leaves the node.
-fn assert_fully_fetchable(url: &str) -> Result<()> {
+/// literals before a byte leaves the node. `pub` so other crates reuse
+/// the same stance verbatim (the bot's pipeline macro-tool rides it).
+pub fn assert_fully_fetchable(url: &str) -> Result<()> {
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         bail!("fetch target must be an http(s):// URL");

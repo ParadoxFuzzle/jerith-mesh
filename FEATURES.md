@@ -1004,3 +1004,278 @@ path and its test — this file's markers are audited against the tree
 and the Phase 0.5 memory backend were all re-verified with code grep +
 live drills), and the roadmap section is where future claims land first —
 with the gotchas written down *before* the feature, not after.
+
+## 14. Multi-bot coordination + workflow recording (2026-10-19)
+
+Three surfaces, one shared store (`crates/core/src/coordinator.rs`, SQLite at
+`<data>/coordinator.db`, served by every node gateway at
+`/v1/coordinator/*` — merge into the gateway router when
+`[coordinator] enabled`, default on):
+
+- **The mesh coordinator** (the abstraction layer): a named-worker
+  registry, a DEDICATED HAND-OFF CHANNEL (FIFO work queue with claim
+  leases — a worker that dies mid-job loses the lease and the job
+  requeues; removal expires a worker's backlog), and a SHARED MEMORY POOL
+  (namespaced context blobs; delegators stage context under a key and
+  hand only the key name to the worker). Tests: `coordinator` store +
+  HTTP wire surface (`CoordinatorStore` + `/v1/coordinator/*`).
+- **Multi-bot coordination** (bots-side, `crates/bot/src/coordinator.rs`):
+  users shape distinct named bots in owner DMs — `bot.worker.spawn` pins
+  each a model (`qwen3:8b`, any gateway model id — local weights or
+  remote tiers), `bot.delegate` posts onto the hand-off channel, a
+  per-worker claim loop solves through the gateway with THAT worker's
+  model, and a worker's answer may end with one
+  `HANDOFF> <worker> | <subject>` line that spawns a depth-1 chained
+  task (`[chained]` marker) — workers hand each other work with no human
+  pasting context between turns. The registry is the source of truth: a
+  rejoin updates the running loop the next tick; removal exits it.
+- **Workflow recording** (`crates/bot/src/workflows.rs`, plugin
+  `workflows`, owner-DM-only like `external:gcp` and `coordinator`):
+  `workflow.record.start` opens the REAL chrome (headed, on the
+  configured display) holding a CDP session with an injected recorder —
+  the OWNER does the task once and every click/field/Enter/page change
+  lands as a structured step; `workflow.record.stop` coalesces
+  (keystrokes → one `type` with the final value) and saves the playbook
+  (0600 JSON). `workflow.run` replays HEADLESSLY through the same
+  engine: native value setter + input events for fields (framework-safe
+  typing), Input-domain mouse press/release at the element center (real
+  activation), recorded `goto`s healing mid-flow page changes. Bounded:
+  ≤200 steps, 1k-char selectors, per-run wall clock, typed per-step
+  errors. Live proof path: `cargo test -p jerith-mesh-bot
+  chrome_cdp_live_smoke -- --ignored` (spawn → devtools-ws →
+  Runtime.evaluate → Input click → typed failures).
+
+Trust boundary: `OWNER_ONLY_PLUGINS` now covers `gcp` (external drop),
+`coordinator` and `workflows` (in-tree) — none of these ride
+`[plugins] enabled` (refused at load); their skills join a session's
+registry ONLY in owner-DM conversations, enforced twice (config load +
+registry owner-mode gate at dispatch `enabled`). Workflows carry
+recorded credentials → JSON files are 0600; the coordinator carries
+mesh identities and host compute → owner-DM only.
+
+
+---
+
+## 15. Human-in-the-Loop approval bridge (2026-10-19)
+
+`crates/bot/src/approval.rs` — the agent carries a task right up to the
+critical side effect (an API payment, an email send, a purchase flow, a
+privileged external skill) and parks **exactly that step**:
+
+```json
+{ "skill": "approval.request",
+  "args": { "summary": "Charge the $24 provider invoice to Shopify",
+            "kind": "http_call", "method": "POST",
+            "url": "https://api.shopified.example/v1/pay",
+            "body": {"amount": 2400} } }
+```
+
+The request is persisted (`~/.jerith-mesh/bot/approvals/<id>.json`,
+0600, atomically rewritten on every transition — the on-disk checkpoint
+of the paused state) and the model is answered **immediately** with a
+pending id: the tool loop never blocks on a human. State machine:
+`Pending → (Approve|Correct|Deny→Cancelled|TTL→Expired) → Done/Failed`,
+with a sweeper repairing Approved-but-unspawned orphans after a restart
+(the deterministic, typed local analogue of a LangGraph
+`interrupt_before` node).
+
+ Certified live 2026-10-19: the Telegram pair is configured in bot.toml
+(token + chat id), `getMe` validated the token, a real card was
+confirmed delivered to the owner's chat via the API (send + inline
+keyboard), the poller runs clean in the journal, and the FULL CALLBACK
+ROUND TRIP is verified live: harness card `T56VZVSK` → owner ✔ press →
+one-shot resolve → deferred `memory.embed` executed through the live
+registry → checkpoint flipped `done` (result recorded in the 0600
+store). The shipped harness is the `#[ignore]`d
+`approval::tests::live_telegram_roundtrip` (maintenance runs only)
+that fired the very card that proved it.
+
+Notifications fan out to wherever the operator reads:
+
+| Channel | Shape | Resolution |
+|---|---|---|
+| Discord owner DM | card + **Approve ✓ / Deny ✕** buttons | button press, identity-checked (owner id only) |
+| Telegram | inline keyboard via `@BotFather` token | button callback or `approve <id> [json]` / `deny <id>` (chat-id-checked), 25 s long-poll `getUpdates` — zero open ports |
+| Webhooks | signed `approval_requested` / `approval_resolved` events (hooks.rs HMAC) + optional raw `[approvals] notify_webhooks` card bodies | Slack bridge / ntfy / WhatsApp relays see the request; resolution stays on the approved channels |
+
+Correct-resolution semantics: skill args are **merged** (patch the one
+field you spotted, keep the recorded call), `http_call` bodies are
+**replaced**, and an `http_call`'s method/url are frozen — retargeting
+is a NEW approval card, never a silent redirect.
+
+Trust model (fail-closed):
+- **Only the configured approver can resolve** — the owner's Discord id
+  or the configured Telegram chat id; everyone else's presses get a
+  typed refusal, and `resolve()` re-checks identity as defence in
+  depth.
+- **Deferred skills are down-scoped by construction**: at REQUEST time
+  the named skill must be dispatchable in the NON-owner-privileged
+  registry. Owner-only actions (gcp, coordinator, workflows-as-gate)
+  execute live in owner-DMs instead — the bridge never escalates a
+  plain session's privileges. EXECUTION at APPROVE time does run in an
+  owner-privileged registry (the approver IS the owner).
+- **`http_call` is a double-validated allowlist lane**: `https://`
+  only, GET/POST/PUT/PATCH only, exact-host `[approvals]
+  http_call_allowlist`, body ≤ 64 KiB, response snippet capped at 200
+  chars — validated at deferral time AND again when the trigger is
+  pulled.
+- Request ids: 8-glyph unguessable codes (I/l/O/0/1 excluded, typed
+  safely on a phone); resolution is one-shot and race-safe (Discord +
+  Telegram racing the same card: first wins, everything after is a
+  stable no-op — **never** a second execution).
+- Event payloads never carry model args verbatim (channels are relays;
+  webhook receivers are third parties) — the summary + a coarse action
+  description only.
+
+Config: `[approvals]` in bot.toml (enabled, discord_owner_dm, telegram
+pair, ttl_minutes 1–2880, http_call_allowlist, notify_webhooks,
+prune_resolved_hours). New plugin `approvals` joins
+`PREPACKAGED_PLUGINS` with `approval.request / approval.status /
+approval.cancel`; hooks gained `approval_requested` / `approval_resolved`
+event types.
+
+Tests: 14 in-module (id grammar, effect-arg-blind describe, patch
+merge/replace, down-scope refusal, deny roundtrip one-shot +
+identity-gated, correct-path persistence, TTL expiry, cancel-before-
+resolution, 0600 store roundtrip, card format, config fail-loud —
+14 green, plus the #[ignore]d live Telegram round-trip harness above.
+
+## 16. Rust-native multi-model task router (2026-10-19)
+
+`crates/bot/src/router.rs` — the fresh local lineup (qwen3:0.6b,
+bonsai-2:2b, tev1:0.8b, nemotron-3-nano:4b, qwen3:4b — new downloads
+2026-10-19) turns one-model-fits-all into a waste: intent sorting is a
+sub-second 0.6B job, code generation wants the 4B. The router maps a
+prompt onto a plain Rust enum and swaps the LANE for that chat:
+
+- classification = one direct Ollama `/api/chat` call (router model
+  `qwen3:0.6b`, 10 s cap) with **the answer's JSON schema passed as
+  `format`** — sampler-level grammar, so malformed JSON is physically
+  impossible; the answer then parses through serde into
+  `TaskKind { CodeGeneration, DataExtraction, CloudEscalation,
+  IntentRouting }`. Unknown classes are a compile-time impossibility,
+  and an off-vocabulary answer is refused at the enum wall even if a
+  runtime loosens its own format support.
+- lane map → bare runtime ids only (`qwen3:4b` for code, `qwen3:8b`
+  for extraction/escalation, intent keeps the runtime default). The
+  live-learned rule from 2026-10-17 is encoded: bare ids only —
+  provider-prefixed (`ollama:…`, `openrouter/…`) lanes are refused,
+  because the runtime's `model_name` vocabulary is bare.
+- OPTIMIZER, never a dependency: `[router] enabled` defaults false
+  (opt-in), and any failure (ollama down, timeout, schema break)
+  degrades to no-swap — the runtime's normal tiering continues
+  untouched. The router never picks a remote/cloud model; escalation
+  stays explicit.
+
+Wired into the chat path at `api.rs` (`maybe_lane_model`, before the
+payload model is chosen) with a `tracing::debug` carrying class +
+constrained reason. Config: `[router]` + `[router.lanes]` in bot.toml.
+
+## 17. Staged roadmap — universal driving, macro-tools, escalation, shadowing
+
+What this release establishes, and what stages next on the same rails:
+
+1. **Universal interface driving (docker VM + front-end control)**:
+   half-exists — `workflows.rs` already drives real Chrome front-ends
+   (CDP: click/type/page-change) recorded or replayed, and `sandbox.rs`
+   runs no-network disposable Docker containers for file work. Next
+   stage: a dockerized, X11/S MozVNC-bundled image the replay engine
+   can target instead of the host display, so long-tail software runs
+   as ephemeral UI targets under the same recorded-controls discipline.
+   Open items: a window-manager bootstrap for the container, and an
+   approval-gated pairing rule (any container target gets
+   `workflow.run` approval by construction — the bridge above is
+   already the gate).
+2. **Rust-native macro-tools** (the "heavy lifting out of the model"
+   point): the approval bridge is the first composition pattern — a
+   single model verb (`approval.request`) that bundles fetch/validate/
+   persist/notify/execute for it. **`scrape_summarize` landed
+   (2026-10-19, `pipeline.rs`, plugin `pipeline`)**: one call = fetch
+   (≤5 urls, 2-wide, ≤800 KiB each, the SSRF predicate shared with
+   web_fetch) → strip → word-boundary chunks → embed into private
+   memory → ONE gateway summarize (or question-answer), full
+   per-source status honest on partials. Live-fire verified against
+   example.com + the production gateway (fetch/strip/embed/summary all
+   green, 25.8 s end-to-end). Next: `refactor_module` (parse → patch →
+   build-check → report, `syn`-shaped when a code crate lands).
+3. **Tiered cloud escalation with state serialization**: the approval
+   checkpoint files are the serialization shape. Stage: on a structured
+   local failure (schema break ×3, build-verify fail), serialize the
+   step into an encrypted context package, hand it to ONE cloud call
+   over the existing gateway lanes, pull the corrected structure back,
+   drop the connection. The `MeshTask::CloudEscalation` lane (§16) is
+   the router's eye on it; the state package rides the same
+   RetryInfo-free honest-failure typing the pipeline uses.
+4. **Local workspace shadowing**: `SandboxConfig` already pins no-
+   network/caps-dropped/read-only containers for chat attachments.
+   Shadow-target stage: replay pipelines can pick a disposable
+   containerized profile per session (fresh HOME + mounts from a
+   manifest) so experimentation never touches owner state on disk.
+
+## 17. External chat transports: 11 platforms (2026-10-19)
+
+`crates/bot/src/transports/` — Phase 3d of docs/PLUGIN-SDK.md Role 2,
+shipped BEFORE any operator asks for it (the module doc states the
+dormancy discipline: no `[transports.<platform>]` table in bot.toml =
+no task, zero cost; a table = a supervised task on the SAME dialogue
+core as Discord — `handle_incoming` → gate once →
+`converse::run_session` → delivery — with per-user history keys hashed
+`platform:user`-style so lanes never alias).
+
+| Platform | Inbound | Outbound | Dependencies + notes |
+|---|---|---|---|
+| IRC | native RFC 2812 TCP client (NICK/USER/PING, CTCP ACTION normalize), TLS via tokio-rustls + webpki roots | PRIVMSG chunks @400 chars, flood-paced | no vendor SDK; `respond_to: mention \| all` gate |
+| Slack | **Socket Mode** (wss `apps.connections.open`, envelope acks, zero ports) | `chat.postMessage` @3900 | self-echo via `auth.test`; subtypes skipped |
+| Twitch | IRC-over-WSS (`wss://irc-ws.chat.twitch.tv`), tags parsed (display-name) | PRIVMSG @480 via single writer task (frame pacing) | read-only without `oauth_token` — the deliverer errs loudly per send |
+| Mattermost | personal-access-token websocket `/api/v4/websocket` + authentication_challenge | REST `/api/v4/posts` @4000 | `channels` scoping + mention gate |
+| Signal | signal-cli REST daemon long-poll (`/v1/receive`, loopback default) | `/v2/send` (DM recipients / groupIds) | daemon owns the crypto plumbing; `respond_groups` gate |
+| Nextcloud Talk | OCS long-poll `…/room/{token}/messages?lookIntoFuture=1&timeout=10` + `sinceMessageId` cursor | POST `…/messages` @3200 | app-password (per-device revocable) Base auth |
+| MS Teams | PUSH-only → `webinbox /in/teams` (Bot Framework; JWT validation not this build — loopback `allow_unverified` only) | client-credentials token cache + `{serviceUrl}/v3/conversations/{id}/activities` @3500 | `service_url_origins` allowlist gates every send |
+| Google Chat | (push-only; RS256 service-account ingest not shipped — typed limitation logged) | space webhook URL POST `{text}` @3500 | outbound-only relay |
+| Feishu / Lark | (callback needs public URL + AES; WS long-connection wire is SDK-private — typed limitation) | `tenant_access_token` cache + `im/v1/messages` (text as JSON string), feishu/lark domain switch | boot-time token round-trip = loud credential check |
+| WhatsApp | PUSH-only → `webinbox /in/whatsapp` (X-Hub-Signature-256 HMAC w/ app_secret + hub.verify_token GET handshake) | Graph `/{phone_number_id}/messages` @3500 | `app_secret` REQUIRED — unsigned callbacks refused |
+| GG | — | — | typed dormant stub: NO public bot API exists (researched 2026-10); `validate()` refuses at LOAD with the reason, citing the completion file |
+
+`webinbox` (the one optional listener): loopback-bound axum server
+(`127.0.0.1:5543` default) when `[transports.webinbox]` exists; each
+route fail-closed-verifies its platform's signature (Slack v0 HMAC w/
+±5-min replay window; WhatsApp Hub signature + verify handshake;
+Teams/Google Chat secured flags). `spawn_all` wraps every platform in
+crash-supervision: internal reconnect loops per adapter, config-level
+fatals log loud and stop (never a silent half-transport).
+
+Tests: 30+ new in-module tests — IRC config/parse/addressing, Slack
+token shapes + event router (bot-echo/subtype/reaction → zero extra
+routes), Twitch tag parse + config, Mattermost posted-parse/relay
+gate/ws-url, Signal envelope parse + daemon loopback rule, Nextcloud
+config/basic-auth, Teams activity parse + serviceUrl gate, WhatsApp
+Meta-nest parse + app-secret requirement, Feishu domain map, GG refusal
+lock, webinbox RFC-corpus HMAC + loopback default — suite 197 green.
+
+## 18. MongoDB Atlas lane + recall mirror (2026-10-19)
+
+`crates/bot/src/mongo.rs` + `[mongo]` in bot.toml — the first real
+feature on the shared handle (`memory.embed` / `memory.search` gain a
+cluster-backed mirror):
+
+- **Write side**: every successful `memory.embed` mirrors the note into
+  the cluster (`jerith.memory_mirror`, deduped by the gateway's memory
+  id via upsert) — fire-and-forget from the tool loop, a mirror failure
+  is a typed journal line, never a chat failure.
+- **Read side**: `memory.search` keeps local-first semantics (the
+  node's own nomic embeddings); ZERO local hits fall through to a
+  `$text` search over the mirror, and every mirrored hit carries an
+  explicit `source: "mongo-mirror"` + the payload keys
+  `fallback: "mongo-mirror"` — provenance is never silent. The index
+  is created best-effort at init; a bad index degrades search loudly,
+  never boot.
+- **Boot contract**: validate → connect → ping `admin` → install the
+  handle; any failure = typed log, lane off, bot continues (the
+  crash-loop from a block_on-inside-runtime was fixed same-day to an
+  awaited async init). Live fire is BLOCKED on the Atlas credential
+  fix (`bad auth` 8000 — see RUNBOOK `MongoDB Atlas lane`): everything
+  upstream (SRV DNS, TLS, zlib, reach) is verified.
+
+Tests: config URI scheme rules, absent-table = disabled default,
+mirror doc shape (exactly `_id`/`text`/`ts_ms`), fresh-process lane-off
+refusals — suite 200 green.

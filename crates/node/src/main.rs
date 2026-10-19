@@ -2318,9 +2318,29 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         },
         metrics: std::sync::Arc::new(jerith_mesh_core::metrics::Metrics::new()),
     };
-    let app = axum::Router::new()
+    // Mesh coordinator (FEATURES — named worker registry + hand-off
+    // channel + shared memory pool): the store lives beside the memory
+    // db; `[coordinator] enabled` (default true) gates the HTTP surface,
+    // which merges into the SAME port the gateway answers on — one
+    // address for any agent process on the mesh to speak to.
+    let mut app = axum::Router::new()
         .merge(gw.router())
         .merge(web::router(state.clone()));
+    if cfg.coordinator.enabled {
+        match jerith_mesh_core::coordinator::CoordinatorStore::open(
+            &jerith_mesh_core::config::NodeConfig::data_dir().join("coordinator.db"),
+        ) {
+            Ok(store) => {
+                app = app.merge(jerith_mesh_core::coordinator::router(std::sync::Arc::new(store)));
+                tracing::info!(target: "gateway", "coordinator surface on (/v1/coordinator/*)");
+            }
+            Err(e) => tracing::warn!(
+                target: "gateway",
+                error = %e,
+                "coordinator store unavailable — surface off this boot"
+            ),
+        }
+    }
 
     let addr = format!("{}:{}", cfg.effective_gateway_bind(), cfg.gateway_port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
