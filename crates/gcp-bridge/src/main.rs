@@ -64,7 +64,10 @@ fn valid_token(tok: &str) -> bool {
 
 /// The bridge's full runtime config (CLI flags).
 #[derive(clap::Parser, Debug)]
-#[command(name = "jerith-gcp-bridge", about = "gcloud skill bridge for jerith-mesh external plugins")]
+#[command(
+    name = "jerith-gcp-bridge",
+    about = "gcloud skill bridge for jerith-mesh external plugins"
+)]
 struct Args {
     /// Loopback port to listen on (the manifest endpoint must agree).
     #[arg(long, default_value_t = 7955)]
@@ -102,7 +105,11 @@ fn load_secret(path: &str) -> Result<String> {
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("reading secret file {}", path.display()))?;
     let trimmed = raw.trim().to_string();
-    anyhow::ensure!(!trimmed.is_empty(), "secret file {} is empty", path.display());
+    anyhow::ensure!(
+        !trimmed.is_empty(),
+        "secret file {} is empty",
+        path.display()
+    );
     Ok(trimmed)
 }
 
@@ -140,7 +147,11 @@ fn compute_signature(secret: &str, ts_ms: u64, body: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(format!("{ts_ms}.{body}").as_bytes());
-    mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -322,11 +333,7 @@ fn argv_for(skill: &str, args: &Value) -> Result<Vec<String>> {
 /// parsed (not "operation succeeded" — gcloud's exit + stderr ride
 /// alongside), `data` is the parsed `--format=json` stdout, `text` is
 /// stdout that wasn't JSON, `stderr` is bounded, `exit` is the CLI code.
-async fn run_gcloud(
-    bridge: &Bridge,
-    skill: &str,
-    args: &Value,
-) -> Result<Value> {
+async fn run_gcloud(bridge: &Bridge, skill: &str, args: &Value) -> Result<Value> {
     let argv0 = bridge.gcloud.clone();
     anyhow::ensure!(
         argv0.exists(),
@@ -360,7 +367,10 @@ async fn run_gcloud(
                 timeout_secs = bridge.gcloud_timeout.as_secs(),
                 "gcloud timed out and was killed"
             );
-            anyhow::anyhow!("gcp: gcloud timed out after {}s", bridge.gcloud_timeout.as_secs())
+            anyhow::anyhow!(
+                "gcp: gcloud timed out after {}s",
+                bridge.gcloud_timeout.as_secs()
+            )
         })?
         .context("gcp: spawning gcloud failed")?;
 
@@ -425,7 +435,10 @@ async fn rpc(State(bridge): State<Bridge>, headers: HeaderMap, body: String) -> 
         Ok(v) => v,
         Err(e) => return axum::Json(json!({"ok": false, "error": format!("gcp: bad body: {e}")})),
     };
-    let skill = parsed.get("skill").and_then(Value::as_str).unwrap_or_default();
+    let skill = parsed
+        .get("skill")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let args = parsed.get("args").cloned().unwrap_or(json!({}));
     match run_gcloud(&bridge, skill, &args).await {
         Ok(v) => axum::Json(v),
@@ -437,9 +450,7 @@ fn main() -> Result<()> {
     let args = <Args as clap::Parser>::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info".into()
-            }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let secret = load_secret(&args.secret_file)?;
@@ -453,7 +464,9 @@ fn main() -> Result<()> {
         .build()
         .context("tokio runtime")?;
     runtime.block_on(async move {
-        let app = axum::Router::new().route("/rpc", post(rpc)).with_state(bridge);
+        let app = axum::Router::new()
+            .route("/rpc", post(rpc))
+            .with_state(bridge);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -498,8 +511,11 @@ mod tests {
     fn argv_maps_grounded_skills() {
         // No-shell argv for a zone instance stop with --async high up so
         // the CLI returns in time for the dispatcher's bounded window.
-        let argv = argv_for("gcp.compute.stop", &json!({"zone": "us-central1-a", "name": "vm-1"}))
-            .unwrap();
+        let argv = argv_for(
+            "gcp.compute.stop",
+            &json!({"zone": "us-central1-a", "name": "vm-1"}),
+        )
+        .unwrap();
         assert_eq!(
             argv,
             vec![
@@ -514,13 +530,13 @@ mod tests {
         );
 
         let list = argv_for("gcp.compute.list", &json!({})).unwrap();
-        assert_eq!(
-            list,
-            vec!["compute", "instances", "list", "--format=json"]
-        );
+        assert_eq!(list, vec!["compute", "instances", "list", "--format=json"]);
 
         // Malformed identifiers can never land in argv.
-        let bad = argv_for("gcp.compute.describe", &json!({"zone": "us-central1-a", "name": "a b"}));
+        let bad = argv_for(
+            "gcp.compute.describe",
+            &json!({"zone": "us-central1-a", "name": "a b"}),
+        );
         assert!(bad.is_err());
         // Missing required args name the missing key.
         let missing = argv_for("gcp.compute.describe", &json!({}))
@@ -539,18 +555,24 @@ mod tests {
 
         let too_big = argv_for("gcp.exec", &json!({"argv": vec!["x"; 97]}));
         assert!(too_big.is_err(), "token-count bound");
-        let shell_char = argv_for("gcp.exec", &json!({"argv": ["compute", "instances", "list", "--filter=a b?"]}));
-        assert!(shell_char.is_err(), "metachar token must refuse");
-        let ok = argv_for("gcp.exec", &json!({"argv": ["compute", "instances", "list", "--format=json"]}))
-            .unwrap();
-        assert_eq!(
-            ok.first().and_then(|a| Some(a.as_str())),
-            Some("compute")
+        let shell_char = argv_for(
+            "gcp.exec",
+            &json!({"argv": ["compute", "instances", "list", "--filter=a b?"]}),
         );
-        let project_threaded = argv_for("gcp.exec", &json!({
-            "argv": ["compute", "instances", "list"],
-            "project": "my-proj"
-        }))
+        assert!(shell_char.is_err(), "metachar token must refuse");
+        let ok = argv_for(
+            "gcp.exec",
+            &json!({"argv": ["compute", "instances", "list", "--format=json"]}),
+        )
+        .unwrap();
+        assert_eq!(ok.first().map(|a| a.as_str()), Some("compute"));
+        let project_threaded = argv_for(
+            "gcp.exec",
+            &json!({
+                "argv": ["compute", "instances", "list"],
+                "project": "my-proj"
+            }),
+        )
         .unwrap();
         assert_eq!(project_threaded[0], "--project=my-proj");
     }
@@ -565,7 +587,12 @@ mod tests {
 
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
         mac.update(format!("{ts}.{body}").as_bytes());
-        let expected: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let expected: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(sig, expected);
         assert!(constant_time_eq(sig.as_bytes(), expected.as_bytes()));
         assert!(!constant_time_eq(sig.as_bytes(), b"wrong"));

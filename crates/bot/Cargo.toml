@@ -33,7 +33,11 @@ futures-channel = "0.3"
 # External chat transports (FEATURES §17): IRC TLS builds its own client
 # config out of tokio-rustls + the webpki root store — both already in
 # the tree through tokio-tungstenite's rustls feature, now direct deps.
-tokio-rustls = "0.26"
+# default-features OFF: the defaults activate rustls/aws_lc_rs, which
+# collides with the workspace pin (ring) → provider ambiguity panics at
+# quic test init (the 2026-10-19 CI dual-provider failure). No feature
+# on this line: the provider comes from the workspace rustls pin only.
+tokio-rustls = { version = "0.26", default-features = false }
 webpki-roots = "0.26"
 # Webhook in-box (webinbox.rs): the loopback listener the push-only
 # platforms route through (Teams, Google Chat, WhatsApp, Slack Events).

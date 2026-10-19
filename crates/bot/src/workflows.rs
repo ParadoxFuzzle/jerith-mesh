@@ -56,7 +56,9 @@ pub const LABEL_CAP: usize = 200;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Step {
-    Goto { url: String },
+    Goto {
+        url: String,
+    },
     /// Activate an element; `label` is captured text (humans read it; the
     /// model sees it when a selector rots, then re-records).
     Click {
@@ -64,9 +66,16 @@ pub enum Step {
         #[serde(default)]
         label: String,
     },
-    Type { selector: String, text: String },
-    Press { key: String },
-    Wait { ms: u64 },
+    Type {
+        selector: String,
+        text: String,
+    },
+    Press {
+        key: String,
+    },
+    Wait {
+        ms: u64,
+    },
 }
 
 impl Step {
@@ -75,12 +84,18 @@ impl Step {
             Step::Goto { url } => ensure_url(url),
             Step::Click { selector, label } => {
                 ensure_selector(selector)?;
-                anyhow::ensure!(label.chars().count() <= LABEL_CAP, "label exceeds {LABEL_CAP} chars");
+                anyhow::ensure!(
+                    label.chars().count() <= LABEL_CAP,
+                    "label exceeds {LABEL_CAP} chars"
+                );
                 Ok(())
             }
             Step::Type { selector, text } => {
                 ensure_selector(selector)?;
-                anyhow::ensure!(text.chars().count() <= TEXT_CAP, "typed text exceeds {TEXT_CAP} chars");
+                anyhow::ensure!(
+                    text.chars().count() <= TEXT_CAP,
+                    "typed text exceeds {TEXT_CAP} chars"
+                );
                 Ok(())
             }
             Step::Press { key } => {
@@ -191,7 +206,8 @@ fn validate_workflow(w: &Workflow) -> anyhow::Result<()> {
         w.steps.len()
     );
     for (i, s) in w.steps.iter().enumerate() {
-        s.validate().map_err(|e| anyhow::anyhow!("step {}: {e}", i + 1))?;
+        s.validate()
+            .map_err(|e| anyhow::anyhow!("step {}: {e}", i + 1))?;
     }
     Ok(())
 }
@@ -209,10 +225,10 @@ fn list_names() -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
         let p = entry?.path();
-        if p.extension().is_some_and(|e| e == "json") {
-            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                out.push(stem.to_string());
-            }
+        if p.extension().is_some_and(|e| e == "json")
+            && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+        {
+            out.push(stem.to_string());
         }
     }
     out.sort();
@@ -258,7 +274,9 @@ pub fn coalesce(events: Vec<Recorded>, start_url: &str) -> Vec<Step> {
                 });
             }
             "press" if ev.text == "Enter" || ev.text.is_empty() => {
-                steps.push(Step::Press { key: "Enter".into() });
+                steps.push(Step::Press {
+                    key: "Enter".into(),
+                });
             }
             "press" => steps.push(Step::Press { key: ev.text }),
             "nav" => {
@@ -290,7 +308,11 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait BrowserDriver: Send {
     fn goto<'a>(&'a mut self, url: &'a str) -> BoxFut<'a, anyhow::Result<()>>;
     fn click_on<'a>(&'a mut self, selector: &'a str) -> BoxFut<'a, anyhow::Result<()>>;
-    fn type_text<'a>(&'a mut self, selector: &'a str, text: &'a str) -> BoxFut<'a, anyhow::Result<()>>;
+    fn type_text<'a>(
+        &'a mut self,
+        selector: &'a str,
+        text: &'a str,
+    ) -> BoxFut<'a, anyhow::Result<()>>;
     fn press_key<'a>(&'a mut self, key: &'a str) -> BoxFut<'a, anyhow::Result<()>>;
     fn drain_recorded(&mut self) -> BoxFut<'_, anyhow::Result<Vec<Recorded>>>;
 }
@@ -303,7 +325,10 @@ async fn replay(w: &Workflow, driver: &mut dyn BrowserDriver, budget: Duration) 
     let mut out = Vec::new();
     for (i, step) in w.steps.iter().enumerate() {
         if started.elapsed() > budget {
-            out.push(format!("✗ step {}: wall-clock budget hit after {i} steps", i + 1));
+            out.push(format!(
+                "✗ step {}: wall-clock budget hit after {i} steps",
+                i + 1
+            ));
             break;
         }
         let res = match step {
@@ -465,23 +490,20 @@ impl CdpSession {
                 .await
                 .with_context(|| format!("devtools list {http}"))?;
             let v: Value = resp.json().await.unwrap_or(json!([]));
-            let found = v
-                .as_array()
-                .and_then(|a| {
-                    a.iter()
-                        .find(|t| {
-                            t.get("type").and_then(Value::as_str) == Some("page")
-                                && t
-                                    .get("webSocketDebuggerUrl")
-                                    .and_then(Value::as_str)
-                                    .is_some()
-                        })
-                        .and_then(|t| {
-                            t.get("webSocketDebuggerUrl")
+            let found = v.as_array().and_then(|a| {
+                a.iter()
+                    .find(|t| {
+                        t.get("type").and_then(Value::as_str) == Some("page")
+                            && t.get("webSocketDebuggerUrl")
                                 .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                });
+                                .is_some()
+                    })
+                    .and_then(|t| {
+                        t.get("webSocketDebuggerUrl")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            });
             if let Some(ws) = found {
                 break ws;
             }
@@ -535,7 +557,7 @@ impl CdpSession {
                         };
                         let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
                         if let Some(id) = v.get("id").and_then(Value::as_u64) {
-                            if let Some(cb) = pw.lock().expect("pending map").remove(&(id as u64)) {
+                            if let Some(cb) = pw.lock().expect("pending map").remove(&id) {
                                 let _ = cb.send(Ok(v));
                             }
                             continue;
@@ -660,7 +682,10 @@ async fn wait_devtools_line(
             Ok(Ok(None)) => anyhow::bail!("chrome exited before printing a DevTools endpoint"),
             Ok(Err(e)) => return Err(anyhow::anyhow!("reading chrome stderr: {e}")),
             Err(_) => {
-                anyhow::bail!("timed out ({}s) waiting for the DevTools endpoint", timeout.as_secs())
+                anyhow::bail!(
+                    "timed out ({}s) waiting for the DevTools endpoint",
+                    timeout.as_secs()
+                )
             }
         }
     }
@@ -722,7 +747,11 @@ impl BrowserDriver for CdpSession {
         })
     }
 
-    fn type_text<'a>(&'a mut self, selector: &'a str, text: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
+    fn type_text<'a>(
+        &'a mut self,
+        selector: &'a str,
+        text: &'a str,
+    ) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async move {
             ensure_selector(selector)?;
             anyhow::ensure!(text.chars().count() <= TEXT_CAP, "text exceeds cap");
@@ -787,11 +816,8 @@ impl BrowserDriver for CdpSession {
     }
 
     fn drain_recorded<'s>(&'s mut self) -> BoxFut<'s, anyhow::Result<Vec<Recorded>>> {
-        Box::pin(async move {
-            Ok(self.events.lock().expect("events").drain(..).collect())
-        })
+        Box::pin(async move { Ok(self.events.lock().expect("events").drain(..).collect()) })
     }
-
 }
 
 impl CdpSession {
@@ -828,7 +854,10 @@ fn recorder() -> &'static Mutex<Option<RecState>> {
 }
 
 async fn record_start(cfg: &BotConfig, name: &str, url: &str) -> anyhow::Result<Value> {
-    anyhow::ensure!(valid_workflow_name(name).is_ok(), "invalid workflow name: {name}");
+    anyhow::ensure!(
+        valid_workflow_name(name).is_ok(),
+        "invalid workflow name: {name}"
+    );
     ensure_url(url)?;
     {
         let rec = recorder().lock().expect("recorder lock");
@@ -899,9 +928,20 @@ async fn record_stop(_cfg: &BotConfig, name: &str) -> anyhow::Result<Value> {
         steps,
         last_run_outcome: None,
     };
-    anyhow::ensure!(!w.steps.is_empty(), "the recorder captured 0 steps — nothing to save");
-    let clicks = w.steps.iter().filter(|s| matches!(s, Step::Click { .. })).count();
-    let fields = w.steps.iter().filter(|s| matches!(s, Step::Type { .. })).count();
+    anyhow::ensure!(
+        !w.steps.is_empty(),
+        "the recorder captured 0 steps — nothing to save"
+    );
+    let clicks = w
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::Click { .. }))
+        .count();
+    let fields = w
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::Type { .. }))
+        .count();
     let path = save(&w)?;
     state.driver.shutdown().await;
     Ok(json!({
@@ -940,7 +980,11 @@ async fn run(cfg: &BotConfig, name: &str) -> anyhow::Result<Value> {
     .await;
     driver.shutdown().await;
     let ok = lines.iter().all(|l| l.starts_with('✓'));
-    w.last_run_outcome = Some(format!("{} · {}", lines.last().unwrap_or(&"(no steps)".to_string()), if ok { "full replay" } else { "partial" }));
+    w.last_run_outcome = Some(format!(
+        "{} · {}",
+        lines.last().unwrap_or(&"(no steps)".to_string()),
+        if ok { "full replay" } else { "partial" }
+    ));
     let _ = save(&w);
     Ok(json!({
         "workflow": w.name,
@@ -994,7 +1038,10 @@ fn require_field(args: &Value, field: &str) -> anyhow::Result<String> {
         .with_context(|| format!("field {field:?} is required"))
 }
 
-fn record_start_runner<'a>(cfg: &'a BotConfig, args: &'a Value) -> BoxFut<'a, anyhow::Result<Value>> {
+fn record_start_runner<'a>(
+    cfg: &'a BotConfig,
+    args: &'a Value,
+) -> BoxFut<'a, anyhow::Result<Value>> {
     Box::pin(async move {
         let name = require_field(args, "name")?;
         let url = require_field(args, "url")?;
@@ -1002,7 +1049,10 @@ fn record_start_runner<'a>(cfg: &'a BotConfig, args: &'a Value) -> BoxFut<'a, an
     })
 }
 
-fn record_stop_runner<'a>(cfg: &'a BotConfig, args: &'a Value) -> BoxFut<'a, anyhow::Result<Value>> {
+fn record_stop_runner<'a>(
+    cfg: &'a BotConfig,
+    args: &'a Value,
+) -> BoxFut<'a, anyhow::Result<Value>> {
     Box::pin(async move {
         let name = require_field(args, "name")?;
         record_stop(cfg, &name).await
@@ -1120,19 +1170,52 @@ mod tests {
     #[test]
     fn coalesce_collapses_typing_and_drops_the_start_nav() {
         let events = vec![
-            Recorded { kind: "input".into(), selector: "#email".into(), label: String::new(), text: "o".into() },
-            Recorded { kind: "input".into(), selector: "#email".into(), label: String::new(), text: "ops@x".into() },
-            Recorded { kind: "click".into(), selector: "#login".into(), label: "Log in".into(), text: String::new() },
-            Recorded { kind: "nav".into(), selector: "https://acme.example/invoice/new".into(), label: String::new(), text: String::new() },
-            Recorded { kind: "nav".into(), selector: "https://acme.example/login".into(), label: String::new(), text: String::new() },
+            Recorded {
+                kind: "input".into(),
+                selector: "#email".into(),
+                label: String::new(),
+                text: "o".into(),
+            },
+            Recorded {
+                kind: "input".into(),
+                selector: "#email".into(),
+                label: String::new(),
+                text: "ops@x".into(),
+            },
+            Recorded {
+                kind: "click".into(),
+                selector: "#login".into(),
+                label: "Log in".into(),
+                text: String::new(),
+            },
+            Recorded {
+                kind: "nav".into(),
+                selector: "https://acme.example/invoice/new".into(),
+                label: String::new(),
+                text: String::new(),
+            },
+            Recorded {
+                kind: "nav".into(),
+                selector: "https://acme.example/login".into(),
+                label: String::new(),
+                text: String::new(),
+            },
         ];
         let steps = coalesce(events, "https://acme.example/login");
         assert_eq!(
             steps,
             vec![
-                Step::Type { selector: "#email".into(), text: "ops@x".into() },
-                Step::Click { selector: "#login".into(), label: "Log in".into() },
-                Step::Goto { url: "https://acme.example/invoice/new".into() },
+                Step::Type {
+                    selector: "#email".into(),
+                    text: "ops@x".into()
+                },
+                Step::Click {
+                    selector: "#login".into(),
+                    label: "Log in".into()
+                },
+                Step::Goto {
+                    url: "https://acme.example/invoice/new".into()
+                },
             ],
             "typing collapses to the LAST value; start-page nav dropped"
         );
@@ -1143,18 +1226,30 @@ mod tests {
         let good = Workflow {
             name: "acme-invoices".into(),
             url: "https://acme.example".into(),
-            steps: vec![Step::Click { selector: "#a".into(), label: "x".into() }],
+            steps: vec![Step::Click {
+                selector: "#a".into(),
+                label: "x".into(),
+            }],
             created_ms: 0,
             last_run_outcome: None,
         };
         assert!(validate_workflow(&good).is_ok());
 
-        let bad_name = Workflow { name: "has space".into(), ..good.clone() };
+        let bad_name = Workflow {
+            name: "has space".into(),
+            ..good.clone()
+        };
         assert!(validate_workflow(&bad_name).is_err());
-        let bad_url = Workflow { url: "ftp://acme".into(), ..good.clone() };
+        let bad_url = Workflow {
+            url: "ftp://acme".into(),
+            ..good.clone()
+        };
         assert!(validate_workflow(&bad_url).is_err());
         let bad_selector = Workflow {
-            steps: vec![Step::Type { selector: "".into(), text: "x".into() }],
+            steps: vec![Step::Type {
+                selector: "".into(),
+                text: "x".into(),
+            }],
             ..good.clone()
         };
         assert!(validate_workflow(&bad_selector).is_err(), "empty selector");
@@ -1162,7 +1257,10 @@ mod tests {
             steps: vec![Step::Press { key: "F13".into() }],
             ..good.clone()
         };
-        assert!(validate_workflow(&bad_key).is_err(), "key outside the recorded set");
+        assert!(
+            validate_workflow(&bad_key).is_err(),
+            "key outside the recorded set"
+        );
         assert!(workflow_path("has space").is_err(), "bad name → no path");
     }
 
@@ -1179,7 +1277,10 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
         fn click_on<'a>(&'a mut self, selector: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
-            self.actions.lock().unwrap().push(format!("click {selector}"));
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("click {selector}"));
             let fail = self.fail_on.as_deref() == Some(selector);
             Box::pin(async move {
                 if fail {
@@ -1188,8 +1289,15 @@ mod tests {
                 Ok(())
             })
         }
-        fn type_text<'a>(&'a mut self, selector: &'a str, text: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
-            self.actions.lock().unwrap().push(format!("type {selector}={text}"));
+        fn type_text<'a>(
+            &'a mut self,
+            selector: &'a str,
+            text: &'a str,
+        ) -> BoxFut<'a, anyhow::Result<()>> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("type {selector}={text}"));
             Box::pin(async move { Ok(()) })
         }
         fn press_key<'a>(&'a mut self, key: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
@@ -1209,32 +1317,42 @@ mod tests {
     #[ignore]
     async fn chrome_cdp_live_smoke() {
         let chrome = std::env::var("JERITH_CHROME").unwrap_or_else(|_| "google-chrome".into());
-        let mut s = CdpSession::launch(
-            &chrome,
-            "data:text/html,<div id='a'>hi</div>",
-            true,
-            None,
-        )
-        .await
-        .expect("chrome spawns + devtools attaches");
+        let mut s = CdpSession::launch(&chrome, "data:text/html,<div id='a'>hi</div>", true, None)
+            .await
+            .expect("chrome spawns + devtools attaches");
         let v = s.evaluate("1 + 1").await.expect("evaluate roundtrip");
-        assert_eq!(v["value"].as_i64(), Some(2), "runtime.evaluate returns by value");
+        assert_eq!(
+            v["value"].as_i64(),
+            Some(2),
+            "runtime.evaluate returns by value"
+        );
         // Click the div through the Input domain (mouse press + release).
         s.click_on("#a").await.expect("real input click dispatched");
-        s.type_text("#a", "x").await.expect_err("type on a non-field fails typed");
+        s.type_text("#a", "x")
+            .await
+            .expect_err("type on a non-field fails typed");
         s.shutdown().await;
     }
 
     #[tokio::test]
     async fn replays_steps_and_reports_the_failing_one() {
         let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut driver = MockDriver { fail_on: None, actions: actions.clone() };
+        let mut driver = MockDriver {
+            fail_on: None,
+            actions: actions.clone(),
+        };
         let w = Workflow {
             name: "t".into(),
             url: "https://x.example".into(),
             steps: vec![
-                Step::Type { selector: "#a".into(), text: "hello".into() },
-                Step::Click { selector: "#go".into(), label: String::new() },
+                Step::Type {
+                    selector: "#a".into(),
+                    text: "hello".into(),
+                },
+                Step::Click {
+                    selector: "#go".into(),
+                    label: String::new(),
+                },
             ],
             created_ms: 0,
             last_run_outcome: None,
@@ -1246,11 +1364,17 @@ mod tests {
         assert_eq!(acts, vec!["type #a=hello", "click #go"]);
 
         // A rotted selector breaks the flow AT that step, typed.
-        let mut driver = MockDriver { fail_on: Some("#go".into()), actions };
+        let mut driver = MockDriver {
+            fail_on: Some("#go".into()),
+            actions,
+        };
         let lines = replay(&w, &mut driver, Duration::from_secs(5)).await;
         assert_eq!(lines.len(), 2, "flow stops at the failure");
         assert!(lines[0].starts_with('✓'));
         let failing = &lines[1];
-        assert!(failing.starts_with('✗') && failing.contains("step 2") && failing.contains("#go"), "{failing}");
+        assert!(
+            failing.starts_with('✗') && failing.contains("step 2") && failing.contains("#go"),
+            "{failing}"
+        );
     }
 }

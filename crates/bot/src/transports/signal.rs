@@ -15,12 +15,12 @@
 //! fails fast on the first poll → supervisor respawn loop with its
 //! exponential backoff — the same boot-time handshake as every poller.
 
-use super::{chunk_utf8, handle_incoming, http_json, DeliveryFn, Incoming};
+use super::{DeliveryFn, Incoming, chunk_utf8, handle_incoming, http_json};
 use crate::config::BotConfig;
 use crate::state::BotState;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,9 +38,17 @@ pub struct SignalConfig {
 impl SignalConfig {
     pub fn validate(&mut self) -> Result<()> {
         let d = self.daemon_url.trim_end_matches('/').to_string();
-        anyhow::ensure!(d.starts_with("http://127.0.0.1") || d.starts_with("http://localhost") || d.starts_with("https://"), "signal: daemon_url must be loopback or https");
+        anyhow::ensure!(
+            d.starts_with("http://127.0.0.1")
+                || d.starts_with("http://localhost")
+                || d.starts_with("https://"),
+            "signal: daemon_url must be loopback or https"
+        );
         self.daemon_url = d;
-        anyhow::ensure!(self.account.trim().starts_with('+'), "signal: account must be E.164 (+1555…)");
+        anyhow::ensure!(
+            self.account.trim().starts_with('+'),
+            "signal: account must be E.164 (+1555…)"
+        );
         Ok(())
     }
 }
@@ -53,9 +61,16 @@ async fn poll_once(scfg: &SignalConfig) -> Result<Vec<Value>> {
         scfg.daemon_url,
         urlencode(&scfg.account)
     );
-    let (code, v) = http_json(reqwest::Method::GET, &url, None, None, Duration::from_secs(40)).await?;
+    let (code, v) = http_json(
+        reqwest::Method::GET,
+        &url,
+        None,
+        None,
+        Duration::from_secs(40),
+    )
+    .await?;
     anyhow::ensure!(
-        code >= 200 && code < 300,
+        (200..300).contains(&code),
         "signal daemon refused receive ({code}): {v}"
     );
     Ok(v.as_array().cloned().unwrap_or_default())
@@ -65,7 +80,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -87,9 +104,10 @@ pub fn parse_envelope(item: &Value, account: &str) -> Option<(String, String, St
         let _ = sync;
         return None;
     }
-    let Some(text) = dm["message"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string) else {
-        return None;
-    };
+    let text = dm["message"]
+        .as_str()
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)?;
     let source = env["sourceNumber"]
         .as_str()
         .or_else(|| env["source"].as_str())
@@ -107,7 +125,12 @@ pub fn parse_envelope(item: &Value, account: &str) -> Option<(String, String, St
     Some((group, source, name, text))
 }
 
-pub async fn run(cfg: Arc<BotConfig>, state: BotState, mut scfg: SignalConfig, owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    cfg: Arc<BotConfig>,
+    state: BotState,
+    mut scfg: SignalConfig,
+    owner: Option<u64>,
+) -> Result<()> {
     scfg.validate()?;
     tracing::info!(transport = "signal", account = %scfg.account, groups = scfg.respond_groups.len(), "starting");
     let deliverer: DeliveryFn = {
@@ -127,8 +150,18 @@ pub async fn run(cfg: Arc<BotConfig>, state: BotState, mut scfg: SignalConfig, o
                         Some(g) => body["groupIds"] = json!([g]),
                         None => body["recipients"] = json!([recip]),
                     }
-                    let (code, v) = http_json(reqwest::Method::POST, &url, None, Some(body), Duration::from_secs(30)).await?;
-                    anyhow::ensure!(code >= 200 && code < 300, "signal send failed ({code}): {v}");
+                    let (code, v) = http_json(
+                        reqwest::Method::POST,
+                        &url,
+                        None,
+                        Some(body),
+                        Duration::from_secs(30),
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        (200..300).contains(&code),
+                        "signal send failed ({code}): {v}"
+                    );
                 }
                 Ok(())
             })
@@ -142,10 +175,8 @@ pub async fn run(cfg: Arc<BotConfig>, state: BotState, mut scfg: SignalConfig, o
                 continue;
             };
             // Group filter (DMs always route).
-            if !group.is_empty() {
-                if !scfg.respond_groups.iter().any(|amt| amt == &group) {
-                    continue;
-                }
+            if !group.is_empty() && !scfg.respond_groups.iter().any(|amt| amt == &group) {
+                continue;
             }
             let channel = if group.is_empty() {
                 source.clone()
@@ -182,7 +213,12 @@ mod tests {
         });
         assert_eq!(
             parse_envelope(&dm, me),
-            Some(("".into(), "+1555999888".into(), "Noodly".into(), "hello mesh".into()))
+            Some((
+                "".into(),
+                "+1555999888".into(),
+                "Noodly".into(),
+                "hello mesh".into()
+            ))
         );
         // Group message.
         let grp = json!({
@@ -218,9 +254,18 @@ mod tests {
         };
         ok.validate().unwrap();
         assert_eq!(ok.daemon_url, "http://127.0.0.1:8080");
-        let mut bad = SignalConfig { daemon_url: "http://0.0.0.0:8080".into(), ..ok.clone() };
-        assert!(bad.validate().is_err(), "non-loopback plaintext daemon refused");
-        let mut bad2 = SignalConfig { account: "me".into(), ..ok };
+        let mut bad = SignalConfig {
+            daemon_url: "http://0.0.0.0:8080".into(),
+            ..ok.clone()
+        };
+        assert!(
+            bad.validate().is_err(),
+            "non-loopback plaintext daemon refused"
+        );
+        let mut bad2 = SignalConfig {
+            account: "me".into(),
+            ..ok
+        };
         assert!(bad2.validate().is_err());
     }
 }

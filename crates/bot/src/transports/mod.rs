@@ -57,9 +57,7 @@ pub(crate) async fn http_json(
     body: Option<Value>,
     timeout: std::time::Duration,
 ) -> anyhow::Result<(u16, Value)> {
-    let mut req = crate::api::client()
-        .request(method, url)
-        .timeout(timeout);
+    let mut req = crate::api::client().request(method, url).timeout(timeout);
     if let Some(b) = bearer {
         req = req.bearer_auth(b);
     }
@@ -69,8 +67,7 @@ pub(crate) async fn http_json(
     let resp = req.send().await.with_context_(url)?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
-    let parsed = serde_json::from_str::<Value>(&text)
-        .unwrap_or(Value::String(text.clone()));
+    let parsed = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text.clone()));
     Ok((status, parsed))
 }
 
@@ -119,7 +116,10 @@ pub fn user_key(platform: &str, user: &str) -> u64 {
 /// Rune-safe chunking at a char cap: clean splits at newline (then
 /// space, then the hard boundary), never mid-rune, never mid-emoji.
 pub fn chunk_utf8(text: &str, max_chars: usize) -> Vec<String> {
-    assert!(max_chars >= 16, "chunk cap {max_chars} is too small to be sane");
+    assert!(
+        max_chars >= 16,
+        "chunk cap {max_chars} is too small to be sane"
+    );
     let mut out = Vec::new();
     let mut rest = text;
     loop {
@@ -164,10 +164,7 @@ struct BufferedSink {
 
 impl crate::converse::ConversationSink for BufferedSink {
     fn on_event(&self, _ev: crate::api::LiveEvent<'_>) {}
-    fn finish(
-        self: Arc<Self>,
-        text: String,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    fn finish(self: Arc<Self>, text: String) -> Pin<Box<dyn Future<Output = ()> + Send>>
     where
         Self: Sized + 'static,
     {
@@ -206,9 +203,11 @@ pub async fn handle_incoming(
     }
     let speaker = format!("[{}:{} @{}] ", inc.platform, inc.display, inc.channel);
     let text = inc.text.clone();
-    let mut sink: Option<Arc<dyn crate::converse::ConversationSink>> = Some(Arc::new(
-        BufferedSink { inc: inc.clone(), deliver: Arc::clone(&deliver) },
-    ));
+    let mut sink: Option<Arc<dyn crate::converse::ConversationSink>> =
+        Some(Arc::new(BufferedSink {
+            inc: inc.clone(),
+            deliver: Arc::clone(&deliver),
+        }));
     // Pre-session capture of the "live surface in play" bit — run_session
     // consumes the Option, so testing it afterwards is the classic
     // double-post mistake (converse.rs documents the 2026-10-17 live fire).
@@ -245,7 +244,12 @@ pub async fn handle_incoming(
                 let tail: String = reason.chars().skip(reason.chars().count() - 160).collect();
                 reason = format!("…{tail}");
             }
-            if let Err(e2) = deliver(&inc.channel, format!("⚠️ the mesh didn't answer just now — {reason}")).await {
+            if let Err(e2) = deliver(
+                &inc.channel,
+                format!("⚠️ the mesh didn't answer just now — {reason}"),
+            )
+            .await
+            {
                 tracing::debug!(error = %e2, "transport error-send also failed");
             }
         }
@@ -257,7 +261,8 @@ pub async fn handle_incoming(
 /// Discord gateway (they hold cfg + state only), so a platform outage
 /// never wobbles Discord, and vice versa.
 pub async fn spawn_all(cfg: Arc<BotConfig>, state: BotState, owner_id: Option<u64>) {
-    let run = |name: &'static str, fut_fut: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>| {
+    let run = |name: &'static str,
+               fut_fut: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>| {
         supervise(name, fut_fut);
     };
     trait_cfg_dispatch(&cfg, &state, owner_id, &run);
@@ -274,11 +279,15 @@ pub async fn spawn_all(cfg: Arc<BotConfig>, state: BotState, owner_id: Option<u6
     }
 }
 
+/// The spawn-seam shape: name + the transport task's own future. A
+/// first-class alias keeps the dispatch signature readable.
+type TransportRun = dyn Fn(&'static str, Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>);
+
 fn trait_cfg_dispatch(
     cfg: &Arc<BotConfig>,
     state: &BotState,
     owner_id: Option<u64>,
-    run: &dyn Fn(&'static str, Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>),
+    run: &TransportRun,
 ) {
     macro_rules! spawn_if {
         ($field:ident, $adapter:ident, $name:literal) => {
@@ -311,7 +320,10 @@ fn trait_cfg_dispatch(
 /// platform restarts). A failing task NEVER wedges anything else: exponential
 /// backoff capped at 5 min, respawn forever; a normal exit (typed refusal) logs
 /// and stops.
-fn supervise(name: &'static str, mut first: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>) {
+fn supervise(
+    name: &'static str,
+    mut first: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>,
+) {
     tokio::spawn(async move {
         match first.as_mut().await {
             Ok(()) => {
@@ -372,18 +384,42 @@ impl TransportsConfig {
     /// Sum of enabled platforms (used by main() to decide the spawn log).
     pub fn enabled_platforms(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
-        if self.irc.is_some() { v.push("irc"); }
-        if self.slack.is_some() { v.push("slack"); }
-        if self.twitch.is_some() { v.push("twitch"); }
-        if self.mattermost.is_some() { v.push("mattermost"); }
-        if self.signal.is_some() { v.push("signal"); }
-        if self.nextcloud.is_some() { v.push("nextcloud"); }
-        if self.teams.is_some() { v.push("teams"); }
-        if self.google_chat.is_some() { v.push("google_chat"); }
-        if self.feishu.is_some() { v.push("feishu"); }
-        if self.whatsapp.is_some() { v.push("whatsapp"); }
-        if self.gg.is_some() { v.push("gg"); }
-        if self.webinbox.is_some() { v.push("webinbox"); }
+        if self.irc.is_some() {
+            v.push("irc");
+        }
+        if self.slack.is_some() {
+            v.push("slack");
+        }
+        if self.twitch.is_some() {
+            v.push("twitch");
+        }
+        if self.mattermost.is_some() {
+            v.push("mattermost");
+        }
+        if self.signal.is_some() {
+            v.push("signal");
+        }
+        if self.nextcloud.is_some() {
+            v.push("nextcloud");
+        }
+        if self.teams.is_some() {
+            v.push("teams");
+        }
+        if self.google_chat.is_some() {
+            v.push("google_chat");
+        }
+        if self.feishu.is_some() {
+            v.push("feishu");
+        }
+        if self.whatsapp.is_some() {
+            v.push("whatsapp");
+        }
+        if self.gg.is_some() {
+            v.push("gg");
+        }
+        if self.webinbox.is_some() {
+            v.push("webinbox");
+        }
         v
     }
 }

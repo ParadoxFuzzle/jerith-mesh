@@ -229,7 +229,11 @@ pub async fn run_session(
     speaker_prefix: &str,
     sink: &mut Option<Arc<dyn ConversationSink>>,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let Session { user, prompt, owner_privileged } = session;
+    let Session {
+        user,
+        prompt,
+        owner_privileged,
+    } = session;
 
     let history0 = state.history(user);
     let history = if cfg.squeeze.enabled {

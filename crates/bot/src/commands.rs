@@ -175,7 +175,11 @@ pub async fn ask(
     let chat = crate::converse::run_session(
         &cfg,
         &ctx.data().state,
-        crate::converse::Session { user, prompt, owner_privileged },
+        crate::converse::Session {
+            user,
+            prompt,
+            owner_privileged,
+        },
         &speaker_prefix,
         &mut sink,
     )

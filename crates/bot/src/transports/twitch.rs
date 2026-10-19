@@ -10,7 +10,7 @@
 //! the login from the nick mask. PING/PONG uses Twitch's one-word form.
 //! Outbound PRIVMSG splits at 480 chars with the shared chunker.
 
-use super::{chunk_utf8, handle_incoming, DeliveryFn, Incoming};
+use super::{DeliveryFn, Incoming, chunk_utf8, handle_incoming};
 use crate::config::BotConfig;
 use crate::state::BotState;
 use anyhow::{Context as _, Result};
@@ -30,7 +30,10 @@ pub struct TwitchConfig {
 impl TwitchConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.nick.trim().is_empty(), "twitch: nick required");
-        anyhow::ensure!(!self.channels.is_empty(), "twitch: channels required non-empty");
+        anyhow::ensure!(
+            !self.channels.is_empty(),
+            "twitch: channels required non-empty"
+        );
         for ch in &self.channels {
             anyhow::ensure!(
                 !ch.starts_with('#'),
@@ -52,7 +55,12 @@ impl TwitchConfig {
 #[derive(Debug, PartialEq)]
 pub enum IrcLine {
     Ping,
-    PrivMsg { channel: String, login: String, display: String, text: String },
+    PrivMsg {
+        channel: String,
+        login: String,
+        display: String,
+        text: String,
+    },
     Join,
     Other,
 }
@@ -69,39 +77,57 @@ pub fn parse_line(line: &str) -> IrcLine {
     if body.starts_with("PING") {
         return IrcLine::Ping;
     }
-    if let Some(rest) = body.strip_prefix(':') {
-        if let Some((mask, after)) = rest.split_once(' ') {
-            if after.starts_with("JOIN ") {
-                return IrcLine::Join;
-            }
-            if let Some((cmd, target_and_text)) = after.split_once(' ') {
-                if cmd == "PRIVMSG" {
-                    if let Some((target, payload)) = target_and_text.split_once(' ') {
-                        let text = payload.trim_start_matches(':').to_string();
-                        if text.is_empty() {
-                            return IrcLine::Other;
-                        }
-                        let login = mask.split('!').next().unwrap_or(mask).to_string();
-                        let display = tags
-                            .and_then(|t| {
-                                t.split(';').find_map(|kv| {
-                                    kv.strip_prefix("display-name=").filter(|v| !v.is_empty()).map(str::to_string)
-                                })
-                            })
-                            .unwrap_or_else(|| login.clone());
-                        let channel = target.trim_start_matches('#').to_lowercase();
-                        return IrcLine::PrivMsg { channel, login, display, text };
-                    }
-                }
-            }
+    let Some(rest) = body.strip_prefix(':') else {
+        return IrcLine::Other;
+    };
+    let Some((mask, after)) = rest.split_once(' ') else {
+        return IrcLine::Other;
+    };
+    if after.starts_with("JOIN ") {
+        return IrcLine::Join;
+    }
+    if let Some((cmd, target_and_text)) = after.split_once(' ')
+        && cmd == "PRIVMSG"
+        && let Some((target, payload)) = target_and_text.split_once(' ')
+    {
+        let text = payload.trim_start_matches(':').to_string();
+        if !text.is_empty() {
+            let login = mask.split('!').next().unwrap_or(mask).to_string();
+            let display = tags
+                .and_then(|t| {
+                    t.split(';').find_map(|kv| {
+                        kv.strip_prefix("display-name=")
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string)
+                    })
+                })
+                .unwrap_or_else(|| login.clone());
+            let channel = target.trim_start_matches('#').to_lowercase();
+            return IrcLine::PrivMsg {
+                channel,
+                login,
+                display,
+                text,
+            };
         }
     }
     IrcLine::Other
 }
 
-pub async fn run(cfg: Arc<BotConfig>, state: BotState, tcfg: TwitchConfig, owner: Option<u64>) -> Result<()> {
-    tcfg.validate().map_err(|e| e.context("twitch: bad config — fix and restart"))?;
-    tracing::info!(transport = "twitch", channels = tcfg.channels.len(), send = tcfg.token_raw().is_some(), "connecting");
+pub async fn run(
+    cfg: Arc<BotConfig>,
+    state: BotState,
+    tcfg: TwitchConfig,
+    owner: Option<u64>,
+) -> Result<()> {
+    tcfg.validate()
+        .map_err(|e| e.context("twitch: bad config — fix and restart"))?;
+    tracing::info!(
+        transport = "twitch",
+        channels = tcfg.channels.len(),
+        send = tcfg.token_raw().is_some(),
+        "connecting"
+    );
     let url = "wss://irc-ws.chat.twitch.tv:443";
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut write, mut read) = ws.split();
@@ -119,7 +145,11 @@ pub async fn run(cfg: Arc<BotConfig>, state: BotState, tcfg: TwitchConfig, owner
             let mut gap = tokio::time::interval(Duration::from_millis(350));
             gap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             while let Some(line) = out_rx.recv().await {
-                if write.send(Message::text(format!("{line}\r\n"))).await.is_err() {
+                if write
+                    .send(Message::text(format!("{line}\r\n")))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 gap.tick().await;
@@ -167,7 +197,12 @@ pub async fn run(cfg: Arc<BotConfig>, state: BotState, tcfg: TwitchConfig, owner
             match parse_line(line) {
                 IrcLine::Ping => push(&out_tx, "PONG :tmi.twitch.tv"),
                 IrcLine::Join => {}
-                IrcLine::PrivMsg { channel, login, display, text } => {
+                IrcLine::PrivMsg {
+                    channel,
+                    login,
+                    display,
+                    text,
+                } => {
                     let inc = Incoming {
                         platform: "twitch",
                         channel,
@@ -215,18 +250,31 @@ mod tests {
         let l1 = ":anon!anon@anon.tmi.twitch.tv PRIVMSG #noodl :hello mesh";
         assert!(matches!(parse_line(l1), IrcLine::PrivMsg { display, .. } if display == "anon"));
         assert_eq!(parse_line("PING :tmi.twitch.tv"), IrcLine::Ping);
-        assert_eq!(parse_line(":bot!bot@bot.tmi.twitch.tv JOIN #noodl"), IrcLine::Join);
+        assert_eq!(
+            parse_line(":bot!bot@bot.tmi.twitch.tv JOIN #noodl"),
+            IrcLine::Join
+        );
         assert_eq!(parse_line("garbage"), IrcLine::Other);
     }
 
     #[test]
     fn config_requires_bare_channels_and_sends_loud_without_token() {
-        let c = TwitchConfig { nick: "jerithbot".into(), oauth_token: None, channels: vec!["noodl".into()] };
+        let c = TwitchConfig {
+            nick: "jerithbot".into(),
+            oauth_token: None,
+            channels: vec!["noodl".into()],
+        };
         c.validate().unwrap();
-        let bad = TwitchConfig { channels: vec!["#noodl".into()], ..c.clone() };
+        let bad = TwitchConfig {
+            channels: vec!["#noodl".into()],
+            ..c.clone()
+        };
         assert!(bad.validate().is_err());
         assert!(c.token_raw().is_none());
-        let with = TwitchConfig { oauth_token: Some("oauth:abcd".into()), ..c };
+        let with = TwitchConfig {
+            oauth_token: Some("oauth:abcd".into()),
+            ..c
+        };
         assert_eq!(with.token_raw(), Some("abcd"));
     }
 }

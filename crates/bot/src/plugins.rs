@@ -45,11 +45,12 @@ pub const PREPACKAGED_PLUGINS: [&str; 7] = [
 ///   hand-off channel + the shared pool (host compute + mesh identities).
 /// - `workflows` — browser record/replay (records the OWNER's browsing
 ///   sessions and drives the bot's own Chrome).
-/// Chat is reachable by every Discord user, so a plain `[plugins]
-/// enabled` listing of ANY of these ids — bare or `external:<id>` — is
-/// refused at load. The registry refuses dispatch of their skills from a
-/// registry not constructed in owner-privileged mode (the refusal
-/// contract).
+///
+///   Chat is reachable by every Discord user, so a plain `[plugins]
+///   enabled` listing of ANY of these ids — bare or `external:<id>` — is
+///   refused at load. The registry refuses dispatch of their skills from a
+///   registry not constructed in owner-privileged mode (the refusal
+///   contract).
 pub const OWNER_ONLY_PLUGINS: [&str; 3] = ["gcp", "coordinator", "workflows"];
 
 /// Boxed executor future for one model-requested skill call.
@@ -445,7 +446,9 @@ pub struct SkillRegistry {
 /// both forms (`external:gcp` for drops, bare `coordinator` for in-tree
 /// plugins) resolve through the same [`OWNER_ONLY_PLUGINS`] set.
 fn owner_only_id_of(gate_or_plugin: &str) -> Option<&str> {
-    let id = gate_or_plugin.strip_prefix("external:").unwrap_or(gate_or_plugin);
+    let id = gate_or_plugin
+        .strip_prefix("external:")
+        .unwrap_or(gate_or_plugin);
     OWNER_ONLY_PLUGINS.contains(&id).then_some(id)
 }
 
@@ -1044,16 +1047,14 @@ mod tests {
         // No tool def reaches the model on any non-owner surface.
         assert!(reg.tool_defs().is_empty());
         // And an invoke is refused like any disabled skill.
-        let refused = reg
-            .dispatch(&test_cfg(), "gcp.status", &json!({}))
-            .await;
+        let refused = reg.dispatch(&test_cfg(), "gcp.status", &json!({})).await;
         assert_err_mentions(&refused, "unknown or disabled");
     }
 
     #[tokio::test]
     async fn owner_privileged_mode_admits_owner_only_skills() {
         let reg = SkillRegistry::standard(Vec::<String>::new())
-            .join(&vec!["external:gcp".to_string()])
+            .join(&["external:gcp".to_string()])
             .owner_privileged()
             .with_external(vec![make_gcp_plugin("http://127.0.0.1:1/rpc".into())])
             .expect("drop joins");
@@ -1073,9 +1074,8 @@ mod tests {
     #[test]
     fn owner_only_id_may_not_ride_the_plain_enabled_list() {
         let exterior = make_gcp_plugin("https://10.9.9.9:12345/rpc".into());
-        let err =
-            SkillRegistry::check_config_enabled(&["external:gcp".into()], &[exterior])
-                .expect_err("owner-only id in [plugins] enabled must fail loud");
+        let err = SkillRegistry::check_config_enabled(&["external:gcp".into()], &[exterior])
+            .expect_err("owner-only id in [plugins] enabled must fail loud");
         let msg = err.to_string();
         assert!(msg.contains("owner-only"), "names the boundary: {msg}");
         assert!(msg.contains("owner_only"), "points at the right key: {msg}");
@@ -1084,11 +1084,9 @@ mod tests {
     #[test]
     fn owner_only_list_validates_against_drops() {
         let exterior = make_gcp_plugin("https://10.9.9.9:12345/rpc".into());
-        assert!(
-            SkillRegistry::check_owner_only(&["external:gcp".into()], &[exterior]).is_ok()
-        );
+        assert!(SkillRegistry::check_owner_only(&["external:gcp".into()], &[exterior]).is_ok());
         // Bare id: not the external-drop form.
-        let err = SkillRegistry::check_owner_only(&["gcp".into()], &[])  // id never matches anyway
+        let err = SkillRegistry::check_owner_only(&["gcp".into()], &[]) // id never matches anyway
             .expect_err("bare id must fail");
         assert!(err.to_string().contains("external:"));
         // External form but no such drop in plugins.d → fail loud.

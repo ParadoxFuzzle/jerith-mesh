@@ -210,10 +210,16 @@ pub async fn classify(cfg: &BotConfig, prompt: &str) -> Result<Classification> {
         .send()
         .await
         .with_context(|| format!("router unreachable at {url}"))?;
-    anyhow::ensure!(resp.status().is_success(), "router call failed: {}", resp.status());
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "router call failed: {}",
+        resp.status()
+    );
     let body: Value = resp.json().await.context("router returned non-JSON")?;
     let answer: RouterAnswer = serde_json::from_value(
-        body.get("message").cloned().ok_or_else(|| anyhow::anyhow!("router response has no message"))?,
+        body.get("message")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("router response has no message"))?,
     )
     .context("router answer did not satisfy its schema")?;
     let kind = TaskKind::from_str(&answer.task)
@@ -238,7 +244,9 @@ pub fn lane_model(kind: TaskKind, cfg: &BotConfig) -> Option<String> {
         TaskKind::IntentRouting => return None,
     };
     let model = model.trim();
-    (!model.is_empty()).then(|| model.to_string()).filter(|m| is_local_lane(m))
+    (!model.is_empty())
+        .then(|| model.to_string())
+        .filter(|m| is_local_lane(m))
 }
 
 /// Only local lanes drive the swap (the safe swap surface): BARE model
@@ -356,17 +364,33 @@ mod tests {
             .expect("enum inside router schema");
         for v in props {
             let s = v.as_str().unwrap();
-            assert!(TaskKind::from_str(s).is_some(), "schema enum {s} unparseable");
+            assert!(
+                TaskKind::from_str(s).is_some(),
+                "schema enum {s} unparseable"
+            );
         }
-        assert!(schema["required"].as_array().unwrap().contains(&json!("task")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("task"))
+        );
         // The struct parses anything the sample-level grammar allows onto
         // "task" as a string — the ENUM parse is where an off-vocabulary
         // answer is caught (the format contract means ollama never sends
         // one, but classify() must still be the hard wall).
         let sneaky: RouterAnswer =
             serde_json::from_value(json!({"task": "mystery"})).expect("string parses");
-        assert_eq!(TaskKind::from_str(&sneaky.task), None, "unknown class maps to nothing");
-        let good: RouterAnswer = serde_json::from_value(json!({"task": "code_generation"})).unwrap();
-        assert_eq!(TaskKind::from_str(&good.task), Some(TaskKind::CodeGeneration));
+        assert_eq!(
+            TaskKind::from_str(&sneaky.task),
+            None,
+            "unknown class maps to nothing"
+        );
+        let good: RouterAnswer =
+            serde_json::from_value(json!({"task": "code_generation"})).unwrap();
+        assert_eq!(
+            TaskKind::from_str(&good.task),
+            Some(TaskKind::CodeGeneration)
+        );
     }
 }

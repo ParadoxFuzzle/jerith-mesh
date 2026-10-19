@@ -15,11 +15,11 @@
 //! Domain: `feishu` (open.feishu.cn) vs `lark` (open.larksuite.com) —
 //! one config word, both domains are the same API shape.
 
-use super::{chunk_utf8, DeliveryFn};
+use super::{DeliveryFn, chunk_utf8};
 use crate::config::BotConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +42,10 @@ fn default_domain() -> String {
 impl FeishuConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.app_id.trim().is_empty(), "feishu: app_id required");
-        anyhow::ensure!(!self.app_secret.trim().is_empty(), "feishu: app_secret required");
+        anyhow::ensure!(
+            !self.app_secret.trim().is_empty(),
+            "feishu: app_secret required"
+        );
         anyhow::ensure!(
             matches!(self.domain.as_str(), "feishu" | "lark"),
             "feishu: domain must be \"feishu\" or \"lark\""
@@ -62,12 +65,15 @@ pub(crate) async fn tenant_token(fcfg: &FeishuConfig) -> Result<String> {
     static CACHE: tokio::sync::Mutex<Option<(std::time::Instant, String)>> =
         tokio::sync::Mutex::const_new(None);
     let mut g = CACHE.lock().await;
-    if let Some((exp, t)) = g.as_ref() {
-        if *exp > std::time::Instant::now() {
-            return Ok(t.clone());
-        }
+    if let Some((exp, t)) = g.as_ref()
+        && *exp > std::time::Instant::now()
+    {
+        return Ok(t.clone());
     }
-    let url = format!("{}/open-apis/auth/v3/tenant_access_token/internal", fcfg.base());
+    let url = format!(
+        "{}/open-apis/auth/v3/tenant_access_token/internal",
+        fcfg.base()
+    );
     let (code, v) = super::http_json(
         reqwest::Method::POST,
         &url,
@@ -139,7 +145,12 @@ pub fn make_deliverer(fcfg: FeishuConfig) -> DeliveryFn {
     })
 }
 
-pub async fn run(_cfg: Arc<BotConfig>, _state: crate::state::BotState, fcfg: FeishuConfig, _owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    _cfg: Arc<BotConfig>,
+    _state: crate::state::BotState,
+    fcfg: FeishuConfig,
+    _owner: Option<u64>,
+) -> Result<()> {
     fcfg.validate()?;
     // Token round-trip as the boot check: wrong app credentials fail
     // HERE, loudly, not on the first reply years later.
@@ -174,9 +185,15 @@ mod tests {
         };
         c.validate().unwrap();
         assert_eq!(c.base(), "https://open.feishu.cn");
-        let lark = FeishuConfig { domain: "lark".into(), ..c };
+        let lark = FeishuConfig {
+            domain: "lark".into(),
+            ..c
+        };
         assert_eq!(lark.base(), "https://open.larksuite.com");
-        let bad = FeishuConfig { domain: "slack".into(), ..lark };
+        let bad = FeishuConfig {
+            domain: "slack".into(),
+            ..lark
+        };
         assert!(bad.validate().is_err());
     }
 }

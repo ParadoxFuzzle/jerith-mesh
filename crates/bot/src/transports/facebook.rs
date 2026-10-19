@@ -11,11 +11,11 @@
 //! No `app_secret` configured → the webhook route refuses messages
 //! (fail-closed: unsigned Meta callbacks are untrusted by definition).
 
-use super::{chunk_utf8, DeliveryFn};
+use super::{DeliveryFn, chunk_utf8};
 use crate::config::BotConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,8 +40,14 @@ fn default_graph_version() -> String {
 
 impl WhatsappConfig {
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.phone_number_id.trim().is_empty(), "whatsapp: phone_number_id required");
-        anyhow::ensure!(!self.access_token.trim().is_empty(), "whatsapp: access_token required");
+        anyhow::ensure!(
+            !self.phone_number_id.trim().is_empty(),
+            "whatsapp: phone_number_id required"
+        );
+        anyhow::ensure!(
+            !self.access_token.trim().is_empty(),
+            "whatsapp: access_token required"
+        );
         anyhow::ensure!(
             self.app_secret.is_some(),
             "whatsapp: app_secret required — webhook messages are untrusted without signature verification"
@@ -119,7 +125,12 @@ pub fn parse_message(v: &Value) -> Option<(String, String, String)> {
     Some((from, profile, text))
 }
 
-pub async fn run(_cfg: Arc<BotConfig>, _state: crate::state::BotState, wcfg: WhatsappConfig, _owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    _cfg: Arc<BotConfig>,
+    _state: crate::state::BotState,
+    wcfg: WhatsappConfig,
+    _owner: Option<u64>,
+) -> Result<()> {
     wcfg.validate()?;
     tracing::info!(
         transport = "whatsapp",
@@ -153,7 +164,8 @@ mod tests {
             Some(("15559998888".into(), "Noodly".into(), "hey mesh".into()))
         );
         // Status notifications (no messages array) → None.
-        let st = json!({ "entry": [{ "changes": [{ "value": { "statuses": [{ "id": "x" }] } }] }] });
+        let st =
+            json!({ "entry": [{ "changes": [{ "value": { "statuses": [{ "id": "x" }] } }] }] });
         assert_eq!(parse_message(&st), None);
     }
 
@@ -167,7 +179,10 @@ mod tests {
             api_version: "v22.0".into(),
         };
         c.validate().unwrap();
-        let no_secret = WhatsappConfig { app_secret: None, ..c };
+        let no_secret = WhatsappConfig {
+            app_secret: None,
+            ..c
+        };
         assert!(no_secret.validate().is_err());
     }
 }

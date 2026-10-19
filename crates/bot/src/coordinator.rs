@@ -171,11 +171,7 @@ async fn supervisor(cfg: BotConfig) {
             let mut map = loops().lock().expect("loop map");
             map.retain(|_, h| !h.is_finished());
             let live: BTreeSet<String> = members.iter().map(|s| s.name.clone()).collect();
-            let stale: Vec<String> = map
-                .keys()
-                .filter(|k| !live.contains(*k))
-                .cloned()
-                .collect();
+            let stale: Vec<String> = map.keys().filter(|k| !live.contains(*k)).cloned().collect();
             for name in stale {
                 if let Some(h) = map.remove(&name) {
                     h.abort();
@@ -215,7 +211,12 @@ async fn worker_loop(cfg: BotConfig, mut spec: WorkerSpec) {
         {
             let v: Value = resp.json().await.unwrap_or(json!({}));
             let mut present = false;
-            for w in v.get("workers").and_then(Value::as_array).map(|a| a.as_slice()).unwrap_or(&[]) {
+            for w in v
+                .get("workers")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
                 if w.get("name").and_then(Value::as_str) != Some(spec.name.as_str()) {
                     continue;
                 }
@@ -368,7 +369,11 @@ async fn solve(base: &str, spec: &WorkerSpec, subject: &str, task: &str) -> anyh
     let status = resp.status();
     let v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
-        let err = v.get("error").and_then(Value::as_str).unwrap_or("").to_string();
+        let err = v
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         anyhow::bail!("gateway {status}: {err}");
     }
     let answer = v
@@ -387,14 +392,12 @@ fn parse_handoff_directive(answer: &str) -> Option<(String, String)> {
     let mut found = None;
     for line in answer.lines() {
         let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix("HANDOFF>").map(|r| r.trim()) {
-            if let Some((worker, subject)) = rest.split_once('|') {
-                let worker = worker.trim();
-                let subject = subject.trim();
-                if !worker.is_empty() && !subject.is_empty() {
-                    found = Some((worker.to_string(), subject.to_string()));
-                }
-            }
+        if let Some(rest) = line.strip_prefix("HANDOFF>").map(|r| r.trim())
+            && let Some((worker, subject)) = rest.split_once('|')
+            && !worker.trim().is_empty()
+            && !subject.trim().is_empty()
+        {
+            found = Some((worker.trim().to_string(), subject.trim().to_string()));
         }
     }
     found
@@ -418,7 +421,11 @@ async fn post_coordinator(base: &str, path: &str, body: Value) -> anyhow::Result
     let status = resp.status();
     let v: Value = resp.json().await.unwrap_or(json!({}));
     if !status.is_success() {
-        let err = v.get("error").and_then(Value::as_str).unwrap_or("").to_string();
+        let err = v
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         anyhow::bail!("coordinator {status}: {err}");
     }
     Ok(v)
@@ -686,8 +693,7 @@ mod tests {
         assert!(parse_handoff_directive("HANDOFF> carpenter only").is_none());
         let (w, _) = parse_handoff_directive("HANDOFF> a | x\n\nHANDOFF> b | y").unwrap();
         assert_eq!(w, "b");
-        let (w, _) =
-            parse_handoff_directive("step 1...\n    HANDOFF> painter | walls").unwrap();
+        let (w, _) = parse_handoff_directive("step 1...\n    HANDOFF> painter | walls").unwrap();
         assert_eq!(w, "painter");
     }
 
@@ -704,12 +710,18 @@ mod tests {
         .unwrap();
         assert_eq!(big.persona.chars().count(), 6_000, "persona capped");
 
-        assert!(WorkerSpec::from_args(&json!({"model": "m"})).is_err(), "name required");
+        assert!(
+            WorkerSpec::from_args(&json!({"model": "m"})).is_err(),
+            "name required"
+        );
         assert!(
             WorkerSpec::from_args(&json!({"name": "has space", "model": "m"})).is_err(),
             "charset enforced"
         );
-        assert!(WorkerSpec::from_args(&json!({"name": "a"})).is_err(), "model required");
+        assert!(
+            WorkerSpec::from_args(&json!({"name": "a"})).is_err(),
+            "model required"
+        );
         assert!(WorkerSpec::valid_name("").is_err());
         assert!(WorkerSpec::valid_name("eval$(id)").is_err());
         assert!(WorkerSpec::valid_name(&"x".repeat(101)).is_err());
@@ -817,11 +829,16 @@ mod tests {
             events.iter().any(|(k, v)| k == "post"
                 && v["to"] == json!("inspector")
                 && v["from"] == json!("welder")
-                && v["subject"].as_str().unwrap_or("").starts_with(CHAIN_MARKER)),
+                && v["subject"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with(CHAIN_MARKER)),
             "chained post carries the depth-1 marker: {events:?}"
         );
         assert!(
-            events.iter().any(|(k, v)| k == "solve" && v["model"] == json!("ollama:welder:7b")),
+            events
+                .iter()
+                .any(|(k, v)| k == "solve" && v["model"] == json!("ollama:welder:7b")),
             "solve rides the worker's own model: {events:?}"
         );
     }

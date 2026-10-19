@@ -14,12 +14,10 @@
 //! logged (log lines carry the database name and ping verdict, never
 //! the connection string).
 
-use crate::config::BotConfig;
 use anyhow::{Context as _, Result};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoConfig {
@@ -41,8 +39,12 @@ fn default_true() -> bool {
 
 impl MongoConfig {
     pub fn validate(&self) -> Result<()> {
-        let scheme_ok = self.uri.starts_with("mongodb://") || self.uri.starts_with("mongodb+srv://");
-        anyhow::ensure!(scheme_ok, "mongo: uri must start with mongodb:// or mongodb+srv://");
+        let scheme_ok =
+            self.uri.starts_with("mongodb://") || self.uri.starts_with("mongodb+srv://");
+        anyhow::ensure!(
+            scheme_ok,
+            "mongo: uri must start with mongodb:// or mongodb+srv://"
+        );
         anyhow::ensure!(!self.database.trim().is_empty(), "mongo: database required");
         Ok(())
     }
@@ -68,7 +70,8 @@ pub struct MongoHandle {
     pub database: String,
 }
 
-static HANDLE: std::sync::OnceLock<std::sync::Arc<MongoHandle>> = std::sync::OnceLock::new();/// Boot init: validate, connect, ping `admin`, memorize. Awaited from
+static HANDLE: std::sync::OnceLock<std::sync::Arc<MongoHandle>> = std::sync::OnceLock::new();
+/// Boot init: validate, connect, ping `admin`, memorize. Awaited from
 /// main() (it IS an async task — never block_on inside the runtime: the
 /// 2026-10-19 crash-loop). Failure is typed + logged loud but NON-fatal
 /// at boot (the bot's Discord lane must not die because Atlas wobbles;
@@ -102,7 +105,10 @@ pub async fn init(cfg: &MongoConfig) {
             if let Err(e) = ensure_mirror_index(&c, &db).await {
                 tracing::warn!(error = %e, transport = "mongo", "mirror index not created — $text fallback degrades");
             }
-            let _ = HANDLE.set(std::sync::Arc::new(MongoHandle { client: c, database: db }));
+            let _ = HANDLE.set(std::sync::Arc::new(MongoHandle {
+                client: c,
+                database: db,
+            }));
         }
         Err(e) => {
             tracing::error!(error = %e, transport = "mongo", "mongodb connect/ping failed — lane off until fixed")
@@ -116,7 +122,9 @@ pub fn handle() -> Option<std::sync::Arc<MongoHandle>> {
     HANDLE.get().map(std::sync::Arc::clone)
 }
 
-/// Standalone ping (used by the ignored live test + any health check).
+/// Standalone ping (used by the ignored live harness only — hence the
+/// dormant annotation: the boot lane pings via init() itself).
+#[allow(dead_code)]
 pub async fn ping(uri: &str) -> Result<()> {
     let client = mongodb::Client::with_uri_str(uri)
         .await
@@ -154,7 +162,10 @@ pub async fn mirror_note(id: &str, text: &str) -> Result<()> {
     h.client
         .database(&h.database)
         .collection::<mongodb::bson::Document>(MIRROR_COLLECTION)
-        .replace_one(mongodb::bson::doc! { "_id": id }, mirror_doc(id, text, ts_ms))
+        .replace_one(
+            mongodb::bson::doc! { "_id": id },
+            mirror_doc(id, text, ts_ms),
+        )
         .upsert(true)
         .await
         .context("mongo mirror write")?;
@@ -179,10 +190,7 @@ pub async fn search_notes(query: &str, top_k: u64) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     while let Some(doc) = cursor.next().await {
         let doc = doc.context("mongo mirror cursor read")?;
-        let text = doc
-            .get_str("text")
-            .unwrap_or_default()
-            .to_string();
+        let text = doc.get_str("text").unwrap_or_default().to_string();
         if text.is_empty() {
             continue;
         }
@@ -212,13 +220,17 @@ async fn ensure_mirror_index(client: &mongodb::Client, database: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BotConfig;
 
     #[test]
     fn mirror_doc_shape_is_typed() {
         let doc = mirror_doc("abc123", "remember the tally rule", 1_700_000_000_001);
         assert_eq!(doc.get_str("_id").unwrap(), "abc123");
         assert_eq!(doc.get_str("text").unwrap(), "remember the tally rule");
-        assert_eq!(doc.get("ts_ms").unwrap().as_i64().unwrap(), 1_700_000_000_001);
+        assert_eq!(
+            doc.get("ts_ms").unwrap().as_i64().unwrap(),
+            1_700_000_000_001
+        );
         // No accidental extra fields — the contract is exactly three.
         assert_eq!(doc.len(), 3);
     }
@@ -237,7 +249,7 @@ mod tests {
 
     #[test]
     fn config_uri_schemes_fail_loud() {
-        let mut ok = MongoConfig {
+        let ok = MongoConfig {
             uri: "mongodb+srv://user:pass@cluster0.xf7oa2t.mongodb.net/?compressors=zlib".into(),
             database: "jerith".into(),
             enabled: true,
@@ -245,13 +257,25 @@ mod tests {
         // Absent-table default is a disabled, non-validating lane.
         assert!(!MongoConfig::default().enabled);
         ok.validate().unwrap();
-        let mut plain = MongoConfig { uri: "mongodb://localhost:27017".into(), ..ok.clone() };
+        let plain = MongoConfig {
+            uri: "mongodb://localhost:27017".into(),
+            ..ok.clone()
+        };
         plain.validate().unwrap();
-        let mut bad = MongoConfig { uri: "postgres://x".into(), ..ok.clone() };
+        let bad = MongoConfig {
+            uri: "postgres://x".into(),
+            ..ok.clone()
+        };
         assert!(bad.validate().is_err());
-        let mut no_scheme = MongoConfig { uri: "cluster0.example.net".into(), ..ok.clone() };
+        let no_scheme = MongoConfig {
+            uri: "cluster0.example.net".into(),
+            ..ok.clone()
+        };
         assert!(no_scheme.validate().is_err());
-        let mut no_db = MongoConfig { database: "".into(), ..ok };
+        let no_db = MongoConfig {
+            database: "".into(),
+            ..ok
+        };
         assert!(no_db.validate().is_err());
     }
 
@@ -266,9 +290,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "pings the real MongoDB Atlas cluster with real credentials"]
     async fn atlas_ping() {
-        let cfg = BotConfig::load().context("loading the real bot.toml").unwrap();
+        let cfg = BotConfig::load()
+            .context("loading the real bot.toml")
+            .unwrap();
         let uri = cfg.mongo.uri.clone();
-        assert!(!uri.is_empty(), "[mongo] table missing from the real bot.toml");
+        assert!(
+            !uri.is_empty(),
+            "[mongo] table missing from the real bot.toml"
+        );
         ping(&uri)
             .await
             .context("atlas ping failed — check whitelist/network/credentials")

@@ -16,11 +16,11 @@
 //! No `webinbox` configured = the runner logs its typed requirement and
 //! exits Ok (dormant outbound-capable): never a silent half-transport.
 
-use super::{chunk_utf8, DeliveryFn};
+use super::{DeliveryFn, chunk_utf8};
 use crate::config::BotConfig;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +37,11 @@ pub struct TeamsConfig {
 }
 impl TeamsConfig {
     pub fn validate(&self) -> Result<()> {
-        for (f, v) in [("app_id", &self.app_id), ("app_secret", &self.app_secret), ("tenant_id", &self.tenant_id)] {
+        for (f, v) in [
+            ("app_id", &self.app_id),
+            ("app_secret", &self.app_secret),
+            ("tenant_id", &self.tenant_id),
+        ] {
             anyhow::ensure!(!v.trim().is_empty(), "teams: {f} required");
         }
         Ok(())
@@ -51,12 +55,15 @@ async fn bearer(tcfg: &TeamsConfig) -> Result<String> {
     static CACHE: tokio::sync::Mutex<Option<(std::time::Instant, String)>> =
         tokio::sync::Mutex::const_new(None);
     let mut guard = CACHE.lock().await;
-    if let Some((exp, tok)) = guard.as_ref() {
-        if *exp > std::time::Instant::now() {
-            return Ok(tok.clone());
-        }
+    if let Some((exp, tok)) = guard.as_ref()
+        && *exp > std::time::Instant::now()
+    {
+        return Ok(tok.clone());
     }
-    let url = format!("https://login.microsoftonline.com/{}/oauth2/v2.0/token", tcfg.tenant_id);
+    let url = format!(
+        "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+        tcfg.tenant_id
+    );
     let form: &[(&str, &str)] = &[
         ("client_id", &tcfg.app_id),
         ("client_secret", &tcfg.app_secret),
@@ -73,7 +80,10 @@ async fn bearer(tcfg: &TeamsConfig) -> Result<String> {
     let status = resp.status().as_u16();
     let v: Value = resp.json().await.unwrap_or(Value::Null);
     anyhow::ensure!(status == 200, "teams token failed ({status}): {v}");
-    let tok = v["access_token"].as_str().context("teams token: missing access_token")?.to_string();
+    let tok = v["access_token"]
+        .as_str()
+        .context("teams token: missing access_token")?
+        .to_string();
     let ttl = v["expires_in"].as_i64().unwrap_or(3500).clamp(60, 3500) as u64;
     *guard = Some((
         std::time::Instant::now() + Duration::from_secs(ttl.saturating_sub(300)),
@@ -166,7 +176,12 @@ pub fn make_deliverer(cfg: Arc<BotConfig>) -> DeliveryFn {
 
 /// Runner: outbound-capable, dormant until a webinbox ingests; the
 /// typed log IS the operator's instruction, never a guess.
-pub async fn run(_cfg: Arc<BotConfig>, _state: crate::state::BotState, tcfg: TeamsConfig, _owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    _cfg: Arc<BotConfig>,
+    _state: crate::state::BotState,
+    tcfg: TeamsConfig,
+    _owner: Option<u64>,
+) -> Result<()> {
     tcfg.validate()?;
     tracing::info!(
         transport = "teams",
@@ -195,12 +210,27 @@ mod tests {
     #[test]
     fn config_and_serviceurl_gate() {
         cfg().validate().unwrap();
-        let empty = TeamsConfig { app_id: "".into(), ..cfg() };
+        let empty = TeamsConfig {
+            app_id: "".into(),
+            ..cfg()
+        };
         assert!(empty.validate().is_err());
-        assert!(service_url_allowed(&cfg(), "https://smba.trafficmanager.net/amer/v3/x"));
-        assert!(!service_url_allowed(&cfg(), "https://evil.example.net/v3/x"));
-        let no_origins = TeamsConfig { service_url_origins: vec![], ..cfg() };
-        assert!(!service_url_allowed(&no_origins, "https://smba.trafficmanager.net/amer/v3/x"));
+        assert!(service_url_allowed(
+            &cfg(),
+            "https://smba.trafficmanager.net/amer/v3/x"
+        ));
+        assert!(!service_url_allowed(
+            &cfg(),
+            "https://evil.example.net/v3/x"
+        ));
+        let no_origins = TeamsConfig {
+            service_url_origins: vec![],
+            ..cfg()
+        };
+        assert!(!service_url_allowed(
+            &no_origins,
+            "https://smba.trafficmanager.net/amer/v3/x"
+        ));
     }
 
     #[test]
@@ -213,9 +243,21 @@ mod tests {
             "text": "hey bot, what's the tally?"
         });
         let parsed = parse_activity(&v);
-        assert!(matches!(parsed, Some((conv, _, user, _d, t)) if conv == "19:abc@thread.v2" && user == "29:xyz" && t.starts_with("hey bot")));
+        assert!(
+            matches!(parsed, Some((conv, _, user, _d, t)) if conv == "19:abc@thread.v2" && user == "29:xyz" && t.starts_with("hey bot"))
+        );
         // Non-message / empty text refused.
-        assert_eq!(parse_activity(&json!({"type": "typing", "conversation": {"id": "c"}, "from": {"id": "u"}, "serviceUrl": "s"})), None);
-        assert_eq!(parse_activity(&json!({"type": "message", "conversation": {"id": "c"}, "from": {"id": "u"}, "serviceUrl": "s", "text": "  "}), ), None);
+        assert_eq!(
+            parse_activity(
+                &json!({"type": "typing", "conversation": {"id": "c"}, "from": {"id": "u"}, "serviceUrl": "s"})
+            ),
+            None
+        );
+        assert_eq!(
+            parse_activity(
+                &json!({"type": "message", "conversation": {"id": "c"}, "from": {"id": "u"}, "serviceUrl": "s", "text": "  "}),
+            ),
+            None
+        );
     }
 }

@@ -89,7 +89,7 @@ pub async fn fetch_source(_cfg: &crate::config::BotConfig, url: &str) -> Source 
                 url: url.clone(),
                 text: Err(first_line(&e.to_string())),
                 content_type: String::new(),
-            }
+            };
         }
     };
     // Pull status-line + final URL + content-type BEFORE consuming the
@@ -124,7 +124,7 @@ pub async fn fetch_source(_cfg: &crate::config::BotConfig, url: &str) -> Source 
                 url: final_url.clone(),
                 text: Err(first_line(&e.to_string())),
                 content_type: ctype,
-            }
+            };
         }
     };
     if bytes.len() > MAX_DOWNLOAD_BYTES {
@@ -235,7 +235,6 @@ pub fn decode_entities(s: &str) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
         let consumed = if let Some(semi) = rest.find(';') {
-            let semi = semi as usize;
             if semi > 1 && semi <= 10 {
                 let ent = &rest[1..semi];
                 let decoded = match ent {
@@ -356,7 +355,10 @@ async fn summarize(
             {"role": "user", "content": body}
         ]
     });
-    let url = format!("{}/v1/chat/completions", cfg.gateway_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v1/chat/completions",
+        cfg.gateway_url.trim_end_matches('/')
+    );
     let resp = crate::api::client()
         .post(&url)
         .json(&payload)
@@ -518,9 +520,7 @@ pub fn skills() -> Vec<crate::plugins::SkillSpec> {
 fn scrape_summarize_runner<'args>(
     cfg: &'args crate::config::BotConfig,
     args: &'args Value,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + 'args>,
-> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + 'args>> {
     Box::pin(async move {
         let urls: Vec<String> = args
             .get("urls")
@@ -570,7 +570,10 @@ mod tests {
     fn entities_decode_and_unknown_stay() {
         assert_eq!(decode_entities("A &amp; B &lt;x&gt; Z"), "A & B <x> Z");
         assert_eq!(decode_entities("a&#65;b"), "aAb");
-        assert_eq!(decode_entities("nbs p test &nbsp; tail"), "nbs p test   tail");
+        assert_eq!(
+            decode_entities("nbs p test &nbsp; tail"),
+            "nbs p test   tail"
+        );
         assert_eq!(decode_entities("weird &gtos; thing"), "weird &gtos; thing");
         assert_eq!(decode_entities("safe & intact"), "safe & intact");
     }

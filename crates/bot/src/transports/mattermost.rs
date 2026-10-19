@@ -12,12 +12,12 @@
 //! Split cap: 4000 (MM's hard message cap is ~8000; keep under the UI
 //! fold with the shared rune-safe chunker).
 
-use super::{chunk_utf8, handle_incoming, http_json, DeliveryFn, Incoming};
+use super::{DeliveryFn, Incoming, chunk_utf8, handle_incoming, http_json};
 use crate::config::BotConfig;
 use crate::state::BotState;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +44,10 @@ fn default_respond_to() -> String {
 impl MattermostConfig {
     pub fn validate(&mut self) -> Result<()> {
         let site = self.site_url.trim_end_matches('/').to_string();
-        anyhow::ensure!(site.starts_with("https://") || site.starts_with("http://"), "mattermost: site_url must be http(s)");
+        anyhow::ensure!(
+            site.starts_with("https://") || site.starts_with("http://"),
+            "mattermost: site_url must be http(s)"
+        );
         self.site_url = site;
         anyhow::ensure!(!self.token.trim().is_empty(), "mattermost: token required");
         anyhow::ensure!(
@@ -52,7 +55,10 @@ impl MattermostConfig {
             "mattermost: respond_to must be \"mention\" | \"all\""
         );
         if self.respond_to == "mention" {
-            anyhow::ensure!(!self.bot_username.trim().is_empty(), "mattermost: bot_username required in mention mode");
+            anyhow::ensure!(
+                !self.bot_username.trim().is_empty(),
+                "mattermost: bot_username required in mention mode"
+            );
         }
         Ok(())
     }
@@ -80,7 +86,11 @@ pub fn parse_posted(ev: &Value) -> Option<(String, String, String, String)> {
     if post["props"].get("from_bot").is_some() {
         return None;
     }
-    let display = ev["data"].get("sender_name").and_then(Value::as_str).unwrap_or(&user_id).to_string();
+    let display = ev["data"]
+        .get("sender_name")
+        .and_then(Value::as_str)
+        .unwrap_or(&user_id)
+        .to_string();
     Some((channel, user_id, display, message))
 }
 
@@ -90,7 +100,9 @@ fn should_relay(cfg: &MattermostConfig, channel: &str, user_id: &str, message: &
     }
     if cfg.respond_to == "mention" {
         // @mention of the bot OR a direct "mm: " address prefix.
-        message.to_lowercase().contains(&format!("@{}", cfg.bot_username.to_lowercase()))
+        message
+            .to_lowercase()
+            .contains(&format!("@{}", cfg.bot_username.to_lowercase()))
             || message.starts_with("mm: ")
     } else {
         !user_id.is_empty()
@@ -98,7 +110,12 @@ fn should_relay(cfg: &MattermostConfig, channel: &str, user_id: &str, message: &
 }
 
 /// One long session: ws connect, authentication_challenge, route events.
-async fn session(cfg: &BotConfig, state: &BotState, mcfg: &MattermostConfig, owner: Option<u64>) -> Result<()> {
+async fn session(
+    cfg: &BotConfig,
+    state: &BotState,
+    mcfg: &MattermostConfig,
+    owner: Option<u64>,
+) -> Result<()> {
     let deliverer: DeliveryFn = {
         let token = mcfg.token.clone();
         let site = mcfg.site_url.clone();
@@ -117,14 +134,25 @@ async fn session(cfg: &BotConfig, state: &BotState, mcfg: &MattermostConfig, own
                         Duration::from_secs(20),
                     )
                     .await?;
-                    anyhow::ensure!(code == 200 || code == 201, "mattermost post failed ({code}): {v}");
+                    anyhow::ensure!(
+                        code == 200 || code == 201,
+                        "mattermost post failed ({code}): {v}"
+                    );
                 }
                 Ok(())
             })
         })
     };
 
-    loop_session(mcfg, cfg, state, owner, Arc::clone(&deliverer), mcfg.ws_url()).await
+    loop_session(
+        mcfg,
+        cfg,
+        state,
+        owner,
+        Arc::clone(&deliverer),
+        mcfg.ws_url(),
+    )
+    .await
 }
 
 /// (single reconnect loop with an honest exit — the supervisor backoff
@@ -140,11 +168,10 @@ async fn loop_session(
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::Message;
 
-    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(&url)?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {}", mcfg.token).parse()?,
-    );
+    let mut req =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(&url)?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {}", mcfg.token).parse()?);
     let (ws, _resp) = tokio_tungstenite::connect_async(req).await?;
     let (mut write, mut read) = ws.split();
 
@@ -186,7 +213,12 @@ async fn loop_session(
     anyhow::bail!("mattermost websocket closed")
 }
 
-pub async fn run(cfg: Arc<BotConfig>, state: BotState, mut mcfg: MattermostConfig, owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    cfg: Arc<BotConfig>,
+    state: BotState,
+    mut mcfg: MattermostConfig,
+    owner: Option<u64>,
+) -> Result<()> {
     mcfg.validate()?;
     tracing::info!(transport = "mattermost", site = %mcfg.site_url, "starting");
     session(&cfg, &state, &mcfg, owner).await
@@ -206,7 +238,12 @@ mod tests {
         });
         assert_eq!(
             parse_posted(&ev),
-            Some(("c1".into(), "u1".into(), "@noodly".into(), "hello mesh".into()))
+            Some((
+                "c1".into(),
+                "u1".into(),
+                "@noodly".into(),
+                "hello mesh".into()
+            ))
         );
         // Bot echo skipped.
         let bot = json!({
@@ -232,16 +269,22 @@ mod tests {
         assert!(should_relay(&c, "c1", "u1", "could you do it @MESHY?"));
         assert!(!should_relay(&c, "c2", "u1", "@meshy wrong channel"));
         assert!(!should_relay(&c, "c1", "u1", "no mention here"));
-        let mut relay = MattermostConfig { respond_to: "all".into(), ..c };
+        let mut relay = MattermostConfig {
+            respond_to: "all".into(),
+            ..c
+        };
         assert!(relay.validate().is_ok());
         assert!(should_relay(&relay, "c1", "u1", "anything"));
     }
 
     #[test]
     fn ws_url_turns_http_into_ws_once() {
-        let mut c = MattermostConfig {
-            site_url: "https://chat.example.org".into(), token: "t".into(),
-            bot_username: "b".into(), channels: vec![], respond_to: "all".into(),
+        let c = MattermostConfig {
+            site_url: "https://chat.example.org".into(),
+            token: "t".into(),
+            bot_username: "b".into(),
+            channels: vec![],
+            respond_to: "all".into(),
         };
         assert_eq!(c.ws_url(), "wss://chat.example.org/api/v4/websocket");
     }

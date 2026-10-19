@@ -2331,7 +2331,9 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
             &jerith_mesh_core::config::NodeConfig::data_dir().join("coordinator.db"),
         ) {
             Ok(store) => {
-                app = app.merge(jerith_mesh_core::coordinator::router(std::sync::Arc::new(store)));
+                app = app.merge(jerith_mesh_core::coordinator::router(std::sync::Arc::new(
+                    store,
+                )));
                 tracing::info!(target: "gateway", "coordinator surface on (/v1/coordinator/*)");
             }
             Err(e) => tracing::warn!(

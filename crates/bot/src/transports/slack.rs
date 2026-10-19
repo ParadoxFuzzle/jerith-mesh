@@ -14,12 +14,12 @@
 //! wss channel IS the auth), so no HMAC surface here — the webinbox.rs
 //! Events-API lane remains documented for operators who prefer webhooks.
 
-use super::{chunk_utf8, handle_incoming, http_json, DeliveryFn, Incoming};
+use super::{DeliveryFn, Incoming, chunk_utf8, handle_incoming, http_json};
 use crate::config::BotConfig;
 use crate::state::BotState;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,8 +32,14 @@ pub struct SlackConfig {
 }
 impl SlackConfig {
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.app_token.starts_with("xapp-"), "slack: app_token must be an xapp-… token");
-        anyhow::ensure!(self.bot_token.starts_with("xoxb-"), "slack: bot_token must be an xoxb-… token");
+        anyhow::ensure!(
+            self.app_token.starts_with("xapp-"),
+            "slack: app_token must be an xapp-… token"
+        );
+        anyhow::ensure!(
+            self.bot_token.starts_with("xoxb-"),
+            "slack: bot_token must be an xoxb-… token"
+        );
         Ok(())
     }
 }
@@ -67,7 +73,12 @@ pub(crate) fn make_deliverer(bot_token: String) -> DeliveryFn {
 
 /// One reconnect-cycle: resolve a fresh wss url from the app token,
 /// connect, run until the socket dies; Ok(()) if a clean shutdown.
-async fn session(cfg: &BotConfig, state: &BotState, scfg: &SlackConfig, owner: Option<u64>) -> Result<()> {
+async fn session(
+    cfg: &BotConfig,
+    state: &BotState,
+    scfg: &SlackConfig,
+    owner: Option<u64>,
+) -> Result<()> {
     let (code, v) = http_json(
         reqwest::Method::POST,
         "https://slack.com/api/apps.connections.open",
@@ -144,7 +155,14 @@ async fn session(cfg: &BotConfig, state: &BotState, scfg: &SlackConfig, owner: O
                     write.send(Message::text(ack.to_string())).await?;
                 }
                 if env["type"].as_str() == Some("events_api") {
-                    handle_event(cfg, state, &env["payload"]["event"], &me_id, owner, Arc::clone(&deliverer));
+                    handle_event(
+                        cfg,
+                        state,
+                        &env["payload"]["event"],
+                        &me_id,
+                        owner,
+                        Arc::clone(&deliverer),
+                    );
                 }
             }
             Some("hello") => tracing::info!(transport = "slack", "socket mode: hello"),
@@ -200,7 +218,12 @@ fn handle_event(
     });
 }
 
-pub async fn run(cfg: Arc<BotConfig>, state: BotState, scfg: SlackConfig, owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    cfg: Arc<BotConfig>,
+    state: BotState,
+    scfg: SlackConfig,
+    owner: Option<u64>,
+) -> Result<()> {
     scfg.validate()?;
     tracing::info!(transport = "slack", "socket mode starting");
     // Internal reconnect loop: a socket death is routine (slack rotates
@@ -224,9 +247,15 @@ mod tests {
     #[test]
     fn validate_enforces_token_shapes() {
         test_cfg().validate().unwrap();
-        let bad = SlackConfig { app_token: "sekret".into(), ..test_cfg() };
+        let bad = SlackConfig {
+            app_token: "sekret".into(),
+            ..test_cfg()
+        };
         assert!(bad.validate().is_err());
-        let bad2 = SlackConfig { bot_token: "xoxp-1".into(), ..test_cfg() };
+        let bad2 = SlackConfig {
+            bot_token: "xoxp-1".into(),
+            ..test_cfg()
+        };
         assert!(bad2.validate().is_err());
     }
 
@@ -269,6 +298,10 @@ mod tests {
         // yield lets it run before the count (current-thread tokio).
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let got = routed.lock().unwrap();
-        assert_eq!(got.len(), 1, "the human message routed exactly once; bot/subtype echo and reaction events routed ZERO extra times: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "the human message routed exactly once; bot/subtype echo and reaction events routed ZERO extra times: {got:?}"
+        );
     }
 }

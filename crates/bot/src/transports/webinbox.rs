@@ -30,11 +30,11 @@
 use crate::config::BotConfig;
 use crate::state::BotState;
 use anyhow::{Context as _, Result};
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State as AxState;
 use axum::http::HeaderMap;
 use axum::routing::post;
-use axum::Router;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
@@ -104,7 +104,12 @@ pub async fn run(cfg: Arc<BotConfig>, wcfg: &WebinboxConfig) {
         .route("/in/slack", post(in_slack))
         .route("/in/teams", post(in_teams))
         .route("/in/google_chat", post(in_google_chat))
-        .with_state(Wb { cfg, state, wcfg: wcfg.clone(), owner });
+        .with_state(Wb {
+            cfg,
+            state,
+            wcfg: wcfg.clone(),
+            owner,
+        });
     let listener = match tokio::net::TcpListener::bind(&wcfg.bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -129,26 +134,23 @@ async fn verify_whatsapp(
     AxState(wb): AxState<Wb>,
     q: axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let wcfg = wb
-        .cfg
-        .transports
-        .whatsapp
-        .clone()
-        .ok_or((axum::http::StatusCode::FORBIDDEN, "whatsapp transport not configured".into()))?;
-    let want = wcfg
-        .verify_token
-        .clone()
-        .filter(|t| !t.is_empty())
-        .ok_or((axum::http::StatusCode::FORBIDDEN, "whatsapp: verify_token missing".into()))?;
+    let wcfg = wb.cfg.transports.whatsapp.clone().ok_or((
+        axum::http::StatusCode::FORBIDDEN,
+        "whatsapp transport not configured".into(),
+    ))?;
+    let want = wcfg.verify_token.clone().filter(|t| !t.is_empty()).ok_or((
+        axum::http::StatusCode::FORBIDDEN,
+        "whatsapp: verify_token missing".into(),
+    ))?;
     let mode = q.get("hub.mode").map(String::as_str).unwrap_or("");
     let token = q.get("hub.verify_token").map(String::as_str).unwrap_or("");
     if mode == "subscribe" && ct_eq(token.as_bytes(), want.as_bytes()) {
-        return Ok(q
-            .get("hub.challenge")
-            .cloned()
-            .unwrap_or_default());
+        return Ok(q.get("hub.challenge").cloned().unwrap_or_default());
     }
-    Err((axum::http::StatusCode::FORBIDDEN, "verify handshake refused".into()))
+    Err((
+        axum::http::StatusCode::FORBIDDEN,
+        "verify handshake refused".into(),
+    ))
 }
 
 /// Post: verify, parse, route.
@@ -157,16 +159,14 @@ async fn in_whatsapp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
-    let wcfg = wb
-        .cfg
-        .transports
-        .whatsapp
-        .clone()
-        .ok_or((axum::http::StatusCode::FORBIDDEN, "whatsapp transport not configured".into()))?;
-    let secret = wcfg
-        .app_secret
-        .clone()
-        .ok_or((axum::http::StatusCode::FORBIDDEN, "whatsapp: app_secret missing".into()))?;
+    let wcfg = wb.cfg.transports.whatsapp.clone().ok_or((
+        axum::http::StatusCode::FORBIDDEN,
+        "whatsapp transport not configured".into(),
+    ))?;
+    let secret = wcfg.app_secret.clone().ok_or((
+        axum::http::StatusCode::FORBIDDEN,
+        "whatsapp: app_secret missing".into(),
+    ))?;
     let got = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
@@ -174,10 +174,17 @@ async fn in_whatsapp(
         .unwrap_or_default();
     let want = hmac_hex(&secret, &body);
     if got.is_empty() || !ct_eq(got.as_bytes(), want.as_bytes()) {
-        return Err((axum::http::StatusCode::FORBIDDEN, "signature mismatch".into()));
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            "signature mismatch".into(),
+        ));
     }
-    let v: Value = serde_json::from_slice(&body)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
+    let v: Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("bad json: {e}"),
+        )
+    })?;
     let Some((from, display, text)) = crate::transports::facebook::parse_message(&v) else {
         return Ok(""); // status notifications etc. — ack silently
     };
@@ -189,7 +196,13 @@ async fn in_whatsapp(
         display,
         text,
     };
-    spawn_session(Arc::clone(&wb.cfg), wb.state.clone(), inc, wb.owner, deliverer);
+    spawn_session(
+        Arc::clone(&wb.cfg),
+        wb.state.clone(),
+        inc,
+        wb.owner,
+        deliverer,
+    );
     Ok("")
 }
 
@@ -237,13 +250,19 @@ async fn in_slack(
         .get("x-slack-request-timestamp")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i64>().ok())
-        .ok_or((axum::http::StatusCode::FORBIDDEN, "missing signature timestamp".into()))?;
+        .ok_or((
+            axum::http::StatusCode::FORBIDDEN,
+            "missing signature timestamp".into(),
+        ))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     if (now - ts).abs() > 300 {
-        return Err((axum::http::StatusCode::FORBIDDEN, "slack replay window exceeded".into()));
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            "slack replay window exceeded".into(),
+        ));
     }
     let v0 = format!("v0:{ts}:{}", String::from_utf8_lossy(&body));
     let want = format!("v0={}", hmac_hex(&secret, v0.as_bytes()));
@@ -253,10 +272,17 @@ async fn in_slack(
         .unwrap_or_default()
         .to_string();
     if !ct_eq(got.as_bytes(), want.as_bytes()) {
-        return Err((axum::http::StatusCode::FORBIDDEN, "slack signature mismatch".into()));
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            "slack signature mismatch".into(),
+        ));
     }
-    let v: Value = serde_json::from_slice(&body)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
+    let v: Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("bad json: {e}"),
+        )
+    })?;
     if v["type"].as_str() == Some("url_verification") {
         let challenge = v["challenge"].as_str().unwrap_or_default().to_string();
         // (axum response String; the caller sees it raw)
@@ -264,7 +290,8 @@ async fn in_slack(
     }
     if v["type"].as_str() != Some("event_callback") {
         return Ok("");
-    }    let ev = &v["event"];
+    }
+    let ev = &v["event"];
     // Slack Events-API shares the message envelope: skip bots/subtypes,
     // build the Incoming, route through the shared pipeline.
     if ev["type"].as_str() != Some("message")
@@ -275,7 +302,9 @@ async fn in_slack(
     }
     let channel = ev["channel"].as_str().map(str::to_string);
     let user = ev["user"].as_str().map(str::to_string);
-    let text = ev["text"].as_str().and_then(|t| (!t.trim().is_empty()).then(|| t.to_string()));
+    let text = ev["text"]
+        .as_str()
+        .and_then(|t| (!t.trim().is_empty()).then(|| t.to_string()));
     let (Some(channel), Some(user), Some(text)) = (channel, user, text) else {
         return Ok("");
     };
@@ -297,7 +326,13 @@ async fn in_slack(
         display: user,
         text,
     };
-    spawn_session(Arc::clone(&wb.cfg), wb.state.clone(), inc, wb.owner, deliverer);
+    spawn_session(
+        Arc::clone(&wb.cfg),
+        wb.state.clone(),
+        inc,
+        wb.owner,
+        deliverer,
+    );
     Ok("")
 }
 
@@ -315,16 +350,28 @@ async fn in_teams(
             "teams route requires webinbox.allow_unverified (no JWT verification this build — loopback only)".into(),
         ));
     }
-    let v: Value = serde_json::from_slice(&body)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
-    let Some((conv, service_url, user, display, text)) = crate::transports::teams::parse_activity(&v) else {
+    let v: Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("bad json: {e}"),
+        )
+    })?;
+    let Some((conv, service_url, user, display, text)) =
+        crate::transports::teams::parse_activity(&v)
+    else {
         return Ok("");
     };
     let Some(tcfg) = wb.cfg.transports.teams.clone() else {
-        return Err((axum::http::StatusCode::FORBIDDEN, "teams transport not configured".into()));
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            "teams transport not configured".into(),
+        ));
     };
     if !crate::transports::teams::service_url_allowed(&tcfg, &service_url) {
-        return Err((axum::http::StatusCode::FORBIDDEN, "teams: serviceUrl not allowlisted".into()));
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            "teams: serviceUrl not allowlisted".into(),
+        ));
     }
     let deliverer = crate::transports::teams::make_deliverer(Arc::clone(&wb.cfg));
     let inc = crate::transports::Incoming {
@@ -335,7 +382,13 @@ async fn in_teams(
         display,
         text,
     };
-    spawn_session(Arc::clone(&wb.cfg), wb.state.clone(), inc, wb.owner, deliverer);
+    spawn_session(
+        Arc::clone(&wb.cfg),
+        wb.state.clone(),
+        inc,
+        wb.owner,
+        deliverer,
+    );
     Ok("")
 }
 
@@ -349,21 +402,40 @@ async fn in_google_chat(
             "google_chat route requires webinbox.allow_unverified (no service-account JWT verification this build)".into(),
         ));
     }
-    let v: Value = serde_json::from_slice(&body)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
+    let v: Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("bad json: {e}"),
+        )
+    })?;
     // Chat event envelope: message.text, message.sender.{name,displayName},
     // space.name (a webhook-only space can't ping back per-space; replies
     // ride gcfg.webhook_url).
-    let Some(text) = v.pointer("/message/text").and_then(Value::as_str).map(str::to_string) else {
+    let Some(text) = v
+        .pointer("/message/text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
         return Ok("");
     };
-    let user = v.pointer("/message/sender/name").and_then(Value::as_str).unwrap_or("unknown").to_string();
-    let display = v.pointer("/message/sender/displayName").and_then(Value::as_str).unwrap_or(&user).to_string();
+    let user = v
+        .pointer("/message/sender/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let display = v
+        .pointer("/message/sender/displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&user)
+        .to_string();
     if text.trim().is_empty() {
         return Ok("");
     }
     let Some(gcfg) = wb.cfg.transports.google_chat.clone() else {
-        return Err((axum::http::StatusCode::FORBIDDEN, "google_chat transport not configured".into()));
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            "google_chat transport not configured".into(),
+        ));
     };
     let deliverer = crate::transports::google_chat::make_deliverer(gcfg);
     let inc = crate::transports::Incoming {
@@ -373,7 +445,13 @@ async fn in_google_chat(
         display,
         text,
     };
-    spawn_session(Arc::clone(&wb.cfg), wb.state.clone(), inc, wb.owner, deliverer);
+    spawn_session(
+        Arc::clone(&wb.cfg),
+        wb.state.clone(),
+        inc,
+        wb.owner,
+        deliverer,
+    );
     Ok("")
 }
 
@@ -393,10 +471,7 @@ mod tests {
         );
         assert_eq!(
             // Key = 0x0b repeated 20 bytes, data "Hi There" (RFC 4231 TC1).
-            hmac_hex(
-                "\u{b}".repeat(20).as_str(),
-                b"Hi There"
-            ),
+            hmac_hex("\u{b}".repeat(20).as_str(), b"Hi There"),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
     }
@@ -410,10 +485,17 @@ mod tests {
 
     #[test]
     fn webinbox_config_loopback_default() {
-        let c = WebinboxConfig { bind: default_bind(), slack_signing_secret: None, allow_unverified: false };
+        let c = WebinboxConfig {
+            bind: default_bind(),
+            slack_signing_secret: None,
+            allow_unverified: false,
+        };
         assert_eq!(c.bind, "127.0.0.1:5543");
         c.validate().unwrap();
-        let bad = WebinboxConfig { bind: "no-port".into(), ..c };
+        let bad = WebinboxConfig {
+            bind: "no-port".into(),
+            ..c
+        };
         assert!(bad.validate().is_err());
     }
 }

@@ -225,8 +225,10 @@ pub async fn handle(
     // owner's in-guild messages — are never privileged. Computed BEFORE
     // the spawn from Copy values: the spawned block must not borrow a
     // `FullEvent`-lifetime handle.
-    let owner_privileged =
-        is_dm && cfg.owner_discord_id.is_some_and(|id| id == msg.author.id.get());
+    let owner_privileged = is_dm
+        && cfg
+            .owner_discord_id
+            .is_some_and(|id| id == msg.author.id.get());
     tokio::spawn(async move {
         show_typing(&http_ctx, channel).await;
         // Attachments first (downloads + vision/sandbox round-trips can
@@ -267,7 +269,11 @@ pub async fn handle(
         match crate::converse::run_session(
             &cfg,
             &state,
-            crate::converse::Session { user, prompt, owner_privileged },
+            crate::converse::Session {
+                user,
+                prompt,
+                owner_privileged,
+            },
             &speaker_prefix,
             &mut sink,
         )
@@ -569,6 +575,54 @@ pub(crate) fn clip_tail(text: &str, max: usize) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Approval-bridge button presses (FEATURES §15, approval.rs)
+// ---------------------------------------------------------------------------
+
+/// Serve one component interaction that belongs to the approval bridge.
+/// Returns `Ok(true)` when the interaction was consumed (approval custom
+/// id — answered in here, whether the presser was the owner or not), so
+/// the caller can stop without poise treating it as an unowned event.
+async fn approval_press(
+    ctx: poise::FrameworkContext<'_, Data, Error>,
+    ci: &serenityall::ComponentInteraction,
+) -> bool {
+    // Bridge buttons only; anything else is some other integration's.
+    if crate::approval::parse_button(&ci.data.custom_id).is_none() {
+        return false;
+    }
+    let user_id = ci.user.id.get();
+    let cfg_owner = ctx.user_data().await.cfg.owner_discord_id;
+    let is_owner = Some(user_id) == cfg_owner;
+    let ack = |content: String| {
+        ci.create_response(
+            ctx.serenity_context,
+            serenityall::CreateInteractionResponse::Message(
+                serenityall::CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            ),
+        )
+    };
+    let custom_id = ci.data.custom_id.clone();
+    let reply = if !is_owner {
+        "That approval belongs to the bot owner — this card will not act on your press.".to_string()
+    } else {
+        match crate::approval::resolve_discord(user_id, &custom_id).await {
+            Ok(line) => line,
+            Err(e) => approval_error_line(&e.to_string()),
+        }
+    };
+    if let Err(e) = ack(reply).await {
+        tracing::warn!(error = %e, "approval button ack failed");
+    }
+    true
+}
+/// First line of an error string, clipped (card text discipline). Named
+/// past `first_line` — chat_fallback already defines one for its own
+/// reply clipping, and these two stay free to evolve separately.
+use crate::approval::first_line as approval_error_line;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,53 +688,3 @@ mod tests {
         assert!(speaker_tag(&u).starts_with("[Discord user: noodly_handle "));
     }
 }
-
-// ---------------------------------------------------------------------------
-// Approval-bridge button presses (FEATURES §15, approval.rs)
-// ---------------------------------------------------------------------------
-
-/// Serve one component interaction that belongs to the approval bridge.
-/// Returns `Ok(true)` when the interaction was consumed (approval custom
-/// id — answered in here, whether the presser was the owner or not), so
-/// the caller can stop without poise treating it as an unowned event.
-async fn approval_press(
-    ctx: poise::FrameworkContext<'_, Data, Error>,
-    ci: &serenityall::ComponentInteraction,
-) -> bool {
-    // Bridge buttons only; anything else is some other integration's.
-    if crate::approval::parse_button(&ci.data.custom_id).is_none() {
-        return false;
-    }
-    let user_id = ci.user.id.get();
-    let cfg_owner = ctx.user_data().await.cfg.owner_discord_id;
-    let is_owner = Some(user_id) == cfg_owner;
-    let ack = |content: String| {
-        ci.create_response(
-            ctx.serenity_context,
-            serenityall::CreateInteractionResponse::Message(
-                serenityall::CreateInteractionResponseMessage::new()
-                    .content(content)
-                    .ephemeral(true),
-            ),
-        )
-    };
-    let custom_id = ci.data.custom_id.clone();
-    let reply = if !is_owner {
-        "That approval belongs to the bot owner — this card will not act on your press."
-            .to_string()
-    } else {
-        match crate::approval::resolve_discord(user_id, &custom_id).await {
-            Ok(line) => line,
-            Err(e) => approval_error_line(&e.to_string()),
-        }
-    };
-    if let Err(e) = ack(reply).await {
-        tracing::warn!(error = %e, "approval button ack failed");
-    }
-    true
-}
-/// First line of an error string, clipped (card text discipline). Named
-/// past `first_line` — chat_fallback already defines one for its own
-/// reply clipping, and these two stay free to evolve separately.
-use crate::approval::first_line as approval_error_line;
-

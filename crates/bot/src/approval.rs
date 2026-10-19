@@ -14,6 +14,7 @@
 //!      `workflow.run` over a recorded purchase playbook), or
 //!    - `http_call` — a method/URL/body against an owner-allowlisted
 //!      host (raw API payments, webhook triggers).
+//!
 //!    The request is persisted (0600 JSON, one file per request) and
 //!    immediately answered to the model with a pending id — the tool
 //!    loop never blocks on a human.
@@ -338,7 +339,10 @@ fn new_id() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // 31 glyphs
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| ALPHABET[(b % 31) as usize] as char).collect()
+    bytes
+        .iter()
+        .map(|b| ALPHABET[(b % 31) as usize] as char)
+        .collect()
 }
 
 /// Concurrent pending approvals cap (a chatty guest cannot flood the
@@ -385,11 +389,7 @@ pub fn set_discord_http(http: Arc<serenityall::Http>) {
 fn config() -> Result<&'static Arc<crate::config::BotConfig>> {
     #[cfg(test)]
     {
-        if let Some(arc) = TEST_CONFIG
-            .lock()
-            .expect("test config lock")
-            .clone()
-        {
+        if let Some(arc) = TEST_CONFIG.lock().expect("test config lock").clone() {
             // Leak a stable reference so the &'static contract holds for
             // the length of the test process (small, bounded config).
             return Ok(Box::leak(Box::new(arc)));
@@ -476,15 +476,15 @@ pub async fn request(summary: &str, action: DeferredAction, requester_id: u64) -
     // one relay is down — hooks enforces its own bounded retries).
     let card = notification_card(&req);
     emit_hook("approval_requested", &req);
-    if acfg.discord_owner_dm {
-        if let Err(e) = notify_discord(&card, &req.id).await {
-            tracing::warn!(error = %e, id = %id, "discord approval DM failed");
-        }
+    if acfg.discord_owner_dm
+        && let Err(e) = notify_discord(&card, &req.id).await
+    {
+        tracing::warn!(error = %e, id = %id, "discord approval DM failed");
     }
-    if acfg.telegram_chat_id.is_some() {
-        if let Err(e) = notify_telegram(&card, &req.id).await {
-            tracing::warn!(error = %e, id = %id, "telegram approval notice failed");
-        }
+    if acfg.telegram_chat_id.is_some()
+        && let Err(e) = notify_telegram(&card, &req.id).await
+    {
+        tracing::warn!(error = %e, id = %id, "telegram approval notice failed");
     }
     for url in &acfg.notify_webhooks {
         if let Err(e) = post_webhook(url, &json!({"text": card})).await {
@@ -517,10 +517,10 @@ pub async fn status(id: Option<&str>) -> Result<Value> {
     let dir = store_dir();
     let mut rows = Vec::new();
     for sid in list_ids(&dir)? {
-        if let Some(req) = load_request(&sid)? {
-            if req.status == Status::Pending {
-                rows.push(request_row(&req));
-            }
+        if let Some(req) = load_request(&sid)?
+            && req.status == Status::Pending
+        {
+            rows.push(request_row(&req));
         }
     }
     Ok(json!({ "pending": rows, "count": rows.len() }))
@@ -594,10 +594,10 @@ pub async fn resolve(
     match req.status {
         Status::Pending => {}
         Status::Expired => {
-            return Ok(json!({ "id": id, "state": "expired", "note": "already closed by TTL" }))
+            return Ok(json!({ "id": id, "state": "expired", "note": "already closed by TTL" }));
         }
         other => {
-            return Ok(json!({ "id": id, "state": other, "note": "already resolved; no re-run" }))
+            return Ok(json!({ "id": id, "state": other, "note": "already resolved; no re-run" }));
         }
     }
     if now_ms() > req.expires_ms {
@@ -663,16 +663,22 @@ impl ResolverId {
 /// orphaned an Approved/Corrected request). Loads, executes, persists the
 /// terminal status and notifies.
 async fn execute(id: String) {
-    let Some(cfg) = CONFIG.get().cloned() else { return };
-    let Ok(Some(req)) = load_request(&id) else { return };
+    let Some(cfg) = CONFIG.get().cloned() else {
+        return;
+    };
+    let Ok(Some(req)) = load_request(&id) else {
+        return;
+    };
     if !matches!(req.status, Status::Approved | Status::Corrected) {
         return; // another path finished it first
     }
     let action = req.corrected_action.as_ref().unwrap_or(&req.action);
     let outcome = match action {
-        DeferredAction::Skill { gate: _gate, skill, args } => {
-            execute_skill(&cfg, skill, args).await
-        }
+        DeferredAction::Skill {
+            gate: _gate,
+            skill,
+            args,
+        } => execute_skill(&cfg, skill, args).await,
         DeferredAction::HttpCall { method, url, body } => {
             execute_http_call(&cfg, method, url, body.as_ref()).await
         }
@@ -740,7 +746,9 @@ fn validate_http_call(method: &str, url: &str, body: Option<&Value>) -> Result<(
         .to_ascii_lowercase();
     anyhow::ensure!(!host.is_empty(), "http_call url has no parseable host");
     anyhow::ensure!(
-        allowlist.iter().any(|a| a.trim().to_ascii_lowercase() == host),
+        allowlist
+            .iter()
+            .any(|a| a.trim().to_ascii_lowercase() == host),
         "http_call host {host:?} is not on the [approvals] http_call_allowlist"
     );
     if let Some(b) = body {
@@ -930,18 +938,17 @@ async fn post_webhook(url: &str, payload: &Value) -> Result<()> {
 /// follow-up, never as an edit of a dead message identity).
 async fn notify_resolution(cfg: &Arc<crate::config::BotConfig>, req: &Request, outcome: &str) {
     let text = format!("**Approval {id}** — {outcome}", id = req.id);
-    emit_hook("approval_resolved", &req);
-    if cfg.approvals.discord_owner_dm {
-        if let Some(http) = DISCORD_HTTP.get() {
-            if let Some(owner) = cfg.owner_discord_id {
-                let _ = dm_owner(http, owner, &text).await;
-            }
-        }
+    emit_hook("approval_resolved", req);
+    if cfg.approvals.discord_owner_dm
+        && let Some(http) = DISCORD_HTTP.get()
+        && let Some(owner) = cfg.owner_discord_id
+    {
+        let _ = dm_owner(http, owner, &text).await;
     }
-    if let Some(token) = cfg.approvals.telegram_bot_token.as_deref() {
-        if let Some(chat) = cfg.approvals.telegram_chat_id {
-            send_telegram_text(token, chat, &text).await;
-        }
+    if let Some(token) = cfg.approvals.telegram_bot_token.as_deref()
+        && let Some(chat) = cfg.approvals.telegram_chat_id
+    {
+        send_telegram_text(token, chat, &text).await;
     }
     for url in &cfg.approvals.notify_webhooks {
         let _ = post_webhook(url, &json!({"text": text})).await;
@@ -977,7 +984,11 @@ pub async fn resolve_discord(user_id: u64, custom_id: &str) -> Result<String> {
         anyhow::bail!("not an approval button");
     };
     let corrected = None; // v1: patch path arrives via Telegram text / future UI
-    let decision = if yes { Decision::Approve } else { Decision::Deny };
+    let decision = if yes {
+        Decision::Approve
+    } else {
+        Decision::Deny
+    };
     let value = resolve(ResolverId::Discord(user_id), &id, decision, corrected).await?;
     Ok(state_line(&value))
 }
@@ -1086,9 +1097,15 @@ async fn handle_telegram_update(cfg: &Arc<crate::config::BotConfig>, update: &Va
     }
     // Text command: `approve <id> [json]` / `deny <id>` — the json patch
     // on `approve` selects the Correct path.
-    let Some(msg) = update.get("message") else { return };
+    let Some(msg) = update.get("message") else {
+        return;
+    };
     let from = msg.pointer("/from/id").and_then(Value::as_i64).unwrap_or(0);
-    let text = msg.get("text").and_then(Value::as_str).unwrap_or_default().trim();
+    let text = msg
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
     if from != chat {
         return;
     }
@@ -1113,7 +1130,13 @@ async fn handle_telegram_update(cfg: &Arc<crate::config::BotConfig>, update: &Va
     } else {
         match serde_json::from_str::<Value>(patch_json) {
             Ok(patch) => {
-                resolve(ResolverId::Telegram(chat), id, Decision::Correct, Some(patch)).await
+                resolve(
+                    ResolverId::Telegram(chat),
+                    id,
+                    Decision::Correct,
+                    Some(patch),
+                )
+                .await
             }
             Err(e) => Err(anyhow::anyhow!("the corrected args are not JSON: {e}")),
         }
@@ -1140,7 +1163,9 @@ fn token_of(cfg: &Arc<crate::config::BotConfig>) -> String {
 async fn ack_callback(token: &Option<String>, cb_id: &str, text: &str) {
     let Some(token) = token else { return };
     let _ = crate::api::client()
-        .post(format!("https://api.telegram.org/bot{token}/answerCallbackQuery"))
+        .post(format!(
+            "https://api.telegram.org/bot{token}/answerCallbackQuery"
+        ))
         .json(&json!({ "callback_query_id": cb_id, "text": text, "show_alert": true }))
         .timeout(Duration::from_secs(10))
         .send()
@@ -1172,9 +1197,13 @@ pub fn start_sweeper() {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
             let Ok(cfg) = config().cloned() else { continue };
-            let Ok(ids) = list_ids(&store_dir()) else { continue };
+            let Ok(ids) = list_ids(&store_dir()) else {
+                continue;
+            };
             for id in ids {
-                let Ok(req_opt) = load_request(&id) else { continue };
+                let Ok(req_opt) = load_request(&id) else {
+                    continue;
+                };
                 let Some(req) = req_opt else { continue };
                 match req.status {
                     Status::Pending if now_ms() > req.expires_ms => {
@@ -1182,12 +1211,8 @@ pub fn start_sweeper() {
                         expired.status = Status::Expired;
                         expired.result = Some("expired before resolution".to_string());
                         if save_request(&expired).is_ok() {
-                            notify_resolution(
-                                &cfg,
-                                &expired,
-                                "expired — nothing was executed",
-                            )
-                            .await;
+                            notify_resolution(&cfg, &expired, "expired — nothing was executed")
+                                .await;
                         }
                     }
                     Status::Approved | Status::Corrected => {
@@ -1246,10 +1271,11 @@ fn pending_count() -> Result<usize> {
     let dir = store_dir();
     let mut n = 0usize;
     for id in list_ids(&dir)? {
-        if let Some(req) = load_request(&id)? {
-            if req.status == Status::Pending && now_ms() <= req.expires_ms {
-                n += 1;
-            }
+        if let Some(req) = load_request(&id)?
+            && req.status == Status::Pending
+            && now_ms() <= req.expires_ms
+        {
+            n += 1;
         }
     }
     Ok(n)
@@ -1416,19 +1442,16 @@ mod tests {
             .join(new_id().to_ascii_lowercase());
         std::fs::create_dir_all(&dir).expect("scratch store dir");
         *TEST_STORE.lock().expect("test store lock") = Some(dir);
-        let mut cfg = crate::config::BotConfig::from_parts(
-            "http://127.0.0.1:8900",
-            "http://127.0.0.1:8322",
-        );
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:8900", "http://127.0.0.1:8322");
         // The bot deployment's own owner id (resolved from bot.toml/env).
-        cfg.owner_discord_id = Some(std::env::var("JERITH_BOT_OWNER_ID")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(424242));
-        cfg.approvals.http_call_allowlist = allowlist
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        cfg.owner_discord_id = Some(
+            std::env::var("JERITH_BOT_OWNER_ID")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(424242),
+        );
+        cfg.approvals.http_call_allowlist = allowlist.iter().map(|s| s.to_string()).collect();
         *TEST_CONFIG.lock().expect("test config lock") = Some(Arc::new(cfg));
         guard
     }
@@ -1443,6 +1466,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // Single-threaded tokio test: the std-sequencer guard IS the
+    // serialization contract and is deliberately held across the awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn request_refuses_owner_only_skills() {
         let _g = with_test_setup(&[]);
         // workflow.run belongs to the owner-only workflows plugin: its
@@ -1454,9 +1480,14 @@ mod tests {
     }
 
     #[tokio::test]
+    // Single-threaded tokio test: the std-sequencer guard IS the
+    // serialization contract and is deliberately held across the awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn deny_roundtrip_is_one_shot_and_identity_gated() {
         let _g = with_test_setup(&["api.stripe.com"]);
-        let v = request("Remember one note", embed_action(), 0).await.unwrap();
+        let v = request("Remember one note", embed_action(), 0)
+            .await
+            .unwrap();
         let id = v["id"].as_str().unwrap().to_string();
         // A guest's resolver id is refused outright.
         assert!(
@@ -1471,9 +1502,14 @@ mod tests {
         assert_eq!(v2["state"], json!("cancelled"));
         // Second press on the same card is a stable no-op, not an error,
         // and never re-runs anything.
-        let v3 = resolve(ResolverId::Discord(cfg_owner()), &id, Decision::Approve, None)
-            .await
-            .unwrap();
+        let v3 = resolve(
+            ResolverId::Discord(cfg_owner()),
+            &id,
+            Decision::Approve,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(v3["state"], json!("cancelled"));
         let v4 = resolve(ResolverId::Discord(cfg_owner()), &id, Decision::Deny, None)
             .await
@@ -1488,21 +1524,25 @@ mod tests {
     }
 
     #[tokio::test]
+    // Single-threaded tokio test: the std-sequencer guard IS the
+    // serialization contract and is deliberately held across the awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn correct_path_persists_patched_action() {
         let _g = with_test_setup(&["api.stripe.com"]);
-        let v = request(
-            "Remember one note",
-            embed_action(),
-            0,
-        )
-        .await
-        .unwrap();
+        let v = request("Remember one note", embed_action(), 0)
+            .await
+            .unwrap();
         let id = v["id"].as_str().unwrap().to_string();
         // Correct without args is an invalid decision.
         assert!(
-            resolve(ResolverId::Discord(cfg_owner()), &id, Decision::Correct, None)
-                .await
-                .is_err()
+            resolve(
+                ResolverId::Discord(cfg_owner()),
+                &id,
+                Decision::Correct,
+                None
+            )
+            .await
+            .is_err()
         );
         // With args it lands Corrected + the patch merged.
         let v2 = resolve(
@@ -1535,16 +1575,26 @@ mod tests {
     }
 
     #[tokio::test]
+    // Single-threaded tokio test: the std-sequencer guard IS the
+    // serialization contract and is deliberately held across the awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn ttl_expiry_closes_pending() {
         let _g = with_test_setup(&[]);
-        let v = request("Remember one note", embed_action(), 0).await.unwrap();
+        let v = request("Remember one note", embed_action(), 0)
+            .await
+            .unwrap();
         let id = v["id"].as_str().unwrap().to_string();
         let mut req = load_request(&id).unwrap().unwrap();
         req.expires_ms = now_ms() - 1; // force the expiry window open
         save_request(&req).unwrap();
-        let v2 = resolve(ResolverId::Discord(cfg_owner()), &id, Decision::Approve, None)
-            .await
-            .unwrap();
+        let v2 = resolve(
+            ResolverId::Discord(cfg_owner()),
+            &id,
+            Decision::Approve,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(v2["state"], json!("expired"));
         let row = status(Some(&id)).await.unwrap();
         assert_eq!(row["status"], json!("expired"));
@@ -1552,16 +1602,26 @@ mod tests {
     }
 
     #[tokio::test]
+    // Single-threaded tokio test: the std-sequencer guard IS the
+    // serialization contract and is deliberately held across the awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn cancel_before_resolution_works() {
         let _g = with_test_setup(&[]);
-        let v = request("Remember one note", embed_action(), 0).await.unwrap();
+        let v = request("Remember one note", embed_action(), 0)
+            .await
+            .unwrap();
         let id = v["id"].as_str().unwrap().to_string();
         let v2 = cancel(&id).await.unwrap();
         assert_eq!(v2["state"], json!("cancelled"));
         // The requester-cancelled request can no longer be approved.
-        let v3 = resolve(ResolverId::Discord(cfg_owner()), &id, Decision::Approve, None)
-            .await
-            .unwrap();
+        let v3 = resolve(
+            ResolverId::Discord(cfg_owner()),
+            &id,
+            Decision::Approve,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(v3["state"], json!("cancelled"));
         std::fs::remove_dir_all(store_dir()).ok();
     }
@@ -1604,8 +1664,13 @@ mod tests {
         for _ in 0..64 {
             let id = new_id();
             assert_eq!(id.len(), 8);
-            assert!(id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
-            assert!(!id.contains('I') && !id.contains('O') && !id.contains('0') && !id.contains('1'));
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            );
+            assert!(
+                !id.contains('I') && !id.contains('O') && !id.contains('0') && !id.contains('1')
+            );
         }
     }
 
@@ -1627,7 +1692,10 @@ mod tests {
     fn describe_never_reveals_args() {
         let card = skill_action().describe();
         assert!(card.contains("workflow.run"), "{card}");
-        assert!(!card.contains("Staples"), "args leaked into describe: {card}");
+        assert!(
+            !card.contains("Staples"),
+            "args leaked into describe: {card}"
+        );
         let h = DeferredAction::HttpCall {
             method: "POST".into(),
             url: "https://api.stripe.com/v1/charges".into(),
@@ -1671,7 +1739,10 @@ mod tests {
             parse_button("ap:K7M2XQ4P:yes"),
             Some(("K7M2XQ4P".to_string(), true))
         );
-        assert_eq!(parse_button("ap:K7M2XQ4P:no"), Some(("K7M2XQ4P".into(), false)));
+        assert_eq!(
+            parse_button("ap:K7M2XQ4P:no"),
+            Some(("K7M2XQ4P".into(), false))
+        );
         assert_eq!(parse_button("ap::yes"), None);
         assert_eq!(parse_button("ap:TOOLONGID123456:yes"), None);
         assert_eq!(parse_button(":K7M2XQ4P:yes"), None);
@@ -1684,8 +1755,12 @@ mod tests {
     fn allowlist_gates_http_calls() {
         let _g = with_test_setup(&["api.stripe.com"]);
         // https + allowlisted host + body under cap: ok.
-        validate_http_call("POST", "https://api.stripe.com/v1/charges", Some(&json!({"a":1})))
-            .expect("allowlisted call");
+        validate_http_call(
+            "POST",
+            "https://api.stripe.com/v1/charges",
+            Some(&json!({"a":1})),
+        )
+        .expect("allowlisted call");
         // http:// refused.
         assert!(validate_http_call("POST", "http://api.stripe.com/v1/charges", None).is_err());
         // Non-allowlisted host refused.
@@ -1697,7 +1772,9 @@ mod tests {
         assert!(validate_http_call("DELETE", "https://api.stripe.com/v1/charges", None).is_err());
         // Oversized body refused.
         let big = json!({ "blob": "x".repeat(70_000) });
-        assert!(validate_http_call("POST", "https://api.stripe.com/v1/charges", Some(&big)).is_err());
+        assert!(
+            validate_http_call("POST", "https://api.stripe.com/v1/charges", Some(&big)).is_err()
+        );
         // Host with port / path still matches the bare-host entry.
         validate_http_call("PUT", "https://api.stripe.com:443/v1/a?b=c", None).expect("host match");
     }
@@ -1713,6 +1790,9 @@ mod tests {
     /// would break the hand-off to the running bot.
     #[tokio::test]
     #[ignore = "fires a real approval card into the live Telegram chat"]
+    // Single-threaded tokio test: the std-sequencer guard IS the
+    // serialization contract and is deliberately held across the awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn live_telegram_roundtrip() {
         let _g = TEST_SEQUENCER.lock().unwrap_or_else(|e| e.into_inner());
         // JERITH_DISCORD_TOKEN comes bound from the maintenance command
@@ -1739,7 +1819,10 @@ mod tests {
         )
         .await
         .expect("approval.request fired against the live config");
-        println!("approval id = {}  →  press ✔ Approve in Telegram now", out["id"]);
+        println!(
+            "approval id = {}  →  press ✔ Approve in Telegram now",
+            out["id"]
+        );
     }
 
     #[test]
@@ -1782,8 +1865,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(request_path(&req.id)).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "approvals carry secrets, stay owner-only");
+            let mode = std::fs::metadata(request_path(&req.id))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "approvals carry secrets, stay owner-only"
+            );
         }
     }
 }

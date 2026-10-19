@@ -17,14 +17,14 @@ mod archiver;
 mod chat_fallback;
 mod commands;
 mod config;
-mod coordinator;
 mod converse;
+mod coordinator;
 mod external;
 mod gifs;
 mod hooks;
 mod mailbox;
-mod monitor;
 mod mongo;
+mod monitor;
 mod owner;
 mod people;
 mod pipeline;
@@ -203,7 +203,10 @@ async fn main() -> anyhow::Result<()> {
     // supervised task; absent `[transports]` tables cost nothing. They
     // hold config + state only — independent of the Discord gateway.
     if !cfg.transports.enabled_platforms().is_empty() {
-        tracing::info!(platforms = cfg.transports.enabled_platforms().join(", "), "external chat transports starting");
+        tracing::info!(
+            platforms = cfg.transports.enabled_platforms().join(", "),
+            "external chat transports starting"
+        );
         let cfg2 = std::sync::Arc::new(cfg.clone());
         let state2 = state.clone();
         crate::transports::spawn_all(cfg2, state2, cfg.owner_discord_id).await;

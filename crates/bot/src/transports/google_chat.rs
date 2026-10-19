@@ -8,7 +8,7 @@
 //!
 //! Cap: Chat hard-fails posts past 4K; 3500 stays within the UI fold.
 
-use super::{chunk_utf8, DeliveryFn};
+use super::{DeliveryFn, chunk_utf8};
 use crate::config::BotConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,8 @@ pub struct GoogleChatConfig {
 impl GoogleChatConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            self.webhook_url.starts_with("https://chat.googleapis.com/v1/spaces/"),
+            self.webhook_url
+                .starts_with("https://chat.googleapis.com/v1/spaces/"),
             "google_chat: webhook_url must be a chat.googleapis.com space webhook"
         );
         Ok(())
@@ -64,7 +65,12 @@ pub fn make_deliverer(gcfg: GoogleChatConfig) -> DeliveryFn {
     })
 }
 
-pub async fn run(_cfg: Arc<BotConfig>, _state: crate::state::BotState, gcfg: GoogleChatConfig, _owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    _cfg: Arc<BotConfig>,
+    _state: crate::state::BotState,
+    gcfg: GoogleChatConfig,
+    _owner: Option<u64>,
+) -> Result<()> {
     gcfg.validate()?;
     tracing::info!(
         transport = "google_chat",
@@ -74,4 +80,3 @@ pub async fn run(_cfg: Arc<BotConfig>, _state: crate::state::BotState, gcfg: Goo
     );
     Ok(())
 }
-

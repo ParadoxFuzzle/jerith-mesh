@@ -19,7 +19,7 @@
 //! The unit test locks the refusal in: a silent regression to a fake
 //! runner would be caught.
 
-use super::{Incoming, DeliveryFn};
+use super::{DeliveryFn, Incoming};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,8 @@ pub struct GgConfig {
     /// Free-form operator memo (never used to connect).
     #[serde(default)]
     pub note: Option<String>,
-}impl GgConfig {
+}
+impl GgConfig {
     /// Always fails: no public API exists to connect to (see module doc).
     /// (Referenced by the unit test below and any future integration
     /// point; the allow documents the dormant-by-research status.)
@@ -52,7 +53,12 @@ fn _future_contract(_i: Incoming, _d: DeliveryFn) {
     // super::handle_incoming(&cfg, &state, i, None, d).await;
 }
 
-pub async fn run(_cfg: std::sync::Arc<crate::config::BotConfig>, _state: crate::state::BotState, _gcfg: GgConfig, _owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    _cfg: std::sync::Arc<crate::config::BotConfig>,
+    _state: crate::state::BotState,
+    _gcfg: GgConfig,
+    _owner: Option<u64>,
+) -> Result<()> {
     // Unreachable in practice: validate() refuses at load. Typed anyway.
     unreachable!("gg has no public API — validate() refuses before this runs")
 }

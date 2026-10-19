@@ -99,11 +99,11 @@ impl CoordinatorStore {
     /// Open (or create) the store at `path`. `":memory:"` keeps its
     /// documented rusqlite behavior — the unit tests use it.
     pub fn open(path: &FsPath) -> anyhow::Result<Self> {
-        if path.to_string_lossy() != ":memory:" {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
+        if path.to_string_lossy() != ":memory:"
+            && let Some(parent) = path.parent()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening coordinator db {}", path.display()))?;
@@ -172,11 +172,12 @@ impl CoordinatorStore {
         let status: String = status.chars().take(24).collect();
         let conn = self.conn.lock().await;
         let exists: Option<bool> = conn
-            .query_row("SELECT 1 FROM workers WHERE name = ?1", [name], |_| Ok(true))
+            .query_row("SELECT 1 FROM workers WHERE name = ?1", [name], |_| {
+                Ok(true)
+            })
             .optional()?;
         if exists.is_none() {
-            let count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM workers", [], |r| r.get(0))?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM workers", [], |r| r.get(0))?;
             anyhow::ensure!(
                 count < MAX_WORKERS,
                 "coordinator: worker registry full ({MAX_WORKERS})"
@@ -271,8 +272,11 @@ impl CoordinatorStore {
         };
         let t = now_ms();
         let conn = self.conn.lock().await;
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM handoffs WHERE status != 'done'", [], |r| r.get(0))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM handoffs WHERE status != 'done'",
+            [],
+            |r| r.get(0),
+        )?;
         anyhow::ensure!(
             count < MAX_HANDOFF_ROWS,
             "coordinator: handoff store full ({MAX_HANDOFF_ROWS} open rows)"
@@ -408,7 +412,15 @@ impl CoordinatorStore {
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params.as_slice().iter().map(|p| p.as_ref()).collect::<Vec<_>>().as_slice(), row_to_handoff)?
+            .query_map(
+                params
+                    .as_slice()
+                    .iter()
+                    .map(|p| p.as_ref())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                row_to_handoff,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -551,7 +563,11 @@ struct PoolPutBody {
 }
 
 fn err_msg(e: impl std::fmt::Display) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": e.to_string()})),
+    )
+        .into_response()
 }
 
 fn list_of(rows: Vec<Handoff>) -> Response {
@@ -584,7 +600,10 @@ async fn worker_join(
     State(store): State<Arc<CoordinatorStore>>,
     Json(b): Json<WorkerJoinBody>,
 ) -> Response {
-    match store.worker_join(&b.name, &b.model, &b.persona, &b.status).await {
+    match store
+        .worker_join(&b.name, &b.model, &b.persona, &b.status)
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(e) => err_msg(e),
     }
@@ -614,7 +633,10 @@ async fn handoff_post_h(
     State(store): State<Arc<CoordinatorStore>>,
     Json(b): Json<HandoffPostBody>,
 ) -> Response {
-    match store.handoff_post(&b.from, &b.to, &b.subject, &b.body, b.ttl_secs).await {
+    match store
+        .handoff_post(&b.from, &b.to, &b.subject, &b.body, b.ttl_secs)
+        .await
+    {
         Ok(id) => (StatusCode::OK, Json(json!({"id": id}))).into_response(),
         Err(e) => err_msg(e),
     }
@@ -726,8 +748,17 @@ mod tests {
         CoordinatorStore::open(FsPath::new(":memory:")).unwrap()
     }
 
-    async fn post(store: &CoordinatorStore, from: &str, to: &str, subject: &str, body: &str) -> i64 {
-        store.handoff_post(from, to, subject, body, 0).await.unwrap()
+    async fn post(
+        store: &CoordinatorStore,
+        from: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> i64 {
+        store
+            .handoff_post(from, to, subject, body, 0)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -736,11 +767,18 @@ mod tests {
         s.worker_join("alpha", "ollama:llama3.1:8b", "does arithmetic", "idle")
             .await
             .unwrap();
-        s.worker_join("beta", "remote:gpt-4o-mini", "", "idle").await.unwrap();
-        // Rejoin updates persona + never duplicates.
-        s.worker_join("alpha", "ollama:llama3.1:8b", "now does MORE arithmetic", "idle")
+        s.worker_join("beta", "remote:gpt-4o-mini", "", "idle")
             .await
             .unwrap();
+        // Rejoin updates persona + never duplicates.
+        s.worker_join(
+            "alpha",
+            "ollama:llama3.1:8b",
+            "now does MORE arithmetic",
+            "idle",
+        )
+        .await
+        .unwrap();
         let ws = s.workers_list().await.unwrap();
         assert_eq!(ws.len(), 2, "no duplicate join");
         let alpha = &ws[0];
@@ -763,11 +801,17 @@ mod tests {
         let next = s.handoff_claim("alpha").await.unwrap().unwrap();
         assert_eq!(next.id, b);
         s.handoff_finish(b, "alpha", "6").await.unwrap();
-        assert!(s.handoff_claim("alpha").await.unwrap().is_none(), "idle claim");
+        assert!(
+            s.handoff_claim("alpha").await.unwrap().is_none(),
+            "idle claim"
+        );
         // A finished job is exactly the result the delegator reads back.
         let done = s.handoffs_for("alpha", "done", 10).await.unwrap();
         assert_eq!(done.len(), 2);
-        assert!(done.iter().any(|h| h.id == a && h.result.as_deref() == Some("4")));
+        assert!(
+            done.iter()
+                .any(|h| h.id == a && h.result.as_deref() == Some("4"))
+        );
     }
 
     #[tokio::test]
@@ -786,7 +830,11 @@ mod tests {
         }
         let h = s.handoff_claim("alpha").await.unwrap().unwrap();
         assert_eq!(h.id, id);
-        assert_eq!(h.claimed_by.as_deref(), Some("alpha"), "stale lease reclaimed");
+        assert_eq!(
+            h.claimed_by.as_deref(),
+            Some("alpha"),
+            "stale lease reclaimed"
+        );
         // A short-ttl job expires out of the queue entirely.
         let short = s
             .handoff_post("main", "alpha", "ephemeral", "skippable body", 1)
@@ -802,7 +850,10 @@ mod tests {
         }
         // While the valid lease on `vital` is held, the next claim is idle
         // (the short job expired;`vital` is claimed, not stranded).
-        assert!(s.handoff_claim("alpha").await.unwrap().is_none(), "held lease not re-claimed");
+        assert!(
+            s.handoff_claim("alpha").await.unwrap().is_none(),
+            "held lease not re-claimed"
+        );
         // The ghost shape again: expire `vital`'s lease → claimable.
         {
             let conn = s.conn.lock().await;
@@ -824,40 +875,85 @@ mod tests {
     #[tokio::test]
     async fn pool_is_namespaced_and_capped() {
         let s = store();
-        s.pool_put("ctx:invoice", "vendor", "Acme Corp").await.unwrap();
+        s.pool_put("ctx:invoice", "vendor", "Acme Corp")
+            .await
+            .unwrap();
         s.pool_put("ctx:invoice", "amount", "42").await.unwrap();
-        s.pool_put("ctx:other", "vendor", "different context").await.unwrap();
+        s.pool_put("ctx:other", "vendor", "different context")
+            .await
+            .unwrap();
         assert_eq!(
-            s.pool_get("ctx:invoice", "vendor").await.unwrap().as_deref(),
+            s.pool_get("ctx:invoice", "vendor")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("Acme Corp")
         );
-        assert_eq!(s.pool_get("ctx:invoice", "amount").await.unwrap().as_deref(), Some("42"));
-        s.pool_put("ctx:invoice", "vendor", "AcmeUpdated").await.unwrap();
         assert_eq!(
-            s.pool_get("ctx:invoice", "vendor").await.unwrap().as_deref(),
+            s.pool_get("ctx:invoice", "amount")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("42")
+        );
+        s.pool_put("ctx:invoice", "vendor", "AcmeUpdated")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.pool_get("ctx:invoice", "vendor")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("AcmeUpdated")
         );
         let keys = s.pool_keys("ctx:invoice").await.unwrap();
         assert_eq!(keys.len(), 2, "namespace's own keys listed");
-        assert!(!keys.contains(&"different context".to_string()), "values never leak as keys");
-        assert!(s.pool_put("ctx:invoice", "", "x").await.is_err(), "empty key refused");
+        assert!(
+            !keys.contains(&"different context".to_string()),
+            "values never leak as keys"
+        );
+        assert!(
+            s.pool_put("ctx:invoice", "", "x").await.is_err(),
+            "empty key refused"
+        );
         assert!(s.pool_put("", "k", "x").await.is_err(), "empty ns refused");
-        assert!(s.pool_put("ns", "k", "").await.is_err(), "empty val refused");
+        assert!(
+            s.pool_put("ns", "k", "").await.is_err(),
+            "empty val refused"
+        );
     }
 
     #[tokio::test]
     async fn volume_caps_and_requirements_honest() {
         let s = store();
-        assert!(s.handoff_post("main", "alpha", "", "body", 0).await.is_err(), "subject required");
-        assert!(s.handoff_post("main", "alpha", "subj", "", 0).await.is_err(), "body required");
-        assert!(s.handoff_post("main", "", "subj", "body", 0).await.is_err(), "to required");
+        assert!(
+            s.handoff_post("main", "alpha", "", "body", 0)
+                .await
+                .is_err(),
+            "subject required"
+        );
+        assert!(
+            s.handoff_post("main", "alpha", "subj", "", 0)
+                .await
+                .is_err(),
+            "body required"
+        );
+        assert!(
+            s.handoff_post("main", "", "subj", "body", 0).await.is_err(),
+            "to required"
+        );
         // Oversize truncates (documented cap semantics), never a 500.
         let big = "x".repeat(HANDOFF_BODY_CAP + 200);
-        let id = s.handoff_post("main", "alpha", "trim", &big, 0).await.unwrap();
+        let id = s
+            .handoff_post("main", "alpha", "trim", &big, 0)
+            .await
+            .unwrap();
         {
             let conn = s.conn.lock().await;
             let len: i64 = conn
-                .query_row("SELECT LENGTH(body) FROM handoffs WHERE id=?1", [id], |r| r.get(0))
+                .query_row("SELECT LENGTH(body) FROM handoffs WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(len as usize, HANDOFF_BODY_CAP, "body truncated to cap");
         }
@@ -867,7 +963,10 @@ mod tests {
         s.worker_remove("delta").await.unwrap();
         assert!(s.handoff_claim("delta").await.unwrap().is_none());
         let ws = s.workers_list().await.unwrap();
-        assert!(ws.iter().all(|w| w.name != "delta"), "removed worker leaves the registry");
+        assert!(
+            ws.iter().all(|w| w.name != "delta"),
+            "removed worker leaves the registry"
+        );
     }
 
     /// HTTP surface: join → list → post → claim → finish → for → idle
@@ -888,10 +987,18 @@ mod tests {
                 "persona": "fixes pipes",
             }))
             .await;
-        assert_eq!(r.status_code(), StatusCode::OK, "join accepted: {}", r.text());
+        assert_eq!(
+            r.status_code(),
+            StatusCode::OK,
+            "join accepted: {}",
+            r.text()
+        );
 
         let r = t.get("/v1/coordinator/workers/list").await;
-        assert!(r.text().contains("plumber"), "workers list carries the join");
+        assert!(
+            r.text().contains("plumber"),
+            "workers list carries the join"
+        );
 
         let r = t
             .post("/v1/coordinator/handoff/post")
@@ -928,13 +1035,19 @@ mod tests {
             .post("/v1/coordinator/handoff/claim")
             .json(&json!({"worker": "plumber"}))
             .await;
-        assert!(r.text().contains("\"id\":null"), "idle claim honest: {}", r.text());
+        assert!(
+            r.text().contains("\"id\":null"),
+            "idle claim honest: {}",
+            r.text()
+        );
 
         // Pool over the wire: put (POST), get (GET), namespaced.
         t.post("/v1/coordinator/pool/put")
             .json(&json!({"ns": "ctx:demo", "key": "vendor", "val": "Acme"}))
             .await;
-        let r = t.get("/v1/coordinator/pool/get?ns=ctx:demo&key=vendor").await;
+        let r = t
+            .get("/v1/coordinator/pool/get?ns=ctx:demo&key=vendor")
+            .await;
         assert!(r.text().contains("Acme"), "pool get: {}", r.text());
     }
 }

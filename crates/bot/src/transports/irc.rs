@@ -2,9 +2,9 @@
 //!
 //! The simplest honest integration in the list: no vendor SDK — a socket
 //! + NICK/USER + PING/PONG + PRIVMSG. The `channels` list joins at boot;
-//! DMs also route in (the answer goes back to the sender's nick). CTCP
-//! ACTION (/me) normalizes to plain text; server numerics and
-//! joins/parts are ignored except as registration/keepalive events.
+//!   DMs also route in (the answer goes back to the sender's nick). CTCP
+//!   ACTION (/me) normalizes to plain text; server numerics and
+//!   joins/parts are ignored except as registration/keepalive events.
 //!
 //! TLS via tokio-rustls + the webpki root store (both already inside the
 //! tree through tokio-tungstenite's rustls feature — now direct deps so
@@ -18,7 +18,7 @@
 //! between chunks (a socket-level token bucket per network is over-model
 //! here; 400+350 ms survived every network this bot family has ridden).
 
-use super::{chunk_utf8, handle_incoming, DeliveryFn, Incoming};
+use super::{DeliveryFn, Incoming, chunk_utf8, handle_incoming};
 use crate::config::BotConfig;
 use crate::state::BotState;
 use anyhow::{Context as _, Result};
@@ -61,10 +61,7 @@ fn default_respond_to() -> String {
 impl IrcConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.server.trim().is_empty(), "irc: server required");
-        anyhow::ensure!(
-            !self.nick.trim().is_empty(),
-            "irc: nick required"
-        );
+        anyhow::ensure!(!self.nick.trim().is_empty(), "irc: nick required");
         anyhow::ensure!(
             !self.channels.is_empty(),
             "irc: channels required non-empty (a lurker bot is a bug)"
@@ -97,7 +94,10 @@ fn split_server(server: &str, tls: bool) -> (String, u16) {
 /// two-traits object is a compile error — enums are the honest encode).
 enum Conn {
     Plain(tokio::net::TcpStream),
-    Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+    /// Boxed: the rustls client state is ~an order of magnitude larger
+    /// than the tcp side, and a 95-line enum has no business carrying it
+    /// inline (clippy::large_enum_variant's literal point).
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
 impl tokio::io::AsyncRead for Conn {
@@ -108,7 +108,9 @@ impl tokio::io::AsyncRead for Conn {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            Conn::Tls(t) => std::pin::Pin::new(t).poll_read(cx, buf),
+            // Box<TlsStream>: Unpin (TlsStream is Unpin when the tcp side
+            // is), so the deref builds a fresh Pin without projection.
+            Conn::Tls(b) => std::pin::Pin::new(&mut **b).poll_read(cx, buf),
         }
     }
 }
@@ -121,7 +123,7 @@ impl tokio::io::AsyncWrite for Conn {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Conn::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            Conn::Tls(t) => std::pin::Pin::new(t).poll_write(cx, buf),
+            Conn::Tls(b) => std::pin::Pin::new(&mut **b).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -130,7 +132,7 @@ impl tokio::io::AsyncWrite for Conn {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
-            Conn::Tls(t) => std::pin::Pin::new(t).poll_flush(cx),
+            Conn::Tls(b) => std::pin::Pin::new(&mut **b).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -139,7 +141,7 @@ impl tokio::io::AsyncWrite for Conn {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            Conn::Tls(t) => std::pin::Pin::new(t).poll_shutdown(cx),
+            Conn::Tls(b) => std::pin::Pin::new(&mut **b).poll_shutdown(cx),
         }
     }
 }
@@ -162,9 +164,8 @@ async fn connect(cfg: &IrcConfig, host: &str, port: u16) -> Result<Conn> {
     let config = tokio_rustls::rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let name =
-        tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
-            .context("irc tls server name")?;
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+        .context("irc tls server name")?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tcp = tokio::net::TcpStream::connect((host, port))
         .await
@@ -173,14 +174,16 @@ async fn connect(cfg: &IrcConfig, host: &str, port: u16) -> Result<Conn> {
         .connect(name, tcp)
         .await
         .context("irc tls handshake")?;
-    Ok(Conn::Tls(tls))
+    Ok(Conn::Tls(Box::new(tls)))
 }
 
 /// One outbound line, flood-paced. Called from the delivery closure and
 /// the login/join chores (single writer — the Mutex is the serializer).
 async fn send_line(conn: &ConnMu, line: &str) -> Result<()> {
     let mut c = conn.lock().await;
-    c.get_mut().write_all(format!("{line}\r\n").as_bytes()).await?;
+    c.get_mut()
+        .write_all(format!("{line}\r\n").as_bytes())
+        .await?;
     c.get_mut().flush().await?;
     drop(c);
     if line.starts_with("PRIVMSG") {
@@ -210,14 +213,23 @@ fn addressed_in(cfg: &IrcConfig, text: &str) -> bool {
         return true;
     }
     let lower = text.to_lowercase();
-    lower.contains(&cfg.nick.to_lowercase()) || lower.starts_with("ask:") || lower.starts_with("ask ")
+    lower.contains(&cfg.nick.to_lowercase())
+        || lower.starts_with("ask:")
+        || lower.starts_with("ask ")
 }
 
-pub async fn run(cfg: Arc<BotConfig>, state: BotState, icfg: IrcConfig, owner: Option<u64>) -> Result<()> {
+pub async fn run(
+    cfg: Arc<BotConfig>,
+    state: BotState,
+    icfg: IrcConfig,
+    owner: Option<u64>,
+) -> Result<()> {
     icfg.validate()?;
     let (host, port) = split_server(&icfg.server, icfg.tls);
     tracing::info!(server = %host, port, channels = icfg.channels.len(), respond_to = %icfg.respond_to, tls = icfg.tls, "irc transport connecting");
-    let conn: ConnMu = Arc::new(Mutex::new(BufReader::new(connect(&icfg, &host, port).await?)));
+    let conn: ConnMu = Arc::new(Mutex::new(BufReader::new(
+        connect(&icfg, &host, port).await?,
+    )));
 
     // Registration: PASS → NICK → USER, then join + NickServ after 001.
     if let Some(pw) = &icfg.password {
@@ -267,13 +279,21 @@ pub async fn run(cfg: Arc<BotConfig>, state: BotState, icfg: IrcConfig, owner: O
         if !line.starts_with(':') {
             continue;
         }
-        let Some((mask, rest)) = line[1..].split_once(' ') else { continue };
-        let Some((cmd, after)) = rest.split_once(' ') else { continue };
+        let Some((mask, rest)) = line[1..].split_once(' ') else {
+            continue;
+        };
+        let Some((cmd, after)) = rest.split_once(' ') else {
+            continue;
+        };
         if cmd != "PRIVMSG" {
             continue;
         }
-        let Some((target, payload)) = after.split_once(' ') else { continue };
-        let Some(mut text) = payload.strip_prefix(':').map(str::to_string) else { continue };
+        let Some((target, payload)) = after.split_once(' ') else {
+            continue;
+        };
+        let Some(mut text) = payload.strip_prefix(':').map(str::to_string) else {
+            continue;
+        };
         let nick = mask.split('!').next().unwrap_or(mask).to_string();
         // CTCP ACTION normalization; other CTCPs are ignored outright.
         if let Some(inner) = text.strip_prefix('\u{1}') {
@@ -329,39 +349,65 @@ mod tests {
             respond_to: "mention".into(),
         };
         ok.validate().unwrap();
-        let bad_server = IrcConfig { server: "".into(), ..ok.clone() };
+        let bad_server = IrcConfig {
+            server: "".into(),
+            ..ok.clone()
+        };
         assert!(bad_server.validate().is_err());
-        let no_channels = IrcConfig { channels: vec![], ..ok.clone() };
+        let no_channels = IrcConfig {
+            channels: vec![],
+            ..ok.clone()
+        };
         assert!(no_channels.validate().is_err());
-        let bad_req = IrcConfig { respond_to: "everyone".into(), ..ok.clone() };
+        let bad_req = IrcConfig {
+            respond_to: "everyone".into(),
+            ..ok.clone()
+        };
         assert!(bad_req.validate().is_err());
     }
 
     #[test]
     fn split_server_defaults_the_port_by_tls() {
-        assert_eq!(split_server("irc.example.org", true), ("irc.example.org".into(), 6697));
-        assert_eq!(split_server("irc.example.org", false), ("irc.example.org".into(), 6667));
-        assert_eq!(split_server("irc.example.org:7000", false), ("irc.example.org".into(), 7000));
+        assert_eq!(
+            split_server("irc.example.org", true),
+            ("irc.example.org".into(), 6697)
+        );
+        assert_eq!(
+            split_server("irc.example.org", false),
+            ("irc.example.org".into(), 6667)
+        );
+        assert_eq!(
+            split_server("irc.example.org:7000", false),
+            ("irc.example.org".into(), 7000)
+        );
     }
 
     #[test]
     fn mention_gate_matches_the_addressing_contrat() {
         let c = IrcConfig {
-            server: "a:1".into(), tls: true, nick: "meshy".into(), password: None,
-            nickserv_password: None, channels: vec!["#a".into()], respond_to: "mention".into(),
+            server: "a:1".into(),
+            tls: true,
+            nick: "meshy".into(),
+            password: None,
+            nickserv_password: None,
+            channels: vec!["#a".into()],
+            respond_to: "mention".into(),
         };
         assert!(addressed_in(&c, "hey meshy what do you think"));
         assert!(addressed_in(&c, "ask: what's the tally"));
         assert!(addressed_in(&c, "ask what's up"));
         assert!(!addressed_in(&c, "mashed potatoes"));
-        let relay = IrcConfig { respond_to: "all".into(), ..c };
+        let relay = IrcConfig {
+            respond_to: "all".into(),
+            ..c
+        };
         assert!(addressed_in(&relay, "anything goes"));
     }
 
     #[test]
     fn action_parsed_to_plain_text_shape() {
         // The parse contract: "\u1ACTION ... \u1" → "*nick action".
-        let raw = format!("\u{1}ACTION waves at the plain\u{1}");
+        let raw = "\u{1}ACTION waves at the plain\u{1}".to_string();
         let inner = raw.trim_matches('\u{1}');
         let action = inner.strip_prefix("ACTION ").unwrap_or(inner);
         assert_eq!(action, "waves at the plain");
