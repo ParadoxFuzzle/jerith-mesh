@@ -156,6 +156,22 @@ fn assert_fully_fetchable(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The IPv4 private-network table, shared by V4 literals AND the
+/// IPv4-MAPPED V6 arm below (`::ffff:a.b.c.d`) — the same address wearing
+/// a mapped wrapper must not escape the guard (audit F6: only the
+/// `::ffff:127.0.0.1` literal was listed before; `http://[::ffff:10.0.0.1]/`
+/// parsed as a public V6 and pointed the fetcher INTO the private net).
+fn v4_octets_private(o: [u8; 4]) -> bool {
+    o[0] == 0                                              // "this host" RFC1122
+        || o[0] == 10
+        || o[0] == 127
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 169 && o[1] == 254)                    // link-local
+        || (o[0] == 100 && (64..=127).contains(&o[1]))      // CGNAT
+        || o[0] >= 224 // multicast + reserved
+}
+
 fn is_private_host(host: &str) -> bool {
     // Hostname obvious cases.
     if host == "localhost"
@@ -171,23 +187,21 @@ fn is_private_host(host: &str) -> bool {
     // IP literals (bracket form keeps brackets in host_of).
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
         return match ip {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                o[0] == 0                                              // "this host" RFC1122
-                    || o[0] == 10
-                    || o[0] == 127
-                    || (o[0] == 172 && (16..=31).contains(&o[1]))
-                    || (o[0] == 192 && o[1] == 168)
-                    || (o[0] == 169 && o[1] == 254)                    // link-local
-                    || (o[0] == 100 && (64..=127).contains(&o[1]))     // CGNAT
-                    || o[0] >= 224 // multicast + reserved
-            }
+            std::net::IpAddr::V4(v4) => v4_octets_private(v4.octets()),
             std::net::IpAddr::V6(v6) => {
                 let s = v6.segments();
-                s == [0, 0, 0, 0, 0, 0, 0, 1]                          // ::1
-                    || (s[0] & 0xfe00) == 0xfe00                       // fe80::/10
-                    || (s[0] & 0xfff0) == 0xfd00                       // fc00::/7 ULA
-                    || s == [0, 0, 0, 0, 0, 0xffff, 0x7f00, 0] // ::ffff:127.0.0.1
+                // IPv4-MAPPED (::ffff:a.b.c.d): judge by the V4 table.
+                if s[..5] == [0, 0, 0, 0, 0] && s[5] == 0xffff {
+                    return v4_octets_private([
+                        (s[6] >> 8) as u8,
+                        s[6] as u8,
+                        (s[7] >> 8) as u8,
+                        s[7] as u8,
+                    ]);
+                }
+                s == [0, 0, 0, 0, 0, 0, 0, 1]                      // ::1
+                    || (s[0] & 0xfe00) == 0xfe00 // fe80::/10 (link-local, wide)
+                    || (s[0] & 0xfff0) == 0xfd00 // fc00::/7 ULA
             }
         };
     }
@@ -566,6 +580,18 @@ fn decode_entities(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Deterministic splitmix64 — reproducible hostile-shape seeds.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
     /// The resolver's filtering logic, exercised against real resolutions:
     /// filtering out private IPs from a resolved set (and erroring when all
     /// of them are private) is the heart of the DNS-pinning guard; run on
@@ -621,6 +647,14 @@ mod tests {
         for bad in [
             "http://localhost/x",
             "http://127.0.0.1:11434/api",
+            // IPv4-MAPPED V6 wrappers must inherit the V4 verdicts
+            // (audit F6): the mapped wrapper is the same private net.
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:192.168.1.4]/",
+            "http://[::ffff:172.20.0.3]/",
+            "http://[::ffff:169.254.169.254]/latest",
+            "http://[::ffff:100.64.0.7]/",
+            "http://[::ffff:127.0.0.1]/",
             "http://10.1.2.3/",
             "http://192.168.1.4/",
             "http://172.16.0.9/",
@@ -633,7 +667,11 @@ mod tests {
         ] {
             assert!(assert_fully_fetchable(bad).is_err(), "must refuse {bad}");
         }
-        for good in ["https://example.com/page", "http://8.8.8.8/"] {
+        for good in [
+            "https://example.com/page",
+            "http://8.8.8.8/",
+            "http://[::ffff:8.8.8.8]/", // mapped PUBLIC v4 stays public
+        ] {
             assert!(assert_fully_fetchable(good).is_ok(), "must allow {good}");
         }
         assert!(assert_fully_fetchable("ftp://example.com/").is_err());
@@ -662,5 +700,126 @@ mod tests {
         assert_eq!(normalize_freshness(None).unwrap(), None);
         assert_eq!(normalize_freshness(Some(" week ")).unwrap(), Some("week"));
         assert!(normalize_freshness(Some("fortnight")).is_err());
+    }
+
+    /// One seeded-random hostile HTML shape.
+    fn hostile_html(rng: &mut FuzzRng, i: usize) -> String {
+        match rng.next() % 9 {
+            0 => "<script>var steadfastness = '".repeat(50), // unclosed script
+            1 => format!(
+                "<title>tt<span>{}&#x10FFFF;&#0;&#4294967295;&#99999999999999999999;&amp;lt;&amp;apws;&notareal;{}</p>",
+                "&".repeat(300),
+                "\u{0}" // NUL soup
+            ),
+            2 => format!(
+                "<p{}>\u{FFFD}\u{7F}\u{2028}{}",
+                "=".repeat((rng.next() % 4000) as usize),
+                "</p>".repeat(500)
+            ),
+            3 => format!(
+                "<div class =ʛacerbity{}><b>bold</b>{}</div>",
+                i,
+                "cake ".repeat(4000)
+            ),
+            4 => {
+                // Multibyte + truncation boundary probes: a title chase
+                // that ends mid-tag and mid-character.
+                let mut body = String::new();
+                for _ in 0..5000 {
+                    body.push_str("🦂 rebound ");
+                }
+                format!("<title>D{{multi-byte}} title<body>{body}")
+            }
+            5 => format!("</br><br /><br/>{0}", "</P>".repeat(2000)),
+            6 => {
+                let mut body = String::new();
+                let len = 50_000 + (rng.next() % 100_000) as usize;
+                (0..len).for_each(|_| {
+                    body.push(char::from_u32(0x21 + (rng.next() % 0x2F7F) as u32).unwrap_or('x'))
+                });
+                format!("<p>{body}</p>")
+            }
+            7 => "<!DOCTYPE html><x-unknown ««</x-unknown>".repeat(300),
+            _ => format!("<a href=\"javascript:alert(1)\" onerror=\"x\">fuzz{i}",),
+        }
+    }
+
+    /// Fuzz the HTML→text reducer (audit F7): a seeded storm of hostile
+    /// pages — unclosed script/style, entity round-offs (&#x10FFFF;,
+    /// out-of-u32 numerics), NUL and control soup, 50k+ multibyte walls,
+    /// tag-tail truncation mid-character, javascript: attrs — the
+    /// redurned PageText must be exactly ≤ the cap, must never panic,
+    /// and the truncation flag must agree with reality.
+    #[test]
+    fn fuzz_html_reducer_hostile_pages_stay_bounded_and_panic_free() {
+        let mut rng = FuzzRng(0xFEED_CAFE_6012_8891);
+        for i in 0..120usize {
+            let html = hostile_html(&mut rng, i);
+            let cap = 4_000;
+            let page = html_to_page("http://fuzz.example/", &html, cap, 200);
+            let len = page.text.chars().count();
+            assert!(
+                len <= cap,
+                "hostile page #{i} exceeded the cap ({len} chars)"
+            );
+            // The truncation flag must agree with the actual length:
+            // truncated ⟹ exactly the cap (take(max) left nothing more).
+            if page.truncated {
+                assert_eq!(len, cap, "truncation flag on #{i}");
+            }
+        }
+    }
+
+    /// Property fuzz over the SSRF guard (audit F6): a seeded storm of
+    /// hostile fetch-target URLs — bracketed and unbracketed V6, mapped
+    /// literals, decimal-octet tricks, whitespace and unicode hosts —
+    /// NEVER panics, and any target whose host literally parses to a
+    /// private-range address is refused at the URL seam (the DNS hop is
+    /// a SECOND layer behind this one).
+    #[test]
+    fn fuzz_ssrf_guard_refuses_private_literals_and_never_panics() {
+        let mut rng = FuzzRng(0xA5DF_FACE_3141_5992);
+        for _ in 0..150 {
+            let hp = rng.next() % 5;
+            let url = match hp {
+                0 => format!(
+                    "http://[{}:{:x}::{:x}:{:x}]/",
+                    if rng.next().is_multiple_of(2) {
+                        0xffffu64
+                    } else {
+                        0
+                    },
+                    rng.next() % 0xffff,
+                    rng.next() % 0xffff,
+                    rng.next() % 0xffff,
+                ),
+                1 => format!(
+                    "http://{}:{}:{}:{}:{}/",
+                    rng.next() % 256,
+                    rng.next() % 256,
+                    rng.next() % 256,
+                    rng.next() % 256,
+                    "x".repeat((rng.next() % 64) as usize)
+                ),
+                2 => format!("http://\u{fffd}{}\u{7f}.local/", rng.next() % 999),
+                3 => format!("http://{:x}{}", rng.next(), ":65535"),
+                _ => format!(
+                    "http://[::ffff:{}:{}:{}:{}]/",
+                    rng.next() % 256,
+                    rng.next() % 256,
+                    rng.next() % 256,
+                    rng.next() % 256
+                ),
+            };
+            // Invariant (no panic is the test's own survival); if the
+            // guard accepted the URL, its host must not parse as a
+            // private-range literal.
+            if assert_fully_fetchable(&url).is_ok() {
+                let host = host_of(&url.to_ascii_lowercase()).unwrap_or_default();
+                if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+                    assert!(!is_private_host(&ip.to_string()), "leaked {url}");
+                }
+            }
+        }
     }
 }

@@ -440,6 +440,12 @@ async fn ollama_embed(cfg: &EmbedConfig, text: &str) -> anyhow::Result<Vec<f32>>
 /// L2-normalized. Not semantically strong, but stable, fast, and good
 /// enough to exercise storage + search offline.
 pub fn hash_embed(text: &str, dim: usize) -> Vec<f32> {
+    // dim is operator config; a 0 would make the bucket math below a
+    // modulo-by-zero panic (audit F5). An empty vector degrades the row
+    // to "never matches" instead of crashing the store's whole path.
+    if dim == 0 {
+        return Vec::new();
+    }
     let mut v = vec![0.0f32; dim];
     for token in text.split_whitespace() {
         let tok = token.to_lowercase();
@@ -2315,5 +2321,89 @@ mod tests {
         println!("  [file-backed WAL] corpus build: {build:?}");
         run_search_ab(&s, 5, "file-backed WAL").await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- fuzz (audit F5): hostile texts through the store--------------
+
+    /// Fuzz the store/search/forget path (audit F5): a seeded storm of
+    /// hostile texts — SQL-injection payloads, NUL bytes, emoji +
+    /// combining-mark cliffs, huge whitespace walls, empty strings,
+    /// entity-soup — through embed_and_store → count → search →
+    /// similar_to → forget → stats (offline hash embeds only, the
+    /// deterministic fallback). Invariants: nothing panics, every stored
+    /// TEXT round-trips back byte-exact, top_k is honored, the search
+    /// cannot touch a table boundary the schema doesn't have (an
+    /// injection payload must not break COUNT(*) — parameterized
+    /// queries, proven here by the store surviving its own attacks).
+    #[tokio::test]
+    async fn fuzz_memory_store_search_hostile_texts_stay_clean() {
+        let store = MemoryStore::open_in_memory(offline_embed(64)).unwrap();
+        let texts: Vec<String> = [
+            "x'); DROP TABLE memories; -- '".repeat(3),
+            "'; DELETE FROM memories WHERE 1=1; --".to_string(),
+            "nul\u{0}byte\u{0}text".to_string(),
+            "涯\u{301}\u{301}".repeat(2000),
+            "word ".repeat(80_000),
+            String::new(),
+            "&#x110000; &notreal; &#99999999999999; ünïcödé\u{7f}".repeat(7),
+        ]
+        .into_iter()
+        .collect();
+        let mut ids = Vec::new();
+        for text in &texts {
+            let (id, provider) = store.embed_and_store(text).await.unwrap();
+            assert_eq!(provider, EmbedProvider::HashFallback);
+            ids.push(id);
+        }
+        assert_eq!(store.count().await.unwrap(), texts.len() as u64);
+
+        // Injection payloads can't damage the schema: search still runs
+        // and count is exactly the rows we put in.
+        for probe in ["DROP TABLE", "'; DELETE", "word", ""] {
+            let hits = store.search(probe, 3).await.unwrap();
+            assert!(hits.len() <= 3, "top_k honored for {probe:?}");
+            for hit in &hits {
+                // Scores are finite (a corrupt blob orders as equal, never NaN).
+                assert!(!hit.score.is_nan());
+                // Distinct rows — no duplicate hit ids in one response.
+                assert_eq!(hits.iter().filter(|h| h.id == hit.id).count(), 1);
+            }
+        }
+
+        // Every stored text round-trips byte-exact: searching with the
+        // entry's own text must return it (nearest = itself), and similar_to
+        // (which anchors ON the id and excludes it, mirroring)
+        // still resolves — NULs and combining marks included.
+        for (id, text) in ids.iter().zip(texts.iter()) {
+            if text.is_empty() {
+                continue; // an empty vector never matches (cosine 0)
+            }
+            let hits = store.search(text, 10).await.unwrap();
+            assert!(
+                hits.iter().any(|h| h.id == *id),
+                "entry must be findable by its own text"
+            );
+            let hit = hits.iter().find(|h| h.id == *id).unwrap();
+            assert_eq!(hit.text, *text, "exact round-trip");
+            // The similar_to exclusion arm: querying FROM the id Excludes
+            // it, never fabricates it.
+            let similar = store.similar_to(*id, 10).await.unwrap();
+            assert!(!similar.iter().any(|h| h.id == *id));
+        }
+
+        // Forget a real row and a nonexistent one (idempotency).
+        assert!(store.forget(ids[0]).await.unwrap());
+        assert!(!store.forget(999_999_999).await.unwrap());
+        assert_eq!(store.count().await.unwrap(), (texts.len() - 1) as u64);
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.count, (texts.len() - 1) as u64);
+    }
+
+    /// dim = 0 (operator config wedge) must degrade — never the
+    /// modulo-by-zero panic the bucket math would otherwise hit.
+    #[test]
+    fn hash_embed_dim_zero_never_panics() {
+        let v = hash_embed("anything at all", 0);
+        assert!(v.is_empty(), "{v:?}");
     }
 }
