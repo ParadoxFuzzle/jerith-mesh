@@ -136,10 +136,39 @@ struct MeasureTally {
     uploads_duped: u64,
 }
 
+/// Stale-subject prune + map hard cap. Subjects are self-signed node ids
+/// and identities are free to mint (the §10 assumption), so without this
+/// a fleet of fresh keys each attesting its own id adds one `Vec` of
+/// 32 records per key — forever; nothing else sweeps this map (the old
+/// doc "sweep drops subjects no longer advertised" described a sweep
+/// that never existed — audit F2).
+const MEASURE_SUBJECT_MAP_CAP: usize = 8_192;
+/// A subject whose newest attestation is older than this is droppable:
+/// quorum views only ever read the 3×window horizon around the newest
+/// block, so a day-old ring contributes nothing.
+const MEASURE_SUBJECT_STALE_MS: u64 = 24 * 60 * 60 * 1000;
+
 impl MeasureTally {
     /// Record one (verified, deduped) observation. Returns the ring depth
     /// after the insert so the handler can report it.
     fn record(&mut self, subject: &str, rec: MeasureRecord) -> (usize, bool) {
+        // Map bound (audit F2): every FRESH subject prunes stale rings
+        // first; a sustained flood of still-fresh subjects collides the
+        // map entirely — the worst case loses day-old quorum history per
+        // subject, never the active rings or the dedupe inside one.
+        if !self.subjects.contains_key(subject) && self.subjects.len() >= MEASURE_SUBJECT_MAP_CAP {
+            self.subjects.retain(|_, ring| {
+                ring.iter()
+                    .map(|r| r.block_stamp_ms)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(MEASURE_SUBJECT_STALE_MS)
+                    > now_ms()
+            });
+            if self.subjects.len() >= MEASURE_SUBJECT_MAP_CAP {
+                self.subjects.clear();
+            }
+        }
         let ring = self.subjects.entry(subject.to_string()).or_default();
         if ring
             .iter()
@@ -299,6 +328,29 @@ struct Entry {
 
 const DEAD_VOTES_TO_EVICTION: u32 = 2;
 
+impl Entry {
+    /// Reporter-row cap (audit F3): signatures are free to mint, so a
+    /// fresh-keypair flood must not grow a victim's evidence map one row
+    /// per fake identity forever — each row also re-serializes in
+    /// /v1/peers. An existing reporter's row is exempt (refreshes never
+    /// evict). When past the cap, the OLDEST row drops: its score effect
+    /// is already applied and floor-capped, so the cap only forgets stale
+    /// dedupe/corroboration claims, never an active penalty.
+    fn evict_oldest_fraud_report(&mut self, cap: usize) {
+        if self.fraud_reports.len() < cap {
+            return;
+        }
+        if let Some(oldest) = self
+            .fraud_reports
+            .iter()
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| k.clone())
+        {
+            self.fraud_reports.remove(&oldest);
+        }
+    }
+}
+
 /// Wire-format sanity caps. Identity creation is free, so without these an
 /// identity holder could stuff megabyte-sized string fields into the
 /// registry — every entry is re-serialized into each /v1/peers response,
@@ -307,6 +359,13 @@ const AD_NODE_ID_CAP_CHARS: usize = 64;
 const AD_MODEL_CAP_CHARS: usize = 64;
 const AD_QUANT_CAP_CHARS: usize = 32;
 const AD_ADDRESS_CAP_CHARS: usize = 128;
+/// Distinct fraud reporters retained per entry (audit F3): signatures are
+/// free to mint, so a fresh-keypair flood would otherwise grow one
+/// reporter row per fake identity per victim, forever (each row also
+/// costs a /v1/peers re-serialization). Beyond the cap the OLDEST row is
+/// evicted — score effects are already applied and capped at
+/// REPUTATION_FLOOR, dedupe/corroboration simply forget the oldest claim.
+const FRAUD_REPORTERS_PER_ENTRY_CAP: usize = 512;
 /// Total registry entries retained. Refreshes of existing node ids are
 /// exempt — only NEW identities count against the cap.
 const MAX_REGISTRY_ENTRIES: usize = 20_000;
@@ -1142,6 +1201,11 @@ async fn report_fraud(
         .count() as u32;
 
     let already_reported_by_this_reporter = entry.fraud_reports.contains_key(&rep.reporter);
+    // Reporter-row cap (audit F3): every FRESH reporter makes room ahead
+    // of its insert. See Entry::evict_oldest_fraud_report.
+    if !already_reported_by_this_reporter {
+        entry.evict_oldest_fraud_report(FRAUD_REPORTERS_PER_ENTRY_CAP);
+    }
 
     let mut penalty_applied = false;
     if already_reported_by_this_reporter {
@@ -2920,6 +2984,91 @@ mod tests {
         assert_eq!(e.score, -30);
         // Compile-time sanity: the halt line never descends below the floor.
         const _: () = assert!(HALT_SCORE_THRESHOLD > REPUTATION_FLOOR); // -20 > -100
+    }
+
+    #[test]
+    fn fraud_report_rows_evict_oldest_at_cap() {
+        let mut e = test_entry();
+        for i in 0..FRAUD_REPORTERS_PER_ENTRY_CAP {
+            e.fraud_reports
+                .insert(format!("reporter-{i:04}"), (FraudKind::RateAbuse, i as u64));
+        }
+        // A fresh reporter makes room: exactly one (the oldest) row drops.
+        assert!(e.fraud_reports.len() >= FRAUD_REPORTERS_PER_ENTRY_CAP);
+        e.evict_oldest_fraud_report(FRAUD_REPORTERS_PER_ENTRY_CAP);
+        assert_eq!(e.fraud_reports.len(), FRAUD_REPORTERS_PER_ENTRY_CAP - 1);
+        assert!(
+            !e.fraud_reports.contains_key("reporter-0000"),
+            "oldest row evicted"
+        );
+        assert!(
+            e.fraud_reports.contains_key(&format!(
+                "reporter-{:04}",
+                FRAUD_REPORTERS_PER_ENTRY_CAP - 1
+            )),
+            "newest row survives"
+        );
+        // A flood of fresh reporters stays bounded.
+        for i in 0..50 {
+            e.evict_oldest_fraud_report(FRAUD_REPORTERS_PER_ENTRY_CAP);
+            e.fraud_reports
+                .insert(format!("flood-{i}"), (FraudKind::Leeching, now_ms()));
+        }
+        assert!(
+            e.fraud_reports.len() <= FRAUD_REPORTERS_PER_ENTRY_CAP,
+            "bounded under flood (got {})",
+            e.fraud_reports.len(),
+        );
+    }
+
+    #[test]
+    fn measure_tally_subjects_stay_bounded_under_identity_flood() {
+        let mut tally = MeasureTally::default();
+        // One fresh subject per attested self-measurement — identities are
+        // free to mint, and every stamp here is fresh (inside the 24h
+        // staleness window), so the map-collision branch must fire.
+        let stamp = now_ms();
+        for i in 0..(MEASURE_SUBJECT_MAP_CAP + 20) {
+            tally.record(
+                &format!("subject-{i:04}"),
+                MeasureRecord {
+                    reporter: format!("r{i}"),
+                    block_stamp_ms: stamp,
+                    window_secs: 60,
+                    measured_percent: 40,
+                },
+            );
+        }
+        assert!(
+            tally.subjects.len() <= MEASURE_SUBJECT_MAP_CAP,
+            "subject map bounded (got {})",
+            tally.subjects.len(),
+        );
+    }
+
+    fn test_entry() -> Entry {
+        Entry {
+            ad: PeerAd {
+                node_id: "x".into(),
+                address: String::new(),
+                model_id: String::new(),
+                quant: String::new(),
+                contribution_percent: 30,
+                rpc_address: String::new(),
+                last_seen_ms: 0,
+                role: NodeRole::Hybrid,
+                resources: None,
+                hosted_experts: None,
+                hosted_expert_count: None,
+                discovery_servers: Vec::new(),
+                gossip_reputations: None,
+            },
+            last_refresh_ms: 0,
+            first_seen_ms: 0,
+            dead_votes: 0,
+            score: 0,
+            fraud_reports: HashMap::new(),
+        }
     }
 
     #[test]
