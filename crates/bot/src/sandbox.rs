@@ -156,12 +156,19 @@ async fn stage_and_run(
     cfg: &SandboxConfig,
     files: &[FileAttachment],
 ) -> Result<Vec<(String, Result<String, String>)>> {
+    // Uniquely-named staging dir: pid + full nanos + a process-lifetime
+    // sequence. The old name rolled over every second (subsec_nanos), so
+    // two concurrent batches could collide on one directory and race —
+    // one batch's cleanup removing the other's staged files mid-run.
+    static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "jerith-sbx-{}",
+        "jerith-sbx-{}-{}-{}",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+        STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     tokio::fs::create_dir_all(&dir)
         .await

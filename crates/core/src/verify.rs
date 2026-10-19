@@ -107,13 +107,18 @@ pub struct VerificationStats {
     /// DishonestResults fraud reports actually submitted to the bootstrap.
     pub fraud_reports_flushed: u64,
 }
-
 /// Shared verification tracker: counters + signed-evidence flood control.
 ///
 /// The router (or gateway) records every outcome here; the mesh ping loop
 /// flushes pending `DishonestResults` reports to the bootstrap on its regular
 /// cadence. Per-target cooldown prevents a malicious sibling from tricking us
 /// into spamming the bootstrap by sending us self-sabotaged work.
+///
+/// Rows past that threshold trigger the stale-key prune in [`flag_fraud`]:
+/// a hostile peer feeding fresh target ids per flag must not turn the
+/// cooldown memory itself into an unbounded heap row per spritzed id.
+const FLAG_KEY_PRUNE_THRESHOLD: usize = 4_096;
+
 pub struct VerificationTracker {
     stats: Mutex<VerificationStats>,
     /// “kind|node_id” → last flag time (ms), for flood-control dedup.
@@ -196,8 +201,23 @@ impl VerificationTracker {
         let mut last = self.last_flagged.lock().await;
         let mut queued = self.pending.lock().await;
         let now = crate::bootstrap::now_ms();
+        // The cooldown map itself must not become the attack surface: keys
+        // arrive from remote replies (node_id strings), so a hostile peer
+        // spraying fresh targets per flag would otherwise grow this map
+        // without bound. Every FRESH key prunes first: stale rows (long
+        // past cooldown — semantically indistinguishable from absent, a
+        // lookup would allow anyway) drop past a threshold; an extreme
+        // spray of all-fresh rows collapses the map entirely — the worst
+        // case costs one repeated report, never correctness.
         for id in node_ids.iter().copied().filter(|id| !id.is_empty()) {
             let key = format!("{kind:?}|{id}");
+            if !last.contains_key(&key) && last.len() >= FLAG_KEY_PRUNE_THRESHOLD {
+                let stale_after = self.cooldown_ms.saturating_mul(8);
+                last.retain(|_, t| now.saturating_sub(*t) < stale_after);
+                if last.len() >= FLAG_KEY_PRUNE_THRESHOLD {
+                    last.clear();
+                }
+            }
             let allowed = last
                 .get(&key)
                 .map(|t| now.saturating_sub(*t) >= self.cooldown_ms)
@@ -441,6 +461,28 @@ mod tests {
             vec![14.0, -6.0, 3.0]
         );
         assert!(builtin_expert_answer("unknown-kind", &input).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cooldown_map_prunes_under_alias_spray() {
+        let t = VerificationTracker::with_cooldown(60_000);
+        // One unique target per flag: the hostile-alias shape. Past the
+        // prune threshold the cooldown memory collapses — every row here
+        // is fresh (inside the 8× window), so the extreme branch fires.
+        let ids: Vec<String> = (0..(FLAG_KEY_PRUNE_THRESHOLD + 50))
+            .map(|i| format!("spray-{i}"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        t.flag_fraud(crate::bootstrap_server::FraudKind::DishonestResults, &refs)
+            .await;
+        // Bounded: an all-fresh spray collapses the map mid-insert (worst
+        // case one repeated report), so the end state stays at or under the
+        // threshold instead of one row per alias forever.
+        let len = t.last_flagged.lock().await.len();
+        assert!(
+            len <= FLAG_KEY_PRUNE_THRESHOLD,
+            "cooldown map bounded (got {len})"
+        );
     }
 
     #[tokio::test]

@@ -345,8 +345,17 @@ impl ExpertRouter {
     }
 
     /// Book one chat-walk failure for `node_id` (streak +1, timer reset).
+    /// Map-bounded: keys are remote-supplied node ids, so stale streaks
+    /// (idle past the flap window — indistinguishable from absent) prune
+    /// past a threshold instead of one hostile alias per row forever.
     pub fn note_chat_failure(&self, node_id: &str) {
         let mut map = self.chat_failures.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= CHAT_FAIL_PRUNE_THRESHOLD {
+            map.retain(|_, (_, at)| at.elapsed() < CHAT_FLAP_WINDOW);
+            if map.len() >= CHAT_FAIL_PRUNE_THRESHOLD {
+                map.clear();
+            }
+        }
         let streak = map
             .entry(node_id.to_string())
             .or_insert((0, std::time::Instant::now()));
@@ -368,7 +377,6 @@ impl ExpertRouter {
     /// refusal.
     fn chat_flapping(&self, node_id: &str) -> bool {
         const CHAT_FLAP_LINE: u32 = 2;
-        const CHAT_FLAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
         match self
             .chat_failures
             .lock()
@@ -1923,6 +1931,16 @@ pub struct ExpertChunkData {
 /// memory per transfer. The client asks for `EXPERT_CHUNK_DEFAULT_BYTES`
 /// and the server clamps to this.
 pub const EXPERT_CHUNK_MAX_BYTES: usize = 1024 * 1024;
+
+/// Chat-demote window: consecutive-failure streaks live this long. The
+/// failure-map prune in `note_chat_failure` shares this exact horizon.
+const CHAT_FLAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Distinct failure-key rows retained before stale ones prune. Keys are
+/// remote-supplied node ids, so an alias flood must not grow the map one
+/// row per hostile id forever; honest meshes never reach this.
+const CHAT_FAIL_PRUNE_THRESHOLD: usize = 4_096;
+
 /// What a replicating client asks for per round-trip (well under the cap
 /// and under the 1 MiB JSON frame limit, which no longer applies to the
 /// raw payload but still bounds the header).

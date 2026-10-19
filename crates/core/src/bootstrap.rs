@@ -278,8 +278,16 @@ impl PeerRegistry {
         true
     }
 
-    /// Record a successful ping.
+    /// Record a successful ping. Only KNOWN peers (upserted, admitted)
+    /// get a health row: an unknown id must not leave an invented entry in
+    /// the health map — with no ad behind it it would sit there unreferenced
+    /// forever (the health map is otherwise bounded by the sweep-windowed
+    /// peer set).
     pub fn record_ping_ok(&mut self, node_id: &str, rtt_ms: u64) {
+        if !self.peers.contains_key(node_id) {
+            tracing::debug!(peer = %node_id, "ignoring ping-ok for an unknown peer id");
+            return;
+        }
         let h = self
             .health
             .entry(node_id.to_string())
@@ -946,6 +954,18 @@ mod tests {
         let mut reg = PeerRegistry::new(Some(model("glm-5.3", "int4")));
         reg.record_ping_fail("ghost");
         assert!(reg.is_empty());
+    }
+
+    /// A ping-ok for an id that was never upserted leaves NO health row:
+    /// `health` must stay bounded by the (sweep-windowed) peer set, not
+    /// grow one invented entry per unknown id a caller might mention.
+    #[test]
+    fn ping_ok_unknown_peer_creates_no_health_row() {
+        let mut reg = PeerRegistry::new(Some(model("glm-5.3", "int4")));
+        reg.record_ping_ok("ghost", 5);
+        assert!(reg.is_empty());
+        assert!(reg.state_of("ghost").is_none());
+        assert_eq!(reg.routing_rtt_of("ghost"), None);
     }
 
     #[test]

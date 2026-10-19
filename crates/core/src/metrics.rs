@@ -38,6 +38,12 @@ const HISTORY_CAP: usize = 120;
 /// but a hostile alias storm must not balloon /v1/metrics: beyond the cap
 /// an unknown peer folds into a single `_other` row.
 const PEER_CAP: usize = 128;
+/// Cap on the per-model breakdown. The model id arrives in EVERY request
+/// body (free string), so an uncapped map here grows one row per garbage
+/// model name a hostile client invents — the same memory-DoS shape the
+/// peer cap exists to prevent. Beyond the cap an unseen model folds into
+/// a single `_other` row.
+const MODEL_CAP: usize = 64;
 
 // ---- Security-reject counters (process-local, monotonic) ----
 //
@@ -271,7 +277,15 @@ impl Metrics {
             inner.failed_total += 1;
         }
         inner.tokens_total += rec.total_tokens;
-        let entry = inner.models.entry(rec.model.clone()).or_default();
+        // Model-key flood guard (see MODEL_CAP): a pretrained row keeps
+        // filling its own bucket; garbage names beyond the cap fold into
+        // `_other` instead of growing the map one row per request.
+        let model_key = if inner.models.contains_key(&rec.model) || inner.models.len() < MODEL_CAP {
+            rec.model.clone()
+        } else {
+            "_other".to_string()
+        };
+        let entry = inner.models.entry(model_key).or_default();
         entry.requests += 1;
         if ok {
             entry.ok += 1;
@@ -423,6 +437,36 @@ mod tests {
             served_by: None,
             at_ms: 0,
         }
+    }
+
+    #[test]
+    fn model_rows_fold_beyond_cap() {
+        let m = Metrics::new();
+        let seen = "pretrained".to_string();
+        for i in 0..(MODEL_CAP + 6) {
+            let name = if i == 0 {
+                seen.clone()
+            } else {
+                format!("m{i}")
+            };
+            m.record(rec_at(&name, 200, 10, None, 1));
+        }
+        // The early model keeps filling its own row; unseen names beyond
+        // the cap fold into `_other` and the map never grows past
+        // MODEL_CAP + 1 rows (the overflow fold, same shape as peers).
+        let models = m.inner.lock().expect("metrics lock").models.clone();
+        assert_eq!(models.get(&seen).map(|st| st.requests), Some(1));
+        assert!(
+            models.len() <= MODEL_CAP + 1,
+            "rows bounded (got {})",
+            models.len()
+        );
+        let overflow = models.get("_other").expect("_other row exists").requests;
+        assert_eq!(
+            overflow as usize,
+            MODEL_CAP + 6 - (models.len() - usize::from(models.contains_key("_other"))),
+            "every record lands in some row"
+        );
     }
 
     #[test]

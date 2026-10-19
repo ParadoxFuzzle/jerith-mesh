@@ -44,6 +44,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// Served samples kept per peer (bounded ring: a stale window must fade).
 pub const SAMPLES_PER_PEER_CAP: usize = 128;
 
+/// Distinct peers tracked at once. The ledger keys on node ids that come
+/// from plan candidates (ultimately remote ads), so a "new alias per
+/// dispatch" flood would otherwise add one `PeerLedger` plus one score
+/// row per fresh id, forever. Honest meshes are far smaller than this;
+/// beyond the cap stale entries are dropped by insertion order — the peer
+/// re-accounts on its next real sample (statistics, not state).
+pub const PEER_LEDGER_CAP: usize = 4_096;
+
 /// Distinct OTHER peers that must have served the same expert in-window
 /// before a peer's latency is comparable at all.
 pub const POOL_MIN_PEERS: usize = 3;
@@ -141,9 +149,20 @@ impl FreeriderDetector {
             .position(|c| c == served_by)
             .unwrap_or(candidates.len());
         let now_ms = crate::bootstrap::now_ms();
+        let need_bound = self.peers.len() >= PEER_LEDGER_CAP;
         for id in candidates.iter().take(ask_upto + 1) {
             if id.is_empty() {
                 continue;
+            }
+            // Bounded map: when full, a NEW id first evicts an arbitrary
+            // existing entry (correctness of the pattern watch does not
+            // depend on who is evicted); already-tracked ids keep their
+            // ledger untouched so the cap cannot churn honest traffic.
+            if need_bound
+                && !self.peers.contains_key(id)
+                && let Some(oldest) = self.peers.keys().next().cloned()
+            {
+                self.peers.remove(&oldest);
             }
             let answered = id == served_by;
             let led = self.peers.entry(id.clone()).or_default();
@@ -175,6 +194,18 @@ impl FreeriderDetector {
                 *s = 0.0;
             }
         }
+        // Bounded bookkeeping: an id whose ledger is empty AND whose score
+        // fully decayed stops paying rent. Without this, churned aliases
+        // (cap-evicted from `peers`, or simply departed) keep a zero score
+        // row — and `flagged_once` re-arms correctly through the same
+        // lookup, so hysteresis semantics are unchanged.
+        self.scores.retain(|id, s| {
+            *s > 0.0
+                || self
+                    .peers
+                    .get(id)
+                    .is_some_and(|l| !l.served.is_empty() || !l.selections.is_empty())
+        });
         // --- Signal 1: latency-vs-pool, per (peer, expert) ---------------
         let mut by_expert: HashMap<&str, HashMap<&String, Vec<u64>>> = HashMap::new();
         for (id, led) in &self.peers {
@@ -485,5 +516,30 @@ mod tests {
         assert_eq!(median(&[]), None);
         assert_eq!(median_f32(vec![]), None);
         assert_eq!(median_f32(vec![9.0, 7.0, 7.0]), Some(7.0));
+    }
+
+    /// The ledger map is bounded: a flood of one-fresh-alias-per-dispatch
+    /// (the wire-visible hostile shape) cannot grow `peers` — and the zero
+    /// score rows from evicted/decayed ids stop paying rent on the next
+    /// `evaluate`.
+    #[test]
+    fn ledger_map_is_bounded_under_alias_flood() {
+        let mut d = FreeriderDetector::default();
+        let rounds: usize = PEER_LEDGER_CAP * 2;
+        for i in 0..rounds {
+            let alias = format!("alias-{i}");
+            fed(&mut d, "e", &[alias.as_str()], &alias, 5);
+            d.evaluate();
+        }
+        assert!(
+            d.peers.len() <= PEER_LEDGER_CAP,
+            "peer map bounded (got {})",
+            d.peers.len()
+        );
+        assert!(
+            d.scores.len() <= PEER_LEDGER_CAP,
+            "score map bounded (got {})",
+            d.scores.len()
+        );
     }
 }
