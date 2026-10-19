@@ -111,9 +111,13 @@ impl StakeLedger {
     }
 
     /// Record a slash event; caps the audit ring at the last 50 entries.
-    /// Returns the recorded event.
+    /// Returns the recorded event. The total is saturating: a pathological
+    /// per-offense penalty must inflate the aggregate, never roll it over
+    /// to a tiny/zero number in a release build (an overflow wrap would
+    /// read as "barely slashed" — the exact opposite of the harm a slash
+    /// is for).
     pub fn record_slash(&mut self, ev: SlashEvent) -> SlashEvent {
-        self.slashed_total_uj += ev.amount_uj;
+        self.slashed_total_uj = self.slashed_total_uj.saturating_add(ev.amount_uj);
         self.slash_events.push(ev.clone());
         if self.slash_events.len() > 50 {
             self.slash_events.drain(..self.slash_events.len() - 50);
@@ -510,12 +514,19 @@ impl StakeManager {
     }
 
     /// Penalty for one verified offense against `target` (µJER).
-    /// 0 when staking is disabled entirely.
+    /// 0 when staking is disabled entirely. The multiply runs in u128:
+    /// `required_uj × percent` is operator config wide-open (a 1 JER
+    /// requirement at 1e18 µJ with a 999 % slash would wrap u64 math in
+    /// release builds — silent near-zero penalty, the exact opposite of
+    /// the harm a slash is for — or panic in debug builds).
     fn penalty_uj(&self) -> u64 {
         if self.config.required_uj == 0 {
             return 0;
         }
-        (self.config.required_uj * self.config.slash_percent_per_offense as u64 / 100).max(1)
+        let raw = (self.config.required_uj as u128)
+            * (self.config.slash_percent_per_offense as u128)
+            / 100;
+        u64::try_from(raw).unwrap_or(u64::MAX).max(1)
     }
 
     /// Record (and optionally submit) a slash notice for a verified offense.
@@ -697,6 +708,58 @@ mod tests {
         // Pure math check via config: 25 % of 800 µJ = 200; of 1 µJ → min 1.
         assert_eq!(800 * 25 / 100, 200);
         assert_eq!(25 / 100, 0); // why the .max(1) floor exists
+    }
+
+    /// Overflow audit: `required_uj × percent` must saturate in u64, not
+    /// wrap (a release-build wrap turns a huge penalty into a tiny one —
+    /// pathological-config shape, exact same math the live path runs).
+    #[test]
+    fn penalty_math_saturates_instead_of_wrapping() {
+        let big_id = crate::signing::SigningIdentity::generate();
+        let crypto = CryptoConfig {
+            chain: CryptoChain::Jerithchain,
+            // 9e18 µJ required × 400 % → raw 3.6e19 > u64::MAX (1.84e19).
+            stake: StakeConfig {
+                required_uj: 9_000_000_000_000_000_000,
+                slash_percent_per_offense: 400,
+                chain_slash: false,
+            },
+            ..CryptoConfig::default()
+        };
+        let mgr = StakeManager::new(&crypto, Some(big_id), None);
+        assert_eq!(mgr.penalty_uj(), u64::MAX, "saturated, never wrapped");
+        // And the µJ scale (realistic configs) stays exact:
+        let crypto = CryptoConfig {
+            stake: StakeConfig {
+                required_uj: 2_500_000,
+                slash_percent_per_offense: 33,
+                chain_slash: false,
+            },
+            ..CryptoConfig::default()
+        };
+        let mgr = StakeManager::new(&crypto, None, None);
+        assert_eq!(mgr.penalty_uj(), 2_500_000 * 33 / 100);
+    }
+
+    /// The aggregate slash total can never wrap: saturating_add keeps the
+    /// ledger honest (an unbounded overflow would read as "barely cut").
+    #[test]
+    fn slash_total_saturates_instead_of_wrapping() {
+        let mut l = StakeLedger {
+            slashed_total_uj: u64::MAX - 10,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            l.record_slash(SlashEvent {
+                ts_ms: 1,
+                target: "t".into(),
+                amount_uj: 100,
+                reason: "dishonest_results".into(),
+                evidence_digest: "x".into(),
+                chain_accepted: false,
+            });
+        }
+        assert_eq!(l.slashed_total_uj, u64::MAX, "saturated, never wrapped");
     }
 
     #[test]

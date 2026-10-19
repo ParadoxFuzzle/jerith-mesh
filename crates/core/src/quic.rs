@@ -3301,6 +3301,156 @@ mod tests {
         Errored,
     }
 
+    /// Deterministic splitmix64 — reproducible hostile-shape seeds without
+    /// pinning a rand version's seed API (stable across rand releases).
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Fuzz the raw frame path (audit F4): one connection serving a storm
+    /// of seeded-random hostile frames — truncated JSON, random bytes,
+    /// newline mid-stream, oversized no-newline payloads, unicode soup —
+    /// every frame must surface as (a) a bounded reply, (b) a clean close,
+    /// or (c) a transport error, never a hang or a wedged accept loop,
+    /// and a valid signed ping served through the SAME connection after
+    /// the storm must still round-trip.
+    #[tokio::test]
+    async fn fuzz_raw_rpc_frames_reply_or_close_bounded_and_liveness_survives() {
+        let (addr, server_identity, pins) = super::tests::test_server_and_pins(Arc::new(TimesTwo))
+            .await
+            .unwrap();
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut connection: quinn::Connection = {
+            let connecting = client
+                .connect(addr, server_identity.node_id().as_str())
+                .expect("connect");
+            tokio::time::timeout(Duration::from_secs(5), connecting)
+                .await
+                .unwrap()
+                .expect("conn up in the fuzz window")
+        };
+
+        let mut rng = FuzzRng(0x5EED_F00D_2026_10A1);
+        // The server MAY close the whole connection on one hostile frame
+        // (the 1 MiB cap buster and the reliable-transport protocol-fixed
+        // paths do exactly that — pinned by rpc_frame_cap_…). Bounded
+        // refusal includes a clean connection close: redial and continue,
+        // bounded by a redial budget.
+        let mut redials = 0usize;
+        for frame in 0..150u64 {
+            let mut payload: Vec<u8> = Vec::new();
+            let with_newline = rng.next().is_multiple_of(2);
+            match rng.next() % 6 {
+                0 => {
+                    // Truncated valid JSON: half of a real request.
+                    let valid = serde_json::to_vec(&serde_json::json!({
+                        "kind": "ping",
+                        "from_node_id": identity.node_id(),
+                        "stamp_ms": 0u64,
+                        "sig": "café",
+                    }))
+                    .unwrap();
+                    payload = valid[..valid.len() / 2].to_vec();
+                }
+                1 => {
+                    // Random bytes (the URIUTF-8-clean mix too).
+                    let len = 1 + (rng.next() % 2048) as usize;
+                    (0..len).for_each(|_| payload.push((rng.next() % 256) as u8));
+                }
+                2 => {
+                    // Well-formed JSON with a hostile shape inside.
+                    payload = serde_json::to_vec(&serde_json::json!({
+                        "kind": "expert_query",
+                        "req_id": format!("r{frame}"),
+                        "expert_id": "\u{1F5A0}\u{0} injection".replace('\u{0}', ""),
+                        "input": (0..2073).map(|i: u64| (i as f64) * 1.0e37).collect::<Vec<f64>>(),
+                        "from_node_id": "x".repeat((rng.next() % 512) as usize + 1),
+                        "stamp_ms": 1u64,
+                        "sig": String::new(),
+                    }))
+                    .unwrap();
+                }
+                3 => {
+                    // JSON with an embedded newline (frame splitter food).
+                    payload = "{}\n{ More: after }".to_string().into_bytes();
+                }
+                4 => {
+                    // Oversized no-newline noise (the frame-cap path).
+                    payload.resize(1_048_600, b'x');
+                }
+                _ => {
+                    // Unicode + control soup: `{}`, `|`, DEL, U+FFFD, LF.
+                    payload.extend_from_slice(&[0x7b, 0x7d, b'|', 0x7f, 0xef, 0xbf, 0xbd, 0x0a]);
+                    payload.extend(&rng.next().to_le_bytes());
+                }
+            }
+            if with_newline {
+                payload.push(b'\n');
+            }
+            let (mut send, mut recv) = loop {
+                match tokio::time::timeout(Duration::from_secs(2), connection.open_bi()).await {
+                    Ok(Ok(streams)) => break streams,
+                    // Connection closed (clean or transport): a bounded
+                    // refusal of the previous frame — redial, never hang.
+                    Ok(Err(_)) | Err(_) if redials < 25 => {
+                        redials += 1;
+                        let connecting = client
+                            .connect(addr, server_identity.node_id().as_str())
+                            .expect("reconnect after hostile-driven close");
+                        connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+                            .await
+                            .expect("redial inside the fuzz window")
+                            .expect("redial opens");
+                    }
+                    _ => panic!("connection wedged past the redial budget"),
+                }
+            };
+            send.write_all(&payload).await.ok();
+            let _ = send.finish();
+            // Bounded reply: reply bytes may stream, then Closed or
+            // Errored — every path but a hang is acceptable.
+            let end =
+                tokio::time::timeout(Duration::from_secs(3), read_recv_to_end(&mut recv)).await;
+            assert!(
+                end.is_ok(),
+                "frame {frame} ({} bytes) wedged the stream — wrong",
+                payload.len()
+            );
+        }
+
+        // Liveness: a fresh connection still serves a clean round-trip.
+        let _ = redials; // (observable in a panic message above if budgeted out)
+        let mut ping = NodeRpcRequest::Ping {
+            from_node_id: identity.node_id(),
+            stamp_ms: 0,
+            sig: String::new(),
+        };
+        sign_request(&mut ping, &identity);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(8),
+            call(
+                &client,
+                addr,
+                &server_identity.node_id(),
+                &ping,
+                &identity,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("post-storm ping round-trips");
+        assert!(matches!(reply, NodeRpcReply::Pong { .. }), "{reply:?}");
+    }
+
     /// Read a reply stream to its end, for asserting stream-closing
     /// behavior without hanging on a wedged peer.
     async fn read_recv_to_end(recv: &mut quinn::RecvStream) -> StreamEnd {

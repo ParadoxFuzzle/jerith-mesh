@@ -578,12 +578,14 @@ pub async fn optional_chain_probe(card: &OptionalChainWallet) -> anyhow::Result<
 
 /// GET /balance?discord_id=<identity> → µJER credited balance.
 /// (The chain keys wallets by identity strings; a node identity behaves
-/// like any other account handle for this purpose.)
+/// like any other account handle for this purpose. The identity is
+/// urlencoded so a future id shape with `&`/`%` bytes cannot reshape the
+/// query — the same defense the WalletCard query already uses.)
 pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u64> {
     let url = format!(
         "{}/balance?discord_id={}",
         rpc_url.trim_end_matches('/'),
-        identity
+        urlencode(identity)
     );
     let resp = crate::http::mesh_http()
         .get(&url)
@@ -709,6 +711,13 @@ impl JerithMiner {
     }
 
     /// Per-mille probability roll.
+    ///
+    /// `%`-modulo introduces a tiny bias (2^32 % 1000 = 296 values of
+    /// u32, i.e. ~7e-8 off the configured chance) — deliberately accepted
+    /// over a rejection-sampling loop: this is a self-rewarding lottery
+    /// where an extra ~1e-7 of chance is invisible next to the chain
+    /// node's own server-side cooldown/limiter decisions that actually
+    /// gate the payout.
     pub fn roll(&self) -> bool {
         if self.config.mine_chance_permille >= 1000 {
             return true;

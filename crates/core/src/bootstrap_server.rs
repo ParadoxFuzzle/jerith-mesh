@@ -3046,6 +3046,133 @@ mod tests {
         );
     }
 
+    /// Deterministic splitmix64 — reproducible hostile-shape seeds.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// One hostile JSON mutation of a live-ad-shaped base, seeded-random:
+    /// wrong types, negative/overflow numbers, unicode/control strings,
+    /// empty invaders, giant fields, json-null blobs.
+    fn hostile_variant(rng: &mut FuzzRng, base: &serde_json::Value, i: usize) -> serde_json::Value {
+        let mut v = base.clone();
+        let fields = [
+            "node_id",
+            "address",
+            "model_id",
+            "quant",
+            "contribution_percent",
+            "rpc_address",
+            "last_seen_ms",
+            "role",
+        ];
+        for (k, _f) in fields.iter().enumerate() {
+            match rng.next() % 7 {
+                0 => {
+                    v[fields[k]] = serde_json::json!("\u{005C}u{FFFD}s\\x7f x".to_string());
+                }
+                1 => {
+                    let n = ((rng.next() % 4096) as usize) + 1;
+                    v[fields[k]] = serde_json::json!("A".repeat(n));
+                }
+                2 => v[fields[k]] = serde_json::json!(-1),
+                3 => v[fields[k]] = serde_json::json!(u64::MAX),
+                4 => v[fields[k]] = serde_json::json!(1.0e308),
+                5 => v[fields[k]] = serde_json::json!({"nested": i}),
+                _ => v[fields[k]] = serde_json::json!(false),
+            }
+        }
+        v
+    }
+
+    /// Fuzz the registry write/read endpoints (audit F4, HTTP half): a
+    /// seeded storm of hostile ad/report bodies against every public
+    /// route — each must answer with a status < 500 (400/401/413-by-caps
+    /// /404 are all honest), never 5xx, never a panic, and the server
+    /// must still serve a clean /v1/peers at the end.
+    #[tokio::test]
+    async fn fuzz_registry_endpoints_refuse_hostile_bodies_and_stay_alive() {
+        let registry = Arc::new(Registry::default());
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let base_ad = serde_json::json!({
+            "node_id": "fuzznode0123456789abcdef",
+            "address": "127.0.0.1:9000",
+            "model_id": "qwen3:8b",
+            "quant": "int4",
+            "contribution_percent": 30,
+            "rpc_address": "127.0.0.1:9001",
+            "last_seen_ms": 0,
+            "role": "Hybrid",
+        });
+        let mut rng = FuzzRng(0xB00B_5EED_2468_1357);
+        for i in 0..120u64 {
+            let reject = |rng: &mut FuzzRng| -> serde_json::Value {
+                match rng.next() % 5 {
+                    0 => hostile_variant(rng, &base_ad, i as usize),
+                    1 => serde_json::json!("not json despite best effort"),
+                    2 => serde_json::json!([]),
+                    3 => serde_json::json!(null),
+                    _ => serde_json::json!({}), // shapeless
+                }
+            };
+            let body = reject(&mut rng);
+            // Round-robin the writers; the unsigned 401 path is exercised
+            // by the shape that gets through (the lane's rate limiter may
+            // answer 429s — also < 500).
+            let route = match i % 4 {
+                0 => client.put(format!("{base}/v1/advertise")),
+                1 => client.post(format!("{base}/v1/report-fraud")),
+                2 => client.post(format!("{base}/v1/report-dead")),
+                _ => client.post(format!("{base}/v1/leave")),
+            };
+            let resp = route
+                .json(&body)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+                .expect("HTTP layer alive");
+            let status = resp.status().as_u16();
+            assert!(status < 500, "hostile body #{i} got {status}");
+        }
+
+        // The read surface is still clean after the storm. /v1/peers is
+        // the (signed) read lane — unsigned here it may answer 401, and
+        // the lane limiter may burst 429s; both are bounded refusals, so
+        // liveness is "status < 500, and a 200 body is the clean shape".
+        let resp = client
+            .get(format!("{base}/v1/peers"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("HTTP layer alive after the storm");
+        let status = resp.status().as_u16();
+        assert!(status < 500, "post-storm /v1/peers got {status}");
+        if status == 200 {
+            let body: serde_json::Value = resp.json().await.unwrap();
+            // The /v1/peers read surface: the roster array bare (as some
+            // callers consume) or inside the documented wrapper object.
+            let roster = if body.is_array() {
+                Some(&body)
+            } else {
+                body.get("peers").filter(|v| v.is_array())
+            };
+            assert!(roster.is_some(), "peers read surface shape: {body}");
+        }
+    }
+
     fn test_entry() -> Entry {
         Entry {
             ad: PeerAd {
