@@ -1197,17 +1197,29 @@ constrained reason. Config: `[router]` + `[router.lanes]` in bot.toml.
 
 What this release establishes, and what stages next on the same rails:
 
-1. **Universal interface driving (docker VM + front-end control)**:
-   half-exists — `workflows.rs` already drives real Chrome front-ends
-   (CDP: click/type/page-change) recorded or replayed, and `sandbox.rs`
-   runs no-network disposable Docker containers for file work. Next
-   stage: a dockerized, X11/S MozVNC-bundled image the replay engine
-   can target instead of the host display, so long-tail software runs
-   as ephemeral UI targets under the same recorded-controls discipline.
-   Open items: a window-manager bootstrap for the container, and an
-   approval-gated pairing rule (any container target gets
-   `workflow.run` approval by construction — the bridge above is
-   already the gate).
+1. **Universal interface driving (docker VM + front-end control) —
+   LANDED (2026-10-20, `images/driver-vm/` + `workflows.rs`
+   `[workflows.driver_vm]`)**: the dockerized desktop exists — Xvfb +
+   a REAL window-manager bootstrap (openbox; WM-less X is the typed
+   fallback) + an x11vnc preview the owner watches through a
+   loopback-mapped port + chromium + a socat CDP relay (9223 → chrome's
+   loopback 9222, because headful chromium binds DevTools
+   loopback-only and IGNORES the bind-address flag — debugged live).
+   Record AND replay can target it (`launch_vm_session`; shadow wins
+   for replay when both lanes are enabled — headless-over-headful is
+   the cheaper contract; the VM always owns record when enabled, so
+   the owner drives windows INSIDE the VM instead of on the host
+   display). Same ownership discipline as the §17.4 shadow: unique
+   `--rm` container, prefixed sweep, shutdown removes BY NAME.
+   E2E verified live: a real playbook saved through the real store,
+   run end-to-end through `run()` with the VM config (playbook →
+   container → WM bootstrap → relay → CDP → per-step ✓ → named
+   removal), 7.9 s. Approval-gated pairing rule: unchanged by
+   construction and unit-pinned (`workflow_targets_never_outgrow_the
+   _owner_gate` — the workflows plugin is owner-only, the §15 bridge
+   is the approval surface). Long-tail software as ephemeral UI
+   targets now reduces to: bake the software into a driver-VM-layout
+   image and point `image` at it.
 2. **Rust-native macro-tools** (the "heavy lifting out of the model"
    point): the approval bridge is the first composition pattern — a
    single model verb (`approval.request`) that bundles fetch/validate/

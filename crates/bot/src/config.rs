@@ -159,6 +159,57 @@ pub struct WorkflowsConfig {
     /// running replays the legacy way).
     #[serde(default)]
     pub shadow: ShadowConfig,
+    /// §17.1 driver VM: the disposable DESKTOP (Xvfb + openbox + VNC +
+    /// chromium) record AND replay target instead of the host display.
+    /// Default OFF; the image is the operator's pick and vouch.
+    #[serde(default)]
+    pub driver_vm: DriverVmConfig,
+}
+
+/// `[workflows.driver_vm]` in bot.toml — FEATURES §17.1: ephemeral UI
+/// targets. Image contract: build the shipped
+/// `images/driver-vm/Dockerfile` (Xvfb + openbox window-manager
+/// bootstrap + VNC preview + chromium + the CDP relay) or a
+/// layout-compatible equivalent. Default OFF. Precedence when both
+/// shadow and driver_vm are enabled: shadow wins for replay (documented
+/// in workflows.rs; the operator enabled two lanes — headless-over-
+/// headful is the cheaper contract), the VM always owns record when
+/// enabled (the owner watches it via VNC instead of the host display).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DriverVmConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The desktop image. Empty + enabled is a typed refusal at run
+    /// time — the bot never picks an image by itself (same stance as
+    /// the §17.4 shadow).
+    #[serde(default)]
+    pub image: String,
+    /// Browser binary inside the image (full path resolved via the
+    /// image's PATH).
+    #[serde(default = "default_vm_browser")]
+    pub browser: String,
+    /// Desktop geometry (Xvfb `-screen 0 ...x24`).
+    #[serde(default = "default_vm_size")]
+    pub size: String,
+}
+
+impl Default for DriverVmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: String::new(),
+            browser: default_vm_browser(),
+            size: default_vm_size(),
+        }
+    }
+}
+
+fn default_vm_browser() -> String {
+    "chromium".to_string()
+}
+
+fn default_vm_size() -> String {
+    "1280x800".to_string()
 }
 
 /// `[workflows.shadow]` in bot.toml — the local workspace shadowing
@@ -206,6 +257,7 @@ impl Default for WorkflowsConfig {
             recorder_display: default_recorder_display(),
             run_budget_secs: default_run_budget_secs(),
             shadow: ShadowConfig::default(),
+            driver_vm: DriverVmConfig::default(),
         }
     }
 }

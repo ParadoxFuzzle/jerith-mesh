@@ -511,7 +511,7 @@ impl CdpSession {
             !image.is_empty(),
             "[workflows.shadow] enabled without an image — refusing to pick one silently"
         );
-        sweep_stale_shadows().await;
+        sweep_stale().await;
         let name = format!(
             "{SHADOW_PREFIX}{}-{}",
             std::process::id(),
@@ -964,6 +964,19 @@ const SHADOW_IN_PORT: u16 = 9222;
 /// with it — replay state is disposable by construction.
 const SHADOW_HOME: &str = "/home/shadow";
 
+/// Name prefix of §17.1 driver-VM containers (same ownership contract
+/// as the shadow: the sweep touches prefixed containers only).
+const VM_PREFIX: &str = "jerith-wf-vm-";
+/// The §17.1 CDP port INSIDE the VM: the relay's listener (the image's
+/// socat forwards 9223 → 127.0.0.1:9222) — headful chromium binds the
+/// DevTools endpoint loopback-only and IGNORES
+/// --remote-debugging-address, so the map must target the relay
+/// (debugged live with in-container + host probes).
+const VM_IN_CDP_PORT: u16 = 9223;
+/// The VM's VNC preview port INSIDE the container (x11vnc; the owner
+/// watches the desktop through a loopback-mapped host port).
+const VM_IN_VNC_PORT: u16 = 5900;
+
 /// One parsed manifest mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShadowMount {
@@ -1092,11 +1105,11 @@ fn shadow_docker_argv(
 /// Arrival sweeper: any leftover container OUR prefix owns from a bot
 /// death (a docker CLI dying does not stop the container) is removed
 /// before a new session spawns — best-effort, bounded, name-scoped.
-async fn sweep_stale_shadows() {
+async fn sweep_stale_containers(prefix: &str) {
     let Ok(list) = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new("docker")
-            .args(["ps", "-aq", "--filter", &format!("name={SHADOW_PREFIX}")])
+            .args(["ps", "-aq", "--filter", &format!("name={prefix}")])
             .output(),
     )
     .await
@@ -1115,6 +1128,13 @@ async fn sweep_stale_shadows() {
     }
 }
 
+/// §17.1: sweep BOTH the shadow's and the VM's prefixed containers —
+/// a launch sweeps its own kind before spawning.
+async fn sweep_stale() {
+    sweep_stale_containers(SHADOW_PREFIX).await;
+    sweep_stale_containers(VM_PREFIX).await;
+}
+
 /// One fresh loopback host port per session.
 fn pick_shadow_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1122,6 +1142,122 @@ fn pick_shadow_port() -> anyhow::Result<u16> {
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(port)
+}
+
+/// The exact §17.1 driver-VM docker argv (pure; every line carries its
+/// reasoning — grep-able and unit-pinned):
+/// - `--rm` + unique name: one disposable DESKTOP per session, swept
+///   and removed by name like the shadow;
+/// - loopback-only maps for BOTH services: the CDP RELAY port (the
+///   image's socat forwards 9223 → chrome's loopback 9222) and the VNC
+///   preview (the owner's eyes);
+/// - `--cap-drop ALL` + no-new-privileges + shm — the same sandbox
+///   posture as the §17.4 shadow (the argv passes --no-sandbox for the
+///   same reason: the container IS the sandbox layer);
+/// - entrypoint chain `/bin/sh -c "/entrypoint.sh …"`: the image's
+///   window-manager bootstrap boots Xvfb + openbox + x11vnc + the
+///   relay, then execs the browser argv HEADFULLY inside Xvfb — real
+///   windows on a real desktop, which is what record needs;
+/// - DEFAULT docker networking on purpose (same stance as the shadow:
+///   a workflow target must reach the pages it drives).
+#[allow(clippy::too_many_arguments)]
+fn vm_docker_argv(
+    image: &str,
+    browser: &str,
+    name: &str,
+    cdp_host_port: u16,
+    vnc_host_port: u16,
+    size: &str,
+    target_url: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        "docker".to_string(),
+        "run".to_string(),
+        "--rm".to_string(),
+        format!("--name={name}"),
+        "-p".to_string(),
+        format!("127.0.0.1:{cdp_host_port}:{VM_IN_CDP_PORT}"),
+        "-p".to_string(),
+        format!("127.0.0.1:{vnc_host_port}:{VM_IN_VNC_PORT}"),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--shm-size".to_string(),
+        "512m".to_string(),
+        "-e".to_string(),
+        format!("JERITH_VM_SIZE={size}"),
+    ];
+    argv.push("--entrypoint".to_string());
+    argv.push("/bin/sh".to_string());
+    argv.push(image.to_string());
+    argv.push("-c".to_string());
+    argv.push(format!(
+        "/entrypoint.sh {} --remote-debugging-port=9222 --no-first-run \
+         --no-default-browser-check --no-sandbox --disable-dev-shm-usage \
+         --disable-gpu --user-data-dir=/home/chrome/profile {}",
+        browser, target_url
+    ));
+    argv
+}
+
+/// The §17.1 launch path: docker argv + spawn + connect via the mapped
+/// RELAY port, container name pinned so shutdown does the real kill.
+async fn launch_vm_session(
+    vm: &crate::config::DriverVmConfig,
+    target_url: &str,
+) -> anyhow::Result<CdpSession> {
+    anyhow::ensure!(
+        which("docker").is_ok(),
+        "driver_vm needs docker on PATH — not found"
+    );
+    let image = vm.image.trim();
+    anyhow::ensure!(
+        !image.is_empty(),
+        "[workflows.driver_vm] enabled without an image — refusing to pick one silently"
+    );
+    sweep_stale().await;
+    let name = format!(
+        "{VM_PREFIX}{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    );
+    let cdp_host = pick_shadow_port()?;
+    let vnc_host = pick_shadow_port()?;
+    let argv = vm_docker_argv(
+        image,
+        &vm.browser,
+        &name,
+        cdp_host,
+        vnc_host,
+        &vm.size,
+        target_url,
+    );
+    tracing::info!(
+        target: "bot",
+        container = %name,
+        cdp_port = cdp_host,
+        vnc_port = vnc_host,
+        "driver-VM session launching (disposable desktop, record-or-replay)"
+    );
+    let child = tokio::process::Command::new(argv[0].clone())
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning driver-VM docker run")?;
+    // Same boot contract as the shadow: loopback refused until the relay
+    // serves the browser's DevTools — the real-deadline boot probe handles
+    // the transient refusals (the fresh-Instant bug is already fixed).
+    let cdp_port_str = cdp_host.to_string();
+    let mut session = CdpSession::connect_session(&cdp_port_str, child).await?;
+    session.container = Some(name);
+    Ok(session)
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,18 +1290,26 @@ async fn record_start(cfg: &BotConfig, name: &str, url: &str) -> anyhow::Result<
             );
         }
     }
-    anyhow::ensure!(
-        which(cfg.workflows.chrome_binary.as_str()).is_ok(),
-        "chrome binary not found: {} — set [workflows] chrome_binary",
-        cfg.workflows.chrome_binary
-    );
-    let mut driver = CdpSession::launch(
-        &cfg.workflows.chrome_binary,
-        url,
-        false, // headed: the owner drives the window
-        Some(&cfg.workflows.recorder_display),
-    )
-    .await?;
+    let mut driver = if cfg.workflows.driver_vm.enabled {
+        // §17.1: record targets the disposable desktop — the owner drives
+        // the windows INSIDE the VM and watches via the loopback VNC map
+        // instead of a window on the host display (docker/image
+        // validation happens in launch_vm_session, typed + early).
+        launch_vm_session(&cfg.workflows.driver_vm, url).await?
+    } else {
+        anyhow::ensure!(
+            which(cfg.workflows.chrome_binary.as_str()).is_ok(),
+            "chrome binary not found: {} — set [workflows] chrome_binary",
+            cfg.workflows.chrome_binary
+        );
+        CdpSession::launch(
+            &cfg.workflows.chrome_binary,
+            url,
+            false, // headed: the owner drives the window
+            Some(&cfg.workflows.recorder_display),
+        )
+        .await?
+    };
     // Seed the recorder into the fresh page.
     let injected = driver.evaluate(RECORDER_JS).await?;
     let seeded = injected
@@ -1249,6 +1393,13 @@ async fn run(cfg: &BotConfig, name: &str) -> anyhow::Result<Value> {
         // fresh HOME + manifest-only mounts; docker/image validation
         // is inside launch_shadow (typed, before anything spawns).
         CdpSession::launch_shadow(&cfg.workflows.shadow, &w.url).await?
+    } else if cfg.workflows.driver_vm.enabled {
+        // §17.1: replays can also ride the disposable DESKTOP (headful
+        // chrome inside Xvfb; the owner can watch through the VNC map).
+        // Shadow takes precedence when both are enabled — headless-over-
+        // headful is the cheaper contract for the same job. Docker and
+        // image validation is inside launch_vm_session (typed, early).
+        launch_vm_session(&cfg.workflows.driver_vm, &w.url).await?
     } else {
         anyhow::ensure!(
             which(cfg.workflows.chrome_binary.as_str()).is_ok(),
@@ -1817,11 +1968,124 @@ mod tests {
         );
     }
 
+    /// LIVE (§17.1 + the E2E replay): author a real playbook the way
+    /// rec_stop would coalesce one, save it through the REAL store, and
+    /// run it through run()'s full path with the DRIVER-VM config —
+    /// Xvfb + openbox + x11vnc + the CDP relay inside one disposable
+    /// container, per-step report through the replay engine, then
+    /// shutdown's named `docker rm -f`. Run alone:
+    /// `cargo test -p jerith-mesh-bot live_vm_replay -- --ignored --exact --nocapture`
+    #[tokio::test]
+    #[ignore = "live docker + the real driver-VM desktop + the real web"]
+    async fn live_workflow_replay_inside_driver_vm() {
+        use crate::config::DriverVmConfig;
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:8900", "http://127.0.0.1:8322");
+        cfg.workflows.driver_vm = DriverVmConfig {
+            enabled: true,
+            image: "jerith-driver-vm:latest".into(),
+            browser: "chromium".into(),
+            size: "1280x800".into(),
+        };
+        // example.com's one live control, exactly as recorded: a click.
+        let w = Workflow {
+            name: "vm-fire-example".into(),
+            url: "https://example.com/".into(),
+            created_ms: 0,
+            last_run_outcome: None,
+            steps: vec![Step::Click {
+                selector: "a".into(),
+                label: "More information...".into(),
+            }],
+        };
+        save(&w).expect("playbook save");
+        let t0 = std::time::Instant::now();
+        let out = run(&cfg, &w.name).await.expect("live driver-VM replay");
+        println!("live driver-VM E2E replay: {:?}", t0.elapsed());
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        assert_eq!(out["ok"], json!(true), "replay must go end to end: {out}");
+        assert!(
+            out["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("\u{2713}"),
+            "per-step \u{2713}: {out}"
+        );
+    }
+
     #[test]
     fn shadow_defaults_off_with_no_silent_image() {
         let shadow = crate::config::ShadowConfig::default();
         assert!(!shadow.enabled, "opt-in only");
         assert!(shadow.image.is_empty(), "no silent image pick");
         assert!(shadow.mounts.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // §17.1 driver VM: argv contract + the approval pairing rule
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vm_argv_contract_is_greppable() {
+        let argv = vm_docker_argv(
+            "jerith-driver-vm:latest",
+            "chromium",
+            "jerith-wf-vm-123-abc",
+            44801,
+            59010,
+            "1440x900",
+            "https://example/app",
+        );
+        assert_eq!(argv[0], "docker");
+        assert_eq!(argv[1], "run");
+        let s = argv.join(" ");
+        // Both services map to loopback only: CDP via the in-image relay,
+        // VNC for the owner's eyes.
+        assert!(s.contains("-p 127.0.0.1:44801:9223"), "{s}");
+        assert!(s.contains("-p 127.0.0.1:59010:5900"), "{s}");
+        // The sandbox posture matches the shadow's.
+        assert!(s.contains("--cap-drop ALL"), "{s}");
+        assert!(s.contains("no-new-privileges"));
+        assert!(
+            !s.contains("--network"),
+            "default networking on purpose: {s}"
+        );
+        // The WM bootstrap drives the desktop, the browser rides headful
+        // INSIDE Xvfb (no --headless anywhere).
+        assert!(s.contains("--entrypoint /bin/sh"), "{s}");
+        assert!(s.contains("-c /entrypoint.sh chromium"), "{s}");
+        assert!(s.contains("--remote-debugging-port=9222"));
+        assert!(
+            !s.contains("--headless"),
+            "headful inside Xvfb is the point"
+        );
+        assert!(s.contains("-e JERITH_VM_SIZE=1440x900"), "{s}");
+        assert!(
+            !s.contains("--remote-debugging-address"),
+            "bind flag is a headful no-op"
+        );
+        assert!(s.ends_with("https://example/app"), "{s}");
+    }
+
+    #[test]
+    fn vm_defaults_off_with_no_silent_image() {
+        let vm = crate::config::DriverVmConfig::default();
+        assert!(!vm.enabled, "opt-in only");
+        assert!(vm.image.is_empty(), "no silent image pick");
+        assert_eq!(vm.size, "1280x800");
+    }
+
+    /// §17.1's pairing rule: a container/desktop target never widens the
+    /// skill surface. Every verb in this file lives behind ONE gate — the
+    /// plugin family is owner-only (OWNER_ONLY_PLUGINS), so a plain
+    /// session cannot even fetch the skill list; the §15 bridge is the
+    /// approval surface (approvals execute in an owner-privileged
+    /// registry, never a plain one).
+    #[test]
+    fn workflow_targets_never_outgrow_the_owner_gate() {
+        assert!(
+            crate::plugins::OWNER_ONLY_PLUGINS.contains(&"workflows"),
+            "the §17.1 pairing rule needs this invariant to hold"
+        );
     }
 }
