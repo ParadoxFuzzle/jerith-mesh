@@ -1585,7 +1585,13 @@ mod tests {
     #[tokio::test]
     async fn ttl_expiry_drops_stale_entries() {
         let registry = Arc::new(Registry::default());
-        let app = router(Arc::clone(&registry), 50); // 50 ms TTL
+        // 300 ms TTL: the "fresh" read below must land INSIDE the TTL
+        // window, and on slow CI runners (macOS) a 50 ms window lost the
+        // race to the axum serve + first connection (entry read back as
+        // already-expired, fresh assert died). 300 ms dominates that
+        // jitter while the 400 ms expiry sleep still honestly proves the
+        // same drop semantics; test stays wall-clock tiny.
+        let app = router(Arc::clone(&registry), 300); // 300 ms TTL
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1610,7 +1616,7 @@ mod tests {
             .unwrap();
         assert_eq!(list.peers.len(), 1);
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         let list: PeerListResponse = client
             .get(format!("{base}/v1/peers?model=glm-5.3"))
             .send()
