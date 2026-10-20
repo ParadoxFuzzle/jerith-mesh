@@ -947,11 +947,15 @@ pub async fn build_check(language: RefLang, code: &str) -> BuildCheck {
     let fut = match tokio::fs::write(&file, code).await {
         Ok(_) => {
             let mut argv = argv.clone();
-            argv.push(if tool == "rustc" {
-                out.to_string_lossy().to_string()
+            if tool == "rustc" {
+                argv.push(out.to_string_lossy().to_string());
+                // The module itself is rustc's input file — forgetting it
+                // makes the checker answer "no input filename given",
+                // which the live harness catches.
+                argv.push(file.to_string_lossy().to_string());
             } else {
-                file.to_string_lossy().to_string()
-            });
+                argv.push(file.to_string_lossy().to_string());
+            }
             tokio::process::Command::new(argv[0].clone())
                 .args(&argv[1..])
                 .current_dir(&dir)
