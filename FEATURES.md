@@ -1434,3 +1434,46 @@ cluster-backed mirror):
 Tests: config URI scheme rules, absent-table = disabled default,
 mirror doc shape (exactly `_id`/`text`/`ts_ms`), fresh-process lane-off
 refusals — suite 200 green.
+
+## 20. Video attachment lane: understand uploaded videos (2026-10-20)
+
+`crates/bot/src/video.rs` + `[video]` in bot.toml — videos get
+*understood* on the honesty-first shape the image and sandbox lanes
+already use (no new wire protocol: the composed block is the same
+bracketed attachment context):
+
+- **Pipeline**: capped download (the sandbox lane's downloader) →
+  `ffprobe` caps + stream honesty (audio-only containers, live/
+  fragmented streams, over-cap durations → honest refusal lines, never
+  guesses) → `ffmpeg` audio strip (16 kHz mono WAV) → local
+  `openai-whisper` transcription (default `tiny`, wall-time budgeted) →
+  evenly-strided frame sampling (default **every 5 s**, capped 8
+  frames; long clips resample evenly across the WHOLE duration and the
+  block says so) → per-frame vision through the gateway's LOCAL tier
+  (same skill images ride; frames ride as data URLs, nothing leaves the
+  node) → composed `Ok` block with duration, sampling note, transcript
+  (or honest absence — a no-audio clip says so, an empty transcript
+  says so) and per-timestamp frame notes.
+- **Caps + knobs** (`[video]`): `enabled` (default on), bin paths
+  (ffmpeg/ffprobe/whisper), `whisper_model`, `frame_stride_secs`
+  (clamp 1–30), `max_frames` (clamp 1–16), `max_duration_secs` (clamp
+  30–3600), `max_file_mb` (clamp 1–2048), `whisper_timeout_secs`
+  (clamp 30–1800). Missing tooling degrades to honest lines, never
+  boot failures nor silent drops.
+- **Budget honesty**: ONE video per message (`MAX_VIDEOS_PER_MESSAGE`)
+  keeps a lane run inside the chat timeout; extras get an honest
+  "send 1 at a time" line. Results cache in the sandbox-extraction
+  cache (same id/name+size keying) — a re-ask never re-runs whisper.
+  Scratch files wipe on drop; every subprocess is timeout-bounded and
+  kill-on-drop; argv builders are pure and unit-tested (the
+  `docker_argv` pattern). A probed-ok run whose frames ALL fail
+  refuses to fabricate understanding.
+- **Routing**: shared `video::classify_kind` routes image / video /
+  other at both attachment sites (the @mention/DM fallback and `/read`);
+  a lying extension is caught by the probe, not believed.
+
+Tests: 12 new units (classify, timestamps incl. long-clip resample,
+argv shapes, probe-parse honesty, clamps) + a `#[ignore]` live harness
+that generates a REAL 6-second clip and runs the entire lane through
+the host toolchain (ffmpeg → ffprobe → whisper → frames → vision stub)
+— suite 237 green, live harness pass.

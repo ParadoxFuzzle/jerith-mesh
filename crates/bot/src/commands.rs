@@ -44,15 +44,7 @@ pub async fn read(
     // skill's description, other files get the Docker sandbox read —
     // and the extraction cache means a re-sent file doesn't re-run the
     // container.
-    let kind = if file
-        .content_type
-        .as_deref()
-        .is_some_and(|t| t.starts_with("image/"))
-    {
-        crate::converse::AttKind::Image
-    } else {
-        crate::converse::AttKind::Other
-    };
+    let kind = crate::video::classify_kind(&file.filename, file.content_type.as_deref());
     let spec = crate::converse::AttSpec {
         url: file.url.clone(),
         label: file.filename.clone(),

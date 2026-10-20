@@ -91,6 +91,12 @@ pub const IMAGE_ONLY_PROMPT: &str = "What's in this image? Describe it";
 /// unreadable anyway. Files ride the sandbox's own `[sandbox]` caps.
 pub const MAX_IMAGES_PER_MESSAGE: usize = 3;
 
+/// Cap on video attachments per message: ONE. A video walk can spend
+/// minutes in ffmpeg + whisper (per [video] caps); two concurrent
+/// transcriptions would blow through the chat timeout for marginal
+/// value, and the honest line below says what happened to the rest.
+pub const MAX_VIDEOS_PER_MESSAGE: usize = 1;
+
 /// What a transport hands over per attachment: the CDN url, display
 /// label (the filename), the kind that routes it — images through
 /// the gateway's vision skill, everything else through the Docker
@@ -108,6 +114,9 @@ pub struct AttSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttKind {
     Image,
+    /// Riding the video lane (video.rs): probe → audio strip → whisper
+    /// transcription → sampled frames through the vision tier.
+    Video,
     Other,
 }
 
@@ -163,6 +172,7 @@ pub async fn attachments_context(
     let mut batch_meta: Vec<(Option<u64>, Option<u64>)> = Vec::new(); // (id, size) per batch entry
     let mut batch_slots: Vec<usize> = Vec::new(); // line slot per batch entry
     let mut images_used = 0usize;
+    let mut videos_used = 0usize;
     for att in attachments {
         match att.kind {
             AttKind::Image => {
@@ -180,6 +190,40 @@ pub async fn attachments_context(
                     Err(e) => (att.label.clone(), Err(format!("{e:#}"))),
                 };
                 lines.push(entry);
+            }
+            AttKind::Video => {
+                // One video per message: a lane run can spend minutes
+                // inside ffmpeg + whisper; the honest line covers the
+                // rest. A disabled lane also degrades to a line here.
+                videos_used += 1;
+                if videos_used > MAX_VIDEOS_PER_MESSAGE {
+                    lines.push((
+                        att.label.clone(),
+                        Err(format!(
+                            "skipped: one video per message keeps transcription within the chat timeout — send {MAX_VIDEOS_PER_MESSAGE} at a time"
+                        )),
+                    ));
+                    continue;
+                }
+                if !cfg.video.enabled {
+                    lines.push((
+                        att.label.clone(),
+                        Err("video lane disabled by config".to_string()),
+                    ));
+                    continue;
+                }
+                // Same extraction cache as the sandbox lane: the
+                // composed block is keyed by attachment id / name+size,
+                // so a re-ask never re-runs whisper.
+                if let Some(hit) = state.sandbox_cache_get(att.id, &att.label, att.size) {
+                    lines.push((att.label.clone(), hit));
+                    continue;
+                }
+                let out = crate::video::video_context(cfg, &att.label, &att.url).await;
+                if out.is_ok() {
+                    state.sandbox_cache_put(att.id, &att.label, att.size, out.clone());
+                }
+                lines.push((att.label.clone(), out));
             }
             AttKind::Other => {
                 if let Some(hit) = state.sandbox_cache_get(att.id, &att.label, att.size) {

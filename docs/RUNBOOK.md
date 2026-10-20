@@ -1453,3 +1453,33 @@ cargo test -p jerith-mesh-bot \\
 - Both container lanes may run while a real owner session goes on —
   they sweep only their OWN prefixed containers
   (`jerith-wf-shadow-*` / `jerith-wf-vm-*`), nothing else.
+
+## Video attachment lane (live 2026-10-20)
+
+FEATURES §20 / `crates/bot/src/video.rs` — uploaded videos are probed
+(ffprobe), audio-stripped (ffmpeg → 16 kHz mono WAV), transcribed
+(LOCAL openai-whisper, default `tiny` — cached at `~/.cache/whisper`),
+and evenly-sampled frames (default every 5 s, cap 8) described through
+the gateway's LOCAL vision tier. One video per message; results cache
+in the sandbox-extraction cache so a re-ask never re-runs whisper.
+
+- **Ops knobs** (`[video]` in bot.toml): `enabled` (default on;
+  `false` degrades every video to an honest config line), bin paths,
+  `whisper_model` (`tiny` → `base` doubles wall time for better
+  transcripts), `frame_stride_secs`, `max_frames`, `max_duration_secs`
+  (default 600), `max_file_mb` (default 512), `whisper_timeout_secs`
+  (default 600).
+- **Downgrade shapes are by design**: no tool on PATH / download /
+  ffprobe / no video stream / over-cap duration / frame-extract /
+  vision failures all degrade to honest per-attachment lines in the
+  context block — the journal + the chat both say exactly why, nothing
+  is silent.
+- **Timing reality**: whisper-tiny on CPU ≈ near-realtime (a 6 s clip
+  ran the whole lane in ~15 s in the live harness; a 10-minute clip
+  will spend most of its time in whisper). The `[chat]` timeout (240 s)
+  bounds the wait; the 600 s default duration cap keeps worst-case
+  runs inside it.
+- **Verify**: `cargo test -p jerith-mesh-bot --bins video -- --ignored
+  --nocapture` — generates a real 6-second clip and runs the entire
+  lane through the host toolchain (requires ffmpeg + ffprobe + whisper
+  with a cached model).

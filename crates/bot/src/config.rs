@@ -118,6 +118,12 @@ pub struct BotConfig {
     /// repo-built `jerith-sandbox` image; missing docker degrades to
     /// honest per-file failure lines, never a silent drop.
     pub sandbox: SandboxConfig,
+    /// Video attachment lane (`[video]` in bot.toml, see video.rs):
+    /// uploaded videos get ffprobe'd, their audio stripped and
+    /// transcribed by local whisper, and evenly-strided frames analyzed
+    /// through the gateway's vision tier — composed into one context
+    /// block. Default on; tooling-absent degrades to honest lines.
+    pub video: crate::video::VideoConfig,
     /// Multi-bot coordination (`[coordinator]` in bot.toml, see
     /// coordinator.rs): named worker loops claiming the mesh hand-off
     /// channel with per-worker model routing. Default on — loops only
@@ -487,6 +493,11 @@ impl BotConfig {
                 s.max_output_kb = s.max_output_kb.clamp(4, 64);
                 s
             },
+            video: {
+                let mut v = file.video.clone().unwrap_or_default();
+                v.clamp();
+                v
+            },
             external_plugins,
             coordinator: file.coordinator.clone().unwrap_or_default(),
             workflows: {
@@ -564,6 +575,7 @@ impl BotConfig {
             chat_stream: true,
             chat_max_tool_rounds: DEFAULT_CHAT_MAX_TOOL_ROUNDS as usize,
             sandbox: SandboxConfig::default(),
+            video: crate::video::VideoConfig::default(),
             coordinator: CoordinatorBotConfig::default(),
             workflows: WorkflowsConfig::default(),
             approvals: crate::approval::ApprovalConfig::default(),
@@ -842,6 +854,9 @@ struct FileConfig {
     /// Optional `[sandbox]` table — Docker-sandboxed attachment reading
     /// (see sandbox.rs; on by default with the repo-built image).
     sandbox: Option<SandboxConfig>,
+    /// Optional `[video]` table — the video attachment lane (video.rs;
+    /// absent = defaults).
+    video: Option<crate::video::VideoConfig>,
     /// Optional `[coordinator]` table — named-worker loops (see coordinator.rs).
     coordinator: Option<CoordinatorBotConfig>,
     /// Optional `[workflows]` table — browser record/replay (workflows.rs).

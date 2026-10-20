@@ -386,7 +386,9 @@ async fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("chmod {mode:o} {}", path.display()))
 }
 
-async fn download_to(
+/// Capped attachment downloader (also the video lane's step 1 —
+/// pub(crate) so video.rs shares ONE honest download path).
+pub(crate) async fn download_to(
     dir: &Path,
     safe: String,
     url: &str,

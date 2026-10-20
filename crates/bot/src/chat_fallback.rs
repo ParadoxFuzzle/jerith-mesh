@@ -197,15 +197,7 @@ pub async fn handle(
             .map(|a| crate::converse::AttSpec {
                 url: a.url.clone(),
                 label: a.filename.clone(),
-                kind: if a
-                    .content_type
-                    .as_deref()
-                    .is_some_and(|t| t.starts_with("image/"))
-                {
-                    crate::converse::AttKind::Image
-                } else {
-                    crate::converse::AttKind::Other
-                },
+                kind: crate::video::classify_kind(&a.filename, a.content_type.as_deref()),
                 id: Some(a.id.get()),
                 size: Some(a.size as u64),
             })

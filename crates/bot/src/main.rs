@@ -34,6 +34,7 @@ mod sandbox;
 mod squeeze;
 mod state;
 mod transports;
+mod video;
 mod workflows;
 mod workspace;
 
