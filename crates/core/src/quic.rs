@@ -3405,7 +3405,14 @@ mod tests {
                         let connecting = client
                             .connect(addr, server_identity.node_id().as_str())
                             .expect("reconnect after hostile-driven close");
-                        connection = tokio::time::timeout(Duration::from_secs(5), connecting)
+                        // 10 s per redial handshake: the frame sequence is
+                        // pinned (FuzzRng seed), so the only variance is
+                        // runner timing — a loaded macOS box blew the old
+                        // 5 s bound mid-fuzz-storm on a perfectly healthy
+                        // redial (CI 2026-10-20). A genuinely wedged
+                        // transport still fails: the bound is real, just
+                        // headroomed for slow-but-alive runners.
+                        connection = tokio::time::timeout(Duration::from_secs(10), connecting)
                             .await
                             .expect("redial inside the fuzz window")
                             .expect("redial opens");
