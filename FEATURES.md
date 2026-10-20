@@ -1273,11 +1273,27 @@ What this release establishes, and what stages next on the same rails:
    package landed in the real store (0700 dir, 0600 package, opaque:
    `esc-…-5f3a.esc`, 556 bytes) beside the freshly-created 0600 key —
    the full at-rest chain audited live, not asserted.
-4. **Local workspace shadowing**: `SandboxConfig` already pins no-
-   network/caps-dropped/read-only containers for chat attachments.
-   Shadow-target stage: replay pipelines can pick a disposable
-   containerized profile per session (fresh HOME + mounts from a
-   manifest) so experimentation never touches owner state on disk.
+4. **Local workspace shadowing — LANDED (2026-10-20, `workflows.rs`,
+   `[workflows.shadow]` in bot.toml)**: `[workflows.shadow] enabled =
+   true` + an `image` the operator vouched for (the bot NEVER picks an
+   image silently — enabled-without-image is a typed refusal at run
+   time) and replays ride a disposable containerized chrome instead of
+   a host profile: unique-name `--rm` container per session,
+   loopback-only CDP port map, `--cap-drop ALL` + no-new-privileges
+   (chrome's own sandbox off — the container IS the sandbox), a fresh
+   nosuid/noexec tmpfs HOME (`/home/shadow`, 64 MiB) carrying the
+   profile, and ONLY manifest-listed mounts (`host:container[:ro|rw]`,
+   default ro — rw must be visible in the manifest). The exact argv is
+   a pure, grep-able, unit-pinned function. Shutdown removes the
+   container BY NAME (docker-daemon-owned children outlive a killed
+   CLI), and an arrival sweeper removes leftover prefix-owned containers
+   before a new session. DEFAULT docker networking stays ON (replays
+   must reach the pages they drive — `--network none` remains the
+   chat-attachment sandbox contract, not this tool's). Record stays on
+   the host display; only replay shadows. Live-fire: PENDING a
+   chrome-capable image on the host (none of the three local images
+   carries a browser — pull or build one, set `image`, and a replay is
+   the whole test).
 
 ## 18. External chat transports: 11 platforms (2026-10-19)
 

@@ -27,6 +27,9 @@
 //! activation), recorded `goto`s heal mid-flow page changes. Bounded:
 //! 200 steps, 1k-char selectors, per-run wall clock, HTTP(S) nav only,
 //! argv-only chrome spawn on an ephemeral loopback port.
+//! With `[workflows.shadow] enabled`, replay instead rides the §17.4
+//! shadow target: a disposable containerized chrome (fresh tmpfs HOME,
+//! manifest-only mounts) so experiments never touch owner state on disk.
 //!
 //! Config ([workflows] in bot.toml): `chrome_binary` ("google-chrome"),
 //! `recorder_display` (":0"), `run_budget_secs` (120).
@@ -427,6 +430,10 @@ struct CdpSession {
     /// The chrome process itself — owned here so the session's lifetime
     /// IS the browser's (drop = kill_on_drop fires).
     child: tokio::process::Child,
+    /// When the session rode the §17.4 shadow container: its NAME, so
+    /// shutdown can `docker rm -f` the browser the daemon still owns
+    /// (the CLI child dying does NOT stop a container).
+    container: Option<String>,
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Value>>>>>;
@@ -479,6 +486,82 @@ impl CdpSession {
             .context("devtools url shape")?
             .to_string();
 
+        let mut session = Self::connect_session(&port, child).await?;
+        session.container = None;
+        Ok(session)
+    }
+
+    /// §17.4 shadow launch — replay inside the disposable containerized
+    /// chrome (local workspace shadowing): fresh tmpfs HOME, only the
+    /// manifest-listed mounts (ro by default), loopback-mapped CDP, a
+    /// uniquely-named `--rm` container that shutdown removes by name.
+    /// Validation is honest where the operator can act on it: docker
+    /// missing or enabled-without-image is a typed refusal before
+    /// anything spawns.
+    async fn launch_shadow(
+        shadow: &crate::config::ShadowConfig,
+        target_url: &str,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            which("docker").is_ok(),
+            "shadow replay needs docker on PATH — not found"
+        );
+        let image = shadow.image.trim();
+        anyhow::ensure!(
+            !image.is_empty(),
+            "[workflows.shadow] enabled without an image — refusing to pick one silently"
+        );
+        sweep_stale_shadows().await;
+        let name = format!(
+            "{SHADOW_PREFIX}{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        );
+        let host_port = pick_shadow_port()?;
+        let mounts: Vec<ShadowMount> = shadow
+            .mounts
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                parse_shadow_mount(entry)
+                    .map_err(|e| anyhow::anyhow!("[workflows.shadow] mounts[{i}]: {e}"))
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        let argv = shadow_docker_argv(
+            image,
+            &shadow.browser,
+            &name,
+            host_port,
+            &mounts,
+            target_url,
+        );
+        tracing::info!(
+            target: "bot",
+            container = %name,
+            port = host_port,
+            mounts = mounts.len(),
+            "shadow replay target launching (fresh HOME, manifest mounts only)"
+        );
+        let child = tokio::process::Command::new(argv[0].clone())
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning shadow docker run")?;
+        let mut session = Self::connect_session(&host_port.to_string(), child).await?;
+        session.container = Some(name);
+        Ok(session)
+    }
+
+    /// Attach the page target + wire the CDP event loop — exactly the
+    /// body host launch ran after parsing the DevTools port; both the
+    /// host and the shadow path converge here.
+    async fn connect_session(port: &str, child: tokio::process::Child) -> anyhow::Result<Self> {
         // The page target's own ws: events arrive WITHOUT session ids —
         // no flatten/attach dance needed for a single-page flow.
         let page_ws: String = loop {
@@ -611,6 +694,7 @@ impl CdpSession {
             feeds: feeds_tx,
             task,
             child,
+            container: None,
         };
         session.command("Page.enable", json!({})).await?;
         session.command("Runtime.enable", json!({})).await?;
@@ -823,7 +907,19 @@ impl BrowserDriver for CdpSession {
 impl CdpSession {
     /// Explicit shutdown helper: logs the child's liveness for the
     /// journal (Drop aborts the ws task; kill_on_drop kills the child).
+    /// §17.4 containers additionally get the real kill: the daemon owns
+    /// the shadow browser, so only `docker rm -f` stops it (bounded,
+    /// best-effort, by the name the launch pinned).
     async fn shutdown(mut self) {
+        if let Some(container) = self.container.take() {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::process::Command::new("docker")
+                    .args(["rm", "-f", &container])
+                    .output(),
+            )
+            .await;
+        }
         let chrome_exited = self
             .child
             .try_wait()
@@ -836,6 +932,167 @@ impl CdpSession {
         );
         drop(self);
     }
+}
+
+// ---------------------------------------------------------------------------
+// §17.4 shadow target — the disposable containerized replay environment
+// ---------------------------------------------------------------------------
+
+/// Name prefix of shadow containers. Grep-able ownership: the sweep and
+/// the shutdown removal only ever touch containers carrying this prefix.
+const SHADOW_PREFIX: &str = "jerith-wf-shadow-";
+/// Where chrome serves DevTools INSIDE the container (the argv build
+/// maps this port to a fresh loopback host port per session).
+const SHADOW_IN_PORT: u16 = 9222;
+/// The shadow's fresh HOME: a tmpfs born with the container and gone
+/// with it — replay state is disposable by construction.
+const SHADOW_HOME: &str = "/home/shadow";
+
+/// One parsed manifest mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShadowMount {
+    src: String,
+    dst: String,
+    ro: bool,
+}
+
+/// Parse one manifest entry `host_abs:container_abs[:ro|rw]`. Plain
+/// `host_abs` is refused (the manifest must stay legible); the default
+/// mode is ro — write access has to be a visibly explicit choice.
+fn parse_shadow_mount(entry: &str) -> anyhow::Result<ShadowMount> {
+    let parts: Vec<&str> = entry.split(':').collect();
+    anyhow::ensure!(
+        parts.len() == 2 || parts.len() == 3,
+        "mount must be host_abs:container_abs[:ro|rw]"
+    );
+    let (src, dst) = (parts[0].trim(), parts[1].trim());
+    anyhow::ensure!(
+        !src.is_empty() && !dst.is_empty(),
+        "mount paths must be non-empty"
+    );
+    anyhow::ensure!(
+        src.starts_with('/'),
+        "mount src must be an absolute host path ({src})"
+    );
+    anyhow::ensure!(
+        dst.starts_with('/'),
+        "mount dst must be an absolute container path ({dst})"
+    );
+    let ro = if parts.len() == 2 {
+        true
+    } else {
+        match parts[2].trim() {
+            "ro" => true,
+            "rw" => false,
+            other => anyhow::bail!("mount mode must be ro or rw (got {other:?})"),
+        }
+    };
+    Ok(ShadowMount {
+        src: src.to_string(),
+        dst: dst.to_string(),
+        ro,
+    })
+}
+
+/// The exact docker argv for one shadow session (pure; each path carries
+/// its own safety reasoning — grep-able and unit-pinned):
+/// - `--rm` + a unique name: one container per session, removed by name;
+/// - loopback-only port map — the CDP endpoint never goes off-host;
+/// - `--cap-drop ALL` + `no-new-privileges`, and chrome's own setuid
+///   sandbox disabled (`--no-sandbox`) because the container IS the
+///   sandbox layer at this point;
+/// - fresh HOME: a bounded nosuid/noexec tmpfs + `HOME` env + the
+///   user-data-dir under it — the profile is born disposable;
+/// - manifest mounts only, ro by default (rw visible in the manifest);
+/// - DEFAULT docker networking ON PURPOSE: a replay must reach the
+///   pages it drives — `--network none` (the chat-attachment sandbox
+///   contract in sandbox.rs) does NOT apply to this tool.
+#[allow(clippy::too_many_arguments)]
+fn shadow_docker_argv(
+    image: &str,
+    chrome_in_image: &str,
+    name: &str,
+    host_port: u16,
+    mounts: &[ShadowMount],
+    target_url: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        "docker".to_string(),
+        "run".to_string(),
+        "--rm".to_string(),
+        format!("--name={name}"),
+        "-p".to_string(),
+        format!("127.0.0.1:{host_port}:{SHADOW_IN_PORT}"),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--shm-size".to_string(),
+        "256m".to_string(),
+        "--tmpfs".to_string(),
+        format!("{SHADOW_HOME}:rw,nosuid,noexec,size=64m"),
+        "-e".to_string(),
+        format!("HOME={SHADOW_HOME}"),
+    ];
+    for m in mounts {
+        argv.push("-v".to_string());
+        argv.push(format!(
+            "{}:{}{}",
+            m.src,
+            m.dst,
+            if m.ro { ":ro" } else { ":rw" }
+        ));
+    }
+    argv.push(image.to_string());
+    argv.push(chrome_in_image.to_string());
+    argv.extend([
+        "--headless=new".to_string(),
+        format!("--remote-debugging-port={SHADOW_IN_PORT}"),
+        "--remote-debugging-address=0.0.0.0".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--no-sandbox".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-gpu".to_string(),
+        format!("--user-data-dir={SHADOW_HOME}/profile"),
+        target_url.to_string(),
+    ]);
+    argv
+}
+
+/// Arrival sweeper: any leftover container OUR prefix owns from a bot
+/// death (a docker CLI dying does not stop the container) is removed
+/// before a new session spawns — best-effort, bounded, name-scoped.
+async fn sweep_stale_shadows() {
+    let Ok(list) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("docker")
+            .args(["ps", "-aq", "--filter", &format!("name={SHADOW_PREFIX}")])
+            .output(),
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok(list) = list else { return };
+    for id in String::from_utf8_lossy(&list.stdout).split_whitespace() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("docker")
+                .args(["rm", "-f", id])
+                .output(),
+        )
+        .await;
+    }
+}
+
+/// One fresh loopback host port per session.
+fn pick_shadow_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("no free loopback port for the shadow session")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 // ---------------------------------------------------------------------------
@@ -958,18 +1215,25 @@ async fn record_stop(_cfg: &BotConfig, name: &str) -> anyhow::Result<Value> {
 
 async fn run(cfg: &BotConfig, name: &str) -> anyhow::Result<Value> {
     let mut w = load(name)?;
-    anyhow::ensure!(
-        which(cfg.workflows.chrome_binary.as_str()).is_ok(),
-        "chrome binary not found: {}",
-        cfg.workflows.chrome_binary
-    );
-    let mut driver = CdpSession::launch(
-        &cfg.workflows.chrome_binary,
-        &w.url,
-        true, // replay is headless
-        None,
-    )
-    .await?;
+    let mut driver = if cfg.workflows.shadow.enabled {
+        // §17.4: replays ride the disposable containerized shadow —
+        // fresh HOME + manifest-only mounts; docker/image validation
+        // is inside launch_shadow (typed, before anything spawns).
+        CdpSession::launch_shadow(&cfg.workflows.shadow, &w.url).await?
+    } else {
+        anyhow::ensure!(
+            which(cfg.workflows.chrome_binary.as_str()).is_ok(),
+            "chrome binary not found: {}",
+            cfg.workflows.chrome_binary
+        );
+        CdpSession::launch(
+            &cfg.workflows.chrome_binary,
+            &w.url,
+            true, // replay is headless
+            None,
+        )
+        .await?
+    };
     // Give the start page a moment to settle before the first step.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let lines = replay(
@@ -1376,5 +1640,104 @@ mod tests {
             failing.starts_with('✗') && failing.contains("step 2") && failing.contains("#go"),
             "{failing}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // §17.4 shadow target: manifest parse + argv contract (pure parts)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn shadow_mounts_parse_and_default_ro() {
+        let m = parse_shadow_mount("/srv/data:/mount/data").unwrap();
+        assert_eq!(m.src, "/srv/data");
+        assert_eq!(m.dst, "/mount/data");
+        assert!(m.ro, "default is read-only");
+        assert!(parse_shadow_mount("/a:/b:ro").unwrap().ro);
+        // Write access must be an explicit, visible choice.
+        assert!(!parse_shadow_mount("/a:/b:rw").unwrap().ro);
+        for entry in [
+            "srv/data:/b", // relative host path (no leading slash)
+            "host:dst",    // relative everything
+            "/a:/b:x",     // unknown mode
+            "/a:/b:ro:x",  // extra field
+            "/a:",         // empty dst
+            ":/b",         // empty src
+            "/a:/b/c",     // dst fine? NO — wait, this one is legal shape: two fields
+        ] {
+            // The last entry is actually legal shape — pull it out:
+            if entry == "/a:/b/c" {
+                continue;
+            }
+            assert!(parse_shadow_mount(entry).is_err(), "refused: {entry}");
+        }
+        // the legal two-field shape parses
+        parse_shadow_mount("/a:/b/c").expect("legal shape");
+    }
+
+    #[test]
+    fn shadow_argv_contract_is_greppable() {
+        let mounts = vec![
+            parse_shadow_mount("/srv/share:/data").unwrap(),
+            parse_shadow_mount("/srv/upload:/data/upload:rw").unwrap(),
+        ];
+        let argv = shadow_docker_argv(
+            "reg.example/chrome:123",
+            "chromium",
+            "jerith-wf-shadow-123-abc",
+            44777,
+            &mounts,
+            "https://example/app",
+        );
+        assert_eq!(argv[0], "docker");
+        assert_eq!(argv[1], "run");
+        let s = argv.join(" ");
+        // Disposability + identity + a loopback-only CDP map.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--rm" && w[1] == "--name=jerith-wf-shadow-123-abc")
+        );
+        assert!(
+            s.contains("-p 127.0.0.1:44777:9222"),
+            "loopback-only CDP: {s}"
+        );
+        // The container is the sandbox layer.
+        assert!(s.contains("--cap-drop ALL"), "{s}");
+        assert!(s.contains("no-new-privileges"));
+        assert!(s.contains("--no-sandbox"), "chrome's own sandbox is off");
+        // Fresh disposable HOME everywhere state could accrue.
+        assert!(
+            s.contains("--tmpfs /home/shadow:rw,nosuid,noexec,size=64m"),
+            "{s}"
+        );
+        assert!(s.contains("-e HOME=/home/shadow"));
+        assert!(s.contains("--user-data-dir=/home/shadow/profile"));
+        // Manifest mounts: ro by default, rw explicit.
+        assert!(s.contains("-v /srv/share:/data:ro"), "{s}");
+        assert!(s.contains("-v /srv/upload:/data/upload:rw"));
+        // The chat-attachment sandbox contract does NOT apply — replays
+        // must reach the pages they drive.
+        assert!(!s.contains("--network"), "{s}");
+        // In-container dashboard argv + the target.
+        assert!(s.contains("--headless=new"));
+        assert!(s.contains("--remote-debugging-port=9222"));
+        assert!(s.contains("--remote-debugging-address=0.0.0.0"));
+        assert!(
+            s.ends_with("--user-data-dir=/home/shadow/profile https://example/app"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn shadow_port_picker_serves_a_real_loopback_port() {
+        let port = pick_shadow_port().expect("a port exists");
+        assert!(port > 0, "bound an actual ephemeral port");
+    }
+
+    #[test]
+    fn shadow_defaults_off_with_no_silent_image() {
+        let shadow = crate::config::ShadowConfig::default();
+        assert!(!shadow.enabled, "opt-in only");
+        assert!(shadow.image.is_empty(), "no silent image pick");
+        assert!(shadow.mounts.is_empty());
     }
 }

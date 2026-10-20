@@ -154,6 +154,49 @@ pub struct WorkflowsConfig {
     /// Wall-clock cap for one replay run (clamped 30–600).
     #[serde(default = "default_run_budget_secs")]
     pub run_budget_secs: u64,
+    /// §17.4 shadow target: the disposable containerized chrome replays
+    /// ride when the owner enables it (default OFF — host chrome keeps
+    /// running replays the legacy way).
+    #[serde(default)]
+    pub shadow: ShadowConfig,
+}
+
+/// `[workflows.shadow]` in bot.toml — the local workspace shadowing
+/// profile (FEATURES §17.4): a disposable containerized chrome with a
+/// fresh HOME (`/home/shadow` tmpfs) and only the manifest-listed
+/// mounts, so replay experiments never touch owner state on disk.
+/// Default OFF; opt-in means the operator vouched for the image.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ShadowConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The image that carries the browser. Empty + enabled is a typed
+    /// refusal at run time — the bot never picks an image by itself.
+    #[serde(default)]
+    pub image: String,
+    /// Browser binary inside the image.
+    #[serde(default = "default_shadow_browser")]
+    pub browser: String,
+    /// Mount manifest — `host_abs:container_abs[:ro|rw]`; plain
+    /// `host_abs` is refused (format must be legible), default mode ro:
+    /// write access must be a visibly explicit choice.
+    #[serde(default)]
+    pub mounts: Vec<String>,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            image: String::new(),
+            browser: default_shadow_browser(),
+            mounts: Vec::new(),
+        }
+    }
+}
+
+fn default_shadow_browser() -> String {
+    "chromium".to_string()
 }
 
 impl Default for WorkflowsConfig {
@@ -162,6 +205,7 @@ impl Default for WorkflowsConfig {
             chrome_binary: default_chrome_binary(),
             recorder_display: default_recorder_display(),
             run_budget_secs: default_run_budget_secs(),
+            shadow: ShadowConfig::default(),
         }
     }
 }

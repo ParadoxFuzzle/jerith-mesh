@@ -2180,7 +2180,7 @@ mod tests {
         // The corrected artifact must pass the REAL local build-check —
         // the point of structuring the escalation on failure classes at all.
         let check = build_check(RefLang::Rust, &answer).await;
-        assert_eq!(check.checked, true, "rustc runs against the fix");
-        assert_eq!(check.ok, true, "the fix must typecheck: {check:?}");
+        assert!(check.checked, "rustc must run against the fix: {check:?}");
+        assert!(check.ok, "the fix must typecheck: {check:?}");
     }
 }
