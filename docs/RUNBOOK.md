@@ -753,9 +753,20 @@ directly) streams instead of freezing at `…`. Surfaced tradeoffs: a
   request` catch-all in the tool-attachment heuristic is GONE — it
   forced web tools onto every casual chat, which combined with the
   blanket suppression meant ZERO live typing on nearly every bot chat
-  (the same-day "nothing changed" live report). Information requests
-  attach tools via factual openers + a trailing '?' (`search` rejoined
-  the opener list); casual text does not. Toolless
+  (the same-day "nothing changed" live report). Information  requests attach tools via factual openers + a trailing '?'
+  (`search` rejoined the opener list); casual text does not.
+  Tool-declaration WIRE names (2026-10-20, live-verified in the
+  litellm/OpenRouter journal): tool names are validated by
+  OpenAI-compatible providers against `[a-zA-Z0-9_-]+` and a dotted
+  name (`memory.embed`) 400'd EVERY tool-attached chat through the
+  router's remote legs — repeatedly, across its whole fallback list,
+  before the chat reached a working leg at all (tools-attached answers
+  sat at the placeholder every time, the third "not streaming" report
+  shape). `wire_tool_name` now folds dots/colons to underscores at the
+  declaration (`memory.embed` → `memory_embed`), with `dispatch`
+  resolving the wire form back to the real skill — the model can only
+  ever name the wire form, and every emitted def is charset-pinned by
+  test. Toolless
   rounds type, but their fragments are JSON-gated: while the round's
   content still opens `{ "…` (the 193-char intent-slop landing round),
   fragments are HELD and never surface — the moment the content proves

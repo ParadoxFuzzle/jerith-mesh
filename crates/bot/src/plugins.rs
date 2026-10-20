@@ -77,13 +77,38 @@ pub struct SkillSpec {
     pub run: SkillRunner,
 }
 
+/// The WIRE name a tool declaration carries: OpenAI-compatible providers
+/// validate tool names against `[a-zA-Z0-9_-]+` and REJECT anything else
+/// (live 2026-10-20: litellm's OpenRouter leg 400'd every tool-attached
+/// chat with `Function at index 2 has an invalid name: "memory.embed"`,
+/// hammering the router's fallbacks for seconds before the chat reached
+/// any working leg — tools-attached answers sat at the placeholder until
+/// a late single-shot leg delivered, the "still not streaming" report).
+/// Dots and colons fold to underscores. The mapping is a registry
+/// invariant: `dispatch` resolves wire names back to the real skill
+/// (see [`SkillRegistry::dispatch`]), and [`Self::tool_defs`] emits ONLY
+/// wire-safe names — pin by test.
+pub fn wire_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 impl SkillSpec {
-    /// The OpenAI tool declaration this skill turns into.
+    /// The OpenAI tool declaration this skill turns into — with the
+    /// WIRE name (provider-validation-safe), never the dot-notation
+    /// internal name.
     fn tool_def(&self) -> Value {
         json!({
             "type": "function",
             "function": {
-                "name": self.name,
+                "name": wire_tool_name(self.name),
                 "description": self.description,
                 "parameters": self.parameters,
             }
@@ -668,7 +693,7 @@ impl SkillRegistry {
                         json!({
                             "type": "function",
                             "function": {
-                                "name": e.name,
+                                "name": wire_tool_name(&e.name),
                                 "description": e.description,
                                 "parameters": e.parameters,
                             }
@@ -706,17 +731,27 @@ impl SkillRegistry {
         name: &str,
         args: &Value,
     ) -> anyhow::Result<Value> {
+        // The model can only ever name the WIRE form (tool declarations
+        // carry nothing else) — resolve dots/colons back to the real
+        // skill. Exact-name match first keeps bare names one lookup away.
+        let enabled = self.enabled_skill_names();
+        let resolved = enabled
+            .iter()
+            .find(|n| n.as_str() == name)
+            .cloned()
+            .or_else(|| enabled.iter().find(|n| wire_tool_name(n) == name).cloned())
+            .unwrap_or_else(|| name.to_string());
         if let Some(spec) = self
             .skills
             .iter()
-            .find(|s| s.name == name && self.enabled(s))
+            .find(|s| s.name == resolved && self.enabled(s))
         {
             return (spec.run)(cfg, args).await;
         }
         if let Some(entry) = self
             .external
             .iter()
-            .find(|e| e.name == name && self.external_enabled(e))
+            .find(|e| e.name == resolved && self.external_enabled(e))
         {
             return crate::external::invoke(&entry.plugin, &entry.name, args).await;
         }
@@ -892,7 +927,15 @@ mod tests {
         let defs = on.tool_defs();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0]["type"], "function");
-        assert_eq!(defs[0]["function"]["name"], "weather.now");
+        // Wire name (2026-10-20 provider validation); dispatch resolves
+        // both the wire and the real form back to the dot-named skill.
+        assert_eq!(defs[0]["function"]["name"], "weather_now");
+        let served_wire = rt().block_on(on.dispatch(&test_cfg(), "weather_now", &args));
+        assert_eq!(
+            served_wire.unwrap(),
+            json!({"provider": "open-meteo", "temperature_c": 21.5}),
+            "the model can only ever name the wire form — it must dispatch"
+        );
         assert_eq!(
             defs[0]["function"]["parameters"]["required"],
             json!(["place"])
@@ -943,9 +986,61 @@ mod tests {
         for d in defs {
             assert_eq!(d["type"], "function");
             let f = &d["function"];
-            assert!(f["name"].as_str().unwrap().starts_with("memory."));
+            // 2026-10-20: the wire name is the SANITIZED form — dots fold
+            // to underscores (OpenAI/OpenRouter tool-name validation only
+            // allows a-zA-Z0-9_-; dotted names 400'd every tool-attached
+            // chat through litellm's remote legs). Dispatch resolves them
+            // back; the internal dot names stay the registry identity.
+            assert!(
+                f["name"].as_str().unwrap().starts_with("memory_"),
+                "wire name must be the sanitized form: {:?}",
+                f["name"]
+            );
             assert!(f["parameters"]["properties"].is_object());
         }
+    }
+
+    /// The WIRE-name contract: tool declarations are validated by
+    /// OpenAI-compatible providers against `[a-zA-Z0-9_-]+` — every
+    /// emitted def must fit, with dots/colons folded and bare names
+    /// untouched. `dispatch` resolves the wire form back to the real
+    /// skill (the model can only ever name the wire form).
+    #[test]
+    fn wire_tool_names_are_provider_safe_and_resolve_back() {
+        assert_eq!(wire_tool_name("memory.embed"), "memory_embed");
+        assert_eq!(wire_tool_name("external:gcp"), "external_gcp");
+        assert_eq!(wire_tool_name("web_search"), "web_search");
+        let r = SkillRegistry::standard(PREPACKAGED_PLUGINS);
+        for d in r.tool_defs() {
+            let name = d["function"]["name"].as_str().unwrap();
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "provider-unsafe wire tool name: {name:?}"
+            );
+        }
+        // The model calls the WIRE form; the registry resolves the real
+        // skill. The memory plugin's seen-log proves the dot-name ran.
+        let names = r.enabled_skill_names();
+        assert!(
+            names.iter().any(|n| n == "memory.embed"),
+            "the internal dot name stays the registry identity"
+        );
+        let wire = wire_tool_name("memory.embed");
+        assert_eq!(wire, "memory_embed");
+        // Resolve by round-trip through the same matcher dispatch uses.
+        assert!(
+            names
+                .iter()
+                .find(|n| wire_tool_name(n) == wire)
+                .is_some_and(|n| n == "memory.embed")
+        );
+        // An exact real name also resolves (bare callers).
+        assert!(
+            names
+                .iter()
+                .any(|n| n.as_str() == wire_tool_name("web_search"))
+        );
     }
 
     /// Phase 3a registry-level proof: an external skill joined via
@@ -998,10 +1093,12 @@ mod tests {
             names.iter().any(|n| n == "weather.now"),
             "whitelist: {names:?}"
         );
-        // The tool def reaches the chat payload shaped right.
+        // The tool def reaches the chat payload shaped right — with the
+        // WIRE name (2026-10-20 provider validation; dispatch resolves
+        // back to the dot name).
         let defs = reg.tool_defs();
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0]["function"]["name"], "weather.now");
+        assert_eq!(defs[0]["function"]["name"], "weather_now");
         // Dispatch — the registry → HTTP hop the tool loop exercises.
         let hit = reg
             .dispatch(&test_cfg(), "weather.now", &json!({"place": "Praha"}))
@@ -1062,7 +1159,7 @@ mod tests {
             .expect("drop joins");
         let defs = reg.tool_defs();
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0]["function"]["name"], "gcp.status");
+        assert_eq!(defs[0]["function"]["name"], "gcp_status");
         // Dispatch reaches the (dead-endpoint) dispatcher — the typed
         // error proves routing through invoke(), not the refusal path.
         let err = reg
