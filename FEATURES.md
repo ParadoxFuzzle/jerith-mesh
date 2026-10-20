@@ -720,13 +720,29 @@ gotchas surfaced while building the finished parts.
   degraded path) and drill-proven through real QUIC (criterion 8 bound:
   two warm pulls + one mute-owner deadline death + a self-hosted local
   run = a byte-equal-to-reference COMPLETION with the ledger exactly
-  5×transport + the warm bytes). Still open: speculative DECODING
-  itself (draft-model/speculative stream on the chat path) — the walk's
-  pre-flight is its transport-side substrate; the per-request budget's
-  CONFIG surface (deferred until real speculative runs ride the
-  transport — the caps exist and are enforced at generous defaults
-  meanwhile); and speculative-decode-level telemetry once the budget
-  gains a production caller.
+  5×transport + the warm bytes). The speculative DECODING half LANDED
+  2026-10-19 as the chat-path lane (`gateway.rs`, config
+  `[runtime] runtime_spec_decode = { num_speculative_tokens }`): the
+  DECODING itself stays engine-side by design — draft-and-verify needs
+  the logits, which the engine (Colibri's MTP header, llama.cpp `-md`,
+  vLLM `speculative_config`) holds — while the mesh owns the honest
+  wherever-it-must-live part: the forward carries a `spec_decode` hint
+  when (and only when) a ONE-TIME synthetic admission probe proved the
+  runtime accepts the field (a clean probe round-trip guarantees an
+  infra hiccup is never misread as a refusal; a refusal locks the hint
+  inert for the process lifetime so user traffic never faces an
+  unproven engine field), and /status `spec_decode` measures BOTH lanes
+  (`hinted`/`plain` tokens/sec) publishing a `speedup` ratio only past
+  5 measured records each — statistics, never a one-shot verdict.
+  Wired cold (reload plan `runtime_spec_decode` restarts like the other
+  runtime keys). Tests: hint-merge gating (refused/zero/admitted),
+  probe classifications, stats math with the ≥5 gate, plus the live
+  mock-runtime drill (probe admits → hint rides forward 2+, stats
+  fill; strict runtime 400s the field → refused → user traffic stays
+  clean). Still open: the per-request budget's CONFIG surface
+  (deferred until real speculative runs ride the transport — the caps
+  exist and are enforced at generous defaults meanwhile) and
+  draft-expert scheduling once Colibri's layer split lands.
 - ✅ **Asynchronous, timeout-tolerant forward passes + graceful degradation
   (§1)** — the mesh CHAT walk landed async 2026-10-18 (see §2's gateway
   tier notes and §13's config surface for the knobs; the expert walk keeps
@@ -1198,6 +1214,21 @@ What this release establishes, and what stages next on the same rails:
    example.com + the production gateway (fetch/strip/embed/summary all
    green, 25.8 s end-to-end). Next: `refactor_module` (parse → patch →
    build-check → report, `syn`-shaped when a code crate lands).
+   **`refactor_module` LANDED (2026-10-19, `pipeline.rs`, plugin
+   `pipeline`)** — the second macro-tool, same one-call rails:
+   structural balance scan (language-aware string/comment/template
+   states for rust/python/ts-js; `Other` reports unchecked, never
+   false) refuses half-modules BEFORE the model leg, ONE gateway
+   completion applies the instruction, the patch is re-scanned, and   the build-check runs the language's cheapest real tool —
+   `rustc --emit=metadata` (typecheck, no codegen) / `python3 -m
+   py_compile` (bytecode compile, no execution) — never executing the
+   module; absent toolchains report `checked: false` with the reason,
+   never a folded pass. Result carries per-stage status + the patched
+   source; truncation (>64 k chars) is refused, not shipped. Registry
+   gate unchanged (`[plugins] pipeline`); 12 model-facing skills now.
+   Tests: 9 new (scanner per-language positive/negative, fence
+   extraction, cap refusals, no-tool honesty) + an `#[ignore]`d
+   rustc live harness.
 3. **Tiered cloud escalation with state serialization**: the approval
    checkpoint files are the serialization shape. Stage: on a structured
    local failure (schema break ×3, build-verify fail), serialize the

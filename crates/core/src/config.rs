@@ -181,6 +181,30 @@ pub struct SpecialistConfig {
     pub embedding_model: String,
 }
 
+/// Speculative-decoding hint config (FEATURES §1): the mesh forwards
+/// the draft budget; the engine owns draft-and-verify (it has the logits).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SpecDecodeConfig {
+    /// Draft tokens the engine may speculatively pre-compute per
+    /// forward. 0 disables the hint merge even when the block is present
+    /// (= every field is honest: a present block with 0 means "configured
+    /// but deliberately inert").
+    #[serde(default = "default_spec_decode_tokens")]
+    pub num_speculative_tokens: u32,
+}
+
+impl Default for SpecDecodeConfig {
+    fn default() -> Self {
+        SpecDecodeConfig {
+            num_speculative_tokens: default_spec_decode_tokens(),
+        }
+    }
+}
+
+fn default_spec_decode_tokens() -> u32 {
+    8
+}
+
 fn default_ollama_url() -> String {
     "http://127.0.0.1:11434".to_string()
 }
@@ -405,6 +429,18 @@ pub struct NodeConfig {
     /// models that loop unbounded (deepseek-r1:8b live 2026-10-14).
     #[serde(default)]
     pub runtime_num_predict: Option<u64>,
+    /// Speculative-decoding lane (FEATURES §1) for the runtime chat
+    /// forward: when set, every `/v1/chat/completions` carries an extra
+    /// `spec_decode` body field hinting the engine's draft-and-verify
+    /// pass. The DECODING lives engine-side (Colibri's MTP header,
+    /// llama.cpp `-md`, vLLM `speculative_config` — a verifier needs the
+    /// logits, which the mesh holds outside the engine); the mesh's job
+    /// is the honest chat-path lane: hint, admission probe, per-lane
+    /// speed stats (§1's deferred "speculative decoding itself" half).
+    /// Engines without the field drop it inertly (LiteLLM drop_params
+    /// shape — same precedent as the `think:false` merge). Opt-in.
+    #[serde(default)]
+    pub runtime_spec_decode: Option<SpecDecodeConfig>,
     /// Model router: tool-calling tier for any chat request that carries
     /// function definitions (agent tool loops). Chosen for parse
     /// RELIABILITY, not depth — default is the measured-reliable
@@ -819,6 +855,7 @@ impl Default for NodeConfig {
             gateway_bind: None,
             runtime_api_key: None,
             runtime_num_predict: None,
+            runtime_spec_decode: None,
             runtime_tool_model: default_tool_router_model(),
             runtime_vision_model: Some(crate::model_router::DEFAULT_VISION_MODEL.to_string()),
             runtime_deep_model: Some(crate::model_router::DEFAULT_DEEP_MODEL.to_string()),

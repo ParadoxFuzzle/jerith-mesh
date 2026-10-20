@@ -30,6 +30,113 @@ use crate::ping::MeshState;
 /// proper SSE body is streamed through without a byte deadline.
 const RUNTIME_HEADERS_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Speculative-decode chat lane state (FEATURES §1): admission-probe
+/// outcome plus per-lane traffic stats. Honest shapes everywhere — the
+/// engine owns the actual draft-and-verify (it has the logits); the mesh
+/// records whether its hint was ACCEPTED and what each lane's measured
+/// tokens/sec looks like, publishing statistics, never verdicts.
+#[derive(Default)]
+pub struct SpecLane {
+    /// Admission probe: 0 = unprobed, 1 = admitted, 2 = refused,
+    /// 3 = probe in flight. Once refused, the hint merge goes inert for
+    /// the process lifetime (a real user request never becomes the
+    /// Guinea pig for an experimental engine field).
+    probe: std::sync::atomic::AtomicU8,
+    /// Non-stream forward stats: hint lane (requests, completion tokens,
+    /// wall ms) — fills only when usage telemetry comes back.
+    hinted: tokio::sync::Mutex<SpecLaneStats>,
+    /// Same fields for unhinted forwards on the same lane.
+    plain: tokio::sync::Mutex<SpecLaneStats>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct SpecLaneStats {
+    pub requests: u64,
+    pub completion_tokens: u64,
+    pub wall_ms: u64,
+}
+
+impl SpecLane {
+    fn probe_state(&self) -> u8 {
+        self.probe.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record one completed non-stream forward.
+    async fn record(&self, hinted: bool, tokens: u64, wall_ms: u64) {
+        if tokens == 0 || wall_ms == 0 {
+            return; // nothing honest to average over
+        }
+        let slot = if hinted { &self.hinted } else { &self.plain };
+        let mut s = slot.lock().await;
+        s.requests += 1;
+        s.completion_tokens += tokens;
+        s.wall_ms += wall_ms;
+    }
+
+    /// Tokens/sec per lane — None until at least one full datum landed.
+    fn lane_tps(s: &SpecLaneStats) -> Option<f64> {
+        if s.requests == 0 || s.wall_ms == 0 {
+            None
+        } else {
+            Some(s.completion_tokens as f64 / (s.wall_ms as f64 / 1000.0))
+        }
+    }
+
+    /// The /status card: config truth + admission + measured speeds.
+    /// `speedup` is the hinted/plain ratio, published ONLY when both
+    /// lanes have ≥ 5 measured requests (statistical honesty, never a
+    /// one-request verdict).
+    pub async fn status_value(&self, cfg: Option<&crate::config::SpecDecodeConfig>) -> Value {
+        let probe_n = self.probe_state();
+        let (h, p) = {
+            let h = self.hinted.lock().await.clone();
+            let p = self.plain.lock().await.clone();
+            (h, p)
+        };
+        let h_tps = Self::lane_tps(&h);
+        let p_tps = Self::lane_tps(&p);
+        let speedup = match (h_tps, p_tps) {
+            (Some(h_speed), Some(p_speed))
+                if h.requests >= 5 && p.requests >= 5 && p_speed > 0.0 =>
+            {
+                serde_json::Value::from((h_speed / p_speed * 100.0).round() / 100.0)
+            }
+            _ => Value::Null,
+        };
+        json!({
+            "enabled": cfg.is_some(),
+            "num_speculative_tokens": cfg.map(|c| c.num_speculative_tokens).unwrap_or(0),
+            "admission": match probe_n {
+                0 => Value::Null,
+                1 => serde_json::Value::from("accepted"),
+                2 => serde_json::Value::from("refused"),
+                _ => serde_json::Value::from("probing"),
+            },
+            "hinted": { "requests": h.requests, "tokens_per_sec": h_tps },
+            "plain": { "requests": p.requests, "tokens_per_sec": p_tps },
+            "speedup": speedup,
+        })
+    }
+}
+
+/// Pure hint merge: when the lane is live (enabled + admitted tokens),
+/// stamp `spec_decode` onto the forward body (engines that know the
+/// field consume it; drop_params proxies ignore it inertly). Returns
+/// whether a hint rode this forward — the stat-recording key.
+pub fn apply_spec_decode_hint(
+    body: &mut Value,
+    cfg: &crate::config::SpecDecodeConfig,
+    admitted: bool,
+) -> bool {
+    if !admitted || cfg.num_speculative_tokens == 0 {
+        return false;
+    }
+    body["spec_decode"] = json!({
+        "num_speculative_tokens": cfg.num_speculative_tokens,
+    });
+    true
+}
+
 pub struct Gateway {
     pub state: Arc<MeshState>,
     /// Base URL of the local Colibri/Ollama runtime.
@@ -78,6 +185,11 @@ pub struct Gateway {
     /// the crypto section as `optional_wallet` — mined balance by their
     /// own node, typed refusal on error, never a fake number.
     pub optional_wallet: Option<std::sync::Arc<crate::economics::OptionalChainWallet>>,
+    /// Speculative-decode hint config (config `runtime_spec_decode`).
+    /// None → the chat lane forwards untouched, exactly as before.
+    pub spec_decode: Option<crate::config::SpecDecodeConfig>,
+    /// Spec-lane admission + measured per-lane speeds (always present).
+    pub spec_lane: Arc<SpecLane>,
     /// Perf/cost meters (model-performance-benchmark + session-cost-tracker
     /// ports): per-model latency/success/tokens from live traffic.
     pub metrics: Arc<crate::metrics::Metrics>,
@@ -1104,6 +1216,8 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         // Runaway-generation cap state (armed via config `runtime_num_predict`;
         // the site dashboard surfaces it so an operator can see it live).
         "runtime_num_predict": gw.runtime_num_predict,
+        // Speculative-decode lane (§1): admission + measured speeds.
+        "spec_decode": gw.spec_lane.status_value(gw.spec_decode.as_ref()).await,
         // Resource pooling (Phase 1): live fleet census.
         "fleet_resources": fleet_value,
         // Resource isolation (Phase 1): ceilings + kill-switch state.
@@ -1478,6 +1592,37 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body["max_tokens"] = serde_json::json!(cap);
         }
     }
+    // Spec-decode lane (FEATURES §1): decide whether this forward
+    // carries the speculative hint. The engine-side draft-and-verify owns
+    // the real algorithm (it has the logits); the mesh's lane is honest
+    // configure → probe → measure only:
+    // - admitted (1): merge the hint;
+    // - unprobed (0): spawn the ONE synthetic admission probe — a real
+    //   user payload never faces an unproven engine field;
+    // - probing (3): no hint this round; the probe result lands next;
+    // - refused (2): inert for the process lifetime.
+    let mut hinted = false;
+    if let Some(sd) = &gw.spec_decode {
+        match gw.spec_lane.probe_state() {
+            1 => hinted = apply_spec_decode_hint(&mut body, sd, true),
+            0 if gw
+                .spec_lane
+                .probe
+                .compare_exchange(
+                    0,
+                    3,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok() =>
+            {
+                let probe_gw = gw.clone();
+                let tokens = sd.num_speculative_tokens;
+                tokio::spawn(async move { spec_admission_probe(&probe_gw, tokens).await });
+            }
+            _ => {} // probing or refused — no hint this round
+        }
+    }
     // Chat lane client: ONE pooled instance per process — every chat
     // message used to build a fresh TLS-pinned client (and socket pool,
     // and TCP connect) for the runtime lane. The fail-fast contract is
@@ -1797,6 +1942,22 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body.get("usage"),
             None,
         );
+        // Spec-decode lane stats (§1): recorded per forward, split by
+        // whether the hint rode along. Inputs are honest-only — a record
+        // lands only when status is 2xx AND usage carried completion
+        // tokens; streams never reach here.
+        if status.is_success()
+            && let Some(usage) = body.get("usage")
+            && let Some(tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64())
+            && tokens > 0
+        {
+            // Sub-millisecond local round-trips truncate to 0 ms;
+            // ceiling at 1 ms so the datum is recorded (0 tokens/ms
+            // would be a lie in the other direction via the record
+            // guard silently dropping measured completions).
+            let wall_ms = (request_started.elapsed().as_millis() as u64).max(1);
+            gw.spec_lane.record(hinted, tokens, wall_ms).await;
+        }
         // Expert activations: Phase 2 will count real expert traffic; for now
         // we count one activation per completion as a placeholder hook.
         // Spec: every served inference has a chance to mine JER.
@@ -1808,6 +1969,84 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
         }
     }
     (status, [("content-type", "application/json")], bytes).into_response()
+}
+
+/// ONE synthetic admission probe for the spec-decode lane (FEATURES §1): a
+/// minimal completion carrying the hint, then the same request without it —
+/// so an unreachable runtime is never misread as a field refusal. Outcomes:
+/// admitted (1) — runtime accepted the hinted request;
+/// refused (2) — the field alone 4xxed while the clean one succeeded;
+/// unprobed (0) — runtime down/misconfigured (lane retries on a later
+/// request by re-arming from 3 → 0).
+async fn spec_admission_probe(gw: &Arc<Gateway>, tokens: u32) {
+    let Some(base) = gw
+        .base_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        // No advertised model id to probe against — the lane stays
+        // unprobed and therefore never hinted (honest absence).
+        gw.spec_lane
+            .probe
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        return;
+    };
+    let url = format!(
+        "{}/v1/chat/completions",
+        gw.runtime_url.trim_end_matches('/')
+    );
+    let client = crate::http::mesh_http();
+    let hinted_body = json!({
+        "model": base,
+        "messages": [{"role": "user", "content": "."}],
+        "max_tokens": 1,
+        "spec_decode": {"num_speculative_tokens": tokens},
+    });
+    let mut clean_body = hinted_body.clone();
+    if let Some(obj) = clean_body.as_object_mut() {
+        obj.remove("spec_decode");
+    }
+    let auth = |r: reqwest::RequestBuilder| match &gw.runtime_api_key {
+        Some(k) => r.bearer_auth(k),
+        None => r,
+    };
+    let hinted_status = auth(client.post(&url).json(&hinted_body))
+        .send()
+        .await
+        .map(|r| r.status());
+    let clean_status = auth(client.post(&url).json(&clean_body))
+        .send()
+        .await
+        .map(|r| r.status());
+    let lane = &gw.spec_lane.probe;
+    match (hinted_status, clean_status) {
+        (Ok(h), _) if h.is_success() => {
+            lane.store(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::info!(
+                target: "spec",
+                tokens,
+                "spec-decode hint admitted by runtime — hinted lane live"
+            );
+        }
+        (Ok(h), Ok(c)) if h.is_client_error() && c.is_success() => {
+            lane.store(2, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!(
+                target: "spec",
+                tokens,
+                hint_status = h.as_u16(),
+                clean_status = c.as_u16(),
+                "runtime refused the spec-decode hint (healthy without it) — lane inert this process"
+            );
+        }
+        _ => {
+            lane.store(0, std::sync::atomic::Ordering::SeqCst);
+            tracing::debug!(
+                target: "spec",
+                "spec-decode admission probe inconclusive (runtime down?) — unprobed, retries later"
+            );
+        }
+    }
 }
 
 /// Visual noise some runtime models print into otherwise-good text: HTML
@@ -2064,6 +2303,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
     }
@@ -2127,6 +2368,8 @@ mod tests {
             wallet: Some(Arc::new(card)),
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let body: Value = server.get("/status").await.json();
@@ -2166,6 +2409,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let body: Value = server.get("/status").await.json();
@@ -2235,6 +2480,8 @@ mod tests {
             )
             .map(std::sync::Arc::new),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
 
@@ -2285,6 +2532,8 @@ mod tests {
             )
             .map(std::sync::Arc::new),
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let body: Value = server.get("/status").await.json();
@@ -2339,6 +2588,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let body: Value = server.get("/status").await.json();
@@ -2392,6 +2643,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let body: Value = server.get("/status").await.json();
@@ -2437,6 +2690,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
     }
@@ -2472,6 +2727,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         TestServer::new(gw.router().into_make_service()).expect("guarded test server")
     }
@@ -2602,6 +2859,8 @@ mod tests {
             chain_url: None,
             wallet: None,
             optional_wallet: None,
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
             metrics: metrics.clone(),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("metrics test server");
@@ -2707,6 +2966,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let res = server.post("/v1/chat/completions").json(&request).await;
@@ -2792,6 +3053,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
 
@@ -2893,6 +3156,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
 
@@ -3066,6 +3331,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).unwrap();
 
@@ -3111,6 +3378,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).unwrap();
 
@@ -3234,6 +3503,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let res = server
@@ -3288,6 +3559,8 @@ mod tests {
             wallet: None,
             optional_wallet: None,
             metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         let server = TestServer::new(gw.router().into_make_service()).expect("test server");
         let res = server
@@ -3300,5 +3573,241 @@ mod tests {
             body["choices"][0]["message"]["content"],
             json!("A\nBC\nD\nE")
         );
+    }
+
+    // --- spec-decode lane (FEATURES §1) --------------------------------------
+
+    #[test]
+    fn spec_hint_fit_merge_respects_admission_and_zero_budget() {
+        let zero = crate::config::SpecDecodeConfig {
+            num_speculative_tokens: 0,
+        };
+        let mut body = json!({"model": "m"});
+        // Refused → inert (a user payload never carries the field).
+        assert!(!apply_spec_decode_hint(&mut body, &zero, false));
+        assert!(body.get("spec_decode").is_none());
+        // Zero budget → deliberately inert even when admitted.
+        assert!(!apply_spec_decode_hint(&mut body, &zero, true));
+        // Admitted + budget → the shape the engine consumes.
+        let cfg = crate::config::SpecDecodeConfig {
+            num_speculative_tokens: 12,
+        };
+        assert!(apply_spec_decode_hint(&mut body, &cfg, true));
+        assert_eq!(body["spec_decode"]["num_speculative_tokens"], json!(12));
+    }
+
+    #[tokio::test]
+    async fn spec_lane_stats_publish_speedup_only_with_enough_data() {
+        let lane = SpecLane::default();
+        // Nothing measured → nulls everywhere.
+        let v = lane.status_value(None).await;
+        assert_eq!(v["enabled"], false);
+        assert!(v["admission"].is_null());
+        assert!(v["speedup"].is_null());
+        // One lane measured, the other starved → ratio stays withheld.
+        for _ in 0..9 {
+            lane.record(true, 100, 100).await; // hinted: 1000 tok/s
+        }
+        assert!(lane.status_value(None).await["speedup"].is_null());
+        for _ in 0..5 {
+            lane.record(false, 50, 1000).await; // plain: 50 tok/s
+        }
+        let v = lane
+            .status_value(Some(&crate::config::SpecDecodeConfig::default()))
+            .await;
+        assert_eq!(v["enabled"], true);
+        // 1000/50 = 20× (only because both lanes now have ≥ 5 records).
+        assert_eq!(v["speedup"], json!(20.0), "{v}");
+        // A zero-completion record carries nothing honest into the stats.
+        let before = {
+            let s = lane.hinted.lock().await.clone();
+            s.requests
+        };
+        lane.record(true, 0, 100).await;
+        let after = { lane.hinted.lock().await.clone().requests };
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn spec_lane_probes_admits_hints_and_measures() {
+        // Runtime: accepts everything; records bodies so we can prove the
+        // hint rides forward 2+, never the unprobed forward 1.
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let landed = bodies.clone();
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| {
+                let landed = landed.clone();
+                async move {
+                    landed.lock().await.push(body);
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                        "usage": {"completion_tokens": 7}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: format!("http://{addr}"),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: format!("http://{addr}"),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("spec-test-model".to_string()),
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            spec_decode: Some(crate::config::SpecDecodeConfig {
+                num_speculative_tokens: 4,
+            }),
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let lane = gw.spec_lane.clone();
+        let server = TestServer::new(gw.router().into_make_service()).expect("server");
+
+        // Forward 1: unprobed → spawns the probe, carries NO hint.
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+            .await;
+        assert!(res.status_code().is_success());
+        // The probe lands asynchronously (one synthetic hinted round-trip).
+        for _ in 0..50 {
+            if lane.probe_state() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            lane.probe_state(),
+            1,
+            "probe should admit against this mock"
+        );
+        // Forward 2+: admitted → the hint rides.
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "again"}]}))
+            .await;
+        assert!(res.status_code().is_success());
+        // Index order is racy (the probe can land before/after forward 1):
+        // key on content instead. The "hi" forward ran BEFORE admission →
+        // clean; the "again" forward ran after → hinted.
+        let seen = bodies.lock().await;
+        let hi = seen
+            .iter()
+            .find(|b| b.contains("hi"))
+            .expect("forward 1 recorded");
+        let again = seen
+            .iter()
+            .find(|b| b.contains("again"))
+            .expect("forward 2 recorded");
+        assert!(
+            !hi.contains("spec_decode"),
+            "unprobed forward stays clean: {hi}"
+        );
+        assert!(
+            again.contains("spec_decode"),
+            "admitted forward carries the hint: {again}"
+        );
+        // Stats landed on BOTH lanes (usage telemetry is present).
+        let status: Value = server.get("/status").await.json();
+        assert_eq!(status["spec_decode"]["admission"], "accepted");
+        assert_eq!(status["spec_decode"]["num_speculative_tokens"], 4);
+        assert_eq!(status["spec_decode"]["hinted"]["requests"], json!(1));
+        assert_eq!(status["spec_decode"]["plain"]["requests"], json!(1));
+        assert!(
+            status["spec_decode"]["speedup"].is_null(),
+            "one datum is not a verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_lane_probe_refusal_gates_the_hint_off_user_traffic() {
+        // Runtime that REFUSES unknown body fields (the drop_params-less
+        // strict engine shape) but serves the clean request fine.
+        let runtime = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: String| async move {
+                if body.contains("spec_decode") {
+                    axum::http::StatusCode::BAD_REQUEST.into_response()
+                } else {
+                    axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: format!("http://{addr}"),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: format!("http://{addr}"),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("spec-test-model".to_string()),
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            spec_decode: Some(crate::config::SpecDecodeConfig::default()),
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let lane = gw.spec_lane.clone();
+        let server = TestServer::new(gw.router().into_make_service()).expect("server");
+        let _ = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+            .await;
+        for _ in 0..50 {
+            if lane.probe_state() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            lane.probe_state(),
+            2,
+            "field-refusal must lock the lane inert"
+        );
+        // Real user traffic NEVER carries the field once refused.
+        let status: Value = server.get("/status").await.json();
+        assert_eq!(status["spec_decode"]["admission"], "refused");
+        // And subsequent forwards stay clean (request #2 runs after the
+        // probe locked the lane; the mock would have 400'd a hinted one
+        // — success here proves the merge stayed off).
+        let res = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "again"}]}))
+            .await;
+        assert!(res.status_code().is_success());
     }
 }
