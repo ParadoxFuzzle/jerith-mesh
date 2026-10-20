@@ -723,7 +723,7 @@ pub async fn chat_with_usage_live(
             // known text key, surface the prose — keys are metadata. Runs
             // BEFORE the degenerate check, so an envelope whose text field
             // is empty still falls through to the retry/refusal gate.
-            let content = match unwrap_json_text_envelope(&content) {
+            let mut content = match unwrap_json_text_envelope(&content) {
                 Some(inner) => {
                     tracing::info!(
                         target: "bot",
@@ -762,6 +762,30 @@ pub async fn chat_with_usage_live(
                     continue;
                 }
                 return Ok((EMPTY_ANSWER_REFUSAL.to_string(), served_by, tokens_used));
+            }
+            // Honest truncation surface: the gateway stamps the node's
+            // runaway cap (`runtime_num_predict`) on any chat the caller
+            // didn't cap — every leg, the router's rerouted remote tiers
+            // included. A capped generation stops mid-sentence
+            // (finish_reason "length") and used to post silently
+            // truncated (live 2026-10-20 17:16 report: "didn't finish
+            // posting"). Surface both the marker and the continuation
+            // affordance — the history carries this turn, so "continue"
+            // resumes the answer naturally. A stream MId-cut already
+            // carries its own cut marker (the fold appends it), so this
+            // covers the remaining silent shape.
+            if body
+                .pointer("/choices/0/finish_reason")
+                .and_then(value_to_string)
+                .filter(|s| !s.is_empty())
+                .as_deref()
+                == Some("length")
+            {
+                tracing::info!(
+                    target: "bot",
+                    "answer hit the token cap — surfacing the truncation honestly"
+                );
+                content.push_str(TRUNCATED_AT_CAP_NOTE);
             }
             return Ok((content, served_by, tokens_used));
         }
@@ -905,6 +929,14 @@ fn truncate_degenerate_head(content: &str) -> String {
 
 pub const EMPTY_ANSWER_REFUSAL: &str =
     "⚠️ the runtime returned an empty answer — try rephrasing, or ask a direct question.";
+
+/// Appended when the answer round carries `finish_reason: length` — the
+/// node's runaway cap (`runtime_num_predict`, stamped by the gateway on
+/// uncapped chats, rerouted remote tiers included) cut the generation
+/// mid-sentence. The reply surfaces BOTH the honest marker and the
+/// continuation affordance: the history carries the truncated turn, so
+/// a plain "continue" resumes the answer (fresh streamed session).
+pub const TRUNCATED_AT_CAP_NOTE: &str = "\n\n_(the reply hit the node's token cap and stopped there — say **continue** to have me carry on)_";
 
 /// Appended as a per-round system instruction to the TOOLLESS answer rounds
 /// (the budget-exhausted landing and the degenerate retry): the gathered
@@ -1524,6 +1556,71 @@ mod tests {
         assert!(!prompt_requests_web("jerk chicken recipe"));
         assert!(!prompt_requests_web("lol nice"));
         assert!(prompt_requests_web("is jerk chicken hard to make?"));
+    }
+
+    /// The token-cap truncation surface (live 2026-10-20 17:16 report:
+    /// "didn't finish posting" — the gateway stamps the node's
+    /// `runtime_num_predict` cap on uncapped chats, rerouted remote tiers
+    /// included, and a capped generation used to stop mid-sentence with
+    /// no marker at all). `finish_reason: length` now appends the honest
+    /// note + continuation affordance; a plain `stop` never does.
+    #[tokio::test]
+    async fn length_cut_answers_surface_the_cap_note_stop_does_not() {
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|axum::Json(req): axum::Json<Value>| async move {
+                    let reason = if req
+                        .get("messages")
+                        .and_then(|m| m.as_array())
+                        .is_some_and(|ms| ms.len() > 1)
+                    {
+                        // The retry round (history attached): a normal stop.
+                        "stop"
+                    } else {
+                        // First round: capped mid-generation.
+                        "length"
+                    };
+                    axum::Json(json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "partial answer, cut mid-sent"},
+                            "finish_reason": reason
+                        }],
+                        "usage": {"total_tokens": 5}
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        let (reply, _s, _t) = chat_with_usage_live(&cfg, "write something long", &[], None, false)
+            .await
+            .expect("capped chat");
+        assert!(
+            reply.contains("hit the node's token cap"),
+            "capped answer must surface the note: {reply:?}"
+        );
+        assert!(
+            reply.contains("mid-sent"),
+            "the partial content still ships: {reply:?}"
+        );
+        // A `stop` answer never carries the note: same mock, retry round.
+        let (reply2, _s2, _t2) = chat_with_usage_live(
+            &cfg,
+            "again",
+            &[json!({"role": "assistant", "content": "prior turn"})],
+            None,
+            false,
+        )
+        .await
+        .expect("stop chat");
+        assert_eq!(reply2, "partial answer, cut mid-sent");
     }
 
     #[test]

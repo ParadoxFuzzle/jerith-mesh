@@ -787,7 +787,18 @@ directly) streams instead of freezing at `…`. Surfaced tradeoffs: a
   default unset = off): when set, the gateway stamps `max_tokens = N` on
   every chat it forwards to the local runtime lane — but only when the
   caller set no cap of their own (max_tokens / max_completion_tokens /
-  num_predict always win). This is the missing runtime-lane bound for
+  num_predict always win). NOTE (2026-10-20, live-verified at 17:16:
+  the "didn't finish posting" report — the bot's answer stopped
+  mid-sentence): the stamp is applied in the chat ENTRY handler, so it
+  rides EVERY leg the gateway serves without a caller cap — the model
+  router's rerouted remote tiers (litellm/OpenRouter) included — and a
+  generation cut at the cap used to post silently truncated. The bot
+  now surfaces `finish_reason: length` with an honest marker + a
+  continuation affordance ("… say **continue** to have me carry on";
+  the history carries the truncated turn, so a plain continue resumes).
+  Truncation diagnostics: the bot journals `answer hit the token cap`
+  at the cut; a stream MId-cut already ships with its own cut marker.
+  This is the missing runtime-lane bound for
   thinking models that loop unbounded (deepseek-r1:8b, see the
   guardrails entry above): `MAX_QUEUE` fails fast, `MAX_LOADED_MODELS`
   serializes residency, `runtime_num_predict` bounds the generation
