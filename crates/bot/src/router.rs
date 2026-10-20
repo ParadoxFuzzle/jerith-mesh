@@ -1,4 +1,4 @@
-//! Multi-model task swapping via Rust enums (FEATURES §17).
+//! Multi-model task swapping via Rust enums (FEATURES §16).
 //!
 //! A fresh lineup of tiny local models rides the same box (qwen3:0.6b,
 //! bonsai-2:2b, tev1:0.8b, nemotron-3-nano:4b, qwen3:4b). Routing every

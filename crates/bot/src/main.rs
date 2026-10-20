@@ -199,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
         *p = config::cap_system_prompt(p, config::PERSONA_MAX_CHARS);
     }
     let state = new_state();
-    // External chat transports (FEATURES §17): every platform is its own
+    // External chat transports (FEATURES §18): every platform is its own
     // supervised task; absent `[transports]` tables cost nothing. They
     // hold config + state only — independent of the Discord gateway.
     if !cfg.transports.enabled_platforms().is_empty() {

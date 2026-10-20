@@ -134,7 +134,7 @@ pub struct BotConfig {
     /// schema-constrained classification → specialized ollama lane.
     /// Default OFF (opt-in; the runtime keeps its normal tiering).
     pub router: crate::router::RouterConfig,
-    /// External chat transports (FEATURES §17): every platform is an
+    /// External chat transports (FEATURES §18): every platform is an
     /// optional table under `[transports.*]` — absent = dormant, free.
     pub transports: crate::transports::TransportsConfig,
     /// MongoDB Atlas connection lane (mongo.rs) — absent table = disabled.
@@ -733,7 +733,7 @@ struct FileConfig {
     /// Optional `[router]` table — local task-enum router (router.rs).
     router: Option<crate::router::RouterConfig>,
     /// Optional `[transports]` table — external chat platforms
-    /// (FEATURES §17, see transports/mod.rs + its per-platform files).
+    /// (FEATURES §18, see transports/mod.rs + its per-platform files).
     transports: Option<crate::transports::TransportsConfig>,
     /// Optional `[mongo]` table — MongoDB Atlas connection lane
     /// (see mongo.rs). Absent = disabled.

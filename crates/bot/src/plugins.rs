@@ -257,7 +257,7 @@ fn memory_embed_runner<'args>(
         let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
         anyhow::ensure!(!text.trim().is_empty(), "memory.embed: empty text");
         let (id, provider) = crate::api::memory_embed(cfg, text).await?;
-        // Mongo recall mirror (mongo.rs, FEATURES §18): the private note
+        // Mongo recall mirror (mongo.rs, FEATURES §19): the private note
         // also lands in the cluster deduped by id — fire-and-forget, a
         // mirror failure NEVER blocks the tool loop (typed journal only).
         if crate::mongo::handle().is_some() {

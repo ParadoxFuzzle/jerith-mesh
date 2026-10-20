@@ -1005,7 +1005,13 @@ gotchas surfaced while building the finished parts.
   renders both — a sparkline card (last-hour requests/mean/mesh share
   over the bucket bars) and a "mesh peers served" card (id, count, mean
   ms, ok % per answering peer).
-- **Expert-budget telemetry once budgeting lands (Phase 3)**:
+- **Expert-budget telemetry once budgeting lands (Phase 3)**: the walk
+  budgets (chat/remote caps, §13's enforced inline spend guards) exist
+  today but surface nothing about how they constrict dispatch — the
+  telemetry half (refusals-by-cap counters in `/v1/metrics`, per-peer
+  spend vs. disallowed-by-budget ratios) waits until real expert
+  transport rides the caps, the same gate as the §17.3 escalation
+  package; data collected before a real workload is noise.
 - **Testing posture**: the env-gated live-PG tests (`JERITH_TEST_PG_URL`,
   `JERITH_TEST_PG_URL_NOEXT`) are the pattern to copy for any future
   backend — and the chain node smoke tests ADOPTED it 2026-10-18
@@ -1243,7 +1249,7 @@ What this release establishes, and what stages next on the same rails:
    containerized profile per session (fresh HOME + mounts from a
    manifest) so experimentation never touches owner state on disk.
 
-## 17. External chat transports: 11 platforms (2026-10-19)
+## 18. External chat transports: 11 platforms (2026-10-19)
 
 `crates/bot/src/transports/` — Phase 3d of docs/PLUGIN-SDK.md Role 2,
 shipped BEFORE any operator asks for it (the module doc states the
@@ -1283,7 +1289,7 @@ config/basic-auth, Teams activity parse + serviceUrl gate, WhatsApp
 Meta-nest parse + app-secret requirement, Feishu domain map, GG refusal
 lock, webinbox RFC-corpus HMAC + loopback default — suite 197 green.
 
-## 18. MongoDB Atlas lane + recall mirror (2026-10-19)
+## 19. MongoDB Atlas lane + recall mirror (2026-10-19)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml — the first real
 feature on the shared handle (`memory.embed` / `memory.search` gain a

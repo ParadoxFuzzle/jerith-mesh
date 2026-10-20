@@ -141,7 +141,7 @@ pub async fn ping(uri: &str) -> Result<()> {
 // Recall mirror (the first real feature on the handle)
 // ---------------------------------------------------------------------------
 
-/// The mirror collection contract (FEATURES §18): one doc per private
+/// The mirror collection contract (FEATURES §19): one doc per private
 /// memory note, deduped by the gateway's memory id, text-indexed.
 const MIRROR_COLLECTION: &str = "memory_mirror";
 

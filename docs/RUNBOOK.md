@@ -1173,7 +1173,7 @@ Mode), Twitch, Mattermost, Signal (signal-cli daemon), Nextcloud Talk,
 MS Teams, Google Chat, Feishu/Lark, WhatsApp Cloud, and GG. ALL ARE
 DORMANT: a platform runs only if its `[transports.<platform>]` table
 exists in bot.toml — no table, no task, zero cost (so the bot that
-ships today behaves exactly as before). See FEATURES §17 for the
+ships today behaves exactly as before). See FEATURES §18 for the
 per-platform inbound/outbound surface and `transports/<platform>.rs`
 module doc for the setup contract (tokens, endpoints, caps).
 

@@ -5,7 +5,7 @@ skills ship (`crates/bot/src/external.rs`, manifests in
 `~/.jerith-mesh/plugins.d/`), the dialogue core ships
 (`crates/bot/src/converse.rs`, the `ConversationSink` + `run_session`
 seam Role 2 proposed), and the **transports layer now exists**:
-`crates/bot/src/transports/` (FEATURES §17, 2026-10-19) — IRC, Slack,
+`crates/bot/src/transports/` (FEATURES §18, 2026-10-19) — IRC, Slack,
 Twitch, Mattermost, Signal, Nextcloud Talk, MS Teams, Google Chat,
 Feishu/Lark, WhatsApp, GG as dormant `[transports.*]` adapters over
 the shared core, plus the `webinbox` loopback listener for push-only

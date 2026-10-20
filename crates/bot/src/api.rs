@@ -470,7 +470,7 @@ pub async fn chat_with_usage_live(
     let mut model = runtime_model(cfg)
         .await
         .unwrap_or_else(|| MODEL_PLACEHOLDER.to_string());
-    // Task-enum router (FEATURES §17, router.rs): when `[router]` is
+    // Task-enum router (FEATURES §16, router.rs): when `[router]` is
     // enabled, the tiny constrained classifier picks a specialized LOCAL
     // lane for code/data-style prompts (the classification is a direct,
     // schema-frozen ollama call — sample-level grammar, no parse-back).
