@@ -720,7 +720,23 @@ remembering:
   logic stays single-source. Reality check: qwen3:8b thinking arrives as
   `delta.reasoning_content`, so live-typing shows the wait, then the
   answer tails in fast; a broken stream with real content already typed
-  degrades to a cut-marked partial, never a lost  chat. `stream = false` restores the buffered one-shot. Tool rounds
+  degrades to a cut-marked partial, never a lost  chat. `stream = false` restores the buffered one-shot.
+  Edit cadence + thinking marker (2026-10-20, live-verified on the
+  captured 369-chunk probe stream): the OLD ≥120-new-chars edit floor
+  meant chat-length answers (content arrives as 1–2-char fragments —
+  48 content chars total in the probe) NEVER live-edited — the
+  placeholder sat frozen at `…` until finish() replaced it wholesale,
+  exactly the "shows it all only at the end" report. The sink now
+  edits every 2 s tick whenever the SHOWN text changed (first reveal
+  ≤ 2 s after content starts; ~2.5 edits/5 s, safely under Discord's
+  edit limiter), and the think phase shows an honest `🤔 …` marker
+  (reasoning deltas outnumber content ~25:1 before an answer starts —
+  the api layer taps `Thinking` on reasoning-only data rows and stops
+  the moment content flows; tool-bearing rounds still type nothing).
+  The mesh-fallback lane stays single-chunk by wire reality (a peer
+  serves one non-streaming reply, wrapped — gateway-side), so mesh-
+  served answers appear at once; this is the local-runtime lane's
+  streaming, which is the lane in normal use. Tool rounds
   STREAM but never type: tool-bearing rounds fire no live events at all
   (2026-10-16 contract change, after a recall-slop incident — echoed
   embedded-memory text surfaced in the chat before the reply, then the

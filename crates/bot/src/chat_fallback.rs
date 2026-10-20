@@ -390,9 +390,15 @@ async fn show_typing(http_ctx: &serenityall::Context, channel: serenityall::Chan
 /// per-fragment tap → `finish` replaces everything with the final formatted
 /// reply and stops the edit ticker).
 ///
-/// Edits are throttled to ≥ 2 s apart and ≥ 120 new chars — Discord both
-/// rate-limits message edits and renders nothing from sub-token churn, so
-/// tighter edits only trip the limiter. Every failure inside the sink is
+/// Edits are throttled to the 2 s ticker (Discord rate-limits message
+/// edits; ~2.5 edits per 5 s is safely under the limiter) and fire only
+/// when the SHOWN text actually changed — the 2026-10-20 live report
+/// ("…" frozen, then the whole answer at once) was the old ≥120-new-chars
+/// floor: short chat answers stream as 1–2-char fragments and never
+/// crossed it, so nothing edited until finish(). The thinking phase now
+/// shows an honest `🤔 …` marker instead of a frozen placeholder (the
+/// round's reasoning deltas arrive long before any content — 1210 of
+/// 1260 chars in the probe stream). Every failure inside the sink is
 /// swallowed (best-effort by contract): a deleted placeholder, a missing
 /// permission, a Discord hiccup — the streamed chat itself continues, and
 /// the streamed partial already shown is replaced wholesale by finish().
@@ -406,10 +412,30 @@ pub(crate) struct LiveSink {
 
 pub(crate) struct SinkState {
     text: String,
-    /// Chars at the last successfully applied edit (throttle baseline).
-    last_len: usize,
+    /// Reasoning-only deltas seen and no content yet — the thinking
+    /// phase (shown as `🤔 …` until the first content fragment lands).
+    thinking: bool,
     last_edit: std::time::Instant,
     dirty: bool,
+    /// The string actually live-edited last (dedupe: do not re-edit an
+    /// unchanged shown text — a thinking phase would otherwise re-edit
+    /// the same marker every tick).
+    last_shown: Option<String>,
+}
+
+/// What the ticker renders for the current state: the answer tail once
+/// content flows, the thinking marker while only reasoning deltas have
+/// arrived, the bare placeholder otherwise.
+fn shown_state(text: &str, thinking: bool) -> String {
+    if text.is_empty() {
+        if thinking {
+            "🤔 …".to_string()
+        } else {
+            "…".to_string()
+        }
+    } else {
+        clip_tail(text, 1990)
+    }
 }
 
 impl LiveSink {
@@ -420,14 +446,17 @@ impl LiveSink {
         let placeholder = channel.say(http_ctx, "…").await.ok()?;
         tracing::info!(
             channel = %channel,
-            message_id = %placeholder.id,
+            message_id = %            placeholder.id,
             "live sink: placeholder posted (one message per chat; the final edit below is the only other touch)"
         );
         let state = std::sync::Arc::new(tokio::sync::Mutex::new(SinkState {
             text: String::new(),
-            last_len: 0,
+            thinking: false,
             last_edit: std::time::Instant::now() - std::time::Duration::from_secs(10),
             dirty: false,
+            // The placeholder itself is the posted "…" — the initial
+            // shown state, so the first tick re-edits nothing.
+            last_shown: Some("…".to_string()),
         }));
         // Ticker: apply pending edits every 2 s until finish() aborts us.
         let tick_state = state.clone();
@@ -438,22 +467,28 @@ impl LiveSink {
             loop {
                 interval.tick().await;
                 let mut s = tick_state.lock().await;
-                if s.dirty
-                    && s.text.chars().count().saturating_sub(s.last_len) >= 120
-                    && s.last_edit.elapsed() >= std::time::Duration::from_secs(2)
-                {
-                    let shown = clip_tail(&s.text, 1990);
+                if s.dirty && s.last_edit.elapsed() >= std::time::Duration::from_secs(2) {
+                    let shown = shown_state(&s.text, s.thinking);
+                    if s.last_shown.as_deref() == Some(shown.as_str()) {
+                        // Identical shown text at the same cadence: skip the
+                        // edit (nothing new to show) and clear the flag —
+                        // a mid-think Thinking-spam tick lands here once each
+                        // state change, steadily during churn between
+                        // fragments otherwise.
+                        s.dirty = false;
+                        continue;
+                    }
                     let msg_id = placeholder.id;
                     if channel
                         .edit_message(
                             &ticker_ctx,
                             msg_id,
-                            poise::serenity_prelude::EditMessage::new().content(shown),
+                            poise::serenity_prelude::EditMessage::new().content(shown.clone()),
                         )
                         .await
                         .is_ok()
                     {
-                        s.last_len = s.text.chars().count();
+                        s.last_shown = Some(shown);
                         s.last_edit = std::time::Instant::now();
                         s.dirty = false;
                     }
@@ -485,13 +520,19 @@ impl crate::converse::ConversationSink for LiveSink {
             match event {
                 crate::api::LiveEvent::RoundStart => {
                     s.text.clear();
+                    s.thinking = false;
                     s.dirty = true;
                 }
                 crate::api::LiveEvent::Text(frag) => {
                     if !frag.is_empty() {
                         s.text.push_str(frag);
+                        s.thinking = false; // content flowed: stop the marker
                         s.dirty = true;
                     }
+                }
+                crate::api::LiveEvent::Thinking => {
+                    s.thinking = true;
+                    s.dirty = true;
                 }
             }
         }
@@ -626,6 +667,23 @@ use crate::approval::first_line as approval_error_line;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ticker's render decision (pure): content tail once answer text
+    /// flows, the honest thinking marker through a reasoning-only think
+    /// phase, the bare placeholder otherwise — the three LiveSink states
+    /// the 2026-10-20 live report ("…" frozen, whole answer at end)
+    /// collapsed into one.
+    #[test]
+    fn shown_state_covers_reveal_thinking_and_placeholder() {
+        assert_eq!(shown_state("", false), "…");
+        assert_eq!(shown_state("", true), "🤔 …");
+        assert_eq!(shown_state("once ", false), "once ");
+        //Long answer tails clip under Discord's 2000-char cap.
+        let long: String = "x".repeat(2100);
+        let shown = shown_state(&long, false);
+        assert!(shown.chars().count() <= 1990);
+        assert!(shown.starts_with('…'), "tail kept, head clipped");
+    }
 
     #[test]
     fn mention_strip_both_parenthesization_variants() {

@@ -92,6 +92,14 @@ pub enum LiveEvent<'a> {
     RoundStart,
     /// A content fragment of the current round.
     Text(&'a str),
+    /// The model produced a REASONING-only delta (no content yet): a
+    /// reasoning model is thinking, typing no answer. Sinks render an
+    /// honest thinking marker (a frozen `…` used to sit for the whole
+    /// think phase with no signal — the 2026-10-20 live report shape);
+    /// once content fragments flow, `Text` takes over and sinks stop
+    /// showing it. Thinking events never fire for tool-bearing rounds
+    /// (those suppressed outright, as above).
+    Thinking,
 }
 
 /// Type of the live tap passed to `chat_with_usage_live`. HRTB over the
@@ -103,6 +111,12 @@ pub type LiveTap = dyn for<'a> Fn(LiveEvent<'a>) + Send + Sync;
 #[derive(Default)]
 struct RoundAcc {
     content: String,
+    /// Any REASONING delta arrived in this round (`reasoning_content`/
+    /// `reasoning` — litellm/Ollama reasoning models think before
+    /// typing). Drives the sink's thinking marker: with content still
+    /// empty, the tap fires `Thinking` instead of nothing (a frozen `…`
+    /// used to sit through the whole think phase with no signal).
+    saw_reasoning: bool,
     /// OpenAI-shape tool calls accumulated from streamed fragments
     /// (delta.tool_calls pieces arrive index-keyed, name once + argument
     /// fragments incrementally).
@@ -182,6 +196,22 @@ fn note_sse_chunk(acc: &mut RoundAcc, line: &str) {
         .filter(|s| !s.is_empty())
     {
         acc.finish_reason = Some(fr);
+    }
+    if choice
+        .pointer("/delta/reasoning_content")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        acc.saw_reasoning = true;
+    }
+    if choice
+        .pointer("/delta/reasoning")
+        .and_then(value_to_string)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        acc.saw_reasoning = true;
     }
     if let Some(c) = choice
         .pointer("/delta/content")
@@ -307,6 +337,21 @@ async fn fetch_streamed_round(
                                     held.clear();
                                 }
                             }
+                        } else if line.trim_start().starts_with("data:")
+                            && acc.content.is_empty()
+                            && acc.saw_reasoning
+                        {
+                            // Reasoning-only data row BEFORE any content:
+                            // a reasoning model is thinking, the answer not
+                            // started — the tap carries an honest thinking
+                            // marker instead of silence (the frozen-…
+                            // incident shape). The "data:" gate keeps the
+                            // blank SSE separators from double-firing, and
+                            // once content flows the marker phase is over,
+                            // so later contentless chunks (trailing
+                            // reasoning, finish markers) fire nothing.
+                            // Cheap by contract (sync tap, sink dedups).
+                            tap(LiveEvent::Thinking);
                         }
                     }
                 }
@@ -2088,6 +2133,10 @@ mod tests {
             LiveEvent::Text(frag) => {
                 tap_seen.lock().expect("test tap").push(frag.to_string());
             }
+            // A reasoning-prelude tap stream (see the Thinking contract
+            // test below); this fixture streams content only, so nothing
+            // fires — the arm pins the exhaustiveness either way.
+            LiveEvent::Thinking => {}
         };
         let (reply, served_by, tokens) =
             chat_with_usage_live(&cfg, "say hi", &[], Some(&live), false)
@@ -2105,6 +2154,87 @@ mod tests {
                 "live ".to_string(),
                 "typed".to_string()
             ]
+        );
+    }
+
+    /// The Thinking contract (live 2026-10-20 report shape): a reasoning
+    /// model thinks BEFORE typing — its first deltas carry only
+    /// `reasoning_content`, content stays empty for the whole think phase,
+    /// so the barely-there sink used to sit frozen at `…`. The tap must
+    /// fire `Thinking` during the think phase and `Text` fragments the
+    /// moment content flows — never the two at once, and never thinking
+    /// markers in a tool-bearing round (those type nothing at all).
+    #[tokio::test]
+    async fn chat_reasoning_phase_fires_thinking_then_text() {
+        use std::sync::Arc;
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async {
+                    let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking \",\"content\":\"\"}}]}\n\n"
+                        .to_owned()
+                        + "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hard\",\"content\":\"\"}}]}\n\n"
+                        + "data: {\"choices\":[{\"delta\":{\"reasoning\":\"(alt reasoning field)\",\"content\":\"\"}}]}\n\n"
+                        + "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"reasoning_content\":\"more tail thinking\"}}]}\n\n"
+                        + "data: {\"choices\":[{\"delta\":{\"content\":\" lands\"}}]}\n\n"
+                        + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                        + "data: [DONE]\n\n";
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        // Toolless round by construction: web skills off (the <200-char
+        // prompt heuristic would attach tools otherwise, and tool-bearing
+        // rounds fire NO tap at all — the suppression contract above).
+        let mut cfg = cfg;
+        cfg.web.enabled = false;
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let tap_seen = events.clone();
+        let live = move |ev: LiveEvent| match ev {
+            LiveEvent::RoundStart => {
+                tap_seen
+                    .lock()
+                    .expect("test tap")
+                    .push("⇆round".to_string());
+            }
+            LiveEvent::Thinking => {
+                tap_seen.lock().expect("test tap").push("🤔".to_string());
+            }
+            LiveEvent::Text(frag) => {
+                tap_seen.lock().expect("test tap").push(frag.to_string());
+            }
+        };
+        let (reply, _served_by, _tokens) =
+            chat_with_usage_live(&cfg, "say hi", &[], Some(&live), false)
+                .await
+                .expect("reasoning chat");
+        assert_eq!(reply, "answer lands");
+        // The contract, in order: the think phase fires Thinking markers
+        // (every reasoning-only chunk taps one; the sink dedupes), then
+        // content takes over — and “more tail thinking" riding a content
+        // chunk never re-marks the stream a thinking state.
+        assert_eq!(
+            *events.lock().expect("test tap"),
+            vec![
+                "⇆round".to_string(),
+                "🤔".to_string(),
+                "🤔".to_string(),
+                "🤔".to_string(),
+                "answer".to_string(),
+                " lands".to_string()
+            ],
+            "thinking phase → content phase, in order"
         );
     }
 
@@ -2223,6 +2353,7 @@ mod tests {
             match ev {
                 LiveEvent::RoundStart => guard.push("⇆round".to_string()),
                 LiveEvent::Text(f) => guard.push(f.to_string()),
+                LiveEvent::Thinking => guard.push("🤔".to_string()),
             }
         };
         let (reply, served_by, tokens) = chat_with_usage_live(
@@ -2313,6 +2444,7 @@ mod tests {
             match ev {
                 LiveEvent::RoundStart => guard.push("⇆round".to_string()),
                 LiveEvent::Text(f) => guard.push(f.to_string()),
+                LiveEvent::Thinking => guard.push("🤔".to_string()),
             }
         };
         let (reply, _served_by, _tokens) =
@@ -2401,6 +2533,7 @@ mod tests {
             match ev {
                 LiveEvent::RoundStart => guard.push("⇆round".to_string()),
                 LiveEvent::Text(f) => guard.push(f.to_string()),
+                LiveEvent::Thinking => guard.push("🤔".to_string()),
             }
         };
         let (reply, _served_by, _tokens) = chat_with_usage_live(
