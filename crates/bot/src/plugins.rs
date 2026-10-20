@@ -796,12 +796,13 @@ mod tests {
             "approval.cancel",
             "pipeline.scrape_summarize",
             "pipeline.refactor_module",
+            "pipeline.cloud_escalate",
         ] {
             assert!(names.iter().any(|n| n == expect), "missing {expect}");
         }
-        // 12 model-facing skills; squeeze is bot-side (no tool def
+        // 13 model-facing skills; squeeze is bot-side (no tool def
         // anywhere); coordinator/workflows never appear (owner-only gate).
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
         assert!(!names.iter().any(|n| n.contains("squeeze")));
         assert!(!names.iter().any(|n| n.starts_with("workflow.")));
     }

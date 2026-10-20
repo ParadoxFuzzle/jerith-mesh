@@ -4,6 +4,10 @@
 //! small local model spends its reasoning budget on a single decision
 //! instead of orchestrating a dozen granular tool calls.
 //!
+//! Also on the same one-call rails in this module: `refactor_module`
+//! (§17.2) and `cloud_escalate` (§17.3, tiered cloud escalation over an
+//! encrypted at-rest state package).
+//!
 //! The model's whole job:
 //!
 //! ```json
@@ -1092,6 +1096,406 @@ pub async fn refactor_module(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// cloud_escalate — tiered cloud escalation with state serialization (§17.3)
+// ---------------------------------------------------------------------------
+//
+// On a STRUCTURED local failure (schema break ×3, build-verify fail),
+// the failed step is sealed into an encrypted context package at rest
+// (AES-256-GCM, key 0600 under the bot's own home), then handed to ONE
+// bounded cloud call over the EXISTING gateway lanes, the corrected
+// structure pulled back, re-scanned, and reported. No new provider, no
+// new config, no held connection: the gateway leg is one
+// /v1/chat/completions round trip (the same shape refactor_patch rides)
+// and everything else is local. The at-rest package survives a failed
+// cloud leg, so an escalation is an auditable checkpoint even when the
+// leg itself errors.
+
+/// Input context cap (the failing artifact/state serialized for the
+/// package; bigger than a refactor module because escalations carry
+/// surrounding state, not just one module).
+pub const MAX_ESC_CONTEXT_CHARS: usize = 32_000;
+/// The trouble summary cap (what failed, bounded retries, failure class).
+pub const MAX_ESC_TROUBLE_CHARS: usize = 500;
+/// Cloud-leg wall clock (the gateway bounds itself; same headroom model
+/// as the refactor patch leg — a LONG generation, never a hanging call).
+const ESC_TIMEOUT: Duration = Duration::from_secs(300);
+const ESC_COMPLETION_TOKENS: u32 = 3200;
+/// At-rest retention: the newest packages kept; older ones prune
+/// best-effort on each write (audit window, not an archive).
+const ESC_KEEP_PACKAGES: usize = 32;
+/// Sealed blob layout: prefix || 12-byte nonce || AES-256-GCM (ct+tag).
+const ESC_BLOB_PREFIX: &[u8] = b"JERITH-ESC1";
+
+/// Test seam: the escalation store points at a scratch dir in tests
+/// instead of touching process env (edition 2024 makes set_var unsafe).
+#[cfg(test)]
+static ESC_STORE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// The escalation package store (`$JERITH_HOME/bot/escalations`).
+pub fn escalation_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        let seam = ESC_STORE.lock().expect("escalation store lock").clone();
+        if let Some(dir) = seam {
+            return dir;
+        }
+    }
+    let home = std::env::var("JERITH_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                .join(".jerith-mesh")
+        });
+    home.join("bot").join("escalations")
+}
+
+/// The package key: a stable 32-byte secret found next to the store
+/// (`$JERITH_HOME/bot/escalation.key`, 0600). Created once on first
+/// seal; never logged, never shipped. Sealing with a per-run ephemeral
+/// key would make the at-rest package unreadable across restarts — the
+/// audit trail is the point.
+fn esc_key_path() -> std::path::PathBuf {
+    let dir = escalation_dir();
+    dir.parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("escalation.key")
+}
+
+/// Load or create the sealing key.
+pub fn load_or_create_key() -> Result<[u8; 32]> {
+    let path = esc_key_path();
+    match std::fs::read(&path) {
+        Ok(raw) => {
+            let key: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("escalation key file is not 32 bytes"))?;
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            std::fs::create_dir_all(&parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            let mut key = [0u8; 32];
+            {
+                let mut rng = rand::rngs::OsRng;
+                rand::RngCore::fill_bytes(&mut rng, &mut key);
+            }
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, key).with_context(|| format!("writing {}", tmp.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&tmp, &path)?; // atomic on POSIX
+            Ok(key)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// The serialized step (the plaintext INSIDE the sealed package) — the
+/// checkpoint shape, one version pinned field so a later schema change
+/// can never silently re-read an old package.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EscalationPackage {
+    pub v: u32,
+    pub created_ms: u64,
+    pub language: String,
+    pub trouble: String,
+    pub instruction: String,
+    pub context: String,
+}
+
+/// Seal `plain` under AES-256-GCM. Layout: prefix || 12-byte nonce ||
+/// ciphertext+tag. Random nonce per seal; the key file carries no nonce
+/// state; same-plaintext re-seals differ on disk (honest, uncorrelatable
+/// blobs).
+pub fn seal_package(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>> {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    let unbound = UnboundKey::new(&AES_256_GCM, key)
+        .map_err(|_| anyhow::anyhow!("escalation key rejected by the AEAD (key build bug)"))?;
+    let key = LessSafeKey::new(unbound);
+    let mut nonce_bytes = [0u8; 12];
+    {
+        let mut rng = rand::rngs::OsRng;
+        rand::RngCore::fill_bytes(&mut rng, &mut nonce_bytes);
+    }
+    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
+        .map_err(|_| anyhow::anyhow!("nonce construction failed"))?;
+    let mut buf = plain.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+        .map_err(|_| anyhow::anyhow!("escalation seal failed"))?;
+    let mut blob = Vec::with_capacity(ESC_BLOB_PREFIX.len() + 12 + buf.len());
+    blob.extend_from_slice(ESC_BLOB_PREFIX);
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&buf);
+    Ok(blob)
+}
+
+/// Open a sealed blob — an honest typed failure on ANY tamper, wrong
+/// key, or header drift. Never a silent substitution.
+pub fn open_package(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    anyhow::ensure!(
+        blob.len() > ESC_BLOB_PREFIX.len() + 12 + 16,
+        "escalation blob is truncated"
+    );
+    anyhow::ensure!(
+        &blob[..ESC_BLOB_PREFIX.len()] == ESC_BLOB_PREFIX,
+        "escalation blob header mismatch"
+    );
+    let unbound = UnboundKey::new(&AES_256_GCM, key)
+        .map_err(|_| anyhow::anyhow!("escalation key rejected by the AEAD (key build bug)"))?;
+    let key = LessSafeKey::new(unbound);
+    let nonce_end = ESC_BLOB_PREFIX.len() + 12;
+    let nonce = Nonce::try_assume_unique_for_key(
+        blob[ESC_BLOB_PREFIX.len()..nonce_end]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("nonce slice malformed"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("nonce construction failed"))?;
+    let mut buf = blob[nonce_end..].to_vec();
+    let opened = key
+        .open_in_place(nonce, Aad::empty(), &mut buf)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "escalation package failed to authenticate — tampered, truncated, or wrong key"
+            )
+        })?;
+    Ok(opened.to_vec())
+}
+
+/// One persisted escalation package: id + its at-rest facts (sizes
+/// only — the plaintext stays sealed; this never carries context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPackage {
+    pub id: String,
+    /// File NAME inside the escalation store (the dir is fixed).
+    pub file: String,
+    pub plain_chars: usize,
+    pub blob_bytes: usize,
+}
+
+/// Seal a package at rest (dir 0700, file by id) and prune older
+/// packages past the retention window, best-effort.
+fn write_escalation(pkg: &EscalationPackage, key: &[u8; 32]) -> Result<StoredPackage> {
+    let dir = escalation_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let id = format!("esc-{}-{:04x}", pkg.created_ms, rand::random::<u16>());
+    let plain = serde_json::to_vec(&pkg)?;
+    let blob = seal_package(key, &plain)?;
+    let file = format!("{id}.esc");
+    let path = dir.join(&file);
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, blob);
+    let mut tmp = path.clone();
+    tmp.set_extension("tmp");
+    std::fs::write(&tmp, encoded).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, &path)?; // atomic on POSIX
+    prune_escalations(&dir, ESC_KEEP_PACKAGES);
+    // At-rest self-check: the persisted blob must open back to the exact
+    // package under the same key — a write that left a corrupt or wrong-key
+    // blob refuses here, never “succeeds” into an unreadable audit trail.
+    let verify_b64 =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let verify_blob =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, verify_b64)
+            .context("stored escalation blob was not valid base64")?;
+    let verify_plain: EscalationPackage = serde_json::from_slice(&open_package(key, &verify_blob)?)
+        .context("stored escalation opened to a foreign payload")?;
+    anyhow::ensure!(
+        verify_plain == *pkg,
+        "stored escalation round-trip failed — refusing to report it as sealed"
+    );
+    Ok(StoredPackage {
+        id,
+        file,
+        plain_chars: pkg.context.chars().count(),
+        blob_bytes: std::fs::metadata(&path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0),
+    })
+}
+
+/// Retention: keep the newest `keep` packages (ids sort by timestamp),
+/// pruned best-effort — a full disk is never an escalation failure.
+fn prune_escalations(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "esc"))
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    let stale = files.len() - keep;
+    for oldest in files.into_iter().take(stale) {
+        let _ = std::fs::remove_file(oldest);
+    }
+}
+
+/// The single cloud leg: one /v1/chat/completions round trip over the
+/// existing gateway lanes (the same shape as the refactor patch leg —
+/// no other connection is opened, none held).
+async fn escalation_answer(
+    cfg: &crate::config::BotConfig,
+    pkg: &EscalationPackage,
+) -> Result<String> {
+    let task = "You are a cloud escalation assistant. A structured software step failed \
+                locally after bounded retries; the complete serialized context of the failed \
+                step is below. Return ONLY the corrected artifact in one fenced code block — \
+                no commentary, no diffs. Preserve the artifact's public contract unless the \
+                instruction says otherwise.";
+    let payload = json!({
+        "model": crate::api::MODEL_PLACEHOLDER,
+        "temperature": 0.1,
+        "max_tokens": ESC_COMPLETION_TOKENS,
+        "messages": [
+            {"role": "system", "content": task},
+            {"role": "user", "content": format!(
+                "WHAT FAILED:\n{}\n\nWHAT THE CORRECTED ARTIFACT MUST DO:\n{}\n\nSERIALIZED CONTEXT (complete failing artifact/state):\n\n{}",
+                pkg.trouble, pkg.instruction, pkg.context)
+            }
+        ]
+    });
+    let url = format!(
+        "{}/v1/chat/completions",
+        cfg.gateway_url.trim_end_matches('/')
+    );
+    let resp = crate::api::client()
+        .post(&url)
+        .json(&payload)
+        .timeout(ESC_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("gateway unreachable at {url}"))?;
+    let status = resp.status();
+    let parsed: Value = resp.json().await.context("gateway returned non-JSON")?;
+    anyhow::ensure!(status.is_success(), "escalation cloud leg failed: {status}");
+    let content = parsed
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("gateway answer had no content"))?
+        .to_string();
+    // Output budget: a corrected artifact this size is a truncation
+    // symptom, never a resolution — refused, not shipped.
+    anyhow::ensure!(
+        content.chars().count() <= MAX_PATCHED_CHARS,
+        "corrected artifact exceeds the output budget ({} chars > {MAX_PATCHED_CHARS}) — \
+         likely truncated; escalation refused",
+        content.chars().count()
+    );
+    Ok(content)
+}
+
+/// Run the tiered escalation: seal → ONE cloud leg → re-scan → report.
+/// The pre-scan (same discipline as refactor_module) never sends a
+/// half-artifact to the cloud: an unbalanced input is refused locally,
+/// no package written, nothing spent.
+pub async fn cloud_escalate(
+    cfg: &crate::config::BotConfig,
+    trouble: &str,
+    context: &str,
+    language: RefLang,
+    instruction: Option<&str>,
+) -> Result<Value> {
+    let trouble = trouble.trim();
+    anyhow::ensure!(!trouble.is_empty(), "cloud_escalate: trouble is required");
+    anyhow::ensure!(
+        trouble.chars().count() <= MAX_ESC_TROUBLE_CHARS,
+        "cloud_escalate: trouble exceeds {MAX_ESC_TROUBLE_CHARS} chars"
+    );
+    let context = context.trim();
+    anyhow::ensure!(!context.is_empty(), "cloud_escalate: context is required");
+    anyhow::ensure!(
+        context.chars().count() <= MAX_ESC_CONTEXT_CHARS,
+        "cloud_escalate: context exceeds the cap ({MAX_ESC_CONTEXT_CHARS} chars; got {})",
+        context.chars().count()
+    );
+    let instruction = instruction.unwrap_or("").trim().to_string();
+    anyhow::ensure!(
+        instruction.chars().count() <= MAX_INSTRUCTION_CHARS,
+        "cloud_escalate: instruction exceeds {MAX_INSTRUCTION_CHARS} chars"
+    );
+
+    // Pre-phase: a structurally broken artifact never reaches the cloud.
+    let pre = structural_balance(context, language);
+    if pre.balanced == Some(false) {
+        return Ok(json!({
+            "ok": false,
+            "refused": format!("context failed the structural scan: {}", pre.detail),
+            "parse": pre,
+            "language": language.name(),
+        }));
+    }
+
+    // Seal phase: the checkpoint lands at rest BEFORE the cloud leg, so
+    // the escalation state survives even a connection that dies mid-call.
+    let pkg = EscalationPackage {
+        v: 1,
+        created_ms: jerith_mesh_core::bootstrap::now_ms(),
+        language: language.name().to_string(),
+        trouble: trouble.to_string(),
+        instruction,
+        context: context.to_string(),
+    };
+    let key = load_or_create_key()?;
+    let stored = write_escalation(&pkg, &key)?;
+    let package_meta = json!({
+        "id": stored.id,
+        "file": stored.file,
+        "encrypted": true,
+        "plain_chars": stored.plain_chars,
+        "blob_bytes": stored.blob_bytes,
+    });
+
+    // Cloud phase: ONE round trip; a failure here is a typed honest
+    // result naming the retained checkpoint, not a lost escalation.
+    let raw = match escalation_answer(cfg, &pkg).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            return Ok(json!({
+                "ok": false,
+                "error": first_line(&e.to_string()),
+                "package": package_meta,
+                "note": "the sealed package was retained at rest; a later call can retry the cloud leg",
+            }));
+        }
+    };
+    let answer = extract_code_block(&raw);
+    anyhow::ensure!(!answer.is_empty(), "escalation leg produced no artifact");
+    let post = structural_balance(answer, language);
+
+    Ok(json!({
+        "ok": true,
+        "language": language.name(),
+        "trouble": trouble,
+        "package": package_meta,
+        "suspect_truncation": post.balanced == Some(false),
+        "parse": { "before": pre, "after": post },
+        "chars": { "before": context.chars().count(), "after": answer.chars().count() },
+        "answer": answer,
+    }))
+}
+
 /// Run the whole sub-pipeline. `embed` false (or a memory outage) keeps
 /// everything else working; every source reports its own fate.
 pub async fn scrape_summarize(
@@ -1249,6 +1653,27 @@ pub fn skills() -> Vec<crate::plugins::SkillSpec> {
             }),
             run: refactor_module_runner,
         },
+        SkillSpec {
+            name: "pipeline.cloud_escalate",
+            plugin: "pipeline",
+            description: "ONE-CALL tiered cloud escalation: seal the failing step's serialized \
+                      context into an encrypted at-rest package, make ONE bounded gateway \
+                      cloud call with the whole package, and return the corrected artifact \
+                      with per-stage status. Call this after a structured failure (schema \
+                      break, failed build-check) instead of retrying the local lane again.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "context": {"type": "string", "description": "The complete failing artifact/state, serialized"},
+                    "trouble": {"type": "string", "description": "What failed, how, and after which bounded retries"},
+                    "instruction": {"type": "string", "description": "What the corrected artifact must do (optional)"},
+                    "language": {"type": "string", "enum": ["rust", "python", "typescript", "javascript", "other"],
+                                 "description": "Artifact language (default rust)"}
+                },
+                "required": ["context", "trouble"]
+            }),
+            run: cloud_escalate_runner,
+        },
     ]
 }
 
@@ -1293,6 +1718,29 @@ fn refactor_module_runner<'args>(
     })
 }
 
+fn cloud_escalate_runner<'args>(
+    cfg: &'args crate::config::BotConfig,
+    args: &'args Value,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + 'args>> {
+    Box::pin(async move {
+        let context = args
+            .get("context")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let trouble = args
+            .get("trouble")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let instruction = args.get("instruction").and_then(Value::as_str);
+        let language = args
+            .get("language")
+            .and_then(Value::as_str)
+            .map(RefLang::parse)
+            .unwrap_or(RefLang::Rust);
+        cloud_escalate(cfg, trouble, context, language, instruction).await
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests (pure parts + a live-internet integration check, gated on demand)
 // ---------------------------------------------------------------------------
@@ -1300,6 +1748,183 @@ fn refactor_module_runner<'args>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // cloud_escalate (§17.3): package round-trip, tamper honesty, caps,
+    // structural gating, store retention — everything local, no network.
+    // ------------------------------------------------------------------
+
+    fn esc_pkg() -> EscalationPackage {
+        EscalationPackage {
+            v: 1,
+            created_ms: 1_700_000_000_000,
+            language: "rust".into(),
+            trouble: "build-verify fail after 3 bounded retries".into(),
+            instruction: "restore the invariant".into(),
+            context: "pub fn one() -> u32 { 1 }".into(),
+        }
+    }
+
+    #[test]
+    fn escalation_package_seals_and_opens() {
+        let key = [7u8; 32];
+        let plain = serde_json::to_vec(&esc_pkg()).unwrap();
+        let blob = seal_package(&key, &plain).expect("seal");
+        assert!(blob.starts_with(ESC_BLOB_PREFIX), "blob carries the header");
+        assert_ne!(blob[..], plain, "sealed bytes are not plaintext");
+        let opened = open_package(&key, &blob).expect("open");
+        assert_eq!(opened, plain);
+        let pkg: EscalationPackage = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(pkg, esc_pkg());
+        // Distinct seals of identical plaintext differ on disk: the nonce
+        // is fresh per seal, so blobs stay uncorrelatable.
+        let blob2 = seal_package(&key, &plain).expect("seal 2");
+        assert_ne!(blob, blob2, "nonce reuse is a GCM failure class");
+    }
+
+    #[test]
+    fn tampered_or_wrong_key_blobs_refuse() {
+        let key = [1u8; 32];
+        let blob = seal_package(&key, b"state").expect("seal");
+        // Flip one ciphertext byte → authentication must fail, loudly.
+        let mut tampered = blob.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let err = open_package(&key, &tampered).unwrap_err().to_string();
+        assert!(err.contains("authenticate"), "tamper says why: {err}");
+        // Wrong key → same class of failure, never a substitution.
+        let wrong = open_package(&[2u8; 32], &blob).unwrap_err().to_string();
+        assert!(wrong.contains("authenticate"));
+        // Header drift (checked only AFTER the length gate — a foreign blob
+        // that is long enough to otherwise parse) and truncation are both
+        // refused before any crypto runs.
+        let foreign = vec![b'X'; 64];
+        let err = open_package(&key, &foreign).unwrap_err().to_string();
+        assert!(err.contains("header"), "header drift named: {err}");
+        let err = open_package(&key, &blob[..12]).unwrap_err().to_string();
+        assert!(err.contains("truncated"), "truncation named: {err}");
+    }
+
+    #[test]
+    fn esc_caps_refuse_before_any_sealing() {
+        let cfg = crate::config::BotConfig::from_parts("http://gateway", "http://chain");
+        let big = "a".repeat(MAX_ESC_CONTEXT_CHARS + 1);
+        let err = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cloud_escalate(
+                &cfg,
+                "schema break",
+                &big,
+                RefLang::Rust,
+                None,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds the cap"), "cap refusal: {err}");
+        let err = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(cloud_escalate(
+                &cfg,
+                "   ",
+                "fn a() {}",
+                RefLang::Rust,
+                None,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trouble is required"), "empty trouble: {err}");
+    }
+
+    #[tokio::test]
+    async fn unbalanced_context_never_reaches_the_store_or_cloud() {
+        let cfg = crate::config::BotConfig::from_parts("http://gateway", "http://chain");
+        // Broken rust: an unterminated brace means the pre-scan must refuse
+        // locally — no package written, no gateway call (the gateway url is
+        // unreachable on purpose, so a call would Err and prove a leak).
+        let report = cloud_escalate(
+            &cfg,
+            "schema break",
+            "pub fn broken() { [",
+            RefLang::Rust,
+            None,
+        )
+        .await
+        .expect("typed refusal, not an error");
+        assert_eq!(report["ok"], json!(false));
+        assert!(
+            report["refused"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("structural scan")
+        );
+        assert!(report.get("package").is_none(), "nothing was sealed");
+    }
+
+    #[test]
+    fn esc_store_seals_prunes_and_keys_persist() {
+        let dir = std::env::temp_dir().join(format!(
+            "jerith-esc-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        ));
+        *ESC_STORE.lock().expect("seam") = Some(dir.clone());
+        std::fs::create_dir_all(&dir).expect("seam dir create");
+
+        // Key materialization: creates once, stable across loads.
+        let key = load_or_create_key().expect("key create");
+        assert_eq!(load_or_create_key().expect("key reload"), key);
+        let on_disk: [u8; 32] = std::fs::read(dir.parent().unwrap().join("escalation.key"))
+            .expect("key file readable")
+            .try_into()
+            .expect("key file is 32 bytes");
+        assert_eq!(key, on_disk);
+
+        // Seed ESC_KEEP_PACKAGES fake older packages, then write a real
+        // one (newer timestamp sorts last) — retention keeps the window.
+        let keep = ESC_KEEP_PACKAGES;
+        for i in 0..keep + 2 {
+            std::fs::write(dir.join(format!("esc-1000000000000-{i:04}.esc")), "stale").unwrap();
+        }
+        let mut pkg = esc_pkg();
+        pkg.created_ms = 1_800_000_000_000;
+        let stored = write_escalation(&pkg, &key).expect("write");
+        assert!(
+            stored.file.starts_with("esc-180000"),
+            "id carries the stamp"
+        );
+        assert_eq!(stored.plain_chars, pkg.context.chars().count());
+        assert!(stored.blob_bytes > stored.plain_chars, "tag rides the blob");
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".esc"))
+            .collect();
+        assert_eq!(names.len(), keep, "retention window held");
+        names.sort();
+        assert_eq!(names.last().unwrap(), &stored.file, "newest kept");
+        assert!(
+            !names.iter().any(|n| n.contains("esc-1000000000000-0000")),
+            "oldest pruned"
+        );
+
+        // The sealed file re-opens to the exact package (at-rest proof).
+        let blob = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            std::fs::read_to_string(dir.join(&stored.file)).unwrap(),
+        )
+        .unwrap();
+        let opened = open_package(&key, &blob).expect("open from store");
+        let round: EscalationPackage = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(round, pkg);
+
+        *ESC_STORE.lock().expect("seam") = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn stripper_drops_scripts_and_keeps_prose() {

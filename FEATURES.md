@@ -1231,7 +1231,7 @@ What this release establishes, and what stages next on the same rails:
    module; absent toolchains report `checked: false` with the reason,
    never a folded pass. Result carries per-stage status + the patched
    source; truncation (>64 k chars) is refused, not shipped. Registry
-   gate unchanged (`[plugins] pipeline`); 12 model-facing skills now.
+   gate unchanged (`[plugins] pipeline`); 13 model-facing skills now.
    Tests: 9 new (scanner per-language positive/negative, fence
    extraction, cap refusals, no-tool honesty) + an `#[ignore]`d
    rustc live harness.
@@ -1242,7 +1242,29 @@ What this release establishes, and what stages next on the same rails:
    over the existing gateway lanes, pull the corrected structure back,
    drop the connection. The `MeshTask::CloudEscalation` lane (§16) is
    the router's eye on it; the state package rides the same
-   RetryInfo-free honest-failure typing the pipeline uses.
+   **`cloud_escalate` LANDED (2026-10-20, `pipeline.rs`, plugin
+   `pipeline`)** — the third macro-tool, same one-call rails: validate
+   + pre-scan (a structurally broken artifact is refused locally —
+   nothing sealed, nothing spent) → the step is sealed into a versioned
+   `EscalationPackage` (v1) under AES-256-GCM (ring — the workspace
+   rustls pin's own instance, no new provider ambiguity) at
+   `$JERITH_HOME/bot/escalations/`: 0700 dir, 0600 packages, a stable
+   0600 key file created once, atomic writes, and a 32-package
+   retention window pruned best-effort → ONE bounded
+   `/v1/chat/completions` round trip over the EXISTING gateway lanes
+   (no other connection, none held) → the corrected artifact is
+   re-scanned and reported with an honest `suspect_truncation` flag. A
+   failed cloud leg RETAINS the sealed checkpoint and types the result
+   (`ok: false` + package id + note) — an escalation is never lost
+   mid-call. The write self-verifies: the persisted blob must open back
+   to the exact package before the report claims it sealed. Registry
+   gate unchanged (`[plugins] pipeline`); 13 model-facing skills now.
+   Tests: 6 new (seal/open round-trip + nonce freshness, tamper /
+   wrong-key / truncation / header honesty, cap refusals before any
+   sealing, pre-scan refusal with an unreachable gateway, store seal +
+   retention prune + key persistence, unbalanced-context never sealed).
+   Live fire: PENDING an owner-approved escalation — the cloud leg
+   reuses the refactor patch leg's already-live gateway shape.
 4. **Local workspace shadowing**: `SandboxConfig` already pins no-
    network/caps-dropped/read-only containers for chat attachments.
    Shadow-target stage: replay pipelines can pick a disposable

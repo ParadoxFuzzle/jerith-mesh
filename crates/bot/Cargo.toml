@@ -21,6 +21,11 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { workspace = true }
 hmac = "0.12"
 sha2 = "0.10"
+# Escalation package sealing (pipeline.rs cloud_escalate, FEATURES §17.3):
+# AES-256-GCM from ring — the SAME ring instance the workspace rustls pin
+# already compiles, so no new crate graph and no new provider ambiguity
+# (the 2026-10-19 dual-provider lesson). alloc-only features.
+ring = { version = "0.17", default-features = false, features = ["alloc"] }
 base64.workspace = true
 futures-util.workspace = true
 # Approval-request ids (40-bit unguessable codes; see approval.rs).
