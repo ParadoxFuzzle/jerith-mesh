@@ -43,7 +43,7 @@ futures-channel = "0.3"
 # quic test init (the 2026-10-19 CI dual-provider failure). No feature
 # on this line: the provider comes from the workspace rustls pin only.
 tokio-rustls = { version = "0.26", default-features = false }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 # Webhook in-box (webinbox.rs): the loopback listener the push-only
 # platforms route through (Teams, Google Chat, WhatsApp, Slack Events).
 axum.workspace = true

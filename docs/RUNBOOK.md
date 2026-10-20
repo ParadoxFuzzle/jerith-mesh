@@ -1077,7 +1077,7 @@ exceptions, via `.cargo/audit.toml`. Current state after this pass:
   path — most importantly RUSTSEC-2026-0346 (medium), where `Debug`
   impls can print TLS session secrets into logs. The workspace compiles
   and the full suite is green on 0.23.46.
-- **Accepted for now (6 advisories, all one subgraph):** `rustls
+- **Accepted for now (7 advisories, all one subgraph):** `rustls
   0.22.4` + `rustls-webpki 0.102.8`, pulled *only* by `serenity 0.12.5`
   → `tokio-tungstenite 0.21` (the bot's Discord websocket). The fixes
   live in the 0.23/0.103 lines, so clearing them means bumping
@@ -1087,6 +1087,21 @@ exceptions, via `.cargo/audit.toml`. Current state after this pass:
   TLS connection to Discord (a single well-known endpoint over an
   upstream-verified channel), not the mesh's own QUIC mesh traffic,
   which rides rustls 0.23.46. Revisit when serenity 0.13/poise lands.
+  The 2026-10-20 additions landed the SAME day they were published,
+  in two halves each:
+  - RUSTSEC-2026-0382 (webpki cert verification accepts distrusted
+    intermediates): the main rustls line's webpki pin was `cargo
+    update`d `0.103.15 → 0.103.16` (patched, done — no gate
+    relaxation); the acceptance covers ONLY serenity's webpki
+    `0.102.8` pin, which has no patched release in its own line.
+  - RUSTSEC-2026-0381 (bundled roots trust distrusted emSign
+    intermediates): patched EVERYWHERE the tree controls — the 1.0
+    pins `cargo update`d to `1.0.10` AND the bot crate's own direct
+    `webpki-roots 0.26 → 1.0` dependency bump (the IRC/Slack TLS leg
+    compiles unchanged on 1.x — `TLS_SERVER_ROOTS` kept its shape);
+    the acceptance covers ONLY serenity's tokio-tungstenite-pinned
+    `0.26.11`, no patched release in that line. Same exposure logic
+    as the rest of the subgraph: Discord websocket TLS only.
 
 ### Serenity/poise migration plan (clears the six accepted advisories)
 

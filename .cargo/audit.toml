@@ -18,4 +18,6 @@ ignore = [
     "RUSTSEC-2026-0049", # webpki: CRLs not authoritative via faulty DP matching
     "RUSTSEC-2026-0104", # webpki: reachable panic in CRL parsing
     "RUSTSEC-2026-0099", # webpki: name constraints accepted for wildcard names
+    "RUSTSEC-2026-0382", # webpki: distrusted intermediates (2026-10-20; patched 0.103.16 applied to the main rustls line — this ignore only covers serenity's pinned webpki 0.102.8 subgraph)
+    "RUSTSEC-2026-0381", # webpki-roots: distrusted emSign intermediates (2026-10-19; 1.0.10 applied everywhere incl. the bot's own TLS leg — this ignore only covers serenity's pinned 0.26.11)
 ]
