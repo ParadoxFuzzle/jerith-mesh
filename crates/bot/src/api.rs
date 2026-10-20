@@ -633,6 +633,15 @@ pub async fn chat_with_usage_live(
         } else {
             live
         };
+        if tools_enabled && !tools_used {
+            // Journal receipt for the narrowed contract: an operator
+            // watching this line knows round 0 is typing live instead of
+            // the pre-2026-10-20 blanket freeze.
+            tracing::info!(
+                target: "bot",
+                "tools attached but unexecuted — round 0 types live"
+            );
+        }
         if let Some(tap) = round_live {
             tap(LiveEvent::RoundStart);
         }
