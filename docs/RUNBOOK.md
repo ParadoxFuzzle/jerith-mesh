@@ -1227,3 +1227,109 @@ JERITH_DISCORD_TOKEN=x cargo test -p jerith-mesh-bot \
 
 Never log or paste the uri with credentials; the journal carries the
 database name and the ping verdict only.
+
+## Workflow record/replay targets (shadow + driver-VM lanes, 2026-10-20)
+
+The workflow engine (owner-DM-only skills: record → playbook → replay,
+`FEATURES §14/§15`) can run its browser three ways. Both container
+targets are OFF by default — with no config, the legacy host-chrome
+path behaves exactly as day one.
+
+**Lane rules** — precedence is deliberate, documented, and tested:
+
+- `[workflows.shadow] enabled` → replay rides a disposable HEADLESS
+  containerized chrome (FEATURES §17.4). Wins over the VM when both are
+  enabled: headless-over-headful is the cheaper contract for the same job.
+- `[workflows.driver_vm] enabled` → the VM owns RECORD (the owner drives
+  windows INSIDE the disposable desktop and watches over its loopback
+  VNC map instead of the host display), and replay uses it when the
+  shadow is off.
+- Neither → host chrome (`[workflows] chrome_binary`), the day-one path.
+- Pairing rule (unit-pinned): every workflow verb is owner-DM-only via
+  `OWNER_ONLY_PLUGINS`; the §15 approval bridge is the approval surface
+  and executes in an owner-privileged registry, never a plain session's.
+
+### §17.4 shadow — headless replay isolation
+
+```toml
+[workflows.shadow]
+enabled = true
+image = "zenika/alpine-chrome:latest"  # the operator vouches; empty+enabled refuses
+browser = "chromium-browser"           # browser binary PATH inside the image
+mounts = ["/srv/share:/data"]          # host:container[:ro|rw]; default ro
+```
+
+Operator facts (all unit-pinned in the argv contract + two live fires):
+- fresh tmpfs HOME (`/home/shadow`, 64 MiB, `mode=1777` — images run
+  their browser as a non-root user) + manifest-only mounts: replay
+  state is born disposable and dies with the container;
+- CDP over a loopback-ONLY port map — the endpoint never leaves the
+  host (`-p 127.0.0.1:<fresh>:9222`);
+- `--entrypoint=<browser>` argv form: works for every image layout,
+  including ones whose ENTRYPOINT is already the browser;
+- `--headless=old` on purpose: chromium IGNORES the DevTools bind
+  address under the new headless runtime (binds container-loopback
+  only — debugged live with in-container + host probes 2026-10-20).
+  Honest constraint: chromium ≥132 removes that runtime; when images
+  migrate, the fix is an in-image socat relay (the driver-VM image
+  already ships one), flagged by the live harness;
+- docker networking stays default-ON on purpose: replays must reach
+  the pages they drive (`--network none` remains the
+  sandbox.rs/chat-attachment contract, not this tool's);
+- containers are uniquely named `jerith-wf-shadow-*`, removed BY NAME
+  at shutdown, and swept by prefix at the next launch (a killed docker
+  CLI does not stop a container when the bot dies);
+- a plain replay persists only the playbook's `last_run_outcome`;
+  the §17.3 escalation packages (AES-256-GCM under
+  `~/.jerith-mesh/bot/escalations/`) belong to the cloud-escalation
+  macro-tool, not to this lane.
+
+Live fire (one real container replay):
+```bash
+cargo test -p jerith-mesh-bot \\
+  workflows::tests::live_workflow_replay_inside_shadow \\
+  -- --ignored --exact --nocapture
+```
+
+### §17.1 driver VM — the disposable desktop
+
+Build the shipped image once:
+
+```bash
+docker build -t jerith-driver-vm:latest images/driver-vm/
+```
+
+```toml
+[workflows.driver_vm]
+enabled = true
+image = "jerith-driver-vm:latest"
+browser = "chromium"
+size = "1280x800"
+```
+
+- The image's ENTRYPOINT is the window-manager bootstrap
+  (`images/driver-vm/entrypoint.sh`): Xvfb :1 at
+  `$JERITH_VM_SIZE`x24 → openbox (a WM-less X is the typed fallback) →
+  x11vnc :5900 → socat CDP relay 9223 → chrome 127.0.0.1:9222 (headful
+  chromium binds DevTools loopback-only, so the relay is what makes
+  the map reachable) → exec the browser argv, HEADFUL inside Xvfb.
+- While a session runs, point a VNC client at the mapped loopback port
+  (the journal logs `cdp_port` and `vnc_port` per session).
+- Long-tail software: bake the app into a driver-VM-layout image (any
+  distro + the same bootstrap contract) and point `image` at it.
+
+Live fire (the replay-side E2E — author, save, run per-step): 
+```bash
+cargo test -p jerith-mesh-bot \\
+  workflows::tests::live_workflow_replay_inside_driver_vm \\
+  -- --ignored --exact --nocapture
+```
+
+### Shared accounting
+
+- Playbooks persist 0600 JSON under `~/.jerith-mesh/workflows/` in all
+  lanes (the container targets change WHERE the browser runs, never
+  where the playbook lives).
+- Both container lanes may run while a real owner session goes on —
+  they sweep only their OWN prefixed containers
+  (`jerith-wf-shadow-*` / `jerith-wf-vm-*`), nothing else.
