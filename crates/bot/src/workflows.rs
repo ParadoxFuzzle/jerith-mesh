@@ -564,14 +564,30 @@ impl CdpSession {
     async fn connect_session(port: &str, child: tokio::process::Child) -> anyhow::Result<Self> {
         // The page target's own ws: events arrive WITHOUT session ids —
         // no flatten/attach dance needed for a single-page flow.
+        let boot_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let page_ws: String = loop {
             let http = format!("http://127.0.0.1:{port}/json/list");
-            let resp = crate::api::client()
+            // Transient-refused tolerance: a shadow container takes a beat
+            // to boot its browser, so refused connects retry until a REAL
+            // deadline (the old `Instant::now().elapsed()` decided nothing
+            // — elapsed() of a fresh Instant is ~0 — which made the host
+            // path's loop deadline-free and would just fail fast here).
+            let resp = match crate::api::client()
                 .get(&http)
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
-                .with_context(|| format!("devtools list {http}"))?;
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < boot_deadline,
+                        "no chrome page target appeared within 30s (last probe error: {e})"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
             let v: Value = resp.json().await.unwrap_or(json!([]));
             let found = v.as_array().and_then(|a| {
                 a.iter()
@@ -591,7 +607,7 @@ impl CdpSession {
                 break ws;
             }
             anyhow::ensure!(
-                tokio::time::Instant::now().elapsed() < Duration::from_secs(30),
+                tokio::time::Instant::now() < boot_deadline,
                 "no chrome page target appeared within 30s"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1030,7 +1046,10 @@ fn shadow_docker_argv(
         "--shm-size".to_string(),
         "256m".to_string(),
         "--tmpfs".to_string(),
-        format!("{SHADOW_HOME}:rw,nosuid,noexec,size=64m"),
+        // mode=1777: images commonly run their browser as a non-root user
+        // (zenika's chrome is uid 1000) — the fresh HOME must be writable
+        // by whoever the image runs as.
+        format!("{SHADOW_HOME}:rw,nosuid,noexec,size=64m,mode=1777"),
         "-e".to_string(),
         format!("HOME={SHADOW_HOME}"),
     ];
@@ -1043,10 +1062,20 @@ fn shadow_docker_argv(
             if m.ro { ":ro" } else { ":rw" }
         ));
     }
+    // Entrypoint form: `--entrypoint=<browser>` before the image, flags
+    // after it. This works for every image layout — including ones whose
+    // ENTRYPOINT is already the browser (zenika's chromium) — because an
+    // explicit entrypoint override replaces it instead of arguing with it.
+    argv.push(format!("--entrypoint={chrome_in_image}"));
     argv.push(image.to_string());
-    argv.push(chrome_in_image.to_string());
     argv.extend([
-        "--headless=new".to_string(),
+        // old-headless ON PURPOSE: chromium ignores --remote-debugging-address
+        // under the new headless runtime (binds container-loopback only, so
+        // the port map is unreachable — debugged live 2026-10-20: the same
+        // argv with `=old` serves the map). Honest constraint: chromium
+        // ≥132 removes the old runtime; when images migrate, the silent
+        // fix is the relay in the image, flagged by the live harness.
+        "--headless=old".to_string(),
         format!("--remote-debugging-port={SHADOW_IN_PORT}"),
         "--remote-debugging-address=0.0.0.0".to_string(),
         "--no-first-run".to_string(),
@@ -1682,7 +1711,7 @@ mod tests {
         ];
         let argv = shadow_docker_argv(
             "reg.example/chrome:123",
-            "chromium",
+            "chromium-browser",
             "jerith-wf-shadow-123-abc",
             44777,
             &mounts,
@@ -1717,20 +1746,75 @@ mod tests {
         // The chat-attachment sandbox contract does NOT apply — replays
         // must reach the pages they drive.
         assert!(!s.contains("--network"), "{s}");
+        // Entrypoint form: overrides the image's own entrypoint (which may
+        // be the browser itself), flags ride AFTER the image.
+        assert!(
+            s.contains("--entrypoint=chromium-browser reg.example/chrome:123"),
+            "{s}"
+        );
+        assert!(!argv[argv.len() - 1..].contains(&"chromium-browser".to_string()));
+        // Fresh HOME is writable by the image's own user.
+        assert!(s.contains("mode=1777"), "{s}");
         // In-container dashboard argv + the target.
-        assert!(s.contains("--headless=new"));
+        assert!(
+            s.contains("--headless=old"),
+            "old-headless honors the bind: {s}"
+        );
         assert!(s.contains("--remote-debugging-port=9222"));
         assert!(s.contains("--remote-debugging-address=0.0.0.0"));
         assert!(
             s.ends_with("--user-data-dir=/home/shadow/profile https://example/app"),
             "{s}"
         );
+        assert!(s.contains("--entrypoint="), "{s}");
     }
 
     #[test]
     fn shadow_port_picker_serves_a_real_loopback_port() {
         let port = pick_shadow_port().expect("a port exists");
         assert!(port > 0, "bound an actual ephemeral port");
+    }
+
+    /// LIVE: one real replay inside the §17.4 shadow container (runs a
+    /// real browser container against the real web). Run alone:
+    /// `cargo test -p jerith-mesh-bot live_shadow -- --ignored --exact --nocapture`
+    #[tokio::test]
+    #[ignore = "live docker + a real browser container + the real web"]
+    async fn live_workflow_replay_inside_shadow() {
+        use crate::config::ShadowConfig;
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:8900", "http://127.0.0.1:8322");
+        cfg.workflows.shadow = ShadowConfig {
+            enabled: true,
+            image: "zenika/alpine-chrome:latest".into(),
+            browser: "chromium-browser".into(),
+            mounts: vec![],
+        };
+        // A REAL playbook exactly as rec_stop would coalesce one: land on
+        // example.com, click its one live control (the iana.org link).
+        let w = Workflow {
+            name: "shadow-fire-example".into(),
+            url: "https://example.com/".into(),
+            created_ms: 0,
+            last_run_outcome: None,
+            steps: vec![Step::Click {
+                selector: "a".into(),
+                label: "More information...".into(),
+            }],
+        };
+        save(&w).expect("playbook save");
+        let t0 = std::time::Instant::now();
+        let out = run(&cfg, &w.name).await.expect("live shadow replay");
+        println!("live shadow replay: {:?}", t0.elapsed());
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        assert_eq!(out["ok"], json!(true), "replay must go end to end: {out}");
+        assert!(
+            out["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("\u{2713}"),
+            "per-step \u{2713}: {out}"
+        );
     }
 
     #[test]

@@ -1290,10 +1290,25 @@ What this release establishes, and what stages next on the same rails:
    before a new session. DEFAULT docker networking stays ON (replays
    must reach the pages they drive — `--network none` remains the
    chat-attachment sandbox contract, not this tool's). Record stays on
-   the host display; only replay shadows. Live-fire: PENDING a
-   chrome-capable image on the host (none of the three local images
-   carries a browser — pull or build one, set `image`, and a replay is
-   the whole test).
+   the host display; only replay shadows. Live-fire: VERIFIED
+   (2026-10-20 via `workflows::tests::live_workflow_replay_inside_shadow`,
+   run alone): `zenika/alpine-chrome:latest` pulled, one real replay
+   INSIDE the container in 4.7 s — goto example.com + a REAL CDP mouse
+   click on its live link, per-step ✓ through run()'s full path
+   (launch_shadow → mapped CDP → replay engine → typed report). Two
+   debugged-and-landed contracts make it work across image layouts:
+   (a) the argv uses `--entrypoint=<browser>` so images whose ENTRYPOINT
+   is already the browser don't fight it, and the fresh HOME tmpfs is
+   `mode=1777` because the image runs its browser as uid 1000; (b) the
+   builder requests `--headless=old` — chromium IGNORES
+   `--remote-debugging-address=0.0.0.0` under the new headless runtime
+   (binds container-loopback only, port map unreachable — debugged live
+   with in-container + host probes); honest constraint: chromium ≥132
+   removes the old runtime, and when images migrate the fix is an
+   in-image relay, flagged by this harness. The boot-probe loop also
+   gained a REAL 30 s deadline + transient-refused tolerance (the old
+   check called `Instant::now().elapsed()` on a fresh instant — ~0 — so
+   the host path's timeout never actually fired).
 
 ## 18. External chat transports: 11 platforms (2026-10-19)
 
