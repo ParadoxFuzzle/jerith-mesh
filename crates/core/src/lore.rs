@@ -348,7 +348,17 @@ mod tests {
     use std::path::PathBuf;
 
     fn vault_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lore-vault-{}", std::process::id()));
+        // UNIQUE per call: tests run on parallel threads, and a shared
+        // per-process dir (the old key was just the pid) had one test
+        // rewriting the very files another test's build() was reading —
+        // a truncated colonies.md read back with 0 sections and flaked
+        // the split assertion on slow macOS runners.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lore-vault-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let sub = dir.join("seasons");
         let _ = std::fs::create_dir_all(&sub);
         std::fs::write(
