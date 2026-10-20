@@ -54,6 +54,9 @@ pub const MAX_STEPS: usize = 200;
 pub const SELECTOR_CAP: usize = 1_000;
 pub const TEXT_CAP: usize = 4_000;
 pub const LABEL_CAP: usize = 200;
+/// Bounded wait for a replay step's selector to exist in the live DOM
+/// (real pages load in beats; see wait_element).
+const SELECTOR_WAIT: Duration = Duration::from_secs(5);
 
 /// One playbook step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -593,6 +596,15 @@ impl CdpSession {
                 a.iter()
                     .find(|t| {
                         t.get("type").and_then(Value::as_str) == Some("page")
+                            // ONLY a real content page: chrome's own page
+                            // targets (omnibox top-chrome et al.) are
+                            // type=="page" too and attach would otherwise
+                            // be order-dependent — every DOM query would
+                            // fail forever against the wrong target (the
+                            // long-tail fire's second lesson, live).
+                            && t.get("url")
+                                .and_then(Value::as_str)
+                                .is_some_and(|u| u.starts_with("http"))
                             && t.get("webSocketDebuggerUrl")
                                 .and_then(Value::as_str)
                                 .is_some()
@@ -735,6 +747,60 @@ impl CdpSession {
         Ok(v)
     }
 
+    /// Where the connected page actually IS: href + the head of its
+    /// visible text — the typed failure's triage payload (a rotted play-
+    /// book or a dead app names itself honestly instead of a bare
+    /// "never matched").
+    async fn state_snapshot(&mut self) -> String {
+        match self
+            .evaluate(
+                "(() => ({ href: location.href, \
+                 text: (document.body ? document.body.innerText : '').slice(0, 120) }))()",
+            )
+            .await
+        {
+            Ok(v) => {
+                // evaluate returns the {type, value} wrapper — unwrap to
+                // the returned-by-value object first (same as every other
+                // caller of this shape).
+                let obj = v.get("value").cloned().unwrap_or(v.clone());
+                let href = obj.get("href").and_then(Value::as_str).unwrap_or("?");
+                let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+                format!("{href} :: {text:?}")
+            }
+            Err(e) => format!("(page state unreadable: {e})"),
+        }
+    }
+
+    /// Bounded selector wait (replay robustness): a just-started long-tail
+    /// app answers its first page request mid-load, and a ONE-SHOT probe
+    /// can miss the element by a beat — the long-tail fire's own lesson
+    /// (live 2026-10-20). Up to SELECTOR_WAIT at 250 ms steps; past it
+    /// the typed failure names the selector, exactly like a one-shot
+    /// miss — never a hang.
+    async fn wait_element(&mut self, selector: &str) -> anyhow::Result<()> {
+        let sel = serde_json::to_string(selector)?;
+        let deadline = tokio::time::Instant::now() + SELECTOR_WAIT;
+        loop {
+            let v = self
+                .evaluate(&format!(
+                    "(() => {{ const el = document.querySelector({sel}); \
+                     return el ? {{present: true}} : {{err: 'selector did not match'}}; }})()"
+                ))
+                .await?;
+            let inner = v.get("value").cloned().unwrap_or(v.clone());
+            if inner.get("err").is_none() {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "selector never matched within {SELECTOR_WAIT:?} ({selector}) — page: {}",
+                self.state_snapshot().await
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Runtime.evaluate with a `returnByValue` result.
     async fn evaluate(&mut self, expression: &str) -> anyhow::Result<Value> {
         let v = self
@@ -807,6 +873,7 @@ impl BrowserDriver for CdpSession {
     fn click_on<'a>(&'a mut self, selector: &'a str) -> BoxFut<'a, anyhow::Result<()>> {
         Box::pin(async move {
             ensure_selector(selector)?;
+            self.wait_element(selector).await?;
             let sel = serde_json::to_string(selector)?;
             // Locate + scroll + measure once in JS, then dispatch REAL
             // mouse press/release at the center — same activation class
@@ -855,6 +922,7 @@ impl BrowserDriver for CdpSession {
         Box::pin(async move {
             ensure_selector(selector)?;
             anyhow::ensure!(text.chars().count() <= TEXT_CAP, "text exceeds cap");
+            self.wait_element(selector).await?;
             let sel = serde_json::to_string(selector)?;
             let txt = serde_json::to_string(text)?;
             // Native value setter + input/change events: the same shape
@@ -1163,11 +1231,13 @@ fn pick_shadow_port() -> anyhow::Result<u16> {
 #[allow(clippy::too_many_arguments)]
 fn vm_docker_argv(
     image: &str,
+    boot: &str,
     browser: &str,
     name: &str,
     cdp_host_port: u16,
     vnc_host_port: u16,
     size: &str,
+    mounts: &[ShadowMount],
     target_url: &str,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -1188,15 +1258,29 @@ fn vm_docker_argv(
         "-e".to_string(),
         format!("JERITH_VM_SIZE={size}"),
     ];
+    // Manifest mounts (§17.4's parse rules, default ro) — how a long-tail
+    // app inside the VM persists state the owner keeps.
+    for m in mounts {
+        argv.push("-v".to_string());
+        argv.push(format!(
+            "{}:{}{}",
+            m.src,
+            m.dst,
+            if m.ro { ":ro" } else { ":rw" }
+        ));
+    }
     argv.push("--entrypoint".to_string());
     argv.push("/bin/sh".to_string());
     argv.push(image.to_string());
     argv.push("-c".to_string());
+    // The boot script is the image's OWN chain (default: the base
+    // layout's /entrypoint.sh; a long-tail image bakes its wrapper and
+    // points boot at it — its app side never runs otherwise).
     argv.push(format!(
-        "/entrypoint.sh {} --remote-debugging-port=9222 --no-first-run \
+        "{} {} --remote-debugging-port=9222 --no-first-run \
          --no-default-browser-check --no-sandbox --disable-dev-shm-usage \
          --disable-gpu --user-data-dir=/home/chrome/profile {}",
-        browser, target_url
+        boot, browser, target_url
     ));
     argv
 }
@@ -1227,13 +1311,24 @@ async fn launch_vm_session(
     );
     let cdp_host = pick_shadow_port()?;
     let vnc_host = pick_shadow_port()?;
+    let mounts: Vec<ShadowMount> = vm
+        .mounts
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            parse_shadow_mount(entry)
+                .map_err(|e| anyhow::anyhow!("[workflows.driver_vm] mounts[{i}]: {e}"))
+        })
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
     let argv = vm_docker_argv(
         image,
+        &vm.boot,
         &vm.browser,
         &name,
         cdp_host,
         vnc_host,
         &vm.size,
+        &mounts,
         target_url,
     );
     tracing::info!(
@@ -1241,6 +1336,7 @@ async fn launch_vm_session(
         container = %name,
         cdp_port = cdp_host,
         vnc_port = vnc_host,
+        mounts = mounts.len(),
         "driver-VM session launching (disposable desktop, record-or-replay)"
     );
     let child = tokio::process::Command::new(argv[0].clone())
@@ -1986,6 +2082,8 @@ mod tests {
             image: "jerith-driver-vm:latest".into(),
             browser: "chromium".into(),
             size: "1280x800".into(),
+            mounts: vec![],
+            boot: "/entrypoint.sh".into(),
         };
         // example.com's one live control, exactly as recorded: a click.
         let w = Workflow {
@@ -2013,6 +2111,143 @@ mod tests {
         );
     }
 
+    /// LIVE (§17.1's long-tail recipe, exercised end to end): a REAL
+    /// self-hosted app (sqlite-web; images/driver-vm-longtail) baked into
+    /// a driver-VM-layout image; a pristine demo db is created ON THE HOST
+    /// and rw-mounted through the run's manifest, the authored playbook
+    /// (the rec_stop coalesce shape) runs through run()'s FULL VM path,
+    /// and the assertion is persistence through the mount: the row count
+    /// grew and the typed value is readable from the host afterwards —
+    /// the experiment lives only in manifest-listed files. Run alone:
+    /// `cargo test -p jerith-mesh-bot live_longtail -- --ignored --exact --nocapture`
+    #[tokio::test]
+    #[ignore = "live docker + the real long-tail desktop + the real web"]
+    async fn live_workflow_replay_inside_longtail() {
+        use crate::config::DriverVmConfig;
+        // The app's demo db lives on the HOST for the run (manifest-rw),
+        // seeded here with rusqlite — the same crate the app's engine
+        // reads afterwards, so the assertion inspects real file rows.
+        let rundir = std::env::temp_dir().join(format!(
+            "jerith-longtail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&rundir).unwrap();
+        let db_host = rundir.join("demo.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&db_host).unwrap();
+            conn.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 name TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO notes (name, n) VALUES ('baked row', 1)", [])
+                .unwrap();
+        }
+        // The VM's browser user (uid 1000) must be able to WRITE the
+        // mounted sqlite file (WAL/journal writes included).
+        #[cfg(unix)]
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&db_host, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        let before: i64 = {
+            let conn = rusqlite::Connection::open(&db_host).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:8900", "http://127.0.0.1:8322");
+        cfg.workflows.driver_vm = DriverVmConfig {
+            enabled: true,
+            image: "jerith-longtail-vm:latest".into(),
+            browser: "chromium".into(),
+            size: "1280x800".into(),
+            mounts: vec![format!("{}:/home/chrome/demo:rw", db_host.display())],
+            // The long-tail image's ENTRYPOINT wraps the layout's: it
+            // starts the baked app on the container loopback FIRST, then
+            // execs the parent bootstrap. Without `boot` pointing at it
+            // the engine would chain /entrypoint.sh directly — the app
+            // never runs (the debugged hole this fire closed).
+            boot: "/longtail-entrypoint.sh".into(),
+        };
+        // The authored playbook — the same shape rec_stop coalesces —
+        // selectors verified against the app's real markup (its insert
+        // form is the one whose action is /notes/insert/).
+        let w = Workflow {
+            name: "longtail-vm-fire".into(),
+            url: "http://127.0.0.1:8080/notes/".into(),
+            created_ms: 0,
+            last_run_outcome: None,
+            steps: vec![
+                // A real recording ALWAYS carries the page-change: the
+                // first Goto forces a fresh navigation past whatever the
+                // browser showed while the app was booting (the replay's
+                // start hit may predate a self-hosted app's first listen —
+                // the same disease the selector-wait cures mid-page).
+                Step::Goto {
+                    url: "http://127.0.0.1:8080/notes/".into(),
+                },
+                Step::Click {
+                    selector: "a[href=\"/notes/insert/\"]".into(),
+                    label: "Insert".into(),
+                },
+                // TEXT columns render as textarea, not input — the
+                // tag-agnostic [name=…] attribute selector is the honest
+                // playbook form (verified against the real UI).
+                Step::Type {
+                    selector: "[name=\"name\"]".into(),
+                    text: "live long-tail row".into(),
+                },
+                Step::Click {
+                    selector: "form[action=\"/notes/insert/\"] button[type=\"submit\"]".into(),
+                    label: "Insert".into(),
+                },
+            ],
+        };
+        save(&w).expect("playbook save");
+        let t0 = std::time::Instant::now();
+        let out = run(&cfg, &w.name).await.expect("live long-tail replay");
+        println!("live long-tail VM E2E: {:?}", t0.elapsed());
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        assert_eq!(out["ok"], json!(true), "replay must go end to end: {out}");
+        let ok_steps = out["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with('\u{2713}'))
+            .count();
+        assert_eq!(ok_steps, 4, "all four steps \u{2713}: {out}");
+        // The persistence proof: the host file now carries the row the
+        // experiment typed, through the manifest-rw mount — and ONLY
+        // there (the desktop died with its container).
+        let conn = rusqlite::Connection::open(&db_host).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "the typed row must persist through the mount ({before} -> {after})"
+        );
+        let name: String = conn
+            .query_row("SELECT name FROM notes ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            name, "live long-tail row",
+            "the typed value landed verbatim"
+        );
+        let _ = std::fs::remove_dir_all(&rundir);
+    }
+
     #[test]
     fn shadow_defaults_off_with_no_silent_image() {
         let shadow = crate::config::ShadowConfig::default();
@@ -2027,13 +2262,19 @@ mod tests {
 
     #[test]
     fn vm_argv_contract_is_greppable() {
+        let mounts = vec![
+            parse_shadow_mount("/srv/appdata:/data").unwrap(),
+            parse_shadow_mount("/srv/out:/data/out:rw").unwrap(),
+        ];
         let argv = vm_docker_argv(
             "jerith-driver-vm:latest",
+            "/entrypoint.sh",
             "chromium",
             "jerith-wf-vm-123-abc",
             44801,
             59010,
             "1440x900",
+            &mounts,
             "https://example/app",
         );
         assert_eq!(argv[0], "docker");
@@ -2060,6 +2301,10 @@ mod tests {
             "headful inside Xvfb is the point"
         );
         assert!(s.contains("-e JERITH_VM_SIZE=1440x900"), "{s}");
+        // Manifest mounts ride the VM too (§17.4's parse rules): a
+        // long-tail app's persistent state visibly ro unless rw.
+        assert!(s.contains("-v /srv/appdata:/data:ro"), "{s}");
+        assert!(s.contains("-v /srv/out:/data/out:rw"), "{s}");
         assert!(
             !s.contains("--remote-debugging-address"),
             "bind flag is a headful no-op"

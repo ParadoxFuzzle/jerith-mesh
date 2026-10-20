@@ -51,3 +51,8 @@ axum.workspace = true
 [dev-dependencies]
 # Mock gateway for the chat tool-loop test (web skills integration).
 axum.workspace = true
+# The long-tail replay harness seeds + verifies a SQLite db on the host
+# (images/driver-vm-longtail): the app writes inside the VM, the test
+# checks persistence through the manifest mount. Same workspace crate
+# the core uses (bundled sqlite — no system library needed).
+rusqlite = { workspace = true }

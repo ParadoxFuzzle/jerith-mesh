@@ -191,6 +191,22 @@ pub struct DriverVmConfig {
     /// Desktop geometry (Xvfb `-screen 0 ...x24`).
     #[serde(default = "default_vm_size")]
     pub size: String,
+    /// Mount manifest (§17.4's shape, shared): `host_abs:container_abs
+    /// [:ro|rw]`, default ro. This is how a long-tail app inside the VM
+    /// persists state the OWNER keeps — the ephemeral desktop dies, the
+    /// manifest-listed files carry over (visibly ro unless rw is
+    /// explicit).
+    #[serde(default)]
+    pub mounts: Vec<String>,
+    /// The in-container bootstrap script the engine chain-execs the
+    /// browser through. The base driver-VM layout's is `/entrypoint.sh`
+    /// (Xvfb → WM → VNC → relay); a long-tail image bakes its own
+    /// wrapper (start the app, then exec the parent script) and points
+    /// this at it — the app side NEVER runs otherwise (debugged live:
+    /// the engine's chain had `/entrypoint.sh` hardcoded, so a baked
+    /// app's container refused every page until this was configurable).
+    #[serde(default = "default_vm_boot")]
+    pub boot: String,
 }
 
 impl Default for DriverVmConfig {
@@ -200,12 +216,18 @@ impl Default for DriverVmConfig {
             image: String::new(),
             browser: default_vm_browser(),
             size: default_vm_size(),
+            mounts: Vec::new(),
+            boot: default_vm_boot(),
         }
     }
 }
 
 fn default_vm_browser() -> String {
     "chromium".to_string()
+}
+
+fn default_vm_boot() -> String {
+    "/entrypoint.sh".to_string()
 }
 
 fn default_vm_size() -> String {

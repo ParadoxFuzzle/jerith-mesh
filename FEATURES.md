@@ -1214,7 +1214,21 @@ What this release establishes, and what stages next on the same rails:
    E2E verified live: a real playbook saved through the real store,
    run end-to-end through `run()` with the VM config (playbook →
    container → WM bootstrap → relay → CDP → per-step ✓ → named
-   removal), 7.9 s. Approval-gated pairing rule: unchanged by
+   removal), 7.9 s — and again against a REAL LONG-TAIL APP (the
+   recipe exercised): `images/driver-vm-longtail/` bakes sqlite-web
+   onto the layout, the replay typed through the app's real form and
+   the row PERSISTED host-side through the manifest-rw mount (9.3 s;
+   `live_workflow_replay_inside_longtail`). Contracts the fires
+   earned: `[workflows.driver_vm] boot` (the engine's bootstrap chain
+   is configurable — a long-tail image bakes its own wrapper or its
+   app never runs; the debugged hole, entity-named by the typed
+   failure's new `page: <href> :: <text>` triage payload), VM lane
+   manifest mounts (shared §17.4 parse rules), a bounded 5 s selector
+   wait in replay click/type (just-started apps answer mid-load), and
+   CDP attaching only to real http(s) page targets (chrome's own
+   omnibox targets are type-page too — order-dependent attach meant
+   querying the wrong page forever). Approval-gated pairing rule:
+   unchanged by
    construction and unit-pinned (`workflow_targets_never_outgrow_the
    _owner_gate` — the workflows plugin is owner-only, the §15 bridge
    is the approval surface). Long-tail software as ephemeral UI

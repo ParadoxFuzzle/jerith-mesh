@@ -1315,8 +1315,35 @@ size = "1280x800"
   the map reachable) → exec the browser argv, HEADFUL inside Xvfb.
 - While a session runs, point a VNC client at the mapped loopback port
   (the journal logs `cdp_port` and `vnc_port` per session).
-- Long-tail software: bake the app into a driver-VM-layout image (any
-  distro + the same bootstrap contract) and point `image` at it.
+- Long-tail software: the exercised recipe ships as
+  `images/driver-vm-longtail/` (sqlite-web — a real self-hosted app —
+  started on the container loopback by the image's own wrapper,
+  `longtail-entrypoint.sh`, before the layout bootstrap).
+  Operator contract, verified live 2026-10-20:
+  1. bake: `docker build -t jerith-longtail-vm:latest \
+     images/driver-vm-longtail/` (based on jerith-driver-vm — install
+     the app root-side, then `USER chrome`; the install layers need
+     root, the runtime does not);
+  2. point the lane at the wrapper: `[workflows.driver_vm] boot =
+     "/longtail-entrypoint.sh"` — without it the engine chains the
+     layout's plain `/entrypoint.sh` and the app never starts (the
+     debugged hole: the browser showed `chrome-error://chromewebdata`,
+     entity-named by the typed failure's `page: <href> :: <text>`
+     triage payload);
+  3. persist state through a manifest mount — the demo db rides
+     `rw` (`/path/demo.sqlite:/home/chrome/demo:rw`; the file must be
+     writable by the container's uid — mode 666 works). The desktop
+     dies with its container; ONLY manifest-listed files carry over.
+  Full E2E (author → save → run through the REAL app over CDP →
+  per-step ✓ → row-count + value verified host-side through the mount):
+  `cargo test -p jerith-mesh-bot \\
+    workflows::tests::live_workflow_replay_inside_longtail \\
+    -- --ignored --exact --nocapture` (9.3 s live).
+  Replay-engine robustness the fire earned: click/type wait up to 5 s
+  for the selector to exist (just-started apps answer mid-load), and
+  CDP attaches only to a real http(s) page target (chrome's own
+  omnibox targets are type-page too — order-dependent attach meant
+  querying the wrong page forever).
 
 Live fire (the replay-side E2E — author, save, run per-step): 
 ```bash
