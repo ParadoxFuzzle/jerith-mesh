@@ -2030,10 +2030,17 @@ mod tests {
     /// `jerith-fraud1` payload via `signed_headers_for`.
     fn signed_headers_for(
         id: &crate::signing::SigningIdentity,
+        stamp_ms: u64,
         payload: &str,
     ) -> axum::http::HeaderMap {
-        let stamp = crate::bootstrap::now_ms();
-        let auth = crate::signing::WireAuth::with_stamp(id, stamp, payload.as_bytes());
+        // ONE stamp for both payload and header — the exact discipline
+        // `WireAuth::with_stamp`'s doc enforces. Reading `now_ms()` twice
+        // (payload first, header second) races the millisecond boundary:
+        // the verifier rebuilds the payload from the HEADER stamp, so a
+        // second read that rolled makes the signature verify against a
+        // different byte-stream → the request degrades to the anonymous
+        // lane → a fixed-budget test starves (CI's 429-on-fetch-#0).
+        let auth = crate::signing::WireAuth::with_stamp(id, stamp_ms, payload.as_bytes());
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-jerith-pubkey", auth.pubkey.parse().unwrap());
         h.insert("x-jerith-stamp", auth.stamp_ms.to_string().parse().unwrap());
@@ -2048,7 +2055,7 @@ mod tests {
     ) -> axum::http::HeaderMap {
         let stamp = crate::bootstrap::now_ms();
         let payload = crate::signing::dead_payload(reporter, target, stamp);
-        signed_headers_for(id, &payload)
+        signed_headers_for(id, stamp, &payload)
     }
 
     #[tokio::test]
@@ -2438,8 +2445,11 @@ mod tests {
         // though the same IP's anonymous bucket is long exhausted.
         for i in 0..10 {
             let stamp = now_ms();
-            let headers =
-                signed_headers_for(&identity, &crate::signing::peers_fetch_payload(stamp));
+            let headers = signed_headers_for(
+                &identity,
+                stamp,
+                &crate::signing::peers_fetch_payload(stamp),
+            );
             let r = client.get(&url).headers(headers).send().await.unwrap();
             assert_eq!(
                 r.status(),
@@ -2466,8 +2476,9 @@ mod tests {
         // signature degrades to the anonymous floor, not the allowance.
         let mut forged_429s = 0;
         for i in 0..6 {
-            let wrong_payload = format!("not-the-peers-lane|{}|{i}", now_ms());
-            let headers = signed_headers_for(&identity, &wrong_payload);
+            let stamp = now_ms();
+            let wrong_payload = format!("not-the-peers-lane|{stamp}|{i}");
+            let headers = signed_headers_for(&identity, stamp, &wrong_payload);
             let status = client
                 .get(&url)
                 .headers(headers)
