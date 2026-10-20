@@ -2135,4 +2135,52 @@ mod tests {
         assert_eq!(out["summary_ok"], json!(true));
         assert_eq!(out["embedded"][0]["embedded"], json!(true));
     }
+
+    /// LIVE: one real escalation through the real gateway (owner-approved; ·
+    /// one bounded round trip, the at-rest package lands in the real store): ·
+    /// `cargo test -p jerith-mesh-bot live_escalate -- --ignored --exact --nocapture`
+    /// Run alone: it touches the REAL escalation store, so the seam-based
+    /// unit tests must not run concurrently with it.
+    #[tokio::test]
+    #[ignore = "live gateway + real at-rest package write"]
+    async fn live_cloud_escalate_real_failure() {
+        let cfg = std::sync::Arc::new(crate::config::BotConfig::from_parts(
+            "http://127.0.0.1:8900",
+            "http://127.0.0.1:8322",
+        ));
+        // A REAL structured failure: this module fails `rustc
+        // --emit=metadata` every retry (`2 * r` multiplies integer by f64) —
+        // the exact class §17.3 escalates.
+        let context = "pub fn area(r: f64) -> f64 {\n    3.14159 * r * r\n}\
+                       \n\npub fn diameter(r: f64) -> f64 {\n    2 * r\n}";
+        let t0 = std::time::Instant::now();
+        let out = cloud_escalate(
+            &cfg,
+            "build-verify fail x3 (rustc --emit=metadata: `2 * r` cannot multiply \
+             `{integer}` by `{f64}` inside diameter)",
+            context,
+            RefLang::Rust,
+            Some("fix the type error in diameter(); keep both functions' public signature"),
+        )
+        .await
+        .expect("live escalation leg");
+        println!("live escalation round trip: {:?}", t0.elapsed());
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        assert_eq!(out["ok"], json!(true), "the escalation must land");
+        assert_eq!(
+            out["suspect_truncation"],
+            json!(false),
+            "the corrected artifact must be structurally complete"
+        );
+        let answer = out["answer"].as_str().unwrap_or_default().to_string();
+        assert!(
+            answer.contains("fn area") && answer.contains("fn diameter"),
+            "both functions ride through: {answer}"
+        );
+        // The corrected artifact must pass the REAL local build-check —
+        // the point of structuring the escalation on failure classes at all.
+        let check = build_check(RefLang::Rust, &answer).await;
+        assert_eq!(check.checked, true, "rustc runs against the fix");
+        assert_eq!(check.ok, true, "the fix must typecheck: {check:?}");
+    }
 }

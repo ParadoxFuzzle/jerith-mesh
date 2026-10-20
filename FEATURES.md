@@ -1263,8 +1263,16 @@ What this release establishes, and what stages next on the same rails:
    wrong-key / truncation / header honesty, cap refusals before any
    sealing, pre-scan refusal with an unreachable gateway, store seal +
    retention prune + key persistence, unbalanced-context never sealed).
-   Live fire: PENDING an owner-approved escalation — the cloud leg
-   reuses the refactor patch leg's already-live gateway shape.
+   Live fire: VERIFIED (2026-10-20, owner-approved, via the ignored
+   `pipeline::tests::live_cloud_escalate_real_failure` harness): a REAL
+   structured failure (`2 * r` — integer×f64 multiply that fails the
+   local rustc metadata check every retry) escalated through the
+   production gateway in ONE round trip (8.4 s), the corrected artifact
+   (`2.0 * r`) came back re-scanned (`suspect_truncation: false`) and
+   passed the REAL local build-check inside the harness; the sealed
+   package landed in the real store (0700 dir, 0600 package, opaque:
+   `esc-…-5f3a.esc`, 556 bytes) beside the freshly-created 0600 key —
+   the full at-rest chain audited live, not asserted.
 4. **Local workspace shadowing**: `SandboxConfig` already pins no-
    network/caps-dropped/read-only containers for chat attachments.
    Shadow-target stage: replay pipelines can pick a disposable
