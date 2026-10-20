@@ -1108,6 +1108,7 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
         (
             c.memory_backend,
             c.memory_dsn.clone(),
+            c.memory_max_rows,
             c.specialists.embeddings_enabled,
             c.specialists.embedding_dim,
             c.specialists.embedding_model.clone(),

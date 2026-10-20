@@ -179,11 +179,28 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   connection, `vector(N)` columns pinned to the configured `embedding_dim` (server-side
   uniformity; a dimension-mismatched or layout-mismatched table is refused loudly, never
   reshaped or re-dimmed under the user's data) with an HNSW cosine index built best-effort
-  at connect (`vector_cosine_ops`; legacy dimension-free tables keep scrolling scan) and
-  index-eligible `<=>` cosine ordering when the extension is present; an honest bytea
-  polyfill (packed-f32 blobs, cosine in Rust — the exact SQLite semantics) when the
+  at connect (`vector_cosine_ops`) and an **IVFFlat fallback** when the server lacks HNSW
+  (pgvector < 0.5 — the ANN shape an old server would hit exactly when a store is scaled
+  beyond the cap; `lists` sized by pgvector's own guidance: rows/1000, √rows past 1M,
+  floor 1) and index-eligible `<=>` cosine ordering when the extension is present; an honest
+  bytea polyfill (packed-f32 blobs, cosine in Rust — the exact SQLite semantics) when the
   extension is unavailable to the connection, always reported in the banner/describe;
-  retention cap (10 000 rows, newest survive) inherited from the SQLite store
+  retention cap (10 000 rows default, newest survive) inherited from the SQLite store and
+  now CONFIGURABLE (next bullet). The in-node **legacy-layout migration** (landed
+  2026-10-20, live-verified against real pgvector/pgvector:pg16): a dimension-free legacy
+  table — uniform dim, matching config — is rebuilt PINNED inside one transaction at
+  connect (rows preserved verbatim: ids, providers, timestamps, vectors; no re-embedding)
+  and the ANN index becomes buildable; non-uniform or mismatched-dim tables stay exactly
+  where they were (the scan-path shapes), with an honest journal line either way
+- ✅ Vector-store scale beyond the retention cap (Phase 5, landed 2026-10-20):
+  `memory_max_rows` in config (default 10 000, `0` = uncapped) — the deliberate scaling
+  decision the store honors with index maintenance: the pgvector lane keeps/creates its
+  HNSW (or IVFFlat-fallback) index so `<=>` stays index-eligible at any size, while the
+  SQLite lane honestly stays a full exact scan (no native vector index — the uncapped
+  SQLite choice is journaled as a loud WARN at config-validate and printed at `config set`);
+  the cap rides the memory hot-swap triple (a change live-swaps within one ping tick,
+  pruning follows from the NEXT insert — nothing is deleted at swap time), and negative
+  caps are refused at every door
 - ✅ Backend hot-swap at runtime (Phase 0.5 completion): the mesh loop re-reads
   `config.toml` every tick, so `jerith config set memory_backend/memory_dsn` live-swaps
   the store without a restart (the previous store keeps serving until the new one opens;
@@ -991,14 +1008,28 @@ gotchas surfaced while building the finished parts.
   ground truth today is the commitment layer + spot-check ringer + signed
   measurement blocks — hardware attestation arrives later, gated on a
   chip-support survey across the fleet rather than a protocol built in a
-  vacuum.
-- **Vector-store scale beyond the retention cap**: HNSW is approximate —
-  exact scans stay correct under the 10 000-row cap; beyond that, an
-  IVFFlat alternative (or an optional uncap with index maintenance) plus
-  an in-node migration for legacy dimension-free tables (today they run
-  hnsw-less with exact scans — documented, silent-skip on the index
-  build). Postgres connection pooling only when query concurrency
-  actually grows — one client is the right default at this size.
+  vacuum.- ✅ **Vector-store scale beyond the retention cap** (landed 2026-10-20,
+  see §6 for the fielded shape): the HNSW-is-approximate concern is
+  resolved by keeping exact scans as the DEFAULT retention contract —
+  `memory_max_rows` (config, default 10 000; `0` = uncapped) makes the
+  beyond-cap world an operator DELIBERATE choice, and the choice comes
+  with its machinery: the pgvector lane maintains its ANN index end to
+  end (HNSW, with the IVFFlat fallback sized by pgvector's guidance for
+  old servers that never had 0.5, so `<=>` stays index-eligible), the
+  SQLite lane honestly says stay-small (WARN + printed note; a full scan
+  is the whole engine), and legacy dimension-free pgvector tables — the
+  silent skip the old index build left behind — now migrate in-node: at
+  connect, a uniform-dim legacy table matching the config dim is rebuilt
+  pinned transactionally (rows verbatim, sequence re-linked) and the ANN
+  index becomes buildable. Live-verified 2026-10-20 against real
+  `pgvector/pgvector:pg16`: the rebuild pinned the server-side column
+  type (`vector(64)` probed via pg_attribute), ids/providers/timestamps
+  survived verbatim, indexed search served the migrated store, and a
+  mismatched-dim legacy table stayed untouched on the scan path. The
+  cap rides the memory hot-swap triple (pruning follows the NEXT
+  insert; swap-time deletes nothing). Postgres connection pooling stays
+  deliberately NOT done — one client is the right default at this size;
+  pooling only when query concurrency actually grows.
 - ✅ **Ops observability** (Phase 5+ item, landed 2026-10-18 — see §12 for
   the full shape): 5-minute trend buckets (bounded 10 h ring) + a
   per-peer latency breakdown ride `/v1/metrics`, and the dashboard

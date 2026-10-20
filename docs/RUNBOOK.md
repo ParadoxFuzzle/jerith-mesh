@@ -271,6 +271,31 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 #        JERITH_TEST_PG_URL_NOEXT (extension-less DB) with
 #        `cargo test -p jerith-mesh-core memory::tests::pg`.
 #
+#     f. Retention cap (`memory_max_rows` in config.toml, default
+#        10 000; `0` = UNCAPPED): newest rows survive, prune fires at
+#        insert time; `jerith config set memory_max_rows=…` rides the
+#        memory hot-swap triple (applies within one ping tick, nothing
+#        deleted at swap time; pruning follows from the next insert).
+#        Semantics per lane: pgvector keeps/creates its ANN index
+#        (HNSW; IVFFlat fallback covers pgvector < 0.5 servers with
+#        lists sized rows/1000, √rows past 1M); SQLite stays a FULL
+#        EXACT SCAN (no native vector index) — raising/uncapping it
+#        warns loud at `config set` and config validate.
+#
+#     g. Legacy pgvector tables (made before `vector(N)` pinning):
+#        they now migrate IN-NODE at connect — a table that is
+#        uniform-dim AND matches the configured `embedding_dim` is
+#        rebuilt pinned transactionally (rows verbatim: ids, text,
+#        provider, created_ms, vectors; sequence re-linked; no
+#        re-embedding) and the ANN index becomes buildable. Mixed-dim
+#        or mismatched-dim tables stay untouched (the scan-path shapes).
+#        Live-verified 2026-10-20 against pgvector/pgvector:pg16:
+#        post-migrate column probed `vector(64)` server-side, ids and
+#        timestamps verbatim, indexed search green; the mismatched-dim
+#        table stayed dimension-free. No operator action needed — the
+#        journal line "legacy dimension-free memories table MIGRATED"
+#        is the receipt.
+#
 # 5d. Memory-backend hot-swap + migration drill (Phase 0.5 completion,
 #     verified live 2026-10-15 against pgvector/pgvector:pg16 in Docker):
 #

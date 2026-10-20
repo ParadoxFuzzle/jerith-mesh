@@ -243,6 +243,14 @@ fn default_embedding_dim() -> u32 {
     256
 }
 
+/// The retention cap memory stores ship with: search on the SQLite lane
+/// is an exact full scan, correct and fast under this size; an operator
+/// going BEYOND it (`0` = uncapped) is a deliberate scaling decision the
+/// store honors with index maintenance (see FEATURES §13 Phase 5).
+fn default_memory_max_rows() -> i64 {
+    10_000
+}
+
 impl Default for SpecialistConfig {
     fn default() -> Self {
         Self {
@@ -390,6 +398,13 @@ pub struct NodeConfig {
     /// a boot-time misconfiguration, not a silent SQLite swap.
     #[serde(default)]
     pub memory_dsn: Option<String>,
+    /// Retention cap on the memories table (newest rows survive): the
+    /// default 10 000 keeps the SQLite lane's exact full scan the correct
+    /// AND cheap choice. `0` uncaps the store — a deliberate scaling
+    /// decision: SQLite search grows linearly (no native vector index),
+    /// while the pgvector lane keeps/creates its ANN index.
+    #[serde(default = "default_memory_max_rows")]
+    pub memory_max_rows: i64,
     /// Mesh coordinator (FEATURES — named worker registry + hand-off
     /// channel + shared memory pool): ON by default with the store at
     /// `<data>/coordinator.db`; `[coordinator] enabled = false` removes
@@ -845,6 +860,7 @@ impl Default for NodeConfig {
             contribution_percent: MIN_CONTRIBUTION_PERCENT,
             memory_backend: MemoryBackend::Sqlite,
             memory_dsn: None,
+            memory_max_rows: default_memory_max_rows(),
             coordinator: CoordinatorConfig::default(),
             bootstrap_url: "https://p2p.jerithai.com".to_string(),
             crypto: CryptoConfig::default(),
@@ -1084,6 +1100,19 @@ impl NodeConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.node_id.is_empty() {
             anyhow::bail!("node_id is empty — run setup first");
+        }
+        anyhow::ensure!(
+            self.memory_max_rows >= 0,
+            "memory_max_rows must be ≥ 0 (0 = no retention cap); negative counts are meaningless"
+        );
+        if self.memory_backend == MemoryBackend::Sqlite && self.memory_max_rows > 10_000 {
+            // Honest scaling warning at config-time: the SQLite lane has
+            // no native vector index — search is a full exact scan, fine
+            // at the 10 000 default, linear beyond it.
+            tracing::warn!(
+                memory_max_rows = self.memory_max_rows,
+                "SQLite memory retention raised past the 10 000 default — search is a full scan, linear in rows"
+            );
         }
         if self.contribution_percent < MIN_CONTRIBUTION_PERCENT {
             anyhow::bail!(

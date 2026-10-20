@@ -886,6 +886,7 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
                             dim: cfg.specialists.embedding_dim as usize,
                             ..Default::default()
                         },
+                        cfg.memory_max_rows,
                     )
                     .await?
                 }
@@ -902,6 +903,7 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
                             dim: cfg.specialists.embedding_dim as usize,
                             ..Default::default()
                         },
+                        cfg.memory_max_rows,
                     )
                     .await?
                 }
@@ -2647,7 +2649,11 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
     let assignments: Vec<String> = assignments.into_iter().filter(|a| a != "set").collect();
     // Memory backend changes print store-migration guidance; capture
     // the pre-change state for the diff.
-    let old = (cfg.memory_backend, cfg.memory_dsn.clone());
+    let old = (
+        cfg.memory_backend,
+        cfg.memory_dsn.clone(),
+        cfg.memory_max_rows,
+    );
     if assignments.is_empty() {
         println!(
             "{}",
@@ -2713,6 +2719,13 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
                     Some(v.to_string())
                 };
             }
+            "memory_max_rows" => {
+                let n: i64 = v
+                    .parse()
+                    .context("memory_max_rows must be a whole number")?;
+                anyhow::ensure!(n >= 0, "memory_max_rows must be ≥ 0 (0 = no retention cap)");
+                cfg.memory_max_rows = n;
+            }
             other => bail!("unknown config key {other:?}"),
         }
     }
@@ -2728,8 +2741,32 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
         );
     }
     let memory_changed = cfg.memory_backend != old.0 || cfg.memory_dsn != old.1;
+    let cap_changed = cfg.memory_max_rows != old.2;
     cfg.save()?;
     println!("saved {}", NodeConfig::config_path().display());
+    if cap_changed && !memory_changed {
+        // A retention-cap change is not a backend change: it live-swaps
+        // within one ping tick (the same memory-triple reload class), and
+        // pruning follows the NEW cap on the next insert — rows are never
+        // deleted for the old cap at swap time.
+        let cap = if cfg.memory_max_rows > 0 {
+            format!("{} rows", cfg.memory_max_rows)
+        } else {
+            "UNCAPPED (0)".to_string()
+        };
+        println!(
+            "memory retention cap now {cap}. Applies within one ping tick \
+             (store live-swap); pruning follows the new cap from the next insert — \
+             nothing is deleted at swap time.\
+             {}",
+            if cfg.memory_max_rows == 0 && cfg.memory_backend == MemoryBackend::Sqlite {
+                "\nNOTE: SQLite has no native vector index — search is a full exact scan, \
+                 linear in rows."
+            } else {
+                ""
+            }
+        );
+    }
     if memory_changed {
         // A live node applies this within one ping tick (the mesh loop
         // hot-reloads the config file); existing rows are not auto-moved

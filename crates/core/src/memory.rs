@@ -86,20 +86,41 @@ pub struct MemoryHit {
 /// Retention cap on the memories table. The store is append-only with no
 /// delete cadence, so without a ceiling a chat-driven embed loop grows disk
 /// without bound. Oldest rows are pruned at insert time once past this.
-const MAX_MEMORY_ROWS: i64 = 10_000;
+/// This constant is the config default (`[memory] max_rows` / memory_max_rows,
+/// 0 = uncapped); stores carry the effective value as `max_rows`.
+pub const DEFAULT_MAX_MEMORY_ROWS: i64 = 10_000;
+const MAX_MEMORY_ROWS: i64 = DEFAULT_MAX_MEMORY_ROWS;
+
+/// Operator-facing cap wording (stats/describe): the number, or an honest
+/// "uncapped" for the deliberate scaling decision.
+fn cap_desc(max_rows: i64) -> String {
+    if max_rows > 0 {
+        format!("retention {max_rows} rows")
+    } else {
+        "retention uncapped".into()
+    }
+}
 
 /// SQLite-backed memory store.
 pub struct MemoryStore {
     conn: Mutex<Connection>,
     embed: EmbedConfig,
+    /// Effective retention cap (0 = uncapped) — see `DEFAULT_MAX_MEMORY_ROWS`.
+    max_rows: i64,
     /// Path it was opened from (`""` for in-memory tests) — only used for
     /// the operator-facing [`MemoryHandle::describe`] line.
     path: std::path::PathBuf,
 }
 
 impl MemoryStore {
-    /// Open (creating the schema if needed).
+    /// Open (creating the schema if needed) with the default retention cap.
     pub fn open(path: &Path, embed: EmbedConfig) -> anyhow::Result<Self> {
+        Self::open_with(path, embed, MAX_MEMORY_ROWS)
+    }
+
+    /// Open with an operator-chosen retention cap (`0` = uncapped).
+    pub fn open_with(path: &Path, embed: EmbedConfig, max_rows: i64) -> anyhow::Result<Self> {
+        anyhow::ensure!(max_rows >= 0, "memory cap must be ≥ 0 (0 = uncapped)");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -129,12 +150,19 @@ impl MemoryStore {
         Ok(Self {
             conn: Mutex::new(conn),
             embed,
+            max_rows,
             path: path.to_path_buf(),
         })
     }
 
-    /// In-memory database (tests).
+    /// In-memory database (tests). Default cap.
     pub fn open_in_memory(embed: EmbedConfig) -> anyhow::Result<Self> {
+        Self::open_in_memory_with(embed, MAX_MEMORY_ROWS)
+    }
+
+    /// In-memory database with an operator cap (`0` = uncapped).
+    pub fn open_in_memory_with(embed: EmbedConfig, max_rows: i64) -> anyhow::Result<Self> {
+        anyhow::ensure!(max_rows >= 0, "memory cap must be ≥ 0 (0 = uncapped)");
         let conn = Connection::open_in_memory().context("opening in-memory db")?;
         conn.execute_batch(
             "CREATE TABLE memories (
@@ -150,6 +178,7 @@ impl MemoryStore {
         Ok(Self {
             conn: Mutex::new(conn),
             embed,
+            max_rows,
             path: std::path::PathBuf::new(),
         })
     }
@@ -176,11 +205,12 @@ impl MemoryStore {
             .context("inserting memory")?;
             conn.last_insert_rowid()
         };
-        // Retention cap: the table is append-only with no delete cadence, so
-        // an embed loop would grow disk without bound. Once past the cap,
-        // every insert prunes the oldest rows (recent rows always win).
-        if rowid > MAX_MEMORY_ROWS {
-            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        // Retention cap (configurable; 0 = uncapped on purpose): the
+        // table is append-only with no delete cadence, so an embed loop
+        // would grow disk without bound. Once past the cap, every insert
+        // prunes the oldest rows (recent rows always win).
+        if self.max_rows > 0 && rowid > self.max_rows {
+            self.prune_beyond(self.max_rows).await?;
         }
         Ok((rowid, provider))
     }
@@ -299,8 +329,8 @@ impl MemoryStore {
             .context("inserting memory row (migration)")?;
             conn.last_insert_rowid()
         };
-        if id > MAX_MEMORY_ROWS {
-            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        if self.max_rows > 0 && id > self.max_rows {
+            self.prune_beyond(self.max_rows).await?;
         }
         Ok(id)
     }
@@ -625,6 +655,22 @@ fn provider_str(p: EmbedProvider) -> &'static str {
     }
 }
 
+/// IVFFlat `lists` under pgvector's own sizing guidance: ~1000 rows per
+/// list below a million rows, √rows above this, and always ≥ 1 (an empty
+/// or tiny table builds a single-list index, the honest floor). The
+/// index is a one-shot `CREATE INDEX` decision — the next connect where
+/// HNSW is unavailable re-runs this over the then-current row count.
+fn ivfflat_lists(rows: i64) -> i64 {
+    if rows <= 0 {
+        return 1;
+    }
+    if rows > 1_000_000 {
+        ((rows as f64).sqrt() as i64).max(1)
+    } else {
+        (rows / 1000).max(1)
+    }
+}
+
 fn provider_from_str(s: &str) -> EmbedProvider {
     match s {
         "nomic" => EmbedProvider::Nomic,
@@ -666,6 +712,8 @@ pub struct PgMemoryStore {
     embed: EmbedConfig,
     /// true → native `vector` columns + `<=>`-ordered search.
     pgvector: bool,
+    /// Effective retention cap (0 = uncapped) — see `DEFAULT_MAX_MEMORY_ROWS`.
+    max_rows: i64,
     /// Schema holding the memories table (tests isolate via schemas).
     schema: String,
 }
@@ -673,12 +721,23 @@ pub struct PgMemoryStore {
 impl PgMemoryStore {
     /// Connect and prepare the schema, probing for the pgvector extension
     /// first. `schema` isolates parallel test runs; operators share
-    /// `public` in their own database.
+    /// `public` in their own database. The 4-arg form carries the
+    /// effective retention cap (0 = uncapped).
     pub async fn connect(
         dsn: &str,
         embed: EmbedConfig,
         schema: Option<&str>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with(dsn, embed, schema, MAX_MEMORY_ROWS).await
+    }
+
+    pub async fn connect_with(
+        dsn: &str,
+        embed: EmbedConfig,
+        schema: Option<&str>,
+        max_rows: i64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(max_rows >= 0, "memory cap must be ≥ 0 (0 = uncapped)");
         // Refuse a TLS-demanding DSN up front with the real reason: this
         // store connects NoTls (memory is strictly node-local; TLS is the
         // deployment's job — a loopback database or a TLS-terminating
@@ -689,7 +748,7 @@ impl PgMemoryStore {
                  use a loopback database or terminate TLS at a sidecar"
             );
         }
-        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .with_context(|| format!("connecting postgres memory store ({})", describe_dsn(dsn)))?;
         // The store lives as long as the client; a dead connection is a
@@ -781,7 +840,18 @@ impl PgMemoryStore {
                     .context("probing embedding column type")?
                     .get::<_, String>(0);
                 let wanted = format!("vector({})", embed.dim);
-                if stored != "vector" && stored != wanted {
+                if stored == "vector" {
+                    // LEGACY dimension-free layout (pre-pinning runs): rows
+                    // kept the exact-scan path forever. An in-node migration
+                    // now finishes the pinning job the current layout
+                    // started — every uniform-dim legacy table whose dim
+                    // MATCHES the configured one is rebuilt pinned (rows
+                    // preserved verbatim: id, text, provider, created_ms and
+                    // the vectors themselves; no re-embedding, no loss). A
+                    // non-uniform or mismatched-dim table stays exactly
+                    // where it was, with an honest journal line.
+                    Self::maybe_migrate_legacy_layout(&mut client, embed.dim, &schema).await?;
+                } else if stored != wanted {
                     anyhow::bail!(
                         "existing memories table pins embeddings at {stored} but this run \
                          uses embedding_dim {} — restore the configured dimension or migrate \
@@ -813,12 +883,13 @@ impl PgMemoryStore {
             .await
             .context("creating memory schema")?;
         if pgvector {
-            // Index over the cosine-distance operator class so `<=>`
-            // upgrades from an exact scan to approximate nearest-neighbor
-            // search as the store grows past the exact-scan sweet spot.
-            // Best-effort on purpose: pgvector < 0.5 has no hnsw support;
-            // a failed build logs and continues with exact scans (the
-            // retention cap keeps tables small enough for exact to win).
+            // ANN index maintenance: HNSW first over the cosine-distance
+            // operator class so `<=>` upgrades from an exact scan to
+            // approximate nearest-neighbor search as the store grows.
+            // Best-effort on purpose; on failure the IVFFlat index is the
+            // fallback (it exists on pgvector < 0.5, where HNSW does not —
+            // exactly the old-server shape an uncapped store would hit).
+            // Both unavailable → an honest debug line, exact scans continue.
             match client
                 .execute(
                     "CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw \
@@ -828,8 +899,35 @@ impl PgMemoryStore {
                 .await
             {
                 Ok(_) => tracing::info!("pgvector HNSW cosine index ready"),
-                Err(e) => {
-                    tracing::debug!(error = %e, "HNSW index not created — exact scan path continues")
+                Err(hnsw_err) => {
+                    tracing::debug!(
+                        error = %hnsw_err,
+                        "HNSW index not created — trying the IVFFlat fallback (covers pgvector < 0.5)"
+                    );
+                    let rows: i64 = client
+                        .query_one("SELECT COUNT(*) FROM memories", &[])
+                        .await
+                        .map(|r| r.get::<_, i64>(0))
+                        .unwrap_or(0);
+                    let lists = ivfflat_lists(rows);
+                    match client
+                        .execute(
+                            "CREATE INDEX IF NOT EXISTS idx_memories_embedding_ivfflat \
+                             ON memories USING ivfflat (embedding vector_cosine_ops) \
+                             WITH (lists = $1)",
+                            &[&lists],
+                        )
+                        .await
+                    {
+                        Ok(_) => tracing::info!(
+                            lists,
+                            "pgvector IVFFlat cosine index ready (HNSW unavailable on this server)"
+                        ),
+                        Err(e) => tracing::debug!(
+                            error = %e,
+                            "IVFFlat index also unavailable — exact scan path continues"
+                        ),
+                    }
                 }
             }
         }
@@ -838,8 +936,94 @@ impl PgMemoryStore {
             client,
             embed,
             pgvector,
+            max_rows,
             schema,
         })
+    }
+
+    /// The in-node migration for a LEGACY dimension-free pgvector table:
+    /// the pinning rewrite, rows preserved verbatim, inside one
+    /// transaction. Fires only when the table is non-empty, EVERY row
+    /// shares one dim D, and D equals the configured `embedding_dim` —
+    /// exactly the state a current-layout table would have, so the move
+    /// is lossless. Anything else stays untouched with an honest line:
+    /// mixed-dim tables are what the exact-scan path exists for.
+    async fn maybe_migrate_legacy_layout(
+        client: &mut tokio_postgres::Client,
+        want_dim: usize,
+        schema: &str,
+    ) -> anyhow::Result<()> {
+        let row = client
+            .query_one(
+                "SELECT COUNT(*), COALESCE(MIN(dim), 0), COALESCE(MAX(dim), 0) FROM memories",
+                &[],
+            )
+            .await
+            .context("censusing legacy memories table")?;
+        let (count, lo, hi) = (
+            row.get::<_, i64>(0),
+            row.get::<_, i32>(1),
+            row.get::<_, i32>(2),
+        );
+        if count == 0 {
+            // An empty legacy table has nothing to preserve — and a
+            // deliberate multi-dim operator would be surprised by a silent
+            // reshape. Leave it; the scan path handles it.
+            tracing::debug!(
+                "legacy dimension-free memories table is empty — left as-is (scan path)"
+            );
+            return Ok(());
+        }
+        if lo != hi {
+            tracing::info!(
+                rows = count,
+                dims = %format!("{lo}..{hi}"),
+                "legacy dimension-free memories table holds mixed dims — stays on the exact-scan path (no auto-reshape: rows would need re-embedding)"
+            );
+            return Ok(());
+        }
+        if lo as usize != want_dim {
+            tracing::info!(
+                rows = count,
+                stored_dim = lo,
+                configured_dim = want_dim,
+                "legacy dimension-free memories table is uniform at dim {lo} but this run uses dim {want_dim} — left as-is (exactly the mixed-dim situation the scan path exists for)"
+            );
+            return Ok(());
+        }
+        // Lossless rebuild: one transaction, ids preserved (bigserial
+        // sequence re-linked after the copy), vectors carried through the
+        // text projection cast into the pinned type.
+        let tx = client
+            .transaction()
+            .await
+            .context("opening legacy-table migration transaction")?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE memories RENAME TO memories_legacy_unpinned;\
+             CREATE TABLE memories (\
+                 id BIGSERIAL PRIMARY KEY, \
+                 text TEXT NOT NULL, dim INTEGER NOT NULL, \
+                 provider TEXT NOT NULL, created_ms BIGINT NOT NULL, \
+                 embedding vector({want_dim}) NOT NULL);\
+             INSERT INTO memories (id, text, dim, provider, created_ms, embedding) \
+                 SELECT id, text, dim, provider, created_ms, embedding::text::vector \
+                 FROM memories_legacy_unpinned;\
+             DROP TABLE memories_legacy_unpinned;\
+             SELECT setval(pg_get_serial_sequence('\"{schema}\".memories', 'id'), \
+                 (SELECT COALESCE(MAX(id), 1) FROM memories));\
+             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_ms);"
+        ))
+        .await
+        .context("rebuilding legacy dimension-free memories table pinned")?;
+        tx.commit()
+            .await
+            .context("committing legacy-table migration")?;
+        tracing::info!(
+            rows = count,
+            dim = lo,
+            "legacy dimension-free memories table MIGRATED to vector({lo}) in-node ({count} rows preserved verbatim) — HNSW/IVFFlat index now buildable"
+        );
+        Ok(())
     }
 
     /// Raw embedding source (Ollama nomic / hash fallback) — identical to
@@ -877,8 +1061,8 @@ impl PgMemoryStore {
                 .context("inserting memory")?
                 .get::<_, i64>(0)
         };
-        if id > MAX_MEMORY_ROWS {
-            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        if self.max_rows > 0 && id > self.max_rows {
+            self.prune_beyond(self.max_rows).await?;
         }
         Ok((id, provider))
     }
@@ -1170,8 +1354,8 @@ impl PgMemoryStore {
                 .context("inserting memory row (migration)")?
                 .get::<_, i64>(0)
         };
-        if id > MAX_MEMORY_ROWS {
-            self.prune_beyond(MAX_MEMORY_ROWS).await?;
+        if self.max_rows > 0 && id > self.max_rows {
+            self.prune_beyond(self.max_rows).await?;
         }
         Ok(id)
     }
@@ -1294,24 +1478,30 @@ pub type SharedMemory = Arc<MemoryHandle>;
 
 impl MemoryHandle {
     /// Choose-and-open honoring the operator's configured backend. SQLite
-    /// ignores `pg_dsn`; postgres requires one.
+    /// ignores `pg_dsn`; postgres requires one. `max_rows` is the effective
+    /// retention cap (0 = uncapped).
     pub async fn open(
         backend: crate::config::MemoryBackend,
         sqlite_path: &Path,
         pg_dsn: Option<&str>,
         embed: EmbedConfig,
+        max_rows: i64,
     ) -> anyhow::Result<Self> {
         match backend {
-            crate::config::MemoryBackend::Sqlite => {
-                Ok(Self::Sqlite(MemoryStore::open(sqlite_path, embed)?))
-            }
+            crate::config::MemoryBackend::Sqlite => Ok(Self::Sqlite(MemoryStore::open_with(
+                sqlite_path,
+                embed,
+                max_rows,
+            )?)),
             crate::config::MemoryBackend::PostgresPgvector => {
                 let dsn = pg_dsn.filter(|s| !s.trim().is_empty()).context(
                     "memory_backend = postgres but no DSN — set memory_dsn in config.toml \
                          (or the JERITH_MEMORY_DSN environment variable); refusing to run memory \
                          against a different store",
                 )?;
-                Ok(Self::Pg(PgMemoryStore::connect(dsn, embed, None).await?))
+                Ok(Self::Pg(
+                    PgMemoryStore::connect_with(dsn, embed, None, max_rows).await?,
+                ))
             }
         }
     }
@@ -1379,9 +1569,18 @@ impl MemoryHandle {
         match self {
             Self::Sqlite(s) => {
                 if s.path.as_os_str().is_empty() {
-                    format!("SQLite (in memory, dim {})", s.embed.dim)
+                    format!(
+                        "SQLite (in memory, dim {}, {})",
+                        s.embed.dim,
+                        cap_desc(s.max_rows)
+                    )
                 } else {
-                    format!("SQLite at {} (dim {})", s.path.display(), s.embed.dim)
+                    format!(
+                        "SQLite at {} (dim {}, {})",
+                        s.path.display(),
+                        s.embed.dim,
+                        cap_desc(s.max_rows)
+                    )
                 }
             }
             Self::Pg(s) => {
@@ -1390,11 +1589,12 @@ impl MemoryHandle {
                 } else {
                     "PostgreSQL (bytea polyfill — no pgvector extension)"
                 };
+                let cap = cap_desc(s.max_rows);
                 if s.schema == "public" {
-                    format!("{mode} (dim {})", s.embed.dim)
+                    format!("{mode} (dim {}, {cap})", s.embed.dim)
                 } else {
                     format!(
-                        "{mode} (dim {}, schema {schema})",
+                        "{mode} (dim {}, {cap}, schema {schema})",
                         s.embed.dim,
                         schema = s.schema
                     )
@@ -1508,6 +1708,7 @@ impl MemoryHandle {
             &crate::config::NodeConfig::memory_db_path(),
             cfg.effective_memory_dsn().as_deref(),
             embed,
+            cfg.memory_max_rows,
         )
         .await
     }
@@ -1577,6 +1778,47 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(surviving.as_slice(), &ids[2..], "newest rows survive");
+    }
+
+    /// The retention cap honors operator config: a small cap prunes like
+    /// the default did, and `0` uncaps the store entirely (rows grow —
+    /// the deliberate Phase 5 scaling decision).
+    #[tokio::test]
+    async fn retention_cap_follows_the_configured_max_rows() {
+        // Capped at 3: five inserts leave the three newest.
+        let s = MemoryStore::open_in_memory_with(offline_embed(64), 3).unwrap();
+        for i in 0..5 {
+            s.embed_and_store(&format!("capped row {i}")).await.unwrap();
+        }
+        assert_eq!(s.count().await.unwrap(), 3);
+        let hits = s
+            .search("capped row 4", 5)
+            .await
+            .expect("search after prune");
+        assert!(hits.iter().all(|h| h.text != "capped row 0"));
+        assert!(hits.iter().any(|h| h.text == "capped row 4"));
+
+        // Uncapped (0): nothing is ever pruned.
+        let s = MemoryStore::open_in_memory_with(offline_embed(64), 0).unwrap();
+        for i in 0..5 {
+            s.embed_and_store(&format!("uncapped row {i}"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(s.count().await.unwrap(), 5);
+        // The describe line is honest about the cap state either way.
+        assert!(
+            MemoryHandle::Sqlite(MemoryStore::open_in_memory_with(offline_embed(64), 0).unwrap())
+                .describe()
+                .contains("uncapped")
+        );
+        assert!(
+            MemoryHandle::Sqlite(store())
+                .describe()
+                .contains("retention 10000 rows")
+        );
+        // A negative cap is a constructor refusal, never a silent clamp.
+        assert!(MemoryStore::open_in_memory_with(offline_embed(64), -1).is_err());
     }
 
     #[tokio::test]
@@ -1852,6 +2094,16 @@ mod tests {
             vec_from_pg_text("[1.0,oops]").is_err(),
             "malformed vector is a typed error, never silent zeros"
         );
+    }
+
+    #[test]
+    fn ivfflat_lists_follows_pgvector_sizing_guidance() {
+        assert_eq!(ivfflat_lists(0), 1, "empty/unknown → single-list floor");
+        assert_eq!(ivfflat_lists(-5), 1, "negative input → single-list floor");
+        assert_eq!(ivfflat_lists(500), 1);
+        assert_eq!(ivfflat_lists(10_000), 10);
+        assert_eq!(ivfflat_lists(1_000_000), 1000);
+        assert_eq!(ivfflat_lists(4_000_000), 2000, "≥1M rows → √rows");
     }
 
     #[test]
@@ -2147,7 +2399,8 @@ mod tests {
                 let _ = conn.await;
             });
             c.batch_execute(&format!(
-                "CREATE SCHEMA IF NOT EXISTS \"{schema}\";\
+                "CREATE EXTENSION IF NOT EXISTS vector;\
+                 CREATE SCHEMA IF NOT EXISTS \"{schema}\";\
                  SET search_path TO \"{schema}\", public;\
                  CREATE TABLE memories (\
                     id BIGSERIAL PRIMARY KEY, \
@@ -2183,6 +2436,165 @@ mod tests {
         let hits = s64.similar_to(h64, 2).await.expect("mixed search");
         assert_eq!(hits.len(), 2, "all rows located despite mixed dims");
         assert!(hits.iter().all(|h| h.id != h64));
+    }
+
+    /// The in-node migration for a legacy dimension-free pgvector table:
+    /// a uniform-dim table at the configured dimension is rebuilt pinned
+    /// (rows preserved verbatim: ids, providers, timestamps, vectors),
+    /// while a mismatched-dim table is left untouched. Both shapes live
+    /// in real schemas so the connect-time rewrite is exercised END to
+    /// END, not on a cardbaord mock.
+    #[tokio::test]
+    async fn pg_native_legacy_dimension_free_table_migrates_in_node() {
+        let Some(dsn) = pg_url() else {
+            eprintln!("skip pg_native_legacy : set JERITH_TEST_PG_URL");
+            return;
+        };
+        // 1. Legacy table, uniform at dim 64 (the configured dim): rows
+        //    pinned with REAL pgvector literals, distinct ids and
+        //    timestamps kept exact for the verbatim assertions.
+        let schema = format!("memtest_{}_legacy_unpin", std::process::id());
+        {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("raw probe connection");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c.batch_execute(&format!(
+                "CREATE EXTENSION IF NOT EXISTS vector;\
+                 CREATE SCHEMA IF NOT EXISTS \"{schema}\";\
+                 SET search_path TO \"{schema}\", public;\
+                 CREATE TABLE memories (\
+                    id BIGSERIAL PRIMARY KEY, \
+                    text TEXT NOT NULL, dim INTEGER NOT NULL, \
+                    provider TEXT NOT NULL, created_ms BIGINT NOT NULL, \
+                    embedding vector NOT NULL);\
+                 INSERT INTO memories (text, dim, provider, created_ms, embedding) VALUES \
+                    ('how to bake sourdough bread at home', 64, 'hash-fallback', 111222333, \
+                     '[0.5,0.25,0.125,0.0625,0.03125,0.015625,0.0078125,0.00390625,0.001953125,0.0009765625,0.00048828125,0.000244140625,0,0,0,1.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2.0,0,0,0,0,0,0.0]'), \
+                    ('quantum computing stock price forecast', 64, 'hash-fallback', 222333444, \
+                     '[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.1,0,0,0,0,0.0]');"
+            ))
+            .await
+            .expect("create legacy dimension-free table with rows");
+        }
+        // Connect: the migration must fire (table was uniform at the
+        // configured dim 64) and the rebuild must preserve EVERYTHING.
+        let s = PgMemoryStore::connect(&dsn, offline_embed(64), Some(&schema))
+            .await
+            .expect("connect legacy store");
+        assert_eq!(s.count().await.unwrap(), 2, "rows survive the rebuild");
+        {
+            let hits = s.all_rows().await.expect("all rows readable");
+            // The vectors round-trip verbatim (cast into the pinned type
+            // through the text projection — no re-embedding, no loss).
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0].created_ms, 111222333, "timestamps verbatim");
+            assert_eq!(hits[1].created_ms, 222333444);
+            assert_eq!(hits[0].vector[0], 0.5, "vector head survives the cast");
+            assert_eq!(hits[0].vector[15], 1.0);
+            assert_eq!(hits[0].vector[57], 2.0);
+            // ids re-linked from the old rows by the sequence migration.
+            let mut ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![1, 2], "ids preserved across the rebuild");
+        }
+        // The column is now PINNED — verified straight from the server.
+        let typed = {
+            let (pc, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("raw probe 2");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            pc.batch_execute(&format!("SET search_path TO \"{schema}\", public"))
+                .await
+                .expect("search_path for pin probe");
+            pc.query_opt(
+                "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 WHERE a.attrelid = to_regclass(current_schema() || '.memories') \
+                 AND a.attname = 'embedding'",
+                &[],
+            )
+            .await
+            .expect("pin probe")
+            .map(|r| r.get::<_, String>(0))
+            .unwrap_or_default()
+        };
+        assert_eq!(
+            typed.as_str(),
+            "vector(64)",
+            "the migrated column must carry the pinned dimension"
+        );
+        // Indexed search now serves the migrated store (uniform dim):
+        // real `<=>` over pinned vectors, the point of the migration.
+        let top = s
+            .search("sourdough bread baking", 2)
+            .await
+            .expect("post-migrate search");
+        assert_eq!(top.len(), 2);
+        assert!(top[0].score > top[1].score, "strict ordering: {top:?}");
+
+        // 2. A LEGACY table at a DIFFERENT uniform dim stays untouched:
+        //    same migration sweep, zero reshape (exactly the
+        //    pg_native_mixed-adjacent shape the scan path exists for).
+        let schema2 = format!("memtest_{}_legacy_offdim", std::process::id());
+        {
+            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("raw probe connection 3");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c.batch_execute(&format!(
+                "CREATE EXTENSION IF NOT EXISTS vector;\
+                 CREATE SCHEMA IF NOT EXISTS \"{schema2}\";\
+                 SET search_path TO \"{schema2}\", public;\
+                 CREATE TABLE memories (\
+                    id BIGSERIAL PRIMARY KEY, \
+                    text TEXT NOT NULL, dim INTEGER NOT NULL, \
+                    provider TEXT NOT NULL, created_ms BIGINT NOT NULL, \
+                    embedding vector NOT NULL);\
+                 INSERT INTO memories (text, dim, provider, created_ms, embedding) VALUES \
+                    ('mismatched dim row', 32, 'hash-fallback', 555, \
+                     '[1.0,0.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.0]');"
+            ))
+            .await
+            .expect("create off-dim legacy table");
+        }
+        let s2 = PgMemoryStore::connect(&dsn, offline_embed(64), Some(&schema2))
+            .await
+            .expect("connect off-dim legacy store");
+        assert_eq!(s2.count().await.unwrap(), 1);
+        let typed2: Option<String> = {
+            let (pc, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("raw probe 4");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            pc.batch_execute(&format!("SET search_path TO \"{schema2}\", public"))
+                .await
+                .expect("search_path for pin probe 2");
+            pc.query_opt(
+                "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+                 WHERE a.attrelid = to_regclass(current_schema() || '.memories') \
+                 AND a.attname = 'embedding'",
+                &[],
+            )
+            .await
+            .expect("pin probe 2")
+            .map(|r| r.get::<_, String>(0))
+        };
+        assert_eq!(
+            typed2.as_deref(),
+            Some("vector"),
+            "a mismatched-dim legacy table must stay dimension-free"
+        );
+        // …and it still ranks, through the scan path.
+        let hits = s2.search("mismatched dim", 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     // =========================================================================
