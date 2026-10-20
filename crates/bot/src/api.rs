@@ -557,7 +557,11 @@ pub async fn chat_with_usage_live(
     // Tools only for prompts that read as information requests. A shared
     // story/paste (long, no question) must not make the model invent a
     // web_search for it — observed live: a user posted a short story and
-    // the model web-searched a line out of it, then answered "{}".
+    // the model web-searched a line out of it, then answered "{}". The
+    // old `< 200 chars = web request` catch-all made EVERY casual chat
+    // tool-attached (and thus live-typing-suppressed, see round_live
+    // below) — removed 2026-10-20: factual openers + a trailing '?' are
+    // the information-request contract; casual text is not one.
     let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt)
         || (owner_privileged && !registry.enabled_skill_names().is_empty());
 
@@ -570,6 +574,11 @@ pub async fn chat_with_usage_live(
     // A toolless retry over the accumulated exchange usually lands real
     // text; a second degenerate answer still falls to the refusal.
     let mut degenerate_retried = false;
+    // Whether any round of this session EXECUTED a tool call: once tool
+    // results are in the context the echo risk exists, and rounds typing
+    // live stop (the recall-slop incident contract, narrowed 2026-10-20
+    // to the post-execution shape).
+    let mut tools_used = false;
     // Per-request bound ([chat] timeout_secs, default 240 s): slow thinking
     // answers are legit — the gateway bounds the local runtime's header wait
     // at 180 s and hands off to mesh fallback, so the bot's bound only needs
@@ -602,17 +611,28 @@ pub async fn chat_with_usage_live(
             messages.push(json!({"role": "system", "content": PROSE_ANSWER_NUDGE}));
             continue;
         }
-        // Tool-bearing rounds never touch the live surface: their streamed
-        // content is tool-intent JSON and whatever tool results (web rows,
-        // memory-recall hits) the model echoes back — including PRIVATE
-        // embedded memory, typed into the chat before any reply existed
-        // (live 2026-10-16 incident: recall slop streamed into Discord, then
-        // the round degenerated to `{}` and the refusal replaced it). Only
-        // toolless rounds type: those are either the plain-chat answer
-        // (tools never enabled → no fragment suppression) or the toolless
-        // landing round after tool work. Tool-bearing rounds run tap-less,
-        // so nothing is buffered — their fragments simply never surface.
-        let round_live = if tools_enabled { None } else { live };
+        // Rounds that carry TOOL RESULTS in their context never touch the
+        // live surface: their streamed content can echo whatever tool
+        // results fed back — including PRIVATE embedded-memory recall rows,
+        // typed into the chat before any reply existed (live 2026-10-16
+        // incident: recall slop streamed into Discord, then the round
+        // degenerated to `{}` and the refusal replaced it). But ROUND 0
+        // carries only persona + speaker-identity context — no tool results
+        // exist yet, nothing to echo — so it types live exactly like the
+        // tools-never-enabled shape. This was the 2026-10-20 "nothing
+        // changed" live report: the `<200 chars` heuristic attached web
+        // tools to every casual chat, the blanket suppression then meant
+        // ZERO live typing on nearly every bot chat, and the placeholder
+        // froze at `…` until finish(). Intent slop in a typing round stays
+        // held by the fetch layer's brace gate; a round that streams prose
+        // AND a tool call can leave pre-call prose visible until finish()
+        // replaces it — accepted, the same shape toolless parroting has
+        // today.
+        let round_live = if tools_enabled && tools_used {
+            None
+        } else {
+            live
+        };
         if let Some(tap) = round_live {
             tap(LiveEvent::RoundStart);
         }
@@ -766,6 +786,7 @@ pub async fn chat_with_usage_live(
                 "content": answer,
             }));
         }
+        tools_used = true;
         rounds += 1;
     }
 }
@@ -813,11 +834,11 @@ fn prompt_requests_web(prompt: &str) -> bool {
     if NON_FACTUAL_OPENERS.iter().any(|w| body.starts_with(w)) {
         return false;
     }
-    const FACTUAL_OPENERS: [&str; 14] = [
+    const FACTUAL_OPENERS: [&str; 15] = [
         "who", "what", "when", "where", "why", "how", "which", "is", "are", "does", "do", "can",
-        "should", "find",
+        "should", "find", "search",
     ];
-    FACTUAL_OPENERS.iter().any(|w| body.starts_with(w)) || p.chars().count() < 200
+    FACTUAL_OPENERS.iter().any(|w| body.starts_with(w))
 }
 
 /// An answer the model effectively failed to produce: empty, whitespace,
@@ -1485,8 +1506,15 @@ mod tests {
         assert!(!prompt_requests_web("write me a haiku about kilns"));
         assert!(!prompt_requests_web("summarize this thread"));
         assert!(!prompt_requests_web(""));
-        // Short non-question prompts still count as requests (lenient).
-        assert!(prompt_requests_web("jerk chicken recipe"));
+        // 2026-10-20: the old `<200 chars = request` lenient catch is gone —
+        // it forced web tools onto EVERY casual chat ("hi", chat banter),
+        // and a tools-attached session was zero-live-typing under the
+        // tool-round suppression (the "nothing changed" live report the
+        // same day). Information requests still attach tools via openers
+        // and '?'; casual text does not.
+        assert!(!prompt_requests_web("jerk chicken recipe"));
+        assert!(!prompt_requests_web("lol nice"));
+        assert!(prompt_requests_web("is jerk chicken hard to make?"));
     }
 
     #[test]
@@ -2280,12 +2308,82 @@ mod tests {
         assert!(fired.lock().expect("test tap").is_empty());
     }
 
+    /// The 2026-10-20 narrowing, positive side: tools ATTACHED by the
+    /// heuristic (a question-mark prompt), but the model answers directly
+    /// in round 0 without calling any tool — the common casual-chat
+    /// shape. That round has no tool results in context (nothing executed
+    /// yet), so it types live: fragments reach the tap exactly like the
+    /// tools-never-enabled shape instead of freezing the placeholder at
+    /// `…` (the "nothing changed" live report).
     #[tokio::test]
-    async fn chat_tool_sse_streams_answer_round_and_clears_the_first() {
-        // Web-search-augmented chat over SSE: round 0 streams a native
-        // tool_call (no content — nothing typed), the round-1 answer streams
-        // with content after the tap has seen a RoundStart boundary. The
-        // sink must clear between rounds so web-informed answers type live.
+    async fn chat_tools_attached_direct_answer_types_live_in_round0() {
+        use std::sync::Arc;
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async {
+                    let a1 = json!({"choices":[{"delta":{"content":"casual "}}]});
+                    let a2 = json!({"choices":[{"delta":{"content":"answer"}}]});
+                    let fin = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+                    let body = format!(
+                        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        a1, a2, fin
+                    );
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        body,
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        cfg.web.enabled = true;
+        let onset: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(Default::default());
+        let tap_seen = onset.clone();
+        let live = move |ev: LiveEvent| {
+            let mut guard = tap_seen.lock().expect("test tap");
+            match ev {
+                LiveEvent::RoundStart => guard.push("⇆round".to_string()),
+                LiveEvent::Text(f) => guard.push(f.to_string()),
+                LiveEvent::Thinking => guard.push("🤔".to_string()),
+            }
+        };
+        // A question-mark prompt attaches the web tools; the mock never
+        // returns a tool call, so the session ends in tools-attached
+        // round 0 with a direct answer.
+        let (reply, _served_by, _tokens) =
+            chat_with_usage_live(&cfg, "is the kiln hot?", &[], Some(&live), false)
+                .await
+                .expect("tools-attached direct answer");
+        assert_eq!(reply, "casual answer");
+        // The contract: tools attached but unexecuted → round 0 types live.
+        assert_eq!(
+            *onset.lock().expect("test tap"),
+            vec![
+                "⇆round".to_string(),
+                "casual ".to_string(),
+                "answer".to_string()
+            ],
+            "no tool results in context yet — round 0 streams"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_web_tool_session_round0_opens_live_finish_lands_the_answer() {
+        // Web-search-augmented chat over SSE: round 0 now OPENS the live
+        // surface (2026-10-20 narrowing) — it streams a native tool_call
+        // and no content, so only its RoundStart fires — while the round-1
+        // answer round still carries TOOL RESULTS in context (the
+        // 2026-10-16 echo-risk contract) and stays suppressed: the reply
+        // lands via finish().
         use std::sync::Arc;
 
         let app = axum::Router::new()
@@ -2368,19 +2466,30 @@ mod tests {
         assert_eq!(reply, "answer after web search.");
         assert!(served_by.is_none());
         assert_eq!(tokens, 42);
-        // Two round boundaries — wait, the new contract: tool-bearing
-        // rounds fire NOTHING live; the answer text is never typed live
-        // (its round carried tools attached), so the tap stays silent and
-        // the full reply arrives via the sink's finish.
-        assert_eq!(*events.lock().expect("test tap"), Vec::<String>::new());
+        // The 2026-10-20 narrowing: round 0 (tools attached, NOTHING
+        // executed yet) opens the live surface — this fixture's round 0
+        // streams tool-call fragments only, so exactly one RoundStart
+        // fires and nothing types. The answer round still carries TOOL
+        // RESULTS in its context (the 2026-10-16 echo-risk contract:
+        // rounds after an executed tool call stream nothing live), so the
+        // web-informed reply lands via the sink's finish instead — the
+        // honest tradeoff: casual chats stream; tool-informed ones snap
+        // in in place.
+        assert_eq!(
+            *events.lock().expect("test tap"),
+            vec!["⇆round".to_string()],
+            "round 0 opens the surface; the post-tool-answer round stays suppressed"
+        );
     }
 
-    /// Regression for the tool-round suppression: intent JSON + echoed
-    /// memory-recall row streamed in round 0 (tools attached), a real
-    /// answer streamed in the TOOLLESS round — the sink must record only
-    /// the answer, never intent slop or echoed tool results (the live
-    /// 2026-10-16 incident: private embedded-memory text surfaced in the
-    /// chat before the refusal replaced it).
+    /// Regression for the tool-round suppression, narrowed 2026-10-20:
+    /// intent JSON + echoed memory-recall row streamed in round 0 (tools
+    /// attached) — its brace-led shape is HELD by the fetch gate, so
+    /// round 0's only tap is its RoundStart — then the tool executes and
+    /// the landing toolless round types the real answer. The sink must
+    /// record only the answer, never intent slop or echoed tool results
+    /// (the live 2026-10-16 incident: private embedded-memory text
+    /// surfaced in the chat before the refusal replaced it).
     #[tokio::test]
     async fn chat_tool_round_fragments_never_reach_the_live_surface() {
         use std::sync::Arc;
@@ -2453,13 +2562,20 @@ mod tests {
                 .expect("tool-slop chat");
         // The answer landed and is exactly the toolless round's text.
         assert_eq!(reply, "Real reply.");
-        // The tool-bearing rounds fired nothing; the toolless landing round
-        // fired RoundStart then typed its answer — the only typing a tool
-        // chat ever surfaces.
+        // Two RoundStarts: round 0 now OPENs the live surface (2026-10-20
+        // narrowing) — its brace-led slop is HELD by the fetch gate and
+        // types nothing, so only its RoundStart fires — and the toolless
+        // landing round then types the answer, exactly as before (echo
+        // risk lives only in rounds AFTER an executed tool call; the
+        // fixture's later slop rounds stay suppressed under it).
         let seen = events.lock().expect("test tap");
         assert_eq!(
             *seen,
-            vec!["⇆round".to_string(), "Real reply.".to_string()],
+            vec![
+                "⇆round".to_string(),
+                "⇆round".to_string(),
+                "Real reply.".to_string(),
+            ],
             "tap: {seen:?}"
         );
     }

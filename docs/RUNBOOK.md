@@ -737,10 +737,25 @@ remembering:
   serves one non-streaming reply, wrapped — gateway-side), so mesh-
   served answers appear at once; this is the local-runtime lane's
   streaming, which is the lane in normal use. Tool rounds
-  STREAM but never type: tool-bearing rounds fire no live events at all
-  (2026-10-16 contract change, after a recall-slop incident — echoed
-  embedded-memory text surfaced in the chat before the reply, then the
-  round degenerated to `{}` and the refusal replaced it). Toolless
+  STREAM but never type — NARROWED 2026-10-20: only rounds AFTER an
+  executed tool call fire no live events (the 2026-10-16 recall-slop
+  incident's echo risk lives exactly there: web rows and PRIVATE
+  embedded-memory hits exist in context only once a tool has run and
+  fed results back). ROUND 0 — tools attached by the heuristic but
+  nothing executed — has no tool results to echo, so it types live like
+  the tools-never shape: the common casual chat (model answers
+directly) streams instead of freezing at `…`. Surfaced tradeoffs: a
+  web-informed answer round (results in context) lands via finish() in
+  place within a second of readiness — never typed token-by-token; a
+  round that streams prose AND a tool call can leave pre-call prose
+  visible until finish() replaces it (the same shape the toolless path
+  has always accepted). Companion same-day: the `<200 chars = web
+  request` catch-all in the tool-attachment heuristic is GONE — it
+  forced web tools onto every casual chat, which combined with the
+  blanket suppression meant ZERO live typing on nearly every bot chat
+  (the same-day "nothing changed" live report). Information requests
+  attach tools via factual openers + a trailing '?' (`search` rejoined
+  the opener list); casual text does not. Toolless
   rounds type, but their fragments are JSON-gated: while the round's
   content still opens `{ "…` (the 193-char intent-slop landing round),
   fragments are HELD and never surface — the moment the content proves
