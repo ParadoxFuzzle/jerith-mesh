@@ -10,6 +10,12 @@ Description=jerith-mesh Discord bot (jerith-bot)
 After=network-online.target
 Wants=network-online.target
 
+# A systemd --user service runs a NARROWER PATH than a login shell —
+# ~/.local/bin is NOT in it. Tools the lanes need on PATH (ffprobe,
+# whisper — bins resolving as bare names) must find a home here, or in
+# bot.toml ([video]/[audio] ffprobe_bin / whisper_bin) as absolute paths.
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 [Service]
 Type=simple
 ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith-bot

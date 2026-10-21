@@ -338,7 +338,11 @@ pub(crate) async fn run_argv(
     let out = match out {
         Ok(Ok(o)) => o,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
-            "missing tool: no `{}` on PATH — set the [video] bins in bot.toml",
+            // Shared by both lanes — the honest hint says the actual knobs
+            // (`ffprobe_bin`/`whisper_bin`, per [video]/[audio]) and the
+            // usually-real cause (a systemd user service runs a NARROWER
+            // PATH than a login shell; ~/.local/bin commonly vanishes).
+            "missing tool: no `{}` on PATH — set the lane's bin to an absolute path in bot.toml ([video]/[audio] ffprobe_bin / whisper_bin), or widen the service PATH",
             argv[0]
         ),
         Ok(Err(e)) => return Err(e).context(what.to_string()),

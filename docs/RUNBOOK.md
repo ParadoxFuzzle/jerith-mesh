@@ -1522,3 +1522,15 @@ message; transcripts warm the extraction cache.
   -- --ignored --nocapture` — generates a real sine-tone mp3 and runs
   the whole lane on the host toolchain + real whisper (pinned to the
   honest empty-transcript shape).
+- **Deployment trap (found live 2026-10-21)**: both lanes resolve bare
+  bin names from the PROCESS PATH, and a systemd --user service runs a
+  NARROWER PATH than a login shell — `~/.local/bin` (where
+  openai-whisper lived here) is NOT in it. The login-shell live harness
+  passes while the deployed bot returns «no `whisper` on PATH» in the
+  model's context; refusals never journal, so nothing looked wrong.
+  Fix: `jerith-bot.service.d/10-path.conf` drop-in (and the template's
+  `Environment=PATH=%h/.cargo/bin:%h/.local/bin:…`) — reproduce by
+  running the harness with the service's exact PATH. Also 2026-10-21:
+  the shared `missing tool` refusal no longer points at "[video] bins"
+  regardless of lane — it names the real knobs (`[video]/[audio]
+  ffprobe_bin / whisper_bin`, absolute paths) and the PATH cause.
