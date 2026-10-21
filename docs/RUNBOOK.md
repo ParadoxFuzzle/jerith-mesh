@@ -1522,6 +1522,13 @@ message; transcripts warm the extraction cache.
   -- --ignored --nocapture` — generates a real sine-tone mp3 and runs
   the whole lane on the host toolchain + real whisper (pinned to the
   honest empty-transcript shape).
+- **Transcripts are /recall-able (FEATURES §22)**: every successful
+  transcription fire-and-forgets one `memory.embed` note
+  ("transcript of audio attachment …"), so a later `/recall <words>`
+  finds what a voice note said without re-uploading it. Knob:
+  `[memory] index_transcripts` (default on). Once per extraction —
+  cache-warm re-asks never re-run the embed; embed failures journal
+  only and stay re-runnable on the next ask.
 - **Model bump, live 2026-10-21**: `[audio]`/`[video]` in the live
   bot.toml now run whisper `base` (was the code default `tiny`) with
   `whisper_timeout_secs = 900` (was default 600) so a 600-s clip at
@@ -1532,7 +1539,11 @@ message; transcripts warm the extraction cache.
   so the honest claim is "not worse on clean speech, better on noisy
   notes". The espeak synthetic probe misheard with BOTH models —
   robot voice, not a whisper tier issue. Revert: delete the two
-  sections (defaults fall back to tiny/600).
+  sections (defaults fall back to tiny/600). **small NOT worth it on
+  this box (measured 2026-10-21)**: 46.0 s vs base 5.0 s on the same
+  11-s real-speech clip (~9× slower, identical words) and still
+  partly garbled on the synthetic probe — a 3-min voice note would
+  knife past the 900 s timeout; base stands.
 - **Deployment trap (found live 2026-10-21)**: both lanes resolve bare
   bin names from the PROCESS PATH, and a systemd --user service runs a
   NARROWER PATH than a login shell — `~/.local/bin` (where

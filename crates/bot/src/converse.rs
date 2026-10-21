@@ -139,6 +139,109 @@ fn other_overcap_line(cap: usize) -> String {
     )
 }
 
+/// `[memory]` in bot.toml — node-memory indexing knobs (see the hook
+/// doc on `spawn_transcript_indexing`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MemoryConfig {
+    /// Index audio/video attachment transcripts into the node's private
+    /// memory (fire-and-forget `memory.embed`, the same lane the
+    /// archiver embeds thread summaries into) so `/recall` can find
+    /// what was said in a voice note. Default on; `false` = transcripts
+    /// stay chat-local.
+    #[serde(default = "default_index_transcripts")]
+    pub index_transcripts: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            index_transcripts: true,
+        }
+    }
+}
+
+fn default_index_transcripts() -> bool {
+    true
+}
+
+/// Memory index cap for one transcript note — searchable words are the
+/// point, not whole-file text dumps; `/recall` hits stay terse.
+pub const TRANSCRIPT_NOTE_CAP_CHARS: usize = 4000;
+
+/// Honest note shape: lane + file label + the words (capped).
+fn transcript_note(lane: &str, label: &str, body: &str) -> String {
+    let prefix = format!("transcript of {lane} attachment {label}: ");
+    let room = TRANSCRIPT_NOTE_CAP_CHARS.saturating_sub(prefix.chars().count());
+    let truncated = body.chars().count() > room;
+    // The cap is TOTAL: when truncating, the ellipsis lives inside it.
+    let mut text: String = body
+        .chars()
+        .take(if truncated { room - 1 } else { room })
+        .collect();
+    if truncated {
+        text.push('…');
+    }
+    prefix + &text
+}
+
+/// Extract the speech text from a lane block: a REAL transcript is one
+/// line exactly `transcript:` (audio.rs/video.rs compose), the words
+/// underneath, and (video) a `frame notes:` section after. An INLINE
+/// `transcript: …` is an honest absence/failure — never indexable.
+fn transcript_text_from_block(block: &str) -> Option<String> {
+    let mut lines = block.split('\n');
+    while let Some(line) = lines.next() {
+        if line.trim() == "transcript:" {
+            let mut body = String::new();
+            for l in lines {
+                if l.trim() == "frame notes:" {
+                    break;
+                }
+                body.push_str(l);
+                body.push('\n');
+            }
+            let body = body.trim().to_string();
+            return (!body.is_empty()).then_some(body);
+        }
+    }
+    None
+}
+
+/// Fire-and-forget transcript indexing: one `memory.embed` note per
+/// transcribed attachment (archiver.rs convention — the node's private
+/// store, `/recall`-searchable). Never slows a reply; a failure is a
+/// typed journal line, and the transcript stays in the chat-side
+/// extraction cache either way.
+fn spawn_transcript_indexing(cfg: &crate::config::BotConfig, label: &str, lane: &str, block: &str) {
+    if !cfg.memory.index_transcripts {
+        return;
+    }
+    let Some(body) = transcript_text_from_block(block) else {
+        return;
+    };
+    let note = transcript_note(lane, label, &body);
+    let cfg = cfg.clone();
+    let label = label.to_string();
+    let lane = lane.to_string();
+    tokio::spawn(async move {
+        match crate::api::memory_embed(&cfg, &note).await {
+            Ok((id, provider)) => tracing::info!(
+                lane = %lane,
+                attachment = %label,
+                id = %id,
+                provider = %provider,
+                "attachment transcript indexed into node memory"
+            ),
+            Err(e) => tracing::warn!(
+                lane = %lane,
+                attachment = %label,
+                error = %e,
+                "transcript memory index failed — /recall won't see this one (chat cache unaffected)"
+            ),
+        }
+    });
+}
+
 /// Pure assembly behind the transports' attachment context: render one
 /// bracketed line per attachment — description/extracted text or an
 /// honest failure (never a silent drop) — into one block the chat
@@ -237,8 +340,9 @@ pub async fn attachments_context(
                     continue;
                 }
                 let out = crate::audio::audio_context(cfg, &att.label, &att.url).await;
-                if out.is_ok() {
+                if let Ok(block) = &out {
                     state.sandbox_cache_put(att.id, &att.label, att.size, out.clone());
+                    spawn_transcript_indexing(cfg, &att.label, "audio", block);
                 }
                 lines.push((att.label.clone(), out));
             }
@@ -271,8 +375,9 @@ pub async fn attachments_context(
                     continue;
                 }
                 let out = crate::video::video_context(cfg, &att.label, &att.url).await;
-                if out.is_ok() {
+                if let Ok(block) = &out {
                     state.sandbox_cache_put(att.id, &att.label, att.size, out.clone());
+                    spawn_transcript_indexing(cfg, &att.label, "video", block);
                 }
                 lines.push((att.label.clone(), out));
             }
@@ -682,6 +787,38 @@ mod tests {
         let line = other_overcap_line(8);
         assert!(line.contains("skipped:"), "{line}");
         assert!(!line.contains("pending"), "pending must never lie: {line}");
+    }
+
+    /// Transcript indexing (memory hook): speech extraction picks ONLY
+    /// the words — inline honest absences and failures are skipped, and
+    /// video `frame notes:` stay out of the note — and the capped note
+    /// shape stays within the memory budget.
+    #[test]
+    fn transcript_extraction_speech_only_and_capped_note() {
+        let audio_ok = "audio: duration 0:12:\ntranscript:\nfire the kiln at 980";
+        assert_eq!(
+            transcript_text_from_block(audio_ok).as_deref(),
+            Some("fire the kiln at 980")
+        );
+        let audio_empty = "audio: duration 0:06:\ntranscript: (audio track present but transcript came back empty — speech may be absent)";
+        assert!(transcript_text_from_block(audio_empty).is_none());
+        let audio_fail = "audio: duration 0:10:\ntranscript: whisper failed after 1.0s: x";
+        assert!(transcript_text_from_block(audio_fail).is_none());
+        let video_ok = "video: duration 0:30, 6 frame(s) analyzed:\ntranscript:\nsays hello\nframe notes:\n[0:00] a car";
+        assert_eq!(
+            transcript_text_from_block(video_ok).as_deref(),
+            Some("says hello"),
+            "frame notes must stay out of the transcript note"
+        );
+        let note = transcript_note("audio", "clip.mp3", &"w".repeat(5000));
+        assert!(note.chars().count() <= TRANSCRIPT_NOTE_CAP_CHARS, "{note}");
+        assert!(note.contains("attachment clip.mp3"), "{note}");
+        assert!(
+            note.ends_with('…'),
+            "long words must be capped honestly: {note}"
+        );
+        let short = transcript_note("audio", "clip.mp3", "short words");
+        assert!(short.ends_with("short words"), "{short}");
     }
 
     /// Transport-side attachment context end-to-end against a stub

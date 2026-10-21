@@ -129,6 +129,10 @@ pub struct BotConfig {
     /// transcribed by local whisper directly — no frames, no vision.
     /// Default on; tooling-absent degrades to honest lines.
     pub audio: crate::audio::AudioConfig,
+    /// Node-memory indexing knobs (`[memory]` in bot.toml, see
+    /// converse.rs): attachment transcripts fire-and-forget into the
+    /// /recall-able private memory. Default on.
+    pub memory: crate::converse::MemoryConfig,
     /// Multi-bot coordination (`[coordinator]` in bot.toml, see
     /// coordinator.rs): named worker loops claiming the mesh hand-off
     /// channel with per-worker model routing. Default on — loops only
@@ -508,6 +512,7 @@ impl BotConfig {
                 a.clamp();
                 a
             },
+            memory: file.memory.unwrap_or_default(),
             external_plugins,
             coordinator: file.coordinator.clone().unwrap_or_default(),
             workflows: {
@@ -587,6 +592,7 @@ impl BotConfig {
             sandbox: SandboxConfig::default(),
             video: crate::video::VideoConfig::default(),
             audio: crate::audio::AudioConfig::default(),
+            memory: crate::converse::MemoryConfig::default(),
             coordinator: CoordinatorBotConfig::default(),
             workflows: WorkflowsConfig::default(),
             approvals: crate::approval::ApprovalConfig::default(),
@@ -871,6 +877,9 @@ struct FileConfig {
     /// Optional `[audio]` table — the audio attachment lane (audio.rs;
     /// absent = defaults).
     audio: Option<crate::audio::AudioConfig>,
+    /// Optional `[memory]` table — node-memory indexing knobs (see
+    /// converse.rs; absent = defaults).
+    memory: Option<crate::converse::MemoryConfig>,
     /// Optional `[coordinator]` table — named-worker loops (see coordinator.rs).
     coordinator: Option<CoordinatorBotConfig>,
     /// Optional `[workflows]` table — browser record/replay (workflows.rs).
@@ -965,6 +974,22 @@ mod tests {
         let cfg = BotConfig::from_parts("http://127.0.0.1:8900/", "http://127.0.0.1:8322/");
         assert_eq!(cfg.gateway_url, "http://127.0.0.1:8900");
         assert_eq!(cfg.chain_url, "http://127.0.0.1:8322");
+    }
+
+    #[test]
+    fn memory_index_defaults_on_and_respects_the_knob() {
+        // Absent section: the merged default carries indexing ON (the
+        // archiver-precedent private lane — /recall can then find what
+        // was said in a voice note).
+        assert!(
+            BotConfig::from_parts("http://127.0.0.1:1", "http://127.0.0.1:1")
+                .memory
+                .index_transcripts
+        );
+        // Present section: the knob is respected.
+        let fc: FileConfig =
+            toml::from_str("discord_token = \"x\"\n[memory]\nindex_transcripts = false\n").unwrap();
+        assert!(!fc.memory.expect("memory section parsed").index_transcripts);
     }
 
     #[test]
