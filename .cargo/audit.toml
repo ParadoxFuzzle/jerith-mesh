@@ -10,6 +10,19 @@
 # 0.13 territory. The maintenance rule: a new accepted advisory gets a
 # runbook paragraph AND an entry here in the same commit; when the
 # serenity/poise migration lands, delete every entry in this list.
+#
+# Voice-lane block (2026-10-21): songbird 0.6.1's subtree. The eight
+# libcrux-* entries sit in davey (Discord DAVE E2EE/MLS), which songbird
+# links UNCONDITIONALLY (no feature removes it) and the voice lane never
+# enables at runtime (plain transport encryption only — no MLS/DAVE
+# handshake, no HPKE encapsulation is ever executed; dormant linked
+# code). Their fixes are 0.0.x renames/major jumps behind openmls's
+# pinned hpke-rs 0.6 line — unreachable without an upstream songbird
+# release. RUSTSEC-2026-0293 (ringbuf double-free via Consumer::skip/
+# clear when an element's Drop PANICS) does not apply to our usage: the
+# bot's rings hold plain pods ([u8; 16]/[f32; 2]) with no Drop impl, so
+# the drop-panic precondition is unreachable. Delete this block when a
+# songbird release ships the davey fix chain and ringbuf 0.5.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0349", # unauthenticated ServerHello downgrade (via serenity websocket stack)
@@ -20,4 +33,13 @@ ignore = [
     "RUSTSEC-2026-0099", # webpki: name constraints accepted for wildcard names
     "RUSTSEC-2026-0382", # webpki: distrusted intermediates (2026-10-20; patched 0.103.16 applied to the main rustls line — this ignore only covers serenity's pinned webpki 0.102.8 subgraph)
     "RUSTSEC-2026-0381", # webpki-roots: distrusted emSign intermediates (2026-10-19; 1.0.10 applied everywhere incl. the bot's own TLS leg — this ignore only covers serenity's pinned 0.26.11)
+    "RUSTSEC-2026-0209", # libcrux-aesgcm: no enforced AAD limits (davey/DAVE subgraph, dormant — see voice-lane block above)
+    "RUSTSEC-2026-0211", # libcrux-aesgcm: non-constant-time tag check, no fix upstream (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0124", # libcrux-chacha20poly1305: panic on overlong ciphertext (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0330", # libcrux-kem: panic on short hybrid seed (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0331", # libcrux-kem: panic on short hybrid keys (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0212", # libcrux-secrets: CT swap wrong on aarch64 (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0207", # libcrux-sha3: incremental SHAKE wrong across squeezes (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0208", # libcrux-sha3: AVX2 SHAKE-256 panic (davey/DAVE subgraph, dormant)
+    "RUSTSEC-2026-0293", # ringbuf: double-free needs a panicking Drop element — voice rings hold pod-only types
 ]

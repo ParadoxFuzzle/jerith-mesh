@@ -1164,7 +1164,31 @@ exceptions, via `.cargo/audit.toml`. Current state after this pass:
     `0.26.11`, no patched release in that line. Same exposure logic
     as the rest of the subgraph: Discord websocket TLS only.
 
-### Serenity/poise migration plan (clears the six accepted advisories)
+### Voice-lane block (songbird 0.6.1 subtree, 2026-10-21)
+
+The Discord voice lane (§ «Discord voice lane») brought songbird 0.6.1
+and with it nine advisories, accepted the day they tripped the CI gate:
+
+- **Eight libcrux-* (aesgcm/chacha20poly1305/kem/secrets/sha3, 0209
+  0211 0124 0330 0331 0212 0207 0208):** all inside `davey`, the
+  Discord DAVE end-to-end-encryption MLS stack songbird links
+  UNCONDITIONALLY (verified: `cargo tree -e features -i davey` — no
+  feature removes it). The shipped voice config never turns MLS/DAVE
+  on — plain transport encryption only — so davey is dormant linked
+  code, and none of those code paths (HPKE encapsulation, MLS
+  handshake, SHAKE squeeze) execute. The fixes are 0.0.x renames
+  (`libcrux-aesgcm → libcrux-aes`) and ≥0.0.10 jumps blocked by
+  openmls_rust_crypto's pinned `hpke-rs 0.6` — unreachable without an
+  upstream songbird release; revisit then.
+- **ringbuf 0.4.8 (RUSTSEC-2026-0293):** double-free requires an
+  element whose `Drop` panics while `Consumer::skip`/`clear` runs; the
+  bot's rings hold pods (`[u8; 16]`, `[f32; 2]`, no Drop), so the
+  precondition is unreachable in our code. Fix blocked: songbird pins
+  the 0.4 API.
+
+Both facts were checked against the resolved tree, not assumed. The
+`.cargo/audit.toml` voice-lane block holds the entries with the same
+revisit trigger (next songbird release): delete it then.
 
 Verified upstream facts (2026-10-15): **serenity 0.13 does not exist
 yet** — 0.12.5 (2025-12-20) is the newest release and it pins
