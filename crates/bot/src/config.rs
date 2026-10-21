@@ -133,6 +133,11 @@ pub struct BotConfig {
     /// converse.rs): attachment transcripts fire-and-forget into the
     /// /recall-able private memory. Default on.
     pub memory: crate::converse::MemoryConfig,
+    /// Voice lane (`[voice]` in bot.toml, see voice.rs): the always-on
+    /// Discord VC listener — songbird transport + Gemini Live WS dialog
+    /// with parallel transcribe captions. Default OFF (live room audio
+    /// must never start by accident).
+    pub voice: crate::voice::VoiceConfig,
     /// Multi-bot coordination (`[coordinator]` in bot.toml, see
     /// coordinator.rs): named worker loops claiming the mesh hand-off
     /// channel with per-worker model routing. Default on — loops only
@@ -513,6 +518,11 @@ impl BotConfig {
                 a
             },
             memory: file.memory.unwrap_or_default(),
+            voice: {
+                let mut v = file.voice.clone().unwrap_or_default();
+                v.clamp();
+                v
+            },
             external_plugins,
             coordinator: file.coordinator.clone().unwrap_or_default(),
             workflows: {
@@ -593,6 +603,7 @@ impl BotConfig {
             video: crate::video::VideoConfig::default(),
             audio: crate::audio::AudioConfig::default(),
             memory: crate::converse::MemoryConfig::default(),
+            voice: crate::voice::VoiceConfig::default(),
             coordinator: CoordinatorBotConfig::default(),
             workflows: WorkflowsConfig::default(),
             approvals: crate::approval::ApprovalConfig::default(),
@@ -880,6 +891,9 @@ struct FileConfig {
     /// Optional `[memory]` table — node-memory indexing knobs (see
     /// converse.rs; absent = defaults).
     memory: Option<crate::converse::MemoryConfig>,
+    /// Optional `[voice]` table — the always-on VC lane (voice.rs;
+    /// absent = disabled defaults).
+    voice: Option<crate::voice::VoiceConfig>,
     /// Optional `[coordinator]` table — named-worker loops (see coordinator.rs).
     coordinator: Option<CoordinatorBotConfig>,
     /// Optional `[workflows]` table — browser record/replay (workflows.rs).

@@ -1539,3 +1539,44 @@ now recallable without re-uploading it:
 Tests: extraction honesty (speech-only, absence/failure skipped, frame
 notes excluded), note cap totals, config default + knob. Suite 244
 green, clippy `-D warnings` 0.
+
+## 23. Discord voice lane — always-on VC + Gemini Live (2026-10-21)
+
+`crates/bot/src/voice.rs` + `[voice]` in bot.toml — the bot takes a
+ONLY-by-config seat in a Discord voice channel (guild + channel ids)
+and holds a real-time conversation:
+
+- **Transport split**: songbird 0.6 (default-features OFF, explicit
+  `driver/gateway/rustls/serenity/tungstenite/receive` — the workspace
+  rustls=ring pin respected) handles ONLY the Discord voice transport;
+  the Gemini side rides the tokio-tungstenite stack already in the
+  tree. songbird's own receive pipeline delivers DECODED per-user PCM
+  (`VoiceData.decoded_voice`, jitter-buffered stereo 48k) — no local
+  opus decoder to maintain.
+- **Dialog lane** (`gemini-3.8-live`, the v1beta BidiGenerateContent
+  WSS): room audio downmixed 48k→16k (honest 3-fold average, cheap LP
+  for speech) and pushed as `realtimeInput` PCM in 40 ms quanta; model
+  audio returns 24 kHz mono → ×2 upsample → 48 kHz stereo f32 ring →
+  the mixer reference (RawAdapter as a blocking symphonia MediaSource —
+  get-no-bytes-because-mixer-zero-fill lessons pinned in unit tests).
+  Barge-in = the model's own VAD: `interrupted` drains the ring.
+- **Captions lane** (parallel `gemini-3.5-transcribe-live` WSS on the
+  SAME broadcast room stream): diarized input transcriptions sink into
+  the /recall memory lane (bounded `memory.embed` notes, archiver
+  convention) and — when `[voice] captions_channel_id` is set — post
+  live to a text channel via the parked http handle.
+- **Caps + honesty**: one wall-time cap (`session_max_minutes`,
+  clamp 5–120, default 30) re-establishes BOTH sessions together; a
+  room studio (goAway/error) restarts supervised, never a crash; the
+  key is never logged and never committed (parked in bot.toml 0600
+  from the operator's litellm config at setup); `[voice] enabled`
+  defaults false — live room capture is opt-in always.
+- **Persona into voice**: the first 1200 characters of the system
+  prompt seed the Live systemInstruction (spoken-to, not written-at;
+  long rules degrade realtime).
+
+Tests: 10 units (config honesty + clamps, WS/URL shape, setup JSON
+shapes for both lanes, DSP bridges both directions, play-ring pair
+decode with an exact power-of-two f32 comparison). Suite 254 green,
+clippy `-D warnings` 0. Live-fire (a human voice in the VC) is the
+operator's next hop.

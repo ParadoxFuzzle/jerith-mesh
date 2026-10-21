@@ -47,6 +47,14 @@ webpki-roots = "1.0"
 # Webhook in-box (webinbox.rs): the loopback listener the push-only
 # platforms route through (Teams, Google Chat, WhatsApp, Slack Events).
 axum.workspace = true
+# Discord voice (voice.rs): the always-on VC lane — songbird only for
+# the transport driver + opus codec; the Gemini Live side rides the
+# tokio-tungstenite stack already in the tree. Features chosen
+# explicitly at the workspace level, provider pin respected.
+songbird.workspace = true
+# songbird's EventHandler is an #[async_trait] trait; our custom
+# VoiceTick capture handler needs the attribute for its own impl.
+async-trait = "0.1"
 
 [dev-dependencies]
 # Mock gateway for the chat tool-loop test (web skills integration).

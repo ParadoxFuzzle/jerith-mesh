@@ -801,6 +801,7 @@ mod tests {
             video: Default::default(),
             audio: Default::default(),
             memory: Default::default(),
+            voice: Default::default(),
             coordinator: crate::config::CoordinatorBotConfig::default(),
             workflows: crate::config::WorkflowsConfig::default(),
             approvals: crate::approval::ApprovalConfig::default(),

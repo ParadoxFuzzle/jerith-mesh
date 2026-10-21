@@ -36,6 +36,7 @@ mod squeeze;
 mod state;
 mod transports;
 mod video;
+mod voice;
 mod workflows;
 mod workspace;
 
@@ -243,6 +244,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let intents = serenityall::GatewayIntents::non_privileged();
+    // Voice lane (voice.rs): songbird installs into the client builder
+    // (voice side of Discord); the lane itself spawns post-ready when
+    // `[voice]` says so. No-op otherwise.
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![
@@ -293,6 +297,9 @@ async fn main() -> anyhow::Result<()> {
                 approval::set_discord_http(ctx.http.clone());
                 approval::start_sweeper();
                 approval::start_telegram_poller();
+                // Voice lane captions surface (voice.rs): the http handle
+                // for the optional `[voice] captions_channel_id` posts.
+                voice::set_captions_http(ctx.http.clone());
                 // Discord thread archiver (OpenClaw skill port): an
                 // operator-configured background ingest — no commands, no
                 // system-level change; subscribed in bot.toml [archiver].
@@ -301,6 +308,29 @@ async fn main() -> anyhow::Result<()> {
                 if cfg.archiver.enabled {
                     let archiving = cfg.clone();
                     tokio::spawn(archiver::run_loop(archiving));
+                }
+                // Voice lane (voice.rs): always-on seat in the configured
+                // VC when `[voice] enabled = true` (default OFF). The
+                // songbird manager is already installed via register();
+                // get() just yields the Arc from the type map.
+                if cfg.voice.runnable() {
+                    match songbird::get(ctx).await {
+                        Some(manager) => {
+                            let lane_cfg = cfg.clone();
+                            let seed = cfg.system_prompt.clone();
+                            tokio::spawn(voice::run_lane(manager, lane_cfg, seed));
+                        }
+                        None => {
+                            tracing::error!(
+                                "songbird manager missing from the client — voice lane off"
+                            );
+                        }
+                    }
+                } else if cfg.voice.enabled {
+                    tracing::warn!(
+                        channel = cfg.voice.channel_id.unwrap_or(0),
+                        "voice enabled but not runnable (ids/key/model missing) — lane stays off"
+                    );
                 }
                 // Monitor scaffold (OpenClaw ops-monitor port): periodic
                 // checks with a single owner DM when something fails.
@@ -321,9 +351,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .build();
 
-    let mut client = serenityall::ClientBuilder::new(token, intents)
-        .framework(framework)
-        .await?;
+    let mut client =
+        songbird::register(serenityall::ClientBuilder::new(token, intents).framework(framework))
+            .await?;
     client.start().await?;
     Ok(())
 }

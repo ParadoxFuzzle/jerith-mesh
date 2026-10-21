@@ -1582,3 +1582,35 @@ message; transcripts warm the extraction cache.
   log trace all day because refusal lines lived only in the model's
   context. Over-cap sandbox files also get honest `skipped: N files per
   message…` lines instead of a "pending" that never pends.
+
+## Discord voice lane (config-opt-in, code live 2026-10-21)
+
+FEATURES §23 / `crates/bot/src/voice.rs` — an always-on `songbird` seat
+in one voice channel running a Gemini Live dialog WSS (downmixed room
+16 kHz in, model TTS into the mixer reference) plus a parallel
+transcribe-live WSS feeding /recall notes and optional live captions.
+NOT for voice NOTES — those stay on the audio attachment lane above.
+
+- **It is OFF until configured**: `[voice] enabled = false` is the code
+  default. Turn it on in bot.toml with `enabled = true`,
+  `guild_id`/`channel_id` (the join targets),
+  `gemini_api_key` (parked 0600, never logged), and — if wanted —
+  `captions_channel_id` (live caption posts). Without the key the lane
+  mistrusts startup with an honest journal line.
+- **Knobs**: `model` (gemini-3.8-live dialog / gemini-3.5-transcribe-live
+  transcript), `session_max_minutes` clamp 5–120 default 30 — ONE
+  wall-time cap re-establishes BOTH sessions together (never one leg
+  alone), `max_caption_len` (default 400), `memory.turn_note_max`
+  (bounded /recall notes).
+- **Watch in the journal** (INFO level): `voice lane enabled — joining …`,
+  `voice: dialog connected`, `voice: captions connected`,
+  `voice: session cap reached — re-establishing`; WARN-
+  level `voice: room went away (goAway|error) — restart supervised`
+  is normal server-side churn and MUST NOT escalate to a bot crash.
+- **Live-fire is the operator's hop**: the automated suite (10 voice
+  units: config honesty + clamps, WS/URL shapes, setup JSON both
+  lanes, DSP bridges, play-ring pair decode) can't speak; a human
+  voice in the VC is what proves the round trip end-to-end.
+- **Revert**: `[voice] enabled = false` (or delete the section) leaves
+  the bot exactly as before — no voice code starts unless the section
+  says so.
