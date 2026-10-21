@@ -1522,6 +1522,17 @@ message; transcripts warm the extraction cache.
   -- --ignored --nocapture` — generates a real sine-tone mp3 and runs
   the whole lane on the host toolchain + real whisper (pinned to the
   honest empty-transcript shape).
+- **Model bump, live 2026-10-21**: `[audio]`/`[video]` in the live
+  bot.toml now run whisper `base` (was the code default `tiny`) with
+  `whisper_timeout_secs = 900` (was default 600) so a 600-s clip at
+  base's ~2× rate always fits. Measured on-box: base.pt warmed by the
+  lane's exact argv shape; a 6-s tone 23.7 s cold / 5.3 s warm; truth
+  probe on real speech (openai-whisper's jfk.flac, 11 s, ~5 s run):
+  base = word-perfect WITH punctuation, tiny = near-perfect without —
+  so the honest claim is "not worse on clean speech, better on noisy
+  notes". The espeak synthetic probe misheard with BOTH models —
+  robot voice, not a whisper tier issue. Revert: delete the two
+  sections (defaults fall back to tiny/600).
 - **Deployment trap (found live 2026-10-21)**: both lanes resolve bare
   bin names from the PROCESS PATH, and a systemd --user service runs a
   NARROWER PATH than a login shell — `~/.local/bin` (where
