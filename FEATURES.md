@@ -1575,10 +1575,24 @@ and holds a real-time conversation:
   prompt seed the Live systemInstruction (spoken-to, not written-at;
   long rules degrade realtime).
 
-Tests: 10 units (config honesty + clamps, WS/URL shape, setup JSON
+- **Operator surfaces** (2026-10-21): `/status` always carries one
+  honest voice line about the LIVE seat (in-VC · dialogue model ·
+  session age · `captions on <#chan>`/off; config-off, seat-failed, or
+  left states name themselves), and `/voiceleave` (owner-DM only via
+  the default-deny gate, like /timeout) stops the lane until the next
+  bot restart — the Leave switch is watched on a one-second tick, so
+  the Live sessions close within the second instead of riding out the
+  rest of a session that can run up to 30 min; a second call (or one
+  before the lane ever ran) answers with the restart honesty instead
+  of pretending. Rejoining without a restart is deliberately absent:
+  rejoin-ability is the restart path, one honest control.
+
+Tests: 11 units (config honesty + clamps, WS/URL shape, setup JSON
 shapes for both lanes, DSP bridges both directions, play-ring pair
-decode with an exact power-of-two f32 comparison) plus one ignored
-live `ws` probe harness. Suite 254 green, clippy `-D warnings` 0.
+decode with an exact power-of-two f32 comparison, runtime-state
+honesty for /status + /voiceleave in every process state) plus one
+ignored live `ws` probe harness. Suite 256 green (bot bin), clippy
+`-D warnings` 0.
 
 Live-fire against the real endpoint happened the same day — four
 wire-level lessons, each now pinned where it bit:

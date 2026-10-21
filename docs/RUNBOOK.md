@@ -1632,9 +1632,20 @@ NOT for voice NOTES — those stay on the audio attachment lane above.
   the healthy startup sequence. WARN `server closed the session` carries
   the model + close code + reason verbatim. `session cap reached`
   (every 30 min default) re-establishes both legs together.
-- **Live-fire is the operator's hop**: the automated suite (10 voice
+- **Operator leaves + status (2026-10-21)**: `/status` ends with one
+  honest line about the LIVE seat (in-VC · model · session age ·
+  captions target) — or `not running` / `joining…` / `left by operator`
+  as the process state actually is. `/voiceleave` (owner-DM only, same
+  default-deny gate as /timeout) flips the stop switch: the Live
+  sessions close within a second (one-second watch tick, not at the
+  next cycle boundary), the seat leaves via the same songbird manager,
+  and the lane stays out until the next bot restart (`rejoin` =
+  restart, deliberately). Journal lines to expect: `voice left on
+  operator request` (or a honest WARN if the seat was already gone).
+- **Live-fire is the operator's hop**: the automated suite (11 voice
   units: config honesty + clamps, WS/URL shapes, setup JSON both
-  lanes, DSP bridges, play-ring pair decode) can't speak; a human
+  lanes, DSP bridges, play-ring pair decode, runtime-state honesty
+  for /status + /voiceleave) can't speak; a human
   voice in the VC is what proves the round trip end-to-end. The
   wire-level lessons already learned live (2026-10-21, FEATURES §23
   has the detail): `?model=` is rejected (setup carries the model),

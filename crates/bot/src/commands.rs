@@ -250,8 +250,15 @@ pub async fn status(ctx: Ctx<'_>) -> Result<(), Error> {
     ctx.defer().await?;
     let st = api::gateway_status(&ctx.data().cfg).await?;
     let your_tokens = ctx.data().state.tokens_used(user_id(&ctx));
-    ctx.say(format_status_with_tokens(&st, Some(your_tokens)))
-        .await?;
+    // The voice lane line rides the same reply: one honest line about
+    // the LIVE seat (in-VC, model, session age, captions) — or the
+    // config-off / left-by-operator state.
+    ctx.say(format!(
+        "{}\n{}",
+        crate::voice::status_line(),
+        format_status_with_tokens(&st, Some(your_tokens))
+    ))
+    .await?;
     Ok(())
 }
 
@@ -626,6 +633,22 @@ pub async fn timeout(
         member.communication_disabled_until,
     ))
     .await?;
+    Ok(())
+}
+
+/// Stop the voice lane until the next bot restart (owner-DM only).
+///
+/// Deliberately unclassified in owner.rs's USER_COMMANDS, like /timeout:
+/// the default-deny gate makes it owner-DM only (system-level action —
+/// the seat affects the whole room). Rejoining without a restart is
+/// deliberately absent; rejoin-ability is the restart path (one honest
+/// control).
+#[poise::command(slash_command, prefix_command)]
+pub async fn voiceleave(ctx: Ctx<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    let reply = crate::voice::request_leave_by_op();
+    tracing::info!("/voiceleave invoked — lane stop requested by operator");
+    ctx.say(reply).await?;
     Ok(())
 }
 

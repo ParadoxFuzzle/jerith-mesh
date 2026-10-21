@@ -273,6 +273,9 @@ async fn main() -> anyhow::Result<()> {
                 // owner.rs's USER_COMMANDS: the default-deny gate makes
                 // it owner-DM only (system-level action).
                 commands::timeout(),
+                // Same unclassified → owner-DM-only treatment as /timeout:
+                // stops the always-on voice lane until the next restart.
+                commands::voiceleave(),
                 commands::help(),
             ],
             event_handler: |ctx, event| Box::pin(chat_fallback::handle(ctx, event)),

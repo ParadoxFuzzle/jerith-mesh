@@ -336,6 +336,7 @@ pub async fn run_lane(
     let vcfg = cfg.voice.clone();
     let guild = serenall::GuildId::new(vcfg.guild_id.unwrap());
     let channel = serenall::ChannelId::new(vcfg.channel_id.unwrap());
+    lane_started(&vcfg.model, vcfg.captions_channel_id);
     // The persona seeds the Live systemInstruction only in its head:
     // the model is spoken-to, not written-at; long rules degrade realtime.
     let seed: Option<String> = system_prompt
@@ -352,10 +353,12 @@ pub async fn run_lane(
         match tokio::time::timeout(Duration::from_secs(25), manager.join(guild, channel)).await {
             Ok(Ok(call)) => call,
             Ok(Err(e)) => {
+                lane_stopped();
                 tracing::error!(error = %e, "voice join failed — lane off until next boot");
                 return;
             }
             Err(_) => {
+                lane_stopped();
                 tracing::error!("voice join timed out — lane off until next boot");
                 return;
             }
@@ -381,18 +384,36 @@ pub async fn run_lane(
     let (cap_tx, cap_rx) = broadcast::channel::<String>(256);
     tokio::spawn(caption_worker(cfg.clone(), cap_rx));
     spawn_capture(&mut call, audio_tx.clone());
+    lane_halfway(true);
     loop {
-        let res = tokio::join! {
-            supervise_dialog(
-                cfg.clone(),
-                vcfg.clone(),
-                audio_tx.subscribe(),
-                playback.clone(),
-                cap_tx.clone(),
-                seed.as_deref(),
-            ),
-            supervise_captions(cfg.clone(), vcfg.clone(), audio_tx.subscribe(), cap_tx.clone()),
+        // The stop switch is watched on a one-second tick so /voiceleave
+        // takes effect promptly (the Live sessions die within the
+        // second, not at the next cycle boundary — a session under the
+        // cap runs up to a half hour). The seat leaves through the SAME
+        // manager the lane joined with.
+        let res = tokio::select! {
+            biased;
+            _ = watch_for_op_leave() => {
+                honor_leave_if_requested(&manager, guild).await;
+                return;
+            }
+            res = async {
+                tokio::join! {
+                    supervise_dialog(
+                        cfg.clone(),
+                        vcfg.clone(),
+                        audio_tx.subscribe(),
+                        playback.clone(),
+                        cap_tx.clone(),
+                        seed.as_deref(),
+                    ),
+                    supervise_captions(cfg.clone(), vcfg.clone(), audio_tx.subscribe(), cap_tx.clone()),
+                }
+            } => res,
         };
+        if honor_leave_if_requested(&manager, guild).await {
+            return;
+        }
         match res.0 {
             Ok(()) => tracing::warn!("dialog session ended — restarting under caps"),
             Err(e) => tracing::error!(error = %e, "dialog session error — restarting"),
@@ -715,6 +736,138 @@ fn cfg_vc_model(vcfg: &VoiceConfig) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// Operator-facing runtime state: one honest /status line and a stop
+// switch (/voiceleave). This is the LIVE state; `[voice]` in bot.toml
+// stays the intent. Zero-config conversations (no /status yet, no
+// lane) still get honest strings off the same process globals.
+// ---------------------------------------------------------------------------
+
+pub struct VoiceRuntimeState {
+    /// The lane cycle is alive (config-run + post-ready spawn).
+    running: AtomicBool,
+    /// The seat is actually taken (join succeeded).
+    in_vc: AtomicBool,
+    /// /voiceleave: the cycle stops and the bot stays out until the
+    /// next restart (rejoin without a restart is deliberately absent
+    /// — joining back is the restart path, one honest control).
+    left_by_op: AtomicBool,
+    dialog_model: Mutex<String>,
+    captions_channel: Mutex<Option<u64>>,
+    session_started: Mutex<Option<std::time::Instant>>,
+}
+
+static VOICE_RT: std::sync::OnceLock<VoiceRuntimeState> = std::sync::OnceLock::new();
+
+fn rt() -> &'static VoiceRuntimeState {
+    VOICE_RT.get_or_init(|| VoiceRuntimeState {
+        running: AtomicBool::new(false),
+        in_vc: AtomicBool::new(false),
+        left_by_op: AtomicBool::new(false),
+        dialog_model: Mutex::new(String::new()),
+        captions_channel: Mutex::new(None),
+        session_started: Mutex::new(None),
+    })
+}
+
+fn lane_started(model: &str, captions_channel: Option<u64>) {
+    let r = rt();
+    r.running.store(true, Ordering::Relaxed);
+    r.in_vc.store(false, Ordering::Relaxed);
+    *r.dialog_model.lock().unwrap() = model.to_string();
+    *r.captions_channel.lock().unwrap() = captions_channel;
+    *r.session_started.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+fn lane_halfway(state: bool) {
+    rt().in_vc.store(state, Ordering::Relaxed);
+}
+
+fn lane_stopped() {
+    let r = rt();
+    r.running.store(false, Ordering::Relaxed);
+    r.in_vc.store(false, Ordering::Relaxed);
+    *r.session_started.lock().unwrap() = None;
+}
+
+/// The one /status line. Honest in every state the process can be in.
+pub fn status_line() -> String {
+    let r = rt();
+    if r.left_by_op.load(Ordering::Relaxed) {
+        return "voice: left by operator — restart the bot to rejoin".to_string();
+    }
+    if !r.running.load(Ordering::Relaxed) {
+        return "voice: 💤 not running (config-off, or the seat failed to open)".to_string();
+    }
+    if !r.in_vc.load(Ordering::Relaxed) {
+        return "voice: 🔁 lane up — joining the voice channel…".to_string();
+    }
+    let model = r.dialog_model.lock().unwrap().clone();
+    let captions = match *r.captions_channel.lock().unwrap() {
+        Some(chan) => format!("captions on <#{chan}>"),
+        None => "captions off".to_string(),
+    };
+    let age = match *r.session_started.lock().unwrap() {
+        Some(t) => {
+            let s = t.elapsed().as_secs();
+            let min = s / 60;
+            let sec = s % 60;
+            if min > 0 {
+                format!(" · {min}m{sec:02}s this session")
+            } else {
+                format!(" · {sec}s this session")
+            }
+        }
+        None => String::new(),
+    };
+    format!("voice: 🔊 in VC · {model}{age} · {captions}")
+}
+
+/// /voiceleave: the honest verdict for the invoking message.
+pub fn request_leave_by_op() -> String {
+    let r = rt();
+    if r.left_by_op.load(Ordering::Relaxed) || !r.running.load(Ordering::Relaxed) {
+        return "the voice lane is not running (or already left) — restart the bot to rejoin"
+            .to_string();
+    }
+    r.left_by_op.store(true, Ordering::Relaxed);
+    "leaving the voice channel now — it stays out until the next bot restart".to_string()
+}
+
+/// The lane's cycle tests the stop switch and (when set) leaves the VC
+/// through the SAME manager it joined with.
+async fn honor_leave_if_requested(
+    manager: &Arc<songbird::Songbird>,
+    guild: serenall::GuildId,
+) -> bool {
+    if !rt().left_by_op.load(Ordering::Relaxed) {
+        return false;
+    }
+    match tokio::time::timeout(Duration::from_secs(5), manager.leave(guild)).await {
+        Ok(Ok(())) => tracing::info!("voice left on operator request — out until the next restart"),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "voice leave after operator request errored (seat may already be gone)")
+        }
+        Err(_) => tracing::warn!(
+            "voice leave timed out — Discord will drop the seat on its own; lane stopped"
+        ),
+    }
+    lane_stopped();
+    true
+}
+
+/// One-second tick until the operator's leave lands (or forever while
+/// the seat stays normal — the lane's cycle poll is the primary stop
+/// path; this tick only bounds the WAIT).
+async fn watch_for_op_leave() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if rt().left_by_op.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Captions sink: journal now, optional Discord channel knob reserved,
 // and the same memory lane the archiver + transcript hook ride.
 // ---------------------------------------------------------------------------
@@ -771,6 +924,44 @@ mod tests {
             gemini_api_key: "TESTKEY".to_string(),
             ..Default::default()
         }
+    }
+
+    /// /status + /voiceleave read process-global runtime state, so the
+    /// state-shape tests serialize on one mutex.
+    static RT_SEQUENCER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_rt() {
+        rt().running.store(false, Ordering::Relaxed);
+        rt().in_vc.store(false, Ordering::Relaxed);
+        rt().left_by_op.store(false, Ordering::Relaxed);
+        *rt().session_started.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn status_line_is_honest_in_every_runtime_state() {
+        let _g = RT_SEQUENCER.lock().unwrap();
+        reset_rt();
+        assert!(crate::voice::status_line().contains("not running"));
+        lane_started("glm-5.3-live", Some(42));
+        assert!(crate::voice::status_line().contains("joining"));
+        lane_halfway(true);
+        let live = crate::voice::status_line();
+        assert!(live.contains("in VC") && live.contains("glm-5.3-live"));
+        assert!(live.contains("captions on <#42>"));
+        // The leave switch: once set, status flips to `left` and a
+        // second request is refused with the restart honesty.
+        let first = request_leave_by_op();
+        assert!(first.contains("leaving"));
+        assert!(crate::voice::status_line().contains("left by operator"));
+        assert!(request_leave_by_op().contains("restart"));
+        reset_rt();
+    }
+
+    #[test]
+    fn request_leave_when_lane_never_started_is_the_restart_honesty() {
+        let _g = RT_SEQUENCER.lock().unwrap();
+        reset_rt();
+        assert!(request_leave_by_op().contains("not running"));
     }
 
     #[test]
