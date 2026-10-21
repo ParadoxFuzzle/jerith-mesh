@@ -1626,3 +1626,19 @@ slack/twitch/mattermost transports ride the same fixed stack).
 A human voice in the VC is the last hop: the automated suite cannot
 speak. Manual try: join the configured VC, talk, listen for the model,
 check /recall notes and the (optional) captions channel.
+
+**Seat-hold watcher** (2026-10-21, after an observed silent drop): a
+live seat can be lost between boot's join and the WSS lanes' view —
+the day's evidence was the bot disappearing from the VC roster while
+the journal carried NOTHING (no error, no leave line; the voice
+sessions themselves never noticed). The lane therefore spawns a
+seat-hold watcher: every 15 s it asks the parked call handle for its
+live connection state (songbird `current_connection`, None = no voice
+connection), journals the loss honestly, and re-joins the configured
+channel through the SAME manager — the `Call` keeps its playback ring
+and capture events across a rejoin, so the mixer and room fan-out ride
+straight through. Retries while out run on a ~30 s cadence; `re-join
+requested` is logged but the NEXT cadence's poll is the verdict (the
+truth line is `voice seat back (driver reconnected)`). /voiceleave
+exits the watcher — an operator stop is a full stop; the watcher only
+repairs incidental drops.

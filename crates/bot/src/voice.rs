@@ -384,7 +384,20 @@ pub async fn run_lane(
     let (cap_tx, cap_rx) = broadcast::channel::<String>(256);
     tokio::spawn(caption_worker(cfg.clone(), cap_rx));
     spawn_capture(&mut call, audio_tx.clone());
+    // The boot guard is done: the watcher (and nothing else) locks the
+    // call mutex from here on.
+    drop(call);
     lane_halfway(true);
+    // Seat-hold watcher: joins happen at boot, but the live seat can be
+    // lost silently later (observed 2026-10-21: the bot vanished from
+    // the VC roster while the journal stayed convinced everything was
+    // healthy — no line, no error). Watch the connection and repair.
+    tokio::spawn(seat_watch(
+        manager.clone(),
+        guild,
+        channel,
+        call_lock.clone(),
+    ));
     loop {
         // The stop switch is watched on a one-second tick so /voiceleave
         // takes effect promptly (the Live sessions die within the
@@ -853,6 +866,55 @@ async fn honor_leave_if_requested(
     }
     lane_stopped();
     true
+}
+
+/// Seat-hold watcher (always-on lane boot duty): every 15 s ask the
+/// parked call handle for its live connection state — songbird's
+/// `current_connection` is None exactly when the driver has no voice
+/// connection. A lost seat is journaled (the elusiveness this fixes:
+/// nothing else in the stack logs it) and re-joined through the SAME
+/// manager against the configured channel. No rewiring is required:
+/// the `Call` keeps its playback ring and capture events across a
+/// re-join, so the mixer and room fan-out ride straight through.
+/// /voiceleave (left_by_op) exits the watcher — an operator stop is a
+/// FULL stop; the watcher only repairs incidental drops. Retry cadence
+/// while out: ~30 s (15 s sleep + up-to-25 s join attempt).
+async fn seat_watch(
+    manager: Arc<songbird::Songbird>,
+    guild: serenall::GuildId,
+    channel: serenall::ChannelId,
+    call_lock: Arc<tokio::sync::Mutex<songbird::Call>>,
+) {
+    let mut seated = true;
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if rt().left_by_op.load(Ordering::Relaxed) {
+            return;
+        }
+        let connected = call_lock.lock().await.current_connection().is_some();
+        if connected {
+            if !seated {
+                lane_halfway(true);
+                seated = true;
+                tracing::info!("voice seat back (driver reconnected)");
+            }
+            continue;
+        }
+        if seated {
+            seated = false;
+            lane_halfway(false);
+            tracing::warn!("voice seat lost (driver has no voice connection) — rejoining");
+        }
+        match tokio::time::timeout(Duration::from_secs(25), manager.join(guild, channel)).await {
+            // Ok only means the re-join was REQUESTED; the next cadence's
+            // connection poll carries the honest verdict (seat back / still lost).
+            Ok(Ok(_)) => tracing::info!("voice seat re-join requested — verdict on next cadence"),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "voice seat re-join failed — retrying next cadence")
+            }
+            Err(_) => tracing::warn!("voice seat re-join timed out — retrying next cadence"),
+        }
+    }
 }
 
 /// One-second tick until the operator's leave lands (or forever while

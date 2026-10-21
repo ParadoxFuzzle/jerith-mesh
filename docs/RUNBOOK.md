@@ -1632,6 +1632,18 @@ NOT for voice NOTES — those stay on the audio attachment lane above.
   the healthy startup sequence. WARN `server closed the session` carries
   the model + close code + reason verbatim. `session cap reached`
   (every 30 min default) re-establishes both legs together.
+- **Seat-hold watcher (added 2026-10-21)**: the live seat can be lost
+  silently — observed live that day as the bot dropping out of the VC
+  roster while the journal carried no line at all (voice sessions never
+  noticed). The lane now spawns a watcher (15 s cadence) that polls the
+  parked call handle's `current_connection`; None = seat lost → WARN
+  `voice seat lost` + automatic re-join of the configured channel
+  through the same manager (ring + capture events ride through the
+  rejoin, no rewiring). Lines to know: WARN `voice seat lost` first,
+  INFO `voice seat re-join requested`, then the verdict — INFO `voice
+  seat back (driver reconnected)` or another WARN while it retries
+  (~30 s cadence while out). /voiceleave disables the watcher: an
+  operator stop stays stopped.
 - **Operator leaves + status (2026-10-21)**: `/status` ends with one
   honest line about the LIVE seat (in-VC · model · session age ·
   captions target) — or `not running` / `joining…` / `left by operator`
