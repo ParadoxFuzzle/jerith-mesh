@@ -753,8 +753,10 @@ mod tests {
 
     #[test]
     fn clamp_binds_session_minutes() {
-        let mut c = VoiceConfig::default();
-        c.session_max_minutes = 1;
+        let mut c = VoiceConfig {
+            session_max_minutes: 1,
+            ..VoiceConfig::default()
+        };
         c.clamp();
         assert_eq!(c.session_max_minutes, 5);
         c.session_max_minutes = 9_999;
