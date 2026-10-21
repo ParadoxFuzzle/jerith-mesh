@@ -3423,9 +3423,15 @@ mod tests {
             send.write_all(&payload).await.ok();
             let _ = send.finish();
             // Bounded reply: reply bytes may stream, then Closed or
-            // Errored — every path but a hang is acceptable.
+            // Errored — every path but a hang is acceptable. 8 s (was
+            // 3): the same loaded-macOS-runner math as the redial bound
+            // below (its comment, CI 2026-10-20) — a fuzz storm of 150
+            // frames keeps the server legitimately busy, and a slow-
+            // but-alive reply rode past the old 3 s window mid-storm
+            // (run 39515011160). A genuinely wedged stream still fails:
+            // the bound is real, just headroomed like the redials.
             let end =
-                tokio::time::timeout(Duration::from_secs(3), read_recv_to_end(&mut recv)).await;
+                tokio::time::timeout(Duration::from_secs(8), read_recv_to_end(&mut recv)).await;
             assert!(
                 end.is_ok(),
                 "frame {frame} ({} bytes) wedged the stream — wrong",

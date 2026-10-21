@@ -1021,6 +1021,14 @@ Known remaining limitations (accepted, bounded):
   attempt and flip candidate selection. Test timeouts are now 5 s and
   the suite verifies green 3/3 under 2× CPU overcommit; no production
   behaviour involved.
+- ~~macOS CI flake family (test-side timing, 2026-10-20/21)~~ FIXED:
+  three test-side races, each cause-repaired, no assertions weakened:
+  `quic` fuzz reply bound 3→8 s (a 150-frame storm legitimately keeps
+  the server busy; same loaded-runner math as its own redial bound,
+  which went 5→10 s), `bootstrap_server` TTL test fresh-read window
+  50→300 ms (the read raced axum serve startup inside the TTL), and
+  `lore` vault dir was shared per-pid so parallel test threads rewrote
+  each other's files mid-read (unique temp dir per call now).
 
 
 
