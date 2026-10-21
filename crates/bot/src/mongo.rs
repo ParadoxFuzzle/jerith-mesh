@@ -304,4 +304,68 @@ mod tests {
             .unwrap();
         println!("Atlas pinged OK (cluster reachable, credentials good)");
     }
+
+    /// LIVE mirror smoke — maintenance-only, #[ignore]: the REAL
+    /// bot.toml `[mongo]` lane driven through the full write→read→delete
+    /// contract (ping alone proves reachability, not the write path).
+    /// Cleans up after itself: the cluster is left spotless. Same
+    /// harness contract as atlas_ping:
+    ///   JERITH_DISCORD_TOKEN=x cargo test -p jerith-mesh-bot \
+    ///     mongo::tests::mirror_live_roundtrip -- --ignored --exact --nocapture
+    #[tokio::test]
+    #[ignore = "writes + deletes one note on the real MongoDB Atlas cluster"]
+    async fn mirror_live_roundtrip() {
+        let cfg = BotConfig::load()
+            .context("loading the real bot.toml")
+            .unwrap();
+        assert!(
+            cfg.mongo.enabled,
+            "[mongo] must be enabled for the live smoke"
+        );
+        init(&cfg.mongo).await;
+        let h = handle().expect("handle must be live after init of a healthy cluster");
+        assert_eq!(h.database, cfg.mongo.database);
+
+        let id = format!(
+            "mirror-smoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let text = "mirror smoke: write-path roundtrip marker (safe to forget)";
+        mirror_note(&id, text)
+            .await
+            .expect("mirror write must succeed");
+        // Read back through the same collection contract (search_notes
+        // rides $text ranking — a lone doc reads by _id here).
+        let back = h
+            .client
+            .database(&h.database)
+            .collection::<mongodb::bson::Document>(MIRROR_COLLECTION)
+            .find_one(mongodb::bson::doc! { "_id": &id })
+            .await
+            .context("mirror read-back")
+            .unwrap()
+            .expect("the smoke note must exist after the write");
+        assert_eq!(back.get_str("_id").unwrap(), id);
+        assert_eq!(back.get_str("text").unwrap(), text);
+        // Leave the cluster exactly as we found it.
+        let deleted = h
+            .client
+            .database(&h.database)
+            .collection::<mongodb::bson::Document>(MIRROR_COLLECTION)
+            .delete_one(mongodb::bson::doc! { "_id": &id })
+            .await
+            .context("mirror cleanup")
+            .unwrap();
+        assert_eq!(
+            deleted.deleted_count, 1,
+            "cleanup deletes exactly the smoke note"
+        );
+        println!(
+            "mirror round-trip OK (write → read → delete) database={}",
+            h.database
+        );
+    }
 }

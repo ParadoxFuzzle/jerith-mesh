@@ -1299,7 +1299,7 @@ platforms write their logs under the shared tracing names
 `transport failed permanently` only on a config-level fatal — service
 blips fan back internally with backoff.
 
-## MongoDB Atlas lane (native driver, OFF pending credential fix — 2026-10-19)
+## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is
 complete and tested (driver 3.x: rustls + dns-resolver + zlib-compression
@@ -1309,10 +1309,25 @@ and a failure there is NO fatality (typed log, lane off, bot continues:
 the 2026-10-19 crash-loop from a block_on-inside-runtime calling hole
 was fixed to an awaited async init the same day).
 
-Current blocker: the supplied Atlas pair is rejected by the cluster
-itself — `SCRAM failure: bad auth : Authentication failed (AtlasError
-8000)`. Everything upstream is verified good (SRV DNS, TLS, zlib
-handshake, we reach the cluster). Fix path:
+**Live 2026-10-21** (was OFF pending credential fix — 2026-10-19).
+The runbook's fix path below worked exactly as written; two separate
+traps surfaced, both diagnosable from the journal + harness *before*
+any Atlas-guessing:
+
+1. **Username typo** — the config had `glenemlee_db_user` (one n);
+   the Atlas principal is `glennemlee_db_user`. `SCRAM failure: bad
+   auth (AtlasError 8000)` can hide either a wrong username OR password.
+2. **Wrong cluster hostname suffix** — the URI said
+   `cluster0.xf7oa2t.mongodb.net`, under which NOTHING is published:
+   the SRV seedlist, the TXT options record, and the shard aliases
+   are all absent on three independent resolvers while the
+   `mongodb.net` zone itself answers authoritatively (AWS DNS).
+   A DNS-first diagnosis (`dig -t SRV _mongodb._tcp.<host>`) catches
+   this in seconds; the driver error is a flattened "DNS error" chain.
+   Correct host per the operator's credentials file:
+   `cluster0.1mzqrfo.mongodb.net`.
+Cache the diagnostics before touching config, then verify the write
+path (not just reachability) with the live smoke:
 
 ```bash
 # 1. In the Atlas console (cluster0): check the DB user name + reset its
@@ -1323,6 +1338,10 @@ edit ~/.jerith-mesh/bot.toml   # [mongo] uri = "mongodb+srv://user:pass@…"
 # 3. Verify BEFORE restarting the service (maintenance harness):
 JERITH_DISCORD_TOKEN=x cargo test -p jerith-mesh-bot \
   mongo::tests::atlas_ping -- --ignored --exact --nocapture
+# 3b. Verify the WRITE PATH (write → read → delete on jerith.memory_mirror,
+#     leaves the cluster spotless) — new 2026-10-21:
+JERITH_DISCORD_TOKEN=x cargo test -p jerith-mesh-bot \
+  mongo::tests::mirror_live_roundtrip -- --ignored --exact --nocapture
 # 4. systemctl --user restart jerith-bot   # boot log: "mongodb pinged OK"
 ```
 
