@@ -3509,9 +3509,15 @@ mod tests {
             send.write_all(&junk).await.unwrap();
         }
         send.finish().unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), read_recv_to_end(&mut recv))
+        let outcome = tokio::time::timeout(Duration::from_secs(15), read_recv_to_end(&mut recv))
             .await
             .expect("stream must either close or error, not hang");
+        // The ~1.17 MB junk write has to drain plus the server's frame-cap
+        // bail to land; on a loaded macOS runner that legitimately takes
+        // longer than the old 5 s bound (same flake family as the fuzz-
+        // storm reply bound, widened 3s->8s in cd43079). The property
+        // under test is termination, not speed, so the window is just
+        // hang-detection headroom.
         // Either terminal state is correct — the property under test is
         // that the reader terminates without ever emitting a reply frame.
         match outcome {
