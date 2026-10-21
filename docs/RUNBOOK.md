@@ -1626,15 +1626,35 @@ NOT for voice NOTES — those stay on the audio attachment lane above.
   wall-time cap re-establishes BOTH sessions together (never one leg
   alone), `max_caption_len` (default 400), `memory.turn_note_max`
   (bounded /recall notes).
-- **Watch in the journal** (INFO level): `voice lane enabled — joining …`,
-  `voice: dialog connected`, `voice: captions connected`,
-  `voice: session cap reached — re-establishing`; WARN-
-  level `voice: room went away (goAway|error) — restart supervised`
-  is normal server-side churn and MUST NOT escalate to a bot crash.
+- **Watch in the journal** (INFO level): `voice lane starting (always-on)`,
+  `vc ws connected` + `vc setup sent` per leg, `vc first server frame`,
+  then `live dialog session up` and `captions session up` — that is
+  the healthy startup sequence. WARN `server closed the session` carries
+  the model + close code + reason verbatim. `session cap reached`
+  (every 30 min default) re-establishes both legs together.
 - **Live-fire is the operator's hop**: the automated suite (10 voice
   units: config honesty + clamps, WS/URL shapes, setup JSON both
   lanes, DSP bridges, play-ring pair decode) can't speak; a human
-  voice in the VC is what proves the round trip end-to-end.
+  voice in the VC is what proves the round trip end-to-end. The
+  wire-level lessons already learned live (2026-10-21, FEATURES §23
+  has the detail): `?model=` is rejected (setup carries the model),
+  `diarization` is rejected, server→client frames are BINARY carrying
+  JSON, and a silent room needs the pump's 40 ms silence keepalive —
+  zero media earns a 1008 abort at exactly 60 s.
+- **TLS trap (fixed 2026-10-21, affects other ws users of the stack)**:
+  the workspace `tokio-tungstenite` pin had feature `rustls` — the
+  IMPLICIT optional-dependency feature, which pulls the rustls crate
+  but never tokio-rustls; the handshake compiled, ran, and honestly
+  failed at connect time with «URL error: TLS support not compiled
+  in» (the supervised restart loop surfaced it immediately). The pin
+  is now `rustls-tls-webpki-roots`, which pulls the full TLS path
+  (webpki 0.26 rides the same accepted serenity-subgraph pin). Slack/
+  twitch/mattermost `connect_async` callers were silently in the same
+  boat. Lesson: in tokio-tungstenite ≥0.26, `rustls` alone is not
+  TLS — `cargo tree -f "{p} {f}" -p tokio-tungstenite` shows the
+  difference (`tokio-rustls,webpki-roots` present = real). A tungstenite
+  live probe test (`voice::tests::live_ws_probe_setup_complete_arrives`,
+  `--ignored`) reproduces the correct handshake both ways.
 - **Revert**: `[voice] enabled = false` (or delete the section) leaves
   the bot exactly as before — no voice code starts unless the section
   says so.

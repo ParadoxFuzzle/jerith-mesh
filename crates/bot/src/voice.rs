@@ -104,13 +104,14 @@ impl VoiceConfig {
 
 /// Live WSS endpoint (official v1beta GenerativeService BidiGenerate
 /// path; JSON wire; key as a query param — the URL is never logged).
-pub fn live_ws_url(cfg: &VoiceConfig, model: &str) -> String {
-    let model = model.trim();
+/// The MODEL is NOT a query parameter — the server rejects `?model=`
+/// with 1007 «Unknown name model» (found live 2026-10-21); it rides
+/// inside the setup message instead.
+pub fn live_ws_url(cfg: &VoiceConfig, _model: &str) -> String {
     format!(
-        "wss://generativelanguage.googleapis.com/ws/{}?key={}&model={}",
+        "wss://generativelanguage.googleapis.com/ws/{}?key={}",
         "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
         cfg.gemini_api_key.trim(),
-        model,
     )
 }
 
@@ -135,13 +136,15 @@ pub fn setup_message(cfg: &VoiceConfig, model: &str, system_prompt: Option<&str>
     json!({"setup": setup})
 }
 
-/// Captions lane setup (STT model — TEXT in response, diarized input).
+/// Captions lane setup (STT model — TEXT in response, plain input
+/// transcriptions; `diarization` is REJECTED by BidiGenerateContent
+/// with 1007 «diarization is not supported» — found live 2026-10-21).
 pub fn setup_message_stt(_cfg: &VoiceConfig, model: &str) -> Value {
     json!({
         "setup": {
             "model": format!("models/{}", model.trim()),
             "generationConfig": {"responseModalities": ["TEXT"]},
-            "inputAudioTranscription": {"diarization": true},
+            "inputAudioTranscription": {},
         }
     })
 }
@@ -504,21 +507,37 @@ where
     let url = live_ws_url(vcfg, model);
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut w, mut r) = ws.split();
+    tracing::info!(model = %model, "vc ws connected");
     // The pump: setup FIRST, then paced realtimeInput. The send half is
     // owned here alone, so no ordering hazard exists.
     tokio::spawn(async move {
-        w.send(WsMsg::Text(first.to_string().into())).await.ok();
+        if let Err(e) = w.send(WsMsg::Text(first.to_string().into())).await {
+            tracing::error!(error = %e, "vc setup send failed");
+            return;
+        }
+        tracing::info!("vc setup sent");
         let mut quantum: Vec<i16> = Vec::with_capacity(1280);
         loop {
             // Broadcast lags are honest for live audio: a missed chunk is
             // skipped and the stream keeps flowing.
-            let chunk = match rx.recv().await {
-                Ok(c) => c,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
+            let chunk = match tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv())
+                .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                     tracing::debug!(skipped = n, "vc audio consumer lagged — samples skipped");
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
+                Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                // The room is quiet and songbird emits nothing (capture
+                // rides real voice packets). Stream 40 ms of digital
+                // silence as a keepalive — with zero media Google's
+                // bidi session aborts at the 60 s mark with 1008
+                // «The operation was aborted» (observed live 2026-10-21).
+                Err(_) => {
+                    quantum.extend(std::iter::repeat_n(0i16, 640));
+                    Arc::new(Vec::new())
+                }
             };
             quantum.extend_from_slice(&chunk);
             while quantum.len() >= 640 {
@@ -541,25 +560,51 @@ where
             }
         }
     });
+    // First-frame marker (INFO once, then DEBUG per frame).
+    let mut first_frame = true;
+    // Receiver: parse each text frame; the handler decides whether
+    // to continue (false = clean end, e.g. goAway).
     loop {
-        // Receiver: parse each text frame; the handler decides whether
-        // to continue (false = clean end, e.g. goAway).
         let frame = r
             .next()
             .await
             .ok_or_else(|| anyhow::anyhow!("ws closed"))??;
-        match frame {
-            WsMsg::Text(txt) => {
-                let v: Value = serde_json::from_str(&txt)?;
-                if v.get("error").is_some() {
-                    anyhow::bail!("server error frame: {v}");
-                }
-                if !on_frame(v)? {
-                    return Ok(());
-                }
+        // Text AND Binary haul the same JSON — observed live 2026-10-21:
+        // the bidi endpoint ships setupComplete and friends as BINARY
+        // frames; a Text-only match dropped every server reply and the
+        // session idled to the server's 1008 abort at the 60 s mark.
+        let txt = match frame {
+            WsMsg::Text(t) => String::from_utf8_lossy(t.as_bytes()).into_owned(),
+            WsMsg::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+            WsMsg::Close(f) => {
+                let (code, reason) = f
+                    .as_ref()
+                    .map(|c| (c.code.to_string(), c.reason.to_string()))
+                    .unwrap_or_else(|| ("?".into(), "".into()));
+                tracing::warn!(model = %model, close_code = %code, close_reason = %reason, "server closed the session");
+                return Ok(());
             }
-            WsMsg::Close(_) => return Ok(()),
-            _ => {}
+            _ => continue,
+        };
+        let v: Value = serde_json::from_str(&txt)?;
+        if v.get("error").is_some() {
+            anyhow::bail!("server error frame: {v}");
+        }
+        // Diagnostic honesty: the FIRST server frame is journaled at
+        // INFO (truncated) — the setupComplete-never-arrives failure
+        // shape of 2026-10-21 was invisible without a frame trace —
+        // and every following frame at DEBUG so a busy room doesn't
+        // flood the journal.
+        if first_frame {
+            first_frame = false;
+            let head: String = txt.chars().take(200).collect();
+            tracing::info!(model = %model, frame = %head, "vc first server frame");
+        } else {
+            let head: String = txt.chars().take(100).collect();
+            tracing::debug!(model = %model, frame = %head, "vc server frame");
+        }
+        if !on_frame(v)? {
+            return Ok(());
         }
     }
 }
@@ -769,8 +814,10 @@ mod tests {
         let u = live_ws_url(&cfg(), "gemini-3.8-live");
         assert!(u.starts_with("wss://generativelanguage.googleapis.com/ws/"));
         assert!(u.contains("v1beta.GenerativeService.BidiGenerateContent"));
-        // key then model — the model rides AFTER the secret (never first).
-        assert!(u.contains("key=TESTKEY&model=gemini-3.8-live"), "{u}");
+        // The key rides as a query param; the model does NOT — the
+        // server rejects `?model=` outright (setup-message bound).
+        assert!(u.ends_with("?key=TESTKEY"), "{u}");
+        assert!(!u.contains("model="), "{u}");
     }
 
     #[test]
@@ -794,7 +841,9 @@ mod tests {
         let s = &m["setup"];
         assert_eq!(s["model"], "models/gemini-3.5-transcribe-live");
         assert_eq!(s["generationConfig"]["responseModalities"][0], "TEXT");
-        assert_eq!(s["inputAudioTranscription"]["diarization"], json!(true));
+        // diarization is rejected by the bidi endpoint (code 1007) —
+        // the pin stays on the honest accepted shape.
+        assert!(s["inputAudioTranscription"].is_object());
     }
 
     #[test]
@@ -838,5 +887,70 @@ mod tests {
         let r = f32::from_le_bytes(buf[4..8].try_into().unwrap());
         assert_eq!(l, 100.0 / 32768.0, "L must be first (got {l}, {r})");
         assert_eq!(r, -100.0 / 32768.0, "R must be second (got {l}, {r})");
+    }
+
+    /// Live harness probe (2026-10-21 debugging): tungstenite itself,
+    /// unfiltered, against the real endpoint reading the parked key.
+    /// Two legs: (a) setup only, (b) setup then INSTANT audio spam — the
+    /// bot's exact shape (python's client receives setupComplete in both
+    /// shapes; this tells us whether tungstenite or the streaming order
+    /// is the discriminator). Run with `-- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "host harness: parked bot.toml key + network access required"]
+    async fn live_ws_probe_setup_complete_arrives() {
+        let toml_txt = std::fs::read_to_string(std::path::PathBuf::from(
+            "/home/noodly/.jerith-mesh/bot.toml",
+        ))
+        .expect("bot.toml");
+        let mut key = String::new();
+        for line in toml_txt.lines() {
+            let t = line.trim();
+            if let Some(v) = t.strip_prefix("gemini_api_key") {
+                let v = v.trim_start().strip_prefix('=').unwrap().trim();
+                key = v.trim_matches('"').to_string();
+            }
+        }
+        assert!(!key.is_empty(), "no parked gemini key found");
+        let vcfg = VoiceConfig {
+            gemini_api_key: key,
+            ..Default::default()
+        };
+
+        for (tag, spam) in [("setup-only", false), ("setup+instant-audio", true)] {
+            let url = live_ws_url(&vcfg, "gemini-3.8-live");
+            let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let (mut w, mut r) = ws.split();
+            let setup = setup_message(&vcfg, "gemini-3.8-live", None);
+            w.send(WsMsg::Text(setup.to_string().into())).await.unwrap();
+            if spam {
+                // The bot's exact pump shape: a silent 16k PCM quantum
+                // streams out immediately after setup, before any
+                // setupComplete could arrive.
+                let msg = json!({
+                    "realtimeInput": {
+                        "audio": {
+                            "mimeType": "audio/pcm;rate=16000",
+                            "data": base64::engine::general_purpose::STANDARD
+                                .encode([0u8; 2560])
+                        }
+                    }
+                });
+                w.send(WsMsg::Text(msg.to_string().into())).await.unwrap();
+            }
+            for i in 0..3 {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), r.next()).await {
+                    Ok(Some(Ok(frame))) => println!("[{tag}] frame {i}: {frame:?}"),
+                    Ok(Some(Err(e))) => println!("[{tag}] err: {e}"),
+                    Ok(None) => {
+                        println!("[{tag}] stream closed");
+                        break;
+                    }
+                    Err(_) => {
+                        println!("[{tag}] recv timeout 10s");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }

@@ -1577,6 +1577,38 @@ and holds a real-time conversation:
 
 Tests: 10 units (config honesty + clamps, WS/URL shape, setup JSON
 shapes for both lanes, DSP bridges both directions, play-ring pair
-decode with an exact power-of-two f32 comparison). Suite 254 green,
-clippy `-D warnings` 0. Live-fire (a human voice in the VC) is the
-operator's next hop.
+decode with an exact power-of-two f32 comparison) plus one ignored
+live `ws` probe harness. Suite 254 green, clippy `-D warnings` 0.
+
+Live-fire against the real endpoint happened the same day — four
+wire-level lessons, each now pinned where it bit:
+
+1. **The model is NOT a query parameter.** `?model=` on the bidi URL
+   earns close 1007 «Unknown name model» — the model rides inside the
+   setup message (`setup.model = "models/<name>"`), where it already
+   was; the URL is just service + key.
+2. **`diarization` is rejected**, close 1007 «not supported in
+   BidiGenerateContent» — the captions setup sends a plain
+   `inputAudioTranscription: {}`.
+3. **Server-to-client frames are BINARY carrying JSON** (verified byte
+   for byte: identical url + setup; a Text-only read loop receives
+   NOTHING and the session idles to a server 1008 abort at exactly
+   60 s). Fixed by unifying Text/Binary in the session read loop; the
+   bot→server direction stays Text and is accepted.
+4. **A silent room needs a heartbeat.** songbird only emits packets
+   when someone speaks, so an empty channel = zero media and Google
+   kills both legs at the 60 s mark (1008 «The operation was
+   aborted»). The pump now streams 40 ms of digital silence whenever
+   no room packet lands for 150 ms — sessions are stable for minutes
+   in an empty room (measured live 2026-10-21).
+
+Also discovered-then-fixed: the workspace `tokio-tungstenite` pin's
+bare `rustls` feature is the implicit optional-dep feature (pulls the
+rustls crate but NOT tokio-rustls) — `connect_async` ran until runtime
+and honestly errored «TLS support not compiled in». The pin is now
+`rustls-tls-webpki-roots` (RUNBOOK's voice block has the story; the
+slack/twitch/mattermost transports ride the same fixed stack).
+
+A human voice in the VC is the last hop: the automated suite cannot
+speak. Manual try: join the configured VC, talk, listen for the model,
+check /recall notes and the (optional) captions channel.

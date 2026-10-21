@@ -29,7 +29,12 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 futures-core = "0.3"
 futures-util = "0.3"
 quinn = "0.11"
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["rustls", "connect"] }
+# "rustls-tls-webpki-roots" (NOT the bare "rustls" surface: that is the
+# implicit optional-dep feature — it pulls the rustls CRATE but not
+# tokio-rustls, so connect_async reports «TLS support not compiled in»
+# at runtime; found live 2026-10-21 on the voice lane). webpki-roots
+# rides the same 0.26 line as the serenity websocket subgraph.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # Discord voice (voice.rs — always-on VC lane): explicit feature set, NOT
 # defaults — the default feature list pulls native-tls/webcrypto flights
 # that collate with the workspace rustls = ring pin (the 2026-10-19
