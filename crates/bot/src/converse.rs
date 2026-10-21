@@ -224,20 +224,37 @@ fn spawn_transcript_indexing(cfg: &crate::config::BotConfig, label: &str, lane: 
     let label = label.to_string();
     let lane = lane.to_string();
     tokio::spawn(async move {
-        match crate::api::memory_embed(&cfg, &note).await {
-            Ok((id, provider)) => tracing::info!(
-                lane = %lane,
-                attachment = %label,
-                id = %id,
-                provider = %provider,
-                "attachment transcript indexed into node memory"
-            ),
-            Err(e) => tracing::warn!(
-                lane = %lane,
-                attachment = %label,
-                error = %e,
-                "transcript memory index failed — /recall won't see this one (chat cache unaffected)"
-            ),
+        let embedded = match crate::api::memory_embed(&cfg, &note).await {
+            Ok((id, provider)) => {
+                tracing::info!(
+                    lane = %lane,
+                    attachment = %label,
+                    id = %id,
+                    provider = %provider,
+                    "attachment transcript indexed into node memory"
+                );
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lane = %lane,
+                    attachment = %label,
+                    error = %e,
+                    "transcript memory index failed — /recall won't see this one (chat cache unaffected)"
+                );
+                None
+            }
+        };
+        // Mongo recall mirror (FEATURES §19/§22): a live mirror cluster
+        // gets the note deduped by the same id. Lane-off = no mirror;
+        // a mirror failure NEVER surfaces — the local store already
+        // has the words. Skipped entirely when the embed failed: the
+        // mirror exists to back /recall, which would lack the note.
+        if let Some(id) = embedded
+            && crate::mongo::handle().is_some()
+            && let Err(e) = crate::mongo::mirror_note(&id, &note).await
+        {
+            tracing::warn!(error = %e, "transcript memory mirror write skipped");
         }
     });
 }
@@ -787,6 +804,71 @@ mod tests {
         let line = other_overcap_line(8);
         assert!(line.contains("skipped:"), "{line}");
         assert!(!line.contains("pending"), "pending must never lie: {line}");
+    }
+
+    /// Transcript indexing (memory hook), end to end over HTTP: the
+    /// fire-and-forget embed POST carries the honest note shape —
+    /// speech-only with the attachment label — a crafted honest-absence
+    /// block never POSTs anything, and the disabled knob POSTs nothing.
+    #[tokio::test]
+    async fn transcript_indexing_embeds_speech_only_over_http() {
+        let seen: StdArc<TMutex<Vec<Value>>> = StdArc::new(TMutex::new(Vec::new()));
+        let seen_embed = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/skills/memory/embed",
+            axum::routing::post(move |axum::Json(req): axum::Json<Value>| {
+                let seen_embed = seen_embed.clone();
+                async move {
+                    seen_embed.lock().await.push(req);
+                    axum::Json(json!({ "id": "mem-1", "provider": "stub" }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+
+        spawn_transcript_indexing(
+            &cfg,
+            "voice.ogg",
+            "audio",
+            "audio: duration 0:12:\ntranscript:\nfire the kiln at 980",
+        );
+        // Honest absence + disabled knob: no embed POSTs.
+        spawn_transcript_indexing(
+            &cfg,
+            "tone.mp3",
+            "audio",
+            "audio: duration 0:06:\ntranscript: (audio track present but transcript came back empty — speech may be absent)",
+        );
+        let mut off = cfg.clone();
+        off.memory.index_transcripts = false;
+        spawn_transcript_indexing(
+            &off,
+            "quiet.mp3",
+            "audio",
+            "audio: duration 0:10:\ntranscript:\nwould be indexed if enabled",
+        );
+
+        // Fire-and-forget: poll until the ONE expected note lands.
+        for _ in 0..200 {
+            if !seen.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let notes = seen.lock().await.clone();
+        assert_eq!(
+            notes.len(),
+            1,
+            "only the speech block may embed; absence and knob-off must not: {notes:?}"
+        );
+        assert_eq!(
+            notes[0].get("text").and_then(Value::as_str),
+            Some("transcript of audio attachment voice.ogg: fire the kiln at 980")
+        );
     }
 
     /// Transcript indexing (memory hook): speech extraction picks ONLY
