@@ -1487,7 +1487,13 @@ in the sandbox-extraction cache so a re-ask never re-runs whisper.
   will spend most of its time in whisper). The `[chat]` timeout (240 s)
   bounds the wait; the 600 s default duration cap keeps worst-case
   runs inside it.
-- **Verify**: `cargo test -p jerith-mesh-bot --bins video -- --ignored
-  --nocapture` — generates a real 6-second clip and runs the entire
-  lane through the host toolchain (requires ffmpeg + ffprobe + whisper
-  with a cached model).
+- **Verify**: two `#[ignore]` live harnesses, run with `cargo test -p
+  jerith-mesh-bot --bins video -- --ignored --nocapture`:
+  `live_full_lane_on_a_real_generated_clip` (stub vision — pins
+  determinism of the toolchain path), and
+  `live_full_lane_real_download_and_real_vision_tier` (the production
+  shape with zero stubs: local axum "CDN" download → toolchain → the
+  LIVE gateway's MiniCPM-V on :8900; verified live 2026-10-21, 9.9 s —
+  frame prose was real, no failure markers). Both need ffmpeg +
+  ffprobe + whisper with a cached model; the second also needs
+  jerith-node up.

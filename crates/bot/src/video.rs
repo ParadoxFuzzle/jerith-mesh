@@ -853,4 +853,103 @@ mod tests {
             "{block}"
         );
     }
+
+    /// Deep live harness: the WHOLE production shape, no stubs — a local
+    /// axum file server plays the attachment CDN (real HTTP download
+    /// through `video_context`), then the full lane (probe → audio
+    /// strip → whisper → frames) with descriptions landing on the NODE'S
+    /// REAL vision tier (the live gateway's MiniCPM-V, :8900). Requires
+    /// the host toolchain + the node up. Complements the stub harness
+    /// above, which pins determinism instead of reality.
+    #[tokio::test]
+    #[ignore = "live harness: ffmpeg + whisper on PATH, and jerith-node's gateway live on the default :8900 with MiniCPM up"]
+    async fn live_full_lane_real_download_and_real_vision_tier() {
+        // A real clip (same recipe as the stub harness). A 10-frame
+        // clip: stride 5 → 2 sampled frames → 2 real vision calls.
+        let clipdir = Scratch::new().unwrap();
+        let clip = clipdir.0.join("deep.mp4");
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=8:size=320x240:rate=5",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=220:duration=8",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&clip)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "clip generation failed: {}",
+            last_stderr_lines(&String::from_utf8_lossy(&status.stderr), 3)
+        );
+
+        let bytes = std::fs::read(&clip).unwrap();
+        let app = axum::Router::new().route(
+            "/deep.mp4",
+            axum::routing::get(move || {
+                let bytes = bytes.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "video/mp4")
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // The PRODUCTION gateway (default :8900) — where real chats'
+        // vision calls already land.
+        let cfg = crate::config::BotConfig::from_parts(
+            crate::config::DEFAULT_GATEWAY_URL,
+            "http://127.0.0.1:1",
+        );
+        let block = video_context(
+            &cfg,
+            "deep.mp4",
+            &format!("http://{addr}/deep.mp4"),
+        )
+        .await
+        .expect(
+            "full lane against the live node — check jerith-node is up and whisper/ffmpeg are on PATH",
+        );
+
+        assert!(block.contains("duration 0:08"), "{block}");
+        // A sine tone may transcribe to nothing — either story is
+        // honest; the section heading must exist either way.
+        assert!(block.contains("transcript"), "{block}");
+        // REAL tier output: every frame line carries actual prose (not
+        // a failure marker, not a one-word stub).
+        let frame_lines: Vec<&str> = block.lines().filter(|l| l.starts_with("[0:")).collect();
+        assert!(!frame_lines.is_empty(), "no frame lines: {block}");
+        for line in &frame_lines {
+            assert!(
+                !line.contains("frame analysis failed") && !line.contains("(frame not extractable"),
+                "frame failed against the LIVE tier: {line}\n{block}"
+            );
+            assert!(
+                line.len() > 40,
+                "frame description too thin to be real prose: {line}"
+            );
+        }
+    }
 }
