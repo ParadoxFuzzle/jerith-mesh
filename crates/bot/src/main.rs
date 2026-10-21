@@ -14,6 +14,7 @@
 mod api;
 mod approval;
 mod archiver;
+mod audio;
 mod chat_fallback;
 mod commands;
 mod config;

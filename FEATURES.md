@@ -1477,3 +1477,36 @@ argv shapes, probe-parse honesty, clamps) + a `#[ignore]` live harness
 that generates a REAL 6-second clip and runs the entire lane through
 the host toolchain (ffmpeg → ffprobe → whisper → frames → vision stub)
 — suite 237 green, live harness pass.
+
+## 21. Audio attachment lane: transcribe uploads locally (2026-10-21)
+
+`crates/bot/src/audio.rs` + `[audio]` in bot.toml — plain audio (mp3,
+ogg voice notes, m4a, wav, flac…) stops being sandbox binary-garbage
+and gets *transcribed*, on the video lane's honesty-first shape, with
+the same shared machinery (probe/runner/scratch/transcribe) but its
+own economics: no frames, no vision tier, one whisper run per file.
+
+- **Pipeline**: capped download → `ffprobe` honesty (no audio stream,
+  live/fragmented no-duration, over-cap duration → honest refusal
+  lines) → a REAL video stream (not cover-art mjpeg/png inside mp3s,
+  which is expected and ignored) redirects honestly to the video lane
+  instead of a fake transcript → whisper DIRECTLY on the original
+  file (its internal ffmpeg decodes mp3/ogg/m4a/flac) → composed
+  block: duration + transcript, or the honest emptiness line (a pure
+  tone transcribes to nothing — the block says speech may be absent).
+- **Caps + knobs** (`[audio]`): `enabled` (default on), bin paths,
+  `whisper_model` (default `tiny`), `max_duration_secs` (clamp
+  30–3600, default 600), `max_file_mb` (clamp 1–2048), 
+  `whisper_timeout_secs` (clamp 30–1800). TWO audio attachments per
+  message (whisper-only is cheaper than video's frames+transcribe,
+  but still budget-honest with a skip line for the rest).
+- **Routing**: the shared classifier routes audio BEFORE video, so
+  Discord `.ogg` voice notes can never ride the video lane; a lying
+  extension is corrected by the probe, not believed. Transcripts
+  cache in the extraction cache (same id/name+size keying) — a
+  re-ask never re-runs whisper.
+
+Tests: 4 new units (classify, cover-art codec honesty, clamps) + a
+`#[ignore]` live harness that generates a REAL sine-tone mp3 and runs
+the entire lane through the host toolchain + real whisper — pinning
+the honest emptiness shape. Suite 241 green.

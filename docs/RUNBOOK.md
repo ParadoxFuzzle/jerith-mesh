@@ -1497,3 +1497,28 @@ in the sandbox-extraction cache so a re-ask never re-runs whisper.
   frame prose was real, no failure markers). Both need ffmpeg +
   ffprobe + whisper with a cached model; the second also needs
   jerith-node up.
+
+## Audio attachment lane (live 2026-10-21)
+
+FEATURES §21 / `crates/bot/src/audio.rs` — plain audio attachments are
+ffprobe'd (caps + cover-art honesty) and transcribed DIRECTLY by local
+openai-whisper (no strip step; whisper's internal ffmpeg decodes
+mp3/ogg/m4a/flac). `.ogg`/`.opus` classify to this lane FIRST, so
+Discord voice notes always land here; a real video stream wearing an
+audio extension is honestly redirected to the video lane. Two per
+message; transcripts warm the extraction cache.
+
+- **Ops knobs** (`[audio]` in bot.toml): `enabled` (default on),
+  bin paths, `whisper_model` (tiny → base doubles wall time),
+  `max_duration_secs` (default 600), `max_file_mb` (512),
+  `whisper_timeout_secs` (600).
+- **Downgrade shapes**: tool-missing / download / no-audio-stream /
+  no-duration / over-cap / transcription failure all degrade to
+  honest per-attachment lines. An EMPTY transcript is by-design
+  honest ("track present but transcript came back empty") — the most
+  common case is a tone or silent clip, not a toolchain break; check
+  the journal if a REAL voice file comes back empty.
+- **Verify**: `cargo test -p jerith-mesh-bot --bins live_audio_lane
+  -- --ignored --nocapture` — generates a real sine-tone mp3 and runs
+  the whole lane on the host toolchain + real whisper (pinned to the
+  honest empty-transcript shape).

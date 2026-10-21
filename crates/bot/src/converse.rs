@@ -97,6 +97,12 @@ pub const MAX_IMAGES_PER_MESSAGE: usize = 3;
 /// value, and the honest line below says what happened to the rest.
 pub const MAX_VIDEOS_PER_MESSAGE: usize = 1;
 
+/// Cap on audio attachments per message: TWO. Audio is whisper-only
+/// (no frame extraction, no vision) but still costs a transcription
+/// each; two keeps it well within the chat timeout while honest lines
+/// cover the rest.
+pub const MAX_AUDIOS_PER_MESSAGE: usize = 2;
+
 /// What a transport hands over per attachment: the CDN url, display
 /// label (the filename), the kind that routes it — images through
 /// the gateway's vision skill, everything else through the Docker
@@ -117,6 +123,9 @@ pub enum AttKind {
     /// Riding the video lane (video.rs): probe → audio strip → whisper
     /// transcription → sampled frames through the vision tier.
     Video,
+    /// Riding the audio lane (audio.rs): probe → direct whisper — no
+    /// frames, no vision tier.
+    Audio,
     Other,
 }
 
@@ -173,6 +182,7 @@ pub async fn attachments_context(
     let mut batch_slots: Vec<usize> = Vec::new(); // line slot per batch entry
     let mut images_used = 0usize;
     let mut videos_used = 0usize;
+    let mut audios_used = 0usize;
     for att in attachments {
         match att.kind {
             AttKind::Image => {
@@ -190,6 +200,37 @@ pub async fn attachments_context(
                     Err(e) => (att.label.clone(), Err(format!("{e:#}"))),
                 };
                 lines.push(entry);
+            }
+            AttKind::Audio => {
+                // Same honesty/cache discipline as video: a DISABLED
+                // lane and a cap overrun both degrade to honest lines,
+                // and successful transcripts warm the cache.
+                audios_used += 1;
+                if audios_used > MAX_AUDIOS_PER_MESSAGE {
+                    lines.push((
+                        att.label.clone(),
+                        Err(format!(
+                            "skipped: {MAX_AUDIOS_PER_MESSAGE} audio per message keeps transcription within the chat timeout — send them in batches"
+                        )),
+                    ));
+                    continue;
+                }
+                if !cfg.audio.enabled {
+                    lines.push((
+                        att.label.clone(),
+                        Err("audio lane disabled by config".into()),
+                    ));
+                    continue;
+                }
+                if let Some(hit) = state.sandbox_cache_get(att.id, &att.label, att.size) {
+                    lines.push((att.label.clone(), hit));
+                    continue;
+                }
+                let out = crate::audio::audio_context(cfg, &att.label, &att.url).await;
+                if out.is_ok() {
+                    state.sandbox_cache_put(att.id, &att.label, att.size, out.clone());
+                }
+                lines.push((att.label.clone(), out));
             }
             AttKind::Video => {
                 // One video per message: a lane run can spend minutes

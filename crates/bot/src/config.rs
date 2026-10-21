@@ -124,6 +124,11 @@ pub struct BotConfig {
     /// through the gateway's vision tier — composed into one context
     /// block. Default on; tooling-absent degrades to honest lines.
     pub video: crate::video::VideoConfig,
+    /// Audio attachment lane (`[audio]` in bot.toml, see audio.rs):
+    /// plain audio (mp3/ogg/m4a/voice notes) ffprobe'd for caps then
+    /// transcribed by local whisper directly — no frames, no vision.
+    /// Default on; tooling-absent degrades to honest lines.
+    pub audio: crate::audio::AudioConfig,
     /// Multi-bot coordination (`[coordinator]` in bot.toml, see
     /// coordinator.rs): named worker loops claiming the mesh hand-off
     /// channel with per-worker model routing. Default on — loops only
@@ -498,6 +503,11 @@ impl BotConfig {
                 v.clamp();
                 v
             },
+            audio: {
+                let mut a = file.audio.clone().unwrap_or_default();
+                a.clamp();
+                a
+            },
             external_plugins,
             coordinator: file.coordinator.clone().unwrap_or_default(),
             workflows: {
@@ -576,6 +586,7 @@ impl BotConfig {
             chat_max_tool_rounds: DEFAULT_CHAT_MAX_TOOL_ROUNDS as usize,
             sandbox: SandboxConfig::default(),
             video: crate::video::VideoConfig::default(),
+            audio: crate::audio::AudioConfig::default(),
             coordinator: CoordinatorBotConfig::default(),
             workflows: WorkflowsConfig::default(),
             approvals: crate::approval::ApprovalConfig::default(),
@@ -857,6 +868,9 @@ struct FileConfig {
     /// Optional `[video]` table — the video attachment lane (video.rs;
     /// absent = defaults).
     video: Option<crate::video::VideoConfig>,
+    /// Optional `[audio]` table — the audio attachment lane (audio.rs;
+    /// absent = defaults).
+    audio: Option<crate::audio::AudioConfig>,
     /// Optional `[coordinator]` table — named-worker loops (see coordinator.rs).
     coordinator: Option<CoordinatorBotConfig>,
     /// Optional `[workflows]` table — browser record/replay (workflows.rs).

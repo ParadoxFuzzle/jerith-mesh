@@ -161,12 +161,16 @@ fn lane_caps(vcfg: &VideoConfig) -> LaneCaps {
 }
 
 /// Shared classification for every attachment site (Discord @mention/
-/// DM fallback + /read): image / video / other, ONE place. A lying
+/// DM fallback + /read): image / audio / video / other, ONE place. An
+/// audio/ MIME or audio extension wins BEFORE the video extension
+/// check (an .ogg voice note must never ride the video lane). A lying
 /// extension is corrected later by the probe (audio-only container →
 /// honest refusal — no fake understanding).
 pub fn classify_kind(label: &str, content_type: Option<&str>) -> crate::converse::AttKind {
     if content_type.is_some_and(|t| t.trim().starts_with("image/")) {
         crate::converse::AttKind::Image
+    } else if crate::audio::is_audio(label, content_type) {
+        crate::converse::AttKind::Audio
     } else if is_video(label, content_type) {
         crate::converse::AttKind::Video
     } else {
@@ -313,8 +317,12 @@ pub fn whisper_argv(bin: &str, wav: &Path, out_dir: &Path, model: &str) -> Vec<S
 /// Run one argv with a wall-time cap. `tokio::time::timeout` cancels
 /// the wait future on elapse, which drops the child (kill_on_drop) —
 /// a hung ffmpeg/whisper is killed, not leaked. `what` names the stage
-/// honestly in the error.
-async fn run_argv(argv: &[String], timeout: std::time::Duration, what: &str) -> Result<()> {
+/// honestly in the error. (pub(crate): the audio lane shares it.)
+pub(crate) async fn run_argv(
+    argv: &[String],
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let out = tokio::time::timeout(
         timeout,
@@ -351,7 +359,7 @@ async fn run_argv(argv: &[String], timeout: std::time::Duration, what: &str) -> 
     Ok(())
 }
 
-fn last_stderr_lines(s: &str, n: usize) -> String {
+pub(crate) fn last_stderr_lines(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
         "(no stderr)".into()
@@ -361,12 +369,13 @@ fn last_stderr_lines(s: &str, n: usize) -> String {
     }
 }
 
-/// Wipe-on-drop scratch dir: video bytes, wav and frames live far too
+/// Wipe-on-drop scratch dir: media bytes, wav and frames live far too
 /// briefly to be left lying around (privacy hygiene + disk).
-struct Scratch(PathBuf);
+/// (pub(crate): the audio lane shares it — dir and scratch alike.)
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "jerith-vid-{}-{}",
@@ -384,15 +393,16 @@ impl Drop for Scratch {
     }
 }
 
-/// Probe outcome, honestly split.
+/// Probe outcome, honestly split. (pub(crate): the audio lane shares
+/// it — an audio attachment needs the same streams+duration honesty.)
 #[derive(Debug)]
-struct Probe {
-    has_video: bool,
-    has_audio: bool,
-    duration: Option<f64>,
+pub(crate) struct Probe {
+    pub has_video: bool,
+    pub has_audio: bool,
+    pub duration: Option<f64>,
 }
 
-fn parse_probe(body: &str) -> Probe {
+pub(crate) fn parse_probe(body: &str) -> Probe {
     let v = serde_json::from_str::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
     let streams = v
         .get("streams")
@@ -414,14 +424,30 @@ fn parse_probe(body: &str) -> Probe {
 }
 
 /// Transcribe one WAV through whisper; returns the trimmed transcript.
-async fn transcribe(vcfg: &VideoConfig, wav: &Path, dir: &Path) -> Result<String> {
+/// Transcribe one media file through whisper (accepts any format the
+/// whisper binary's internal ffmpeg decodes — wav, mp3, m4a, ogg…).
+pub(crate) async fn transcribe(
+    whisper_bin: &str,
+    model: &str,
+    timeout_secs: u64,
+    media: &Path,
+    dir: &Path,
+) -> Result<String> {
     run_argv(
-        &whisper_argv(&vcfg.whisper_bin, wav, dir, &vcfg.whisper_model),
-        std::time::Duration::from_secs(vcfg.whisper_timeout_secs),
+        &whisper_argv(whisper_bin, media, dir, model),
+        std::time::Duration::from_secs(timeout_secs),
         "whisper",
     )
     .await?;
-    let txt = dir.join("audio.txt");
+    // openai-whisper names the output after the INPUT STEM, so the
+    // caller's filename decides where to read back ("audio.wav" →
+    // audio.txt was the video lane's old hardcode; the audio lane feeds
+    // "input.bin" → input.txt).
+    let stem = media
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("output");
+    let txt = dir.join(format!("{stem}.txt"));
     std::fs::read_to_string(&txt)
         .map(|t| t.trim().to_string())
         .with_context(|| format!("whisper produced no txt at {}", txt.display()))
@@ -481,7 +507,7 @@ async fn run_lane(
     let dir: &PathBuf = &scratch.0;
 
     // Probe: streams + duration with honest refusals.
-    let probe_json = probe(vcfg, input)
+    let probe_json = ffprobe_json(vcfg, input)
         .await
         .map_err(|e| format!("ffprobe: {e:#}"))?;
     let probe = parse_probe(&probe_json);
@@ -506,7 +532,15 @@ async fn run_lane(
     let transcript: Result<String, String> = if probe.has_audio {
         let wav = dir.join("audio.wav");
         match strip_audio(vcfg, input, &wav, &caps).await {
-            Ok(()) => match transcribe(vcfg, &wav, dir).await {
+            Ok(()) => match transcribe(
+                &vcfg.whisper_bin,
+                &vcfg.whisper_model,
+                vcfg.whisper_timeout_secs,
+                &wav,
+                dir,
+            )
+            .await
+            {
                 Ok(t) if t.is_empty() => {
                     Err("(audio track present but transcript came back empty)".to_string())
                 }
@@ -586,7 +620,7 @@ fn format_err(e: &anyhow::Error) -> String {
 }
 
 /// ffprobe with the JSON on stdout captured.
-async fn probe(vcfg: &VideoConfig, input: &Path) -> Result<String> {
+pub(crate) async fn ffprobe_json(vcfg: &VideoConfig, input: &Path) -> Result<String> {
     let argv = probe_argv(&vcfg.ffprobe_bin, input);
     let out = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
