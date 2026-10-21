@@ -1534,3 +1534,10 @@ message; transcripts warm the extraction cache.
   the shared `missing tool` refusal no longer points at "[video] bins"
   regardless of lane — it names the real knobs (`[video]/[audio]
   ffprobe_bin / whisper_bin`, absolute paths) and the PATH cause.
+- **Refusals are journal-visible (2026-10-21)**: every per-attachment
+  failure line now also emits `attachment failure — honest line went to
+  the model context` in the journal (converse.rs), so a degraded lane
+  is diagnosable from `journalctl` alone — the PATH trap above had zero
+  log trace all day because refusal lines lived only in the model's
+  context. Over-cap sandbox files also get honest `skipped: N files per
+  message…` lines instead of a "pending" that never pends.

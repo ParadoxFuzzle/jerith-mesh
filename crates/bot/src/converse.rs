@@ -129,6 +129,16 @@ pub enum AttKind {
     Other,
 }
 
+/// Honest line for "other" files the truncated sandbox batch never
+/// serves — their seat was reserved above, but `pending` would never
+/// become the truth. Words match the skip shapes of the capped audio/
+/// video arms: what happened, why, and what to do about it.
+fn other_overcap_line(cap: usize) -> String {
+    format!(
+        "skipped: {cap} files per message keeps sandbox extraction bounded — send the rest in batches"
+    )
+}
+
 /// Pure assembly behind the transports' attachment context: render one
 /// bracketed line per attachment — description/extracted text or an
 /// honest failure (never a silent drop) — into one block the chat
@@ -283,11 +293,19 @@ pub async fn attachments_context(
     }
     // One sandbox container reads every un-cached file in the batch —
     // capped by [sandbox] max_files (message order kept), each outcome
-    // an honest line. Successes feed the extraction cache; failures stay
-    // re-runnable on the next ask.
+    //    an honest line. Successes feed the extraction cache; failures stay
+    // re-runnable on the next ask. Over-cap files keep their reserved
+    // seat but the truncated batch never serves it — the placeholder
+    // swaps to an honest skip line (`other_overcap_line`), because a
+    // "pending" that never pends lies in the model's context.
+    let overcap = batch_slots[cfg.sandbox.max_files.min(batch_slots.len())..].to_vec();
     file_batch.truncate(cfg.sandbox.max_files);
     batch_meta.truncate(cfg.sandbox.max_files);
     batch_slots.truncate(cfg.sandbox.max_files);
+    let skip = other_overcap_line(cfg.sandbox.max_files);
+    for slot in overcap {
+        lines[slot].1 = Err(skip.clone());
+    }
     if !file_batch.is_empty() {
         let out = crate::sandbox::read_attachments(&cfg.sandbox, &file_batch).await;
         for (out_i, (slot, (label, val))) in batch_slots.iter().zip(out).enumerate() {
@@ -296,6 +314,22 @@ pub async fn attachments_context(
                 let (id, size) = batch_meta[out_i];
                 state.sandbox_cache_put(id, &label, size, lines[*slot].1.clone());
             }
+        }
+    }
+    // Journal-visible failures (2026-10-21 lesson: the honest lines reach
+    // the MODEL, but nothing reached the JOURNAL — a deployed service
+    // PATH narrower than a login shell left zero log trace of audio-lane
+    // refusals all day). One warn per failed attachment makes any lane
+    // refusal diagnosable from `journalctl` alone. Nothing is cached and
+    // nothing is swallowed here — failures stay re-runnable on the next
+    // ask, exactly as before.
+    for (label, res) in lines.iter() {
+        if let Err(failure) = res {
+            tracing::warn!(
+                attachment = %label,
+                failure = %failure,
+                "attachment failure — honest line went to the model context"
+            );
         }
     }
     assemble_attachment_context(&lines)
@@ -639,6 +673,15 @@ mod tests {
         );
         // No attachments, no block (and the transports skip the plainly).
         assert_eq!(assemble_attachment_context(&[]), None);
+    }
+
+    /// Over-cap "other" files must never ride a "pending" placeholder
+    /// into the model's context — the skip line says what happened.
+    #[test]
+    fn overcap_other_files_get_honest_skip_lines() {
+        let line = other_overcap_line(8);
+        assert!(line.contains("skipped:"), "{line}");
+        assert!(!line.contains("pending"), "pending must never lie: {line}");
     }
 
     /// Transport-side attachment context end-to-end against a stub
