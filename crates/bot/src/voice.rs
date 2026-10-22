@@ -452,6 +452,54 @@ fn spawn_capture(
     tx: broadcast::Sender<Arc<Vec<i16>>>,
 ) {
     call.add_global_event(Event::Core(CoreEvent::VoiceTick), capture_handler(tx));
+    // The seat's own driver events, journaled the instant they fire: the
+    // seat-hold watcher polls on a 15 s cadence, but these CoreEvents
+    // timestamp the transition exactly when Discord flipped it — connect,
+    // momentary reconnect, or drop — the data for diagnosing a drop
+    // without guesswork. DriverDisconnect also flips the live /status
+    // seat flag (the watcher's next poll repairs the connection).
+    call.add_global_event(Event::Core(CoreEvent::DriverConnect), seat_events_handler());
+    call.add_global_event(
+        Event::Core(CoreEvent::DriverReconnect),
+        seat_events_handler(),
+    );
+    call.add_global_event(
+        Event::Core(CoreEvent::DriverDisconnect),
+        seat_events_handler(),
+    );
+}
+
+/// The seat's driver-level journal lines (see spawn_capture). Payloads
+/// deliberately not logged — the connect/disconnect data carries voice
+/// server endpoints/keys; only the fact is operational truth.
+struct SeatEvents;
+
+#[async_trait::async_trait]
+impl EventHandler for SeatEvents {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        match ctx {
+            EventContext::DriverConnect(_) => {
+                tracing::info!("voice driver connected to the Discord voice server")
+            }
+            EventContext::DriverReconnect(_) => {
+                tracing::info!("voice driver reconnected after a network blip")
+            }
+            EventContext::DriverDisconnect(_) => {
+                if rt().left_by_op.load(Ordering::Relaxed) {
+                    tracing::warn!("voice driver disconnected — operator leave already in flight");
+                } else {
+                    lane_halfway(false);
+                    tracing::warn!("voice driver disconnected — watcher repairs on its cadence");
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+fn seat_events_handler() -> SeatEvents {
+    SeatEvents
 }
 
 /// VoiceTick handler: songbird's own receive pipeline already DECODED

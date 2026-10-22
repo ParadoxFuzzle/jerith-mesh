@@ -120,7 +120,9 @@ mod tests {
 
     #[test]
     fn classification_counts_the_registered_set() {
-        // Every main.rs-registered command is in the list (10 commands).
+        // All 13 user-level commands classify; the rest of the
+        // registered set (mail, gif, timeout, voiceleave) is
+        // deliberately unclassified → owner-DM-only.
         for (i, cmd) in USER_COMMANDS.iter().enumerate() {
             assert!(command_is_user_level(cmd), "{cmd} must classify");
             let _ = i;

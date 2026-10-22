@@ -1642,7 +1642,12 @@ NOT for voice NOTES — those stay on the audio attachment lane above.
   rejoin, no rewiring). Lines to know: WARN `voice seat lost` first,
   INFO `voice seat re-join requested`, then the verdict — INFO `voice
   seat back (driver reconnected)` or another WARN while it retries
-  (~30 s cadence while out). /voiceleave disables the watcher: an
+  (~30 s cadence while out). For instant truth between polls the
+  driver's own CoreEvents also journal: `voice driver connected`,
+  `voice driver reconnected after a network blip`, WARN `voice driver
+  disconnected` (payloads deliberately not logged — connect/disconnect
+  data carries voice-server endpoints/keys). /voiceleave disables the
+  watcher: an
   operator stop stays stopped.
 - **Operator leaves + status (2026-10-21)**: `/status` ends with one
   honest line about the LIVE seat (in-VC · model · session age ·

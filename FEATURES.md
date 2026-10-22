@@ -1637,7 +1637,10 @@ live connection state (songbird `current_connection`, None = no voice
 connection), journals the loss honestly, and re-joins the configured
 channel through the SAME manager — the `Call` keeps its playback ring
 and capture events across a rejoin, so the mixer and room fan-out ride
-straight through. Retries while out run on a ~30 s cadence; `re-join
+straight through. Between polls, the driver's own CoreEvents journal
+instant truth (connect / reconnect / drop, payloads never logged —
+they carry voice-server endpoints/keys). Retries while out run on a
+~30 s cadence; `re-join
 requested` is logged but the NEXT cadence's poll is the verdict (the
 truth line is `voice seat back (driver reconnected)`). /voiceleave
 exits the watcher — an operator stop is a full stop; the watcher only
