@@ -474,4 +474,113 @@ mod tests {
         assert!(!did_fire("2026-10-23", 3, 8, Some("2026-10-22".into())));
         let _ = std::fs::remove_file(&path);
     }
+
+    /// GOLDEN FIXTURE (2026-10-22, fetched live from the owner DM via the
+    /// Discord API): today's real morning briefing, verbatim. The test
+    /// asserts the builder's format conventions against it — section
+    /// order, per-line emoji prefixes, and each numeric field's shape —
+    /// so a format change (emoji, wording, field rename) breaks this
+    /// test and forces a deliberate, fresh-golden update rather than a
+    /// silent format drift in Jerith's daily DM.
+    const GOLDEN_LIVE_DM: &str = concat!(
+        "🌅 **Jerith daily self-briefing** — 2026-10-22\n",
+        "🕸️ mesh: peers 0/1 alive · contribution 40%\n",
+        "🔊 voice: voice: 🔁 lane up — joining the voice channel…\n",
+        "🪪 approvals: 0 pending\n",
+        "📬 mail: 0 today · 17 archived\n",
+        "   ✉ `20261016-132600` [ai] mail tunnel selftest\n",
+        "   ✉ `20261015-145213` [ai] Hello Jerith\n",
+        "🩺 monitor: 5 checks pass quietly\n",
+        "📜 journal since last briefing: 0 warns — all quiet",
+    );
+
+    /// The number after `needle` in a line: the leading digit-run (so the
+    /// mesh line's `0/1` fraction parses its left side, `40%` its 40).
+    fn digits_after(line: &str, needle: &str) -> Option<u64> {
+        let i = line.find(needle)?;
+        let rest: String = line[i + needle.len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        rest.parse().ok()
+    }
+
+    #[test]
+    fn golden_live_dm_matches_report_format() {
+        let lines: Vec<&str> = GOLDEN_LIVE_DM.lines().collect();
+
+        // The seven sections in the exact order build_report assembles:
+        // header → mesh → voice → approvals → mail(+detail) → monitor →
+        // journal. Order never shuffles.
+        let prefixes = [
+            "🌅 **Jerith daily self-briefing** — ",
+            "🕸️ mesh: peers ",
+            "🔊 voice: voice: ",
+            "🪪 approvals: ",
+            "📬 mail: ",
+            "   ✉ `",
+            "   ✉ `",
+            "🩺 monitor: ",
+            "📜 journal since last briefing: ",
+        ];
+        assert_eq!(
+            lines.len(),
+            prefixes.len(),
+            "{}\n{}",
+            lines.join("\n"),
+            GOLDEN_LIVE_DM
+        );
+        for (line, prefix) in std::iter::zip(&lines, &prefixes) {
+            assert!(
+                line.starts_with(prefix),
+                "line `{line}` does not start with `{prefix}`"
+            );
+        }
+
+        // Header carries a YYYY-MM-DD day.
+        assert!(
+            lines[0]["🌅 **Jerith daily self-briefing** — ".len()..]
+                .chars()
+                .all(|c| c == '-' || c.is_ascii_digit())
+        );
+
+        // Mesh: `peers X/Y alive · contribution Z%` — all numeric fields.
+        let mesh = lines[1];
+        let alive = digits_after(mesh, "peers ").expect("peers_alive");
+        let total = digits_after(mesh, &format!("peers {alive}/")).expect("peer_count");
+        assert!(alive <= total, "{mesh}");
+        digits_after(mesh, "contribution ").expect("contribution_percent");
+        assert!(mesh.contains(" alive · contribution "), "{mesh}");
+
+        // Approvals + mail: `N pending` / `N today · N archived`.
+        digits_after(lines[3], "approvals: ").expect("pending count");
+        digits_after(lines[4], "mail: ").expect("today count");
+        digits_after(lines[4], "· ").expect("archived count");
+
+        // Mail details: ``YYYYMMDD-HHMMSS`` stamp + [box] + subject.
+        for detail in [&lines[5], &lines[6]] {
+            let stamp = &detail["   ✉ `".len()..];
+            let stamp = &stamp[..stamp.find('`').expect("closing backtick")];
+            let stamp = stamp.replace('-', "");
+            assert_eq!(stamp.len(), 14, "{detail}");
+            assert!(stamp.chars().all(|c| c.is_ascii_digit()), "{detail}");
+            assert!(detail.contains("] "), "{detail}");
+        }
+
+        // Monitor: either the all-quiet line (`N checks pass quietly`) or
+        // per-check warn/fail lines. The golden carries the quiet shape.
+        digits_after(lines[7], "monitor: ").expect("check count");
+        assert!(lines[7].contains(" checks pass quietly"), "{}", lines[7]);
+
+        // Journal: `N warn(, N error(s))?` then either trailing lines or
+        // the `s — all quiet` closer (0 warns reads as the plural form).
+        let jour = lines[8];
+        let warns = digits_after(jour, "briefing: ").expect("warn count");
+        if warns == 0 {
+            assert!(jour.ends_with(" warns — all quiet"), "{jour}");
+        } else if let Some(errors) = digits_after(jour, ", ") {
+            assert!(jour.contains(&format!(" {errors} error")), "{jour}");
+        }
+    }
 }
