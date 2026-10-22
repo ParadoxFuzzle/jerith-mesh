@@ -811,25 +811,31 @@ gotchas surfaced while building the finished parts.
   copy already exists: the bot crate's SkillSpec registry + signed webhook
   hooks are the SDK; an adapter only plugs a different transport in front
   of the same loop.
-- **Model-switch hot path (§2's model switching)**. Config hot-reload
-  deliberately leaves `[model]` cold (echo: model switching is mesh
-  re-identity work — disconnect then rejoin). Landed 2026-10-17, the
-  graceful half is LIVE (verified end-to-end against the real bootstrap,
-  2026-10-17): a cold model change fires ONE signed `/v1/leave` on the
-  ping tick — the old-model ad is retracted instantly (no 90 s TTL of a
-  peer that no longer serves), the advertise latch closes, and `/status`
-  `mesh_exit` carries `left_mesh` + `pending_model`. Restart `jerith run`
-  to rejoin under the new model (Rest: in-process rejoin is deliberately
-  NOT attempted — routers, tier bindings and every boot-time identity
-  path read the config once; the cold-field WARN stays for the restart
-  half). Live drill evidence: real node switched models, the journal
-  warned `model changed in config — LEFT the old mesh (signed /v1/leave,
-  not re-advertising)`, our node id dropped off the public peers list
-  within one tick (entries 3→2, no TTL wait), and after restoring the
-  config + restart the node rejoined (`left_mesh: false`, peers alive).
-  What remains: the rejoin half (a supervisor/watchdog applying the new
-  identity in-process) stays 📋 — the honest boundary is documenting
-  that the restart is the intended join mechanic.
+- **Model-switch hot path (§2's model switching)** — LANDED, both halves.
+  The graceful leave half landed 2026-10-17 (verified end-to-end against
+  the real bootstrap): a model change in config fires a signed `/v1/leave`
+  on the ping tick — the old-model ad is retracted instantly (no 90 s TTL
+  of a peer that no longer serves), the advertise latch closes, and
+  `/status` `mesh_exit` carries the pending rejoin target. The rejoin
+  half LANDED 2026-10-22 as the SUPERVISOR (`ping.rs`, no restart): the
+  leave must be ACCEPTED by a bootstrap before re-identifying (a downed
+  bootstrap reads honestly as "old ad expires by TTL — rejoin waits";
+  leaves retry every tick until one accepts, so no dual-mesh presence is
+  ever risked between retraction and rejoin), then the new model is
+  adopted IN-PROCESS — the registry gate rebuilds next tick (it already
+  re-reads the model each iteration), the compat census re-checks once
+  (explicit reset), and the next advertise tick joins the new model's
+  mesh. `/status.mesh_exit` gained `model_switches` (completed in-process
+  switches, so the round-trips are auditable). The WARN log line is
+  honestly reworded: `config model changed — the §2 supervisor handles
+  it`. One live drill evidence entry from 2026-10-17 still stands (real
+  node switched models, our node id dropped off the public peers list
+  within one tick — entries 3→2, no TTL wait — and the node rejoined
+  with `left_mesh: false`, peers alive). Scope note, still honest: the
+  supervisor's rejoin applies the MESH REGISTRY identity (ads, census,
+  peers, compat). The runtime engine's serving-side models (`[runtime]`)
+  remain boot-bound in the reload plan, untouched — a serving-language
+  model change stays a restart.
 - **Cold-list watch for the config hot-reload.** Every new hot field must
   genuinely read from the running config at its use site — the reload
   plan classifier (`ping.rs`) keeps the cold list short and deliberate.

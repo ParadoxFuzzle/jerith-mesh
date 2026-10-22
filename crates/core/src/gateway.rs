@@ -1160,9 +1160,11 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
             })).collect::<Vec<_>>(),
         })
     };
-    // §2 model-switch machinery: whether this node has gracefully LEFT the
-    // mesh (signed leave + advertise latch) ahead of a config-model
-    // restart, and which model it would serve when it rejoins.
+    // §2 model-switch supervisor: whether this node has gracefully LEFT
+    // the mesh (signed leave + advertise latch) while a leave is pending
+    // confirmation, which model would be rejoined after it, and how many
+    // in-process switches have completed (the latched window is seconds
+    // nowadays — the counter makes the visits auditable).
     let mesh_exit_value = {
         let left = gw
             .state
@@ -1171,6 +1173,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         json!({
             "left_mesh": left,
             "pending_model": *gw.state.pending_model.read().await,
+            "model_switches": gw
+                .state
+                .model_switches
+                .load(std::sync::atomic::Ordering::SeqCst),
         })
     };
     let value = json!({

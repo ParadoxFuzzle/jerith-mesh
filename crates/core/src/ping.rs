@@ -116,14 +116,25 @@ pub struct MeshState {
     /// retry for this long so a dead neighbor doesn't spam every tick.
     memory_swap_backoff_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// §2 model-switch machinery: a graceful mesh EXIT is latched (the
-    /// `model` cold change in a reload plan) — the bootstrap got our
-    /// signed /v1/leave, the advertise tick stops, and /status reports
-    /// the pending restart instead of a wedge. One-shot: the executor
-    /// fires once per process via compare_exchange.
+    /// `model` change in a reload plan) — the bootstrap got our signed
+    /// /v1/leave, the advertise tick stops, and /status reports the
+    /// pending rejoin instead of a wedge. Cleared again by the rejoin
+    /// supervisor once the new model is applied in-process.
     pub left_mesh_latch: std::sync::atomic::AtomicBool,
     /// Why the latch fired (typed journal: config model id we would serve
-    /// after a restart), surfaced beside the latch in /status.
+    /// after a rejoin), surfaced beside the latch in /status. Consumers
+    /// clear it when the supervisor's rejoin lands.
     pub pending_model: tokio::sync::RwLock<Option<String>>,
+    /// §2 rejoin supervisor: true ONLY once a bootstrap accepted our
+    /// signed leave (the old-model ad is retracted — no 90 s TTL squatter
+    /// when the new identity re-ads). The rejoin adoption gates on this:
+    /// unconfirmed leaves retry each tick, and a dual-mesh presence is
+    /// never risked by re-advertising before the retraction lands.
+    pub leave_confirmed: std::sync::atomic::AtomicBool,
+    /// §2 rejoin supervisor telemetry: how many model switches this
+    /// process has completed (leave accepted → new identity advertised).
+    /// Surfaced in /status mesh_exit so the dual-mesh shape is auditable.
+    pub model_switches: std::sync::atomic::AtomicU64,
     /// §10 reputation gossip: bootstrap-verified score stamps we may carry
     /// inside ads. Newest-subject-per-stamp, capped; every stamp in here
     /// verified against an ORIGIN pin WE made from a configured/learned
@@ -300,6 +311,8 @@ impl MeshState {
             memory_swap_backoff_until: std::sync::Mutex::new(None),
             left_mesh_latch: std::sync::atomic::AtomicBool::new(false),
             pending_model: tokio::sync::RwLock::new(None),
+            leave_confirmed: std::sync::atomic::AtomicBool::new(false),
+            model_switches: std::sync::atomic::AtomicU64::new(0),
             reputation_cache: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         });
         Ok((state, rx))
@@ -1262,36 +1275,65 @@ async fn reload_config_from_disk(state: &Arc<MeshState>) {
     for field in plan.hot {
         tracing::info!(field, "config hot-applied (took effect this tick)");
     }
+    // A model change is handled by the supervisor (leave → accepted →
+    // in-process rejoin); everything else cold is genuinely restart-only.
     for field in &plan.cold {
-        tracing::warn!(field, "config field changed — restart required to apply");
+        if *field == "model" {
+            tracing::info!(
+                field,
+                "config model changed — the §2 supervisor handles it (leave, then in-process rejoin)"
+            );
+        } else {
+            tracing::warn!(field, "config field changed — restart required to apply");
+        }
     }
-    // §2 model-switch machinery: a model change is cold by deliberate
-    // design (model switching is MESH RE-IDENTITY — routers, tier
-    // bindings and the registry key off the boot-time model), but the
-    // graceful HALF is live right now: signed /v1/leave retracts the
-    // old-model ad instantly, the advertise latch closes, and /status
-    // carries the pending restart.
+    // §2 model-switch machinery: a model change is registry-identity work
+    // (routers, tier bindings and the registry key off the boot-time
+    // model), handled by a supervisor rather than a restart now. The
+    // state machine per tick (all inside the executor's model branch):
+    //   1. CHANGE  — signed /v1/leave retracts the old-model ad instantly,
+    //      the advertise latch closes and /status carries the pending
+    //      rejoin target (graceful half, unchanged shape).
+    //   2. CONFIRM — a bootstrap must ACCEPT that leave before we
+    //      re-identify; unconfirmed leaves RETRY every tick (a down
+    //      bootstrap reads honestly as "old ad expires by TTL — rejoin
+    //      waits"), so no dual-mesh snuck between retraction and rejoin.
+    //   3. REJOIN  — the new model is adopted in-process: the registry
+    //      gate rebuilds next iteration, the census re-checks once, and
+    //      the next advertise tick joins the new model's mesh. Restart
+    //      is no longer the join mechanic.
     if plan.cold.contains(&"model") {
         let pending = disk
             .model
             .as_ref()
             .map(|m| format!("{} ({})", m.id, m.quant));
-        graceful_model_exit(state, pending).await;
+        graceful_model_exit(state, pending).await; // retracts + retries until accepted
+        if state
+            .left_mesh_latch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && state
+                .leave_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            apply_model_rejoin(state, disk.model.clone()).await;
+        }
     }
 }
 
-/// The graceful half of the model-switch: retract our own advertisement
-/// NOW (a stop then restart otherwise leaves the old ad up for the whole
-/// 90 s TTL — a peer in the old mesh that no longer serves its model).
-/// Idempotent per process: the first model-change tick fires the leave
-/// and closes the advertise latch; later ticks see both latched.
+/// A leave reached a bootstrap: the old-model ad is retracted NOW, so
+/// the rejoin may safely re-identify. Retries on later ticks when no
+/// bootstrap answered (none take the mesh down with them: the honest
+/// "expires by TTL" line).
 async fn graceful_model_exit(state: &Arc<MeshState>, pending: Option<String>) {
     let first_change = !state
         .left_mesh_latch
         .swap(true, std::sync::atomic::Ordering::SeqCst);
     *state.pending_model.write().await = pending;
-    if !first_change {
-        return;
+    if state
+        .leave_confirmed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return; // leave already accepted — this is the supervisor's tick, not a retry
     }
     let order = { state.discovery.lock().await.order(None) };
     let node_id = { state.config.read().await.node_id.clone() };
@@ -1303,18 +1345,76 @@ async fn graceful_model_exit(state: &Arc<MeshState>, pending: Option<String>) {
     })
     .await;
     match legs {
-        Ok((advertised_before, used)) => tracing::warn!(
-            target: "mesh",
-            bootstrap = %used,
-            advertised_before,
-            "model changed in config — LEFT the old mesh (signed /v1/leave, not re-advertising); restart `jerith run` to rejoin under the new model"
-        ),
-        Err(e) => tracing::warn!(
-            target: "mesh",
-            error = %e,
-            "model changed — graceful leave could not reach any bootstrap; the old ad expires by TTL instead"
-        ),
+        Ok((advertised_before, used)) => {
+            state
+                .leave_confirmed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if first_change {
+                tracing::warn!(
+                    target: "mesh",
+                    bootstrap = %used,
+                    advertised_before,
+                    "model changed in config — LEFT the old mesh (signed /v1/leave accepted); the supervisor rejoins under the new model in-process"
+                );
+            } else {
+                tracing::info!(
+                    target: "mesh",
+                    bootstrap = %used,
+                    "model-switch leave reached a bootstrap — rejoin may proceed"
+                );
+            }
+        }
+        Err(e) => {
+            // Latch stays closed (old identity stops advertising) but the
+            // rejoin is DELAYED — a retried leave lands on a later tick.
+            // The old ad expires by TTL, so no zombie peer either way.
+            tracing::warn!(
+                target: "mesh",
+                error = %e,
+                "model changed — no bootstrap accepted the leave yet; retried next tick, rejoin waits for the confirmation"
+            );
+        }
     }
+}
+
+/// Step 3 of the model-switch supervisor: adopt the config's new model
+/// in-process. Callers gate on latch + leave_confirmed, so this runs
+/// exactly once per switch; the registry gate + census recheck ride the
+/// loop's own machinery from here (the log line is "restart-key-systems
+/// re-read": the config is checked every tick).
+async fn apply_model_rejoin(state: &Arc<MeshState>, new_model: Option<crate::models::ModelId>) {
+    if let Some(m) = &new_model {
+        let mut live = state.config.write().await;
+        live.model = Some(m.clone());
+    }
+    // Census under the new identity — next bootstrap leg re-checks (the
+    // once-per-process gate is the None here, an explicit reset).
+    *state.compat.write().await = None;
+    *state.pending_model.write().await = None;
+    state
+        .left_mesh_latch
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    state
+        .leave_confirmed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let n = state
+        .model_switches
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    let (model, quant) = (
+        new_model.as_ref().map(|m| m.id.clone()).unwrap_or_default(),
+        new_model
+            .as_ref()
+            .map(|m| m.quant.clone())
+            .unwrap_or_default(),
+    );
+    tracing::info!(
+        target: "mesh",
+        switches = n,
+        model,
+        quant,
+        "model switched in-process — rejoined under the new identity (no restart; registry + census rebuilt on the next tick)"
+    );
 }
 
 /// Background loop handle.
@@ -2755,12 +2855,190 @@ mod tests {
             "pending restart model recorded"
         );
         // Idempotence: the reload executor runs every tick — the second
-        // invocation (any pending value) must not re-fire the leave.
+        // invocation (any pending value) must not re-fire the leave; the
+        // first call's leave was ACCEPTED (the stub accepts), and a
+        // confirmed leave short-circuits the retry lane.
         graceful_model_exit(&state, Some("newmodel (bogquant)".to_string())).await;
         assert_eq!(
             hits.load(AtomicOrdering::SeqCst),
             1,
-            "latch made the leave one-shot"
+            "confirmed leave short-circuits the retry"
+        );
+        assert!(
+            state
+                .leave_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "accepted leave is the confirmed state"
+        );
+    }
+
+    /// §2 supervisor step 3: the rejoin adoption. After an ACCEPTED leave,
+    /// the new model lands in the live config, the latch + confirm flags
+    /// reset (the machine is ready for the NEXT switch), the census
+    /// re-checks once, and the switch counter ticks. Also proves a second
+    /// switch re-fires the leave lane (hits goes 1 → 2) — the reset made
+    /// the side effects fresh again, not process-cumulative.
+    #[tokio::test]
+    async fn model_switch_supervisor_rejoins_after_accepted_leave() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_ref = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/leave",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = hits_ref.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    let _ = body;
+                    axum::Json(serde_json::json!({"left": true}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mk = |id: &str, quant: &str| crate::models::ModelId {
+            id: id.to_string(),
+            quant: quant.to_string(),
+            source: crate::models::ModelSource::Curated,
+        };
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        cfg.model = Some(mk("meshA", "int4"));
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        {
+            let mut d = state.discovery.lock().await;
+            d.configured = vec![format!("http://{addr}")];
+            d.last_good = None;
+        }
+
+        // Step 1+2: change → leave accepted.
+        graceful_model_exit(&state, Some("meshB (int8)".to_string())).await;
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            state
+                .leave_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "accepted leave is confirmed"
+        );
+
+        // Step 3: adopt. Config carries the new identity; the gates reset
+        // so the machine can fire again; telemetry counts ONE switch.
+        apply_model_rejoin(&state, Some(mk("meshB", "int8"))).await;
+        assert_eq!(
+            state.config.read().await.model.as_ref(),
+            Some(&mk("meshB", "int8"))
+        );
+        assert!(
+            !state
+                .left_mesh_latch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "rejoin cleared the advertise latch"
+        );
+        assert!(
+            !state
+                .leave_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "rejoin consumed the confirmation"
+        );
+        assert!(state.compat.read().await.is_none(), "census re-checks once");
+        assert_eq!(state.pending_model.read().await.as_deref(), None);
+        assert_eq!(
+            state
+                .model_switches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // Second switch: the leave lane is live again (not one-shot per
+        // process anymore — the supervisor round-trips).
+        graceful_model_exit(&state, Some("meshC (int4)".to_string())).await;
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 2, "leave fired again");
+        assert!(
+            state
+                .left_mesh_latch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "latch closed for the second switch"
+        );
+    }
+
+    /// §2 supervisor step 2: a leave NO bootstrap accepts keeps the
+    /// machine exited (old identity stops advertising) but does NOT
+    /// confirm — a rejoin would be dual-mesh presence while the old ad
+    /// lives out its TTL. Retries fire per call, and the first accepted
+    /// retry confirms.
+    #[tokio::test]
+    async fn graceful_model_exit_retries_until_a_bootstrap_accepts() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_ref = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/leave",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = hits_ref.clone();
+                async move {
+                    let n = hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    let _ = body;
+                    if n == 0 {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    } else {
+                        axum::Json(serde_json::json!({"left": true})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg = NodeConfig::default();
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        {
+            let mut d = state.discovery.lock().await;
+            d.configured = vec![format!("http://{addr}")];
+            d.last_good = None;
+        }
+
+        // Tick 1: the leave 500s — latched (stop advertising the old id)
+        // but NOT confirmed (no rejoin while the old ad may still stand).
+        graceful_model_exit(&state, Some("meshB (int8)".to_string())).await;
+        assert!(
+            state
+                .left_mesh_latch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "latch closed even unconfirmed"
+        );
+        assert!(
+            !state
+                .leave_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a rejected leave must not confirm the rejoin gate"
+        );
+
+        // Tick 2: the retry is accepted — the gate opens exactly then.
+        graceful_model_exit(&state, Some("meshB (int8)".to_string())).await;
+        assert!(
+            state
+                .leave_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the accepted retry confirms"
+        );
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "one rejected first dial, one accepted retry"
+        );
+
+        // Tick 3: confirmed — no further leave dials, just the supervisor.
+        graceful_model_exit(&state, Some("meshB (int8)".to_string())).await;
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "confirmed short-circuits the retry"
         );
     }
 
