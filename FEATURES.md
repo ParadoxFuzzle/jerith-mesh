@@ -1154,7 +1154,7 @@ Notifications fan out to wherever the operator reads:
 | Channel | Shape | Resolution |
 |---|---|---|
 | Discord owner DM | card + **Approve ✓ / Deny ✕** buttons | button press, identity-checked (owner id only) |
-| Telegram | inline keyboard via `@BotFather` token | button callback or `approve <id> [json]` / `deny <id>` (chat-id-checked), 25 s long-poll `getUpdates` — zero open ports |
+| Telegram | inline keyboard via `@BotFather` token | button callback or `approve <id> [json]` / `deny <id>` (chat-id-checked), 25 s long-poll `getUpdates` — zero open ports; when `§18`'s transport shares the token, the transport is the only poller and resolves these shapes through its stream |
 | Webhooks | signed `approval_requested` / `approval_resolved` events (hooks.rs HMAC) + optional raw `[approvals] notify_webhooks` card bodies | Slack bridge / ntfy / WhatsApp relays see the request; resolution stays on the approved channels |
 
 Correct-resolution semantics: skill args are **merged** (patch the one
@@ -1396,6 +1396,7 @@ core as Discord — `handle_incoming` → gate once →
 | Feishu / Lark | (callback needs public URL + AES; WS long-connection wire is SDK-private — typed limitation) | `tenant_access_token` cache + `im/v1/messages` (text as JSON string), feishu/lark domain switch | boot-time token round-trip = loud credential check |
 | WhatsApp | PUSH-only → `webinbox /in/whatsapp` (X-Hub-Signature-256 HMAC w/ app_secret + hub.verify_token GET handshake) | Graph `/{phone_number_id}/messages` @3500 | `app_secret` REQUIRED — unsigned callbacks refused |
 | GG | — | — | typed dormant stub: NO public bot API exists (researched 2026-10); `validate()` refuses at LOAD with the reason, citing the completion file |
+| Telegram | Bot API long-poll `getUpdates` (offset = max update_id + 1, restart-safe) | `sendMessage` @4000, token rides the URL path — error contexts are REDACTED, never journaling the token | `respond_to: mention \| all`, private chats always relay, groups mention-gated; 409 = a second getUpdates consumer = typed config-fatal. The §15 approvals lane shares the token here by design: `transport_owns_token` gates the standalone poller off and `handle_transport_update` resolves button presses + `approve/deny` text inline — ONE getUpdates consumer per token, always |
 
 `webinbox` (the one optional listener): loopback-bound axum server
 (`127.0.0.1:5543` default) when `[transports.webinbox]` exists; each

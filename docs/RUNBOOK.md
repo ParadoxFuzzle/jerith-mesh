@@ -1291,16 +1291,29 @@ the running bot resolves the ✔ press and executes a harmless deferred
 `memory.embed`), then print the id. Never run it from a temp-config
 suite: the card must persist in this store and resolve in the live bot.
 
-## External chat transports (11 platforms, dormant, 2026-10-19)
+## External chat transports (12 platforms; Telegram live-fire 2026-10-22)
 
 `crates/bot/src/transports/` ships adapters for IRC, Slack (Socket
 Mode), Twitch, Mattermost, Signal (signal-cli daemon), Nextcloud Talk,
-MS Teams, Google Chat, Feishu/Lark, WhatsApp Cloud, and GG. ALL ARE
+MS Teams, Google Chat, Feishu/Lark, WhatsApp Cloud, Telegram, and GG.
+ALL OTHERS REMAIN
 DORMANT: a platform runs only if its `[transports.<platform>]` table
 exists in bot.toml — no table, no task, zero cost (so the bot that
 ships today behaves exactly as before). See FEATURES §18 for the
 per-platform inbound/outbound surface and `transports/<platform>.rs`
 module doc for the setup contract (tokens, endpoints, caps).
+
+Single-consumer rule (Telegram, learned live 2026-10-22): getUpdates
+admits exactly one poller per bot token. The approvals lane's
+`[approvals] telegram_bot_token` and the transport's
+`[transports.telegram].token` MUST NOT be two different bots polling no
+one — when they hold the SAME token, `approval::transport_owns_token`
+gates the standalone approval poller off and approval buttons/commands
+ride the transport's stream (`handle_transport_update`); on a different
+approvals token both lanes poll their own bots independently. A 409
+from getUpdates is a typed config-fatal ("another consumer holds this
+token") — it means exactly one thing: two pollers, usually the bot
+against itself.
 
 ```bash
 # Arm a platform: add its table + restart (fail-loud errors explain gaps)

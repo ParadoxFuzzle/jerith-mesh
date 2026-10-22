@@ -37,6 +37,7 @@ pub(crate) mod nextcloud;
 pub(crate) mod signal;
 pub(crate) mod slack;
 pub(crate) mod teams;
+pub(crate) mod telegram;
 pub(crate) mod twitch;
 pub(crate) mod webinbox;
 
@@ -303,6 +304,7 @@ fn trait_cfg_dispatch(
             }
         };
     }
+    spawn_if!(telegram, telegram, "telegram");
     spawn_if!(irc, irc, "irc");
     spawn_if!(slack, slack, "slack");
     spawn_if!(twitch, twitch, "twitch");
@@ -354,6 +356,8 @@ fn supervise(
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransportsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram: Option<telegram::TelegramConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub irc: Option<irc::IrcConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack: Option<slack::SlackConfig>,
@@ -384,6 +388,9 @@ impl TransportsConfig {
     /// Sum of enabled platforms (used by main() to decide the spawn log).
     pub fn enabled_platforms(&self) -> Vec<&'static str> {
         let mut v = Vec::new();
+        if self.telegram.is_some() {
+            v.push("telegram");
+        }
         if self.irc.is_some() {
             v.push("irc");
         }

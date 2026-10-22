@@ -1003,10 +1003,70 @@ fn state_line(value: &Value) -> String {
     }
 }
 
+/// Whether the external chat transport owns this same bot token
+/// (FEATURES §18): two getUpdates consumers on one token 409-conflict
+/// forever, so when `[transports.telegram].token` equals the approvals
+/// token the transport is the ONLY poller — this poller exits and the
+/// transport hands approval updates back over [`handle_transport_update`].
+pub fn transport_owns_token(cfg: &crate::config::BotConfig) -> bool {
+    let Some(t) = &cfg.transports.telegram else {
+        return false;
+    };
+    cfg.approvals.telegram_bot_token.as_deref() == Some(t.token.as_str())
+}
+
+/// The transport's update stream: does this update belong to the approval
+/// bridge (an inline-keyboard press on an approval card, or an
+/// `approve/deny` command from the configured chat)? Mirrors exactly the
+/// shapes [`handle_telegram_update`] acts on — a false here means the
+/// transport relays the update as ordinary chat.
+fn is_approval_event(cfg: &crate::config::BotConfig, update: &Value) -> bool {
+    if let Some(cb) = update.get("callback_query") {
+        return cb
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|d| parse_button(d).is_some());
+    }
+    let Some(chat) = cfg.approvals.telegram_chat_id else {
+        return false;
+    };
+    let Some(msg) = update.get("message") else {
+        return false;
+    };
+    if msg.pointer("/from/id").and_then(Value::as_i64) != Some(chat) {
+        return false;
+    }
+    let text = msg
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let Some((word, tail)) = text.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let id = tail.split_whitespace().next().unwrap_or("");
+    matches!(word.to_ascii_lowercase().as_str(), "approve" | "deny") && id.len() == 8
+}
+
+/// Hand-off entry for the transport lane (FEATURES §18): one shared
+/// getUpdates consumer — the transport feeds every update through here;
+/// approval events are resolved (and acked) exactly as the old standalone
+/// poller did, everything else returns false for ordinary chat relay.
+pub async fn handle_transport_update(cfg: &Arc<crate::config::BotConfig>, update: &Value) -> bool {
+    if !is_approval_event(cfg, update) {
+        return false;
+    }
+    handle_telegram_update(cfg, update).await;
+    true
+}
+
 /// Telegram long-poll loop: resolves inline-keyboard callbacks and text
 /// commands (`approve <id>` / `deny <id>` / `approve <id> <json>` for the
 /// Correct path) from the configured chat only. Runs until the process
 /// dies; a dead network is absorbed (poll retries at the loop tick).
+/// If the chat transport owns this same token (see
+/// [`transport_owns_token`]) the transport is the poller instead — the
+/// standalone loop exits so the token never has two consumers.
 pub fn start_telegram_poller() {
     tokio::spawn(async move {
         let mut offset: i64 = 0;
@@ -1015,6 +1075,12 @@ pub fn start_telegram_poller() {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             };
+            if transport_owns_token(&cfg) {
+                tracing::info!(
+                    "approvals: chat transport owns this bot token — riding its poll stream"
+                );
+                return;
+            }
             let Some(token) = cfg.approvals.telegram_bot_token.clone() else {
                 return; // telegram not configured — poller exits cleanly
             };
@@ -1823,6 +1889,69 @@ mod tests {
             "approval id = {}  →  press ✔ Approve in Telegram now",
             out["id"]
         );
+    }
+
+    #[test]
+    fn transport_token_ownership_gates_the_standalone_poller() {
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:1", "http://127.0.0.1:1");
+        // No transport configured: the approvals lane owns its token alone.
+        cfg.approvals.telegram_bot_token = Some("t".into());
+        assert!(!transport_owns_token(&cfg));
+        // Transport on a DIFFERENT token: both bots can poll independently.
+        cfg.transports.telegram = Some(crate::transports::telegram::TelegramConfig {
+            api_url: "https://api.telegram.org".into(),
+            token: "other".into(),
+            bot_username: "b".into(),
+            allowed_chats: vec![],
+            respond_to: "mention".into(),
+            poll_timeout_secs: 25,
+        });
+        assert!(!transport_owns_token(&cfg));
+        // Same token: the transport is the single getUpdates consumer.
+        cfg.transports.telegram.as_mut().unwrap().token = "t".into();
+        assert!(transport_owns_token(&cfg));
+    }
+
+    #[test]
+    fn transport_handoff_consumes_only_approval_shapes() {
+        let mut cfg =
+            crate::config::BotConfig::from_parts("http://127.0.0.1:1", "http://127.0.0.1:1");
+        cfg.approvals.telegram_chat_id = Some(7);
+
+        // Inline-button press on an approval card is consumed.
+        assert!(is_approval_event(
+            &cfg,
+            &json!({"callback_query": {"data": "ap:ABC12345:yes"}})
+        ));
+        // Unrelated callback data must reach the chat lane.
+        assert!(!is_approval_event(
+            &cfg,
+            &json!({"callback_query": {"data": "something:else"}})
+        ));
+
+        // approve/deny text from the configured chat is consumed.
+        assert!(is_approval_event(
+            &cfg,
+            &json!({"message": {"from": {"id": 7}, "text": "approve ABC12345"}})
+        ));
+        assert!(is_approval_event(
+            &cfg,
+            &json!({"message": {"from": {"id": 7}, "text": "deny ABC12345"}})
+        ));
+        // Wrong chat, short id, ordinary chatter — all relay as chat.
+        assert!(!is_approval_event(
+            &cfg,
+            &json!({"message": {"from": {"id": 9}, "text": "approve ABC12345"}})
+        ));
+        assert!(!is_approval_event(
+            &cfg,
+            &json!({"message": {"from": {"id": 7}, "text": "approve short"}})
+        ));
+        assert!(!is_approval_event(
+            &cfg,
+            &json!({"message": {"from": {"id": 7}, "text": "hello mesh"}})
+        ));
     }
 
     #[test]
