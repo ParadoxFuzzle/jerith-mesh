@@ -427,6 +427,7 @@ pub async fn run_lane(
         if honor_leave_if_requested(&manager, guild).await {
             return;
         }
+        rt().session_reestablishes.fetch_add(1, Ordering::Relaxed);
         match res.0 {
             Ok(()) => tracing::warn!("dialog session ended — restarting under caps"),
             Err(e) => tracing::error!(error = %e, "dialog session error — restarting"),
@@ -489,6 +490,7 @@ impl EventHandler for SeatEvents {
                     tracing::warn!("voice driver disconnected — operator leave already in flight");
                 } else {
                     lane_halfway(false);
+                    rt().seat_losses.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!("voice driver disconnected — watcher repairs on its cadence");
                 }
             }
@@ -808,6 +810,13 @@ pub struct VoiceRuntimeState {
     running: AtomicBool,
     /// The seat is actually taken (join succeeded).
     in_vc: AtomicBool,
+    /// Live-session cycles re-established since the process started
+    /// (caps + supervised error restarts; the first bring-up is not an
+    /// event, every cycle after is).
+    session_reestablishes: AtomicU64,
+    /// Seat losses seen this process: watcher-detected and driver-
+    /// event-detected (NOT deliberate operator leaves).
+    seat_losses: AtomicU64,
     /// /voiceleave: the cycle stops and the bot stays out until the
     /// next restart (rejoin without a restart is deliberately absent
     /// — joining back is the restart path, one honest control).
@@ -823,6 +832,8 @@ fn rt() -> &'static VoiceRuntimeState {
     VOICE_RT.get_or_init(|| VoiceRuntimeState {
         running: AtomicBool::new(false),
         in_vc: AtomicBool::new(false),
+        session_reestablishes: AtomicU64::new(0),
+        seat_losses: AtomicU64::new(0),
         left_by_op: AtomicBool::new(false),
         dialog_model: Mutex::new(String::new()),
         captions_channel: Mutex::new(None),
@@ -848,6 +859,15 @@ fn lane_stopped() {
     r.running.store(false, Ordering::Relaxed);
     r.in_vc.store(false, Ordering::Relaxed);
     *r.session_started.lock().unwrap() = None;
+}
+
+/// Facts for the daily briefing (and anything else that wants live truth).
+pub fn runtime_facts() -> (u64, u64) {
+    let r = rt();
+    (
+        r.seat_losses.load(Ordering::Relaxed),
+        r.session_reestablishes.load(Ordering::Relaxed),
+    )
 }
 
 /// The one /status line. Honest in every state the process can be in.
@@ -951,6 +971,7 @@ async fn seat_watch(
         if seated {
             seated = false;
             lane_halfway(false);
+            rt().seat_losses.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("voice seat lost (driver has no voice connection) — rejoining");
         }
         match tokio::time::timeout(Duration::from_secs(25), manager.join(guild, channel)).await {

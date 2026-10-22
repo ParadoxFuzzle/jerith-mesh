@@ -793,6 +793,7 @@ mod tests {
             archiver: Default::default(),
             squeeze: Default::default(),
             monitor: Default::default(),
+            briefing: Default::default(),
             external_plugins: Vec::new(),
             chat_timeout_secs: 240,
             chat_stream: false,

@@ -1627,6 +1627,55 @@ A human voice in the VC is the last hop: the automated suite cannot
 speak. Manual try: join the configured VC, talk, listen for the model,
 check /recall notes and the (optional) captions channel.
 
+## 24. Daily owner self-briefing (2026-10-22)
+
+`crates/bot/src/briefing.rs` + `[briefing]` in bot.toml — one owner DM
+per local day that stitches the past 24h into a single honest note, so
+the operator doesn't need `journalctl` to know how the bot is doing.
+Composition, not invention — every section reads a surface the bot
+already owns:
+
+- **journal**: an in-process tracing layer (`JournalRing`, installed on
+  the composed subscriber alongside the fmt layer) records every
+  WARN/ERROR the process emits into a capped ring (24 lines, msg-first
+  rendering, `field=value` context kept) + counters; the briefing
+  drains it (the drain IS the reset — the numbers mean "since the last
+  briefing"). Spawning `journalctl` is deliberately NOT done: the
+  process journal is what the bot can always see about itself, unit-run
+  or dev-run alike; and the ring only keeps the operator's own log
+  lines, so nothing user-content leaks.
+- **monitor**: `run_checks` fresh at brief time — warn/fail lines lead,
+  the pass count is named honestly. Same threshold family as the
+  monitor's own loop; the two messages are not redundant — the monitor
+  DMs only when something is wrong; the briefing also reports when
+  everything is.
+- **mail**: archive listing via `mailbox::list_messages_in` — today's
+  count (per archive filename stamp, labelled as such — these are
+  archive stamps, not delivery receipts) + the two newest subjects.
+- **voice**: the live seat line (`/status`'s proven wording) plus the
+  seat-loss / session-re-establishment counters voice.rs now exposes
+  (driving the next drop's diagnosis instead of folklore).
+- **approvals + mesh**: outstanding human-in-the-loop card count, and
+  peer aliveness/contribution from the gateway status (unreachable →
+  named, with the error, not hidden).
+
+Schedule semantics: hourly cadence; fires once per local day once the
+local hour reaches `hour` (default 08, clamp 0–23). Fire state persists
+to `$JERITH_HOME/bot/briefing-state.json` (same `$JERITH_HOME` rebase
+convention as the mine-tally ledger), so a restart AFTER the hour
+briefs immediately (catch-up) and a restart BEFORE it waits — exactly
+once per local day. A failed DM is NOT persisted: the next hourly tick
+retries today's briefing. Without a resolved owner id the report is
+logged at INFO instead of DM'd — the monitor's fail-quiet rule.
+Delivery rides the same owner resolution the monitor uses
+(`cfg.owner_discord_id`); body is clipped to 1900 chars with the
+honest tail (Discord's 2000-char bound).
+
+Tests: 3 units (journal visitor + ring-drain semantics + state-file
+gate algebra), all pure — the visitor/ring honesty (message first,
+context after, cap, newest-window), and the once-per-day /
+catch-up/before-the-hour gate truth.
+
 **Seat-hold watcher** (2026-10-21, after an observed silent drop): a
 live seat can be lost between boot's join and the WSS lanes' view —
 the day's evidence was the bot disappearing from the VC roster while

@@ -15,6 +15,7 @@ mod api;
 mod approval;
 mod archiver;
 mod audio;
+mod briefing;
 mod chat_fallback;
 mod commands;
 mod config;
@@ -111,12 +112,21 @@ fn core_token() -> anyhow::Result<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,poise=warn")),
-        )
-        .init();
+    // Composed subscriber so the briefing's JournalRing rides alongside
+    // the fmt layer: every WARN/ERROR the process emits is captured
+    // in-process (briefing.rs) — the journalist inside, not a spawned
+    // journalctl.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,poise=warn"));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(briefing::JournalRing)
+            .init();
+    }
 
     let mut cfg = BotConfig::load()?;
     // Webhook event hooks (FEATURES §8): installed once; every emit site
@@ -348,6 +358,17 @@ async fn main() -> anyhow::Result<()> {
                             monitor::run_loop(http_handle, cfg.owner_discord_id, monitor_cfg).await;
                         });
                     }
+                }
+                // Daily owner self-briefing (FEATURES §24): one owner DM
+                // per day stitching journal/monitor/mail/voice/approvals.
+                // enabled in the loop's own gate; without an owner id it
+                // logs its reports instead of DMing (fail-quiet).
+                if cfg.briefing.enabled {
+                    let http_handle = ctx.http.clone();
+                    let bot_cfg = cfg.clone();
+                    tokio::spawn(async move {
+                        briefing::run_loop(http_handle, cfg.owner_discord_id, bot_cfg).await;
+                    });
                 }
                 Ok(Data { cfg, state })
             })

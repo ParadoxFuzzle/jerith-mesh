@@ -1607,6 +1607,32 @@ message; transcripts warm the extraction cache.
   context. Over-cap sandbox files also get honest `skipped: N files per
   message…` lines instead of a "pending" that never pends.
 
+## Daily owner self-briefing (FEATURES §24, live 2026-10-22)
+
+`[briefing]` in bot.toml — one owner DM per local day (default hour 08
+local; `enabled = true` is the code default) that stitches the past
+24h into a single honest note: WARN/ERROR counts + the newest journal
+lines (in-process `JournalRing` tracing layer — nothing spawns
+journalctl), monitor checks fresh at brief time, mail archive arrivals
+(stamps, not receipts), voice seat state + loss/re-establish
+counters, outstanding approvals, and mesh peer truth. No owner id
+configured → the report is journaled each day instead of DM'd
+(fail-quiet, same as the monitor).
+
+- **Knobs**: `hour` (local 0–23, default 8 — the day's brief fires on
+  the first hourly tick at/after that hour; a boot after the hour
+  catches up immediately, before it waits), `enabled`.
+- **Fire state** lives at `$JERITH_HOME/bot/briefing-state.json`
+  (`{last_day}`) — exactly one brief per local day, restart-surviving;
+  a FAILED DM send is not persisted, so the next tick retries.
+- **The drain is the reset**: the journal section's counters mean
+  "since the last briefing" — a manual `/status` interlude does not
+  reset them; only the daily drain does.
+- **Verify live**: set `hour` to the current hour, delete the state
+  file, restart — the owner DM lands within the first tick (≤ a
+  minute), and the INFO line `daily self-briefing DM delivered`
+  confirms. Reset the hour to taste afterwards.
+
 ## Discord voice lane (config-opt-in, code live 2026-10-21)
 
 FEATURES §23 / `crates/bot/src/voice.rs` — an always-on `songbird` seat

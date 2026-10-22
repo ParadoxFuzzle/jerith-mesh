@@ -88,6 +88,9 @@ pub struct BotConfig {
     /// Ops monitor (OpenClaw ops-monitor family port): periodic checks
     /// with a single owner DM when something fails. Reports only.
     pub monitor: MonitorConfig,
+    /// Daily owner self-briefing: one owner DM per day stitching journal,
+    /// monitor, mail, voice and approvals (`[briefing]`, see briefing.rs).
+    pub briefing: BriefingConfig,
     /// Webhook / event hooks for plugin authors (FEATURES §8): fire-
     /// and-forget signed JSON events POSTed to operator URLs. Empty
     /// `urls` (the default) keeps it off; see hooks.rs.
@@ -480,6 +483,7 @@ impl BotConfig {
             archiver: file.archiver.unwrap_or_default(),
             squeeze: file.squeeze.unwrap_or_default(),
             monitor: file.monitor.unwrap_or_default(),
+            briefing: file.briefing.unwrap_or_default(),
             hooks: {
                 let cfg = file.hooks.unwrap_or_default();
                 cfg.validate()
@@ -594,6 +598,7 @@ impl BotConfig {
             archiver: ArchiverConfig::default(),
             squeeze: SqueezeConfig::default(),
             monitor: MonitorConfig::default(),
+            briefing: BriefingConfig::default(),
             hooks: crate::hooks::HooksConfig::default(),
             external_plugins: Vec::new(),
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
@@ -752,6 +757,37 @@ fn default_monitor_interval() -> u64 {
     30
 }
 
+/// Daily owner self-briefing settings (`[briefing]` in bot.toml) — one
+/// owner DM per day that stitches the past 24h into a single note:
+/// WARN/ERROR counts from the process journal ring, monitor findings,
+/// mail arrivals, voice-seat facts and outstanding approvals. Firing
+/// needs a resolved owner id; without one it stays journal-only (the
+/// same fail-quiet rule as the monitor).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BriefingConfig {
+    /// Run the daily DM.
+    #[serde(default = "default_briefing_on")]
+    pub enabled: bool,
+    /// Local hour (0–23) after which the day's briefing fires (also the
+    /// catch-up gate: a boot after this hour briefs immediately).
+    #[serde(default = "default_briefing_hour")]
+    pub hour: u32,
+}
+fn default_briefing_on() -> bool {
+    true
+}
+fn default_briefing_hour() -> u32 {
+    8
+}
+impl Default for BriefingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_briefing_on(),
+            hour: default_briefing_hour(),
+        }
+    }
+}
+
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
@@ -872,6 +908,9 @@ struct FileConfig {
     /// Optional `[monitor]` table — ops-monitor settings (checks +
     /// owner-DM reports; see monitor.rs).
     monitor: Option<MonitorConfig>,
+    /// Optional `[briefing]` table — the daily owner self-briefing (see
+    /// briefing.rs).
+    briefing: Option<BriefingConfig>,
     /// Optional `[hooks]` table — webhook event hooks for plugin authors
     /// (FEATURES §8, see hooks.rs). Empty = disabled.
     hooks: Option<crate::hooks::HooksConfig>,
