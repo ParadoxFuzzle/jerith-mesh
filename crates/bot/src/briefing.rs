@@ -156,7 +156,7 @@ impl LineVisitor {
 /// here, so the daily briefing's numbers mean "since the last briefing".
 pub fn drain_journal_section() -> String {
     let mut ring = RING.lock().unwrap_or_else(|p| p.into_inner());
-    let (warns, errors) = (ring.warns, ring.errors);    // Newest few, presented in chronological order (oldest of the
+    let (warns, errors) = (ring.warns, ring.errors); // Newest few, presented in chronological order (oldest of the
     // shown set first — a day's tail reads bottom-up as the truth).
     let lines: Vec<String> = ring
         .lines
