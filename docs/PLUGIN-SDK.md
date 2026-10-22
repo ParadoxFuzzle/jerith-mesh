@@ -9,8 +9,12 @@ seam Role 2 proposed), and the **transports layer now exists**:
 Twitch, Mattermost, Signal, Nextcloud Talk, MS Teams, Google Chat,
 Feishu/Lark, WhatsApp, GG as dormant `[transports.*]` adapters over
 the shared core, plus the `webinbox` loopback listener for push-only
-platforms. Packaging (Phase 3d template crates) remains design.
-All dormant until their bot.toml table exists, per the module doc.
+platforms (Telegram joined LIVE 2026-10-22). **Packaging ships too**
+(Phase 3d, 2026-10-22): the template crate (`crates/plugin-template/`,
+the `SkillServer` SDK lib + running example) and the Python single-file
+runner (`sdk/python/jerith_plugin.py`) — two SDK flavors, one wire
+contract. All dormant until their bot.toml table exists, per the module
+doc.
 
 This document pre-registers how plugins leave the compiled-in model
 (`crates/bot/src/plugins.rs`, in-tree Rust) so the skills/channels
@@ -148,10 +152,21 @@ reactions and message chunking differ per transport).
 3. **Phase 3c — Telegram adapter.** The first external-channel
    consumer, shipping as a separate binary (`jerith-bot-telegram`)
    configured via `bot.toml [telegram]`, reusing everything else.
-4. **Phase 3d — SDK packaging.** `plugins.d` as the community story: a
-   template crate + a plugin.toml template + an SDK runner (a Rust crate
-   or a foreign-language shim) so a nonzero-key author need only HTTP
-   and JSON.
+4. **Phase 3d — SDK packaging. ✅ implemented** (2026-10-22):
+   `crates/plugin-template/` packages the contract as code — a
+   `SkillServer` builder (the signed `/rpc` service: verification,
+   ±5-min freshness like `gcp-bridge`, the 65536-byte response cap,
+   typed errors) + the `jerith-plugin-example` binary (two demo skills)
+   + the copyable `plugin.toml`. The Python appliance for the
+   no-toolchain author is `sdk/python/jerith_plugin.py` (stdlib only):
+   `Plugin.from_manifest` reads the SAME `[plugin]` endpoint line both
+   halves bind/declare, `@p.skill("name")` registers handlers, boot
+   fails loud on a manifest/handler mismatch. CI pins the union:
+   the template crate's own tests round-trip the wire shapes, and a bot
+   test (`shipped_template_manifest_parses_under_todays_rules`) parses
+   the shipped manifest with the drop parser — template and parser
+   cannot drift silently. The community README is RUNBOOK's "Author a
+   plugin" section.
 
 ## What would falsify this design
 

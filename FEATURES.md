@@ -321,7 +321,12 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   `external:<id>` in `[plugins] enabled`, and dispatch over signed HTTP
   (HMAC recipe shared with the hooks events; bounded responses; typed
   errors keep the refusal contract). [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md)
-  carries the full design (transports for Telegram/WhatsApp remain 📋 Phase 3+)
+  carries the full design; packaging shipped too — Phase 3d ✅
+  (2026-10-22): `crates/plugin-template/` (`SkillServer` lib + example
+  binary + copyable `plugin.toml`) and `sdk/python/jerith_plugin.py`
+  (stdlib-only runner), both serving the ONE signed-dispatch contract
+  the parser does. Telegram's transport is live (§18); WhatsApp remains
+  push-only via `webinbox` (public webhook URL required — 📋 open lane)
 
 ## 8. Plugin / Skill System
 - 🔄 OpenClaw-style modular plugin and skill architecture (Phase 3 core ✅;
@@ -332,6 +337,12 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     chat tool loop reads only from the registry (`crates/bot/src/plugins.rs`)
   - Owners gate per plugin via bot.toml `[plugins] enabled = [...]`
     (websearch/memory/lore/squeeze; default all on, unknown ids fail loud)
+  - **Packaging (Phase 3d ✅, 2026-10-22):** the out-of-process author
+    path ships as two SDK flavors over ONE signed-dispatch contract —
+    Rust: `crates/plugin-template/` (the `SkillServer` service builder
+    + `jerith-plugin-example` demo + copyable `plugin.toml`); Python:
+    `sdk/python/jerith_plugin.py` (stdlib-only single file). CI pins
+    template ⇄ parser agreement; RUNBOOK has the five-minute lane.
   - Model-tool registry dispatch is whitelist-only: a disabled or unknown
     skill is refused to the model (fed back as an error it can recover
     from), never a chat failure — unit-tested (registry, gating, dispatch,

@@ -1336,6 +1336,39 @@ platforms write their logs under the shared tracing names
 `transport failed permanently` only on a config-level fatal — service
 blips fan back internally with backoff.
 
+## Author a plugin (Phase 3d SDK, shipped 2026-10-22)
+
+The community path needs no bot recompile: a plugins.d drop + a running
+skill service. Two SDK shapes, ONE wire contract (signed dispatch —
+`x-jerith-signature` = hex(HMAC-SHA256(secret, "{ts_ms}.{body}"))):
+
+- **Rust**: `crates/plugin-template/` — a library (`SkillServer`) that
+  IS the service (signature gate, ±5-min freshness, bounded responses,
+  typed errors), plus the `jerith-plugin-example` binary with two demo
+  skills. Copy `main.rs`, swap the handlers, keep `plugin.toml` in sync.
+- **Python (3.11+)**: `sdk/python/jerith_plugin.py` — one stdlib-only
+  file; `Plugin.from_manifest(...)` + `@p.skill("name")` decorators is
+  the whole surface. `example_plugin.py` is the same two demo skills.
+
+```bash
+# The five-minute lane (example plugin, both SDKs verified live):
+mkdir -p ~/.jerith-mesh/plugins.d/example
+cp crates/plugin-template/plugin.toml ~/.jerith-mesh/plugins.d/example/
+cargo run -p jerith-plugin-template --bin jerith-plugin-example &
+#    (or: python3 sdk/python/example_plugin.py \
+#          ~/.jerith-mesh/plugins.d/example/plugin.toml &)
+edit ~/.jerith-mesh/bot.toml        # add "external:example" to [plugins] enabled
+systemctl --user restart jerith-bot
+```
+
+Health: a dropped manifest with NO running endpoint costs nothing until
+invoked (then the model reads the typed timeout error); a malformed
+drop fails bot startup loud — the drop parser is fail-closed. The
+shipped template manifest is pinned by a bot test
+(`shipped_template_manifest_parses_under_todays_rules`), so template
+and parser cannot drift silently. Reference plugin in production:
+`crates/gcp-bridge` (the same contract at fleet scale).
+
 ## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is

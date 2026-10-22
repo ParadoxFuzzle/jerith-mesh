@@ -1,0 +1,28 @@
+# The copyable Phase 3d manifest template — companion to
+# `crates/plugin-template/` (the example service). Install path:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/example
+#   cp crates/plugin-template/plugin.toml ~/.jerith-mesh/plugins.d/example/
+#   cargo run -p jerith-plugin-template --bin jerith-plugin-example   # from the repo
+#   # then add "external:example" to [plugins] enabled in bot.toml + restart
+#
+# ONE endpoint line binds BOTH sides: the example binary reads [plugin]
+# endpoint itself and binds that address — manifest and service cannot
+# drift. Loopback by default; non-loopback must be https (the drop
+# parser enforces this, fail-closed at bot start).
+
+[plugin]
+id = "example"
+endpoint = "http://127.0.0.1:7788/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 10                         # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "echo"
+description = "Echo the given text back as an object (lane sanity check)."
+parameters = { type = "object", properties = { text = { type = "string" } }, required = ["text"] }
+
+[[skill]]
+name = "roll"
+description = "Roll one dN die (sides ≤ 1000); returns the roll."
+parameters = { type = "object", properties = { sides = { type = "integer", minimum = 1, maximum = 1000 } } }

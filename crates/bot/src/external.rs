@@ -406,6 +406,22 @@ description = "Multi-day forecast."
         );
     }
 
+    /// Phase 3d pin (docs/PLUGIN-SDK.md): the SHIPPED template manifest
+    /// (`crates/plugin-template/plugin.toml`) must parse right here,
+    /// today's rules — a template that drifts out of the drop parser's
+    /// fail-closed contract breaks the build, never a live bot.
+    #[test]
+    fn shipped_template_manifest_parses_under_todays_rules() {
+        let raw = include_str!("../../plugin-template/plugin.toml");
+        let p = ExternalPlugin::parse(Path::new("plugin-template/plugin.toml"), raw)
+            .expect("the shipped template manifest must stay valid");
+        assert_eq!(p.id, "example");
+        assert_eq!(p.gate_id(), "external:example");
+        let names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["example.echo", "example.roll"]);
+        assert!(p.secret.is_some(), "template ships signed by default");
+    }
+
     #[test]
     fn missing_drop_dir_is_empty_not_error() {
         let ghost = std::env::temp_dir().join("jerith-ext-nope-does-not-exist");
