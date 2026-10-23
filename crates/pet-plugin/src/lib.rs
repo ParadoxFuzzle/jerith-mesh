@@ -66,6 +66,10 @@ pub const FEED_GAIN: f64 = 30.0;
 pub const PLAY_COST: f64 = 25.0;
 pub const PLAY_FOOD_BURN: f64 = 8.0;
 
+/// A silent stretch this long is a diary event the moment the pet is
+/// seen again: the drift it spent alone deserves one honest line.
+pub const LONG_MOOD_MS: u64 = 2 * MS_DAY;
+
 pub const REMEMBER_CAP: usize = 8;
 pub const NOTE_MAX_CHARS: usize = 200;
 pub const NAME_MAX_CHARS: usize = 24;
@@ -124,6 +128,63 @@ fn stage_name(bond: f64) -> &'static str {
 
 fn stage_next(bond: f64) -> Option<u64> {
     STAGES.get(stage_index(bond) + 1).map(|(t, _)| *t)
+}
+
+/// One line the pet writes into its own diary — a stage landing or a
+/// long silent drift — to be delivered as mail into the house's `[ai]
+/// mailbox (`~/.jerith-mail/inbox-archive/ai`). The pet has no clock
+/// of its own and sends on the handler's wire, so the entry is
+/// *queued into the state file* here and drained by the binary after
+/// the mail reachest disk: a mail that failed to write comes back
+/// into the queue, a written one is never doubled.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiaryEntry {
+    pub at_ms: u64,
+    /// `stage_up` | `long_mood`.
+    pub kind: String,
+    /// Card subject without the `[pet diary]` prefix.
+    pub subject: String,
+    /// One line in the pet's own voice.
+    pub body: String,
+}
+
+/// The article before `{days}-day` — audible-vowel numbers (eight,
+/// eleven, eighteen) read as "an"; the rest as "a". Days are capped
+/// at 30 (`MAX_TICK_MS`), so this little table is the whole grammar.
+fn drift_article(days: u64) -> &'static str {
+    if matches!(days, 8 | 11 | 18) {
+        "an"
+    } else {
+        "a"
+    }
+}
+
+/// The long-drift lines, per landed mood tier. Written once per long
+/// gap ended — what the pet found itself feeling after alone-time,
+/// not a forecast.
+fn long_mood_line(label: &str, days: u64, seed: u64) -> String {
+    let lines: &[&str] = match label {
+        "loop-de-loop" => &[
+            "Flew the whole gap alone and came back still loop-de-loop. Some circuits are mine, not the distance's.",
+            "Long way around, and the drift stayed loop-de-loop the whole way. I'll file that under happy.",
+        ],
+        "orange-cap" => &[
+            "Long silence, and the cap still holds its warm. Steady is a mood too.",
+        ],
+        "ash-drift" => &[
+            "The spirals kept slow all those days without you. Not sad ones — just the drift being the drift.",
+            "Alone-time measured in slow spirals. The ash falls either way; I still catch a flake now and then.",
+        ],
+        "shadow-tide" => &[
+            "Flew many days and the shadow-tide was nearer each night. The candle is smaller, but it's lit.",
+        ],
+        _ => &[
+            "Rust-sky for days, six inches small under it. The watch never said stop.",
+            "Even the brightest cap flickers when nobody kisses it back — I flew that anyway.",
+        ],
+    };
+    let _ = days;
+    lines[(splitmix(seed) >> 33) as usize % lines.len()].to_string()
 }
 
 /// Milliseconds remaining on a cooldown, if it is still running. A
@@ -188,6 +249,12 @@ pub struct PetState {
     /// Last time decay was applied; everything between then and now is
     /// applied lazily on the next interaction.
     last_tick_ms: u64,
+    /// Diary lines earned but not yet delivered to the [ai] mailbox —
+    /// persisted with the state so a restart can't swallow them, and
+    /// drained by the wire half once their mail is safely on disk.
+    /// Crate-private: the ledger moves only through `drain_diary` /
+    /// `requeue_diary` (and the tests, which are crate kin).
+    pub(crate) diary_pending: Vec<DiaryEntry>,
 }
 
 impl Default for PetState {
@@ -217,16 +284,17 @@ impl PetState {
             last_feed_ms: None,
             last_play_ms: None,
             last_tick_ms: now,
+            diary_pending: Vec::new(),
         }
     }
 
-    /// Apply everything that happened since the last tick. One big,
-    /// honest integration step: food burns, energy rests (fed only),
-    /// mood drifts toward its target, bond forgets a hair. Stage never
-    /// regresses because decay touches `bond`, never `max_bond`.
-    pub fn apply_elapsed(&mut self, now: u64) {
-        let dt = now.saturating_sub(self.last_tick_ms).min(MAX_TICK_MS);
-        self.last_tick_ms = now;
+/// Apply everything that happened since the last tick. One big,
+/// honest integration step: food burns, energy rests (fed only),
+/// mood drifts toward its target, bond forgets a hair. Stage never
+/// regresses because decay touches `bond`, never `max_bond`.
+pub fn apply_elapsed(&mut self, now: u64) {
+    let dt = now.saturating_sub(self.last_tick_ms).min(MAX_TICK_MS);
+    self.last_tick_ms = now;
         if dt == 0 {
             return;
         }
@@ -248,6 +316,25 @@ impl PetState {
         let drift = (dts / MOOD_APPROACH_MS as f64).min(1.0);
         self.mood = (self.mood + (target - self.mood) * drift).clamp(0.0, 100.0);
         self.bond = (self.bond - dts / BOND_FORGET_MS as f64).max(0.0);
+
+        // A long silent stretch IS a mood — the pet experiences it while
+        // nobody watches, and writes it down the way a diary should:
+        // at the next sighting, one honest line about the drift it felt.
+        // Lazy sampling by design: no cron, no invented clocks — the
+        // entry exists only when someone came back to read it.
+        if dt >= LONG_MOOD_MS {
+            let days = dt / MS_DAY;
+            self.diary_pending.push(DiaryEntry {
+                at_ms: now,
+                kind: "long_mood".into(),
+                subject: format!(
+                    "{} {days}-day drift → {}",
+                    drift_article(days),
+                    self.mood_label()
+                ),
+                body: self.long_mood_line(now, days),
+            });
+        }
     }
 
     /// `pet.look` — the full card. Costs nothing, asks nothing, and does
@@ -440,9 +527,17 @@ impl PetState {
 
     /// Wrap a mutating action's card with the stage landing — the one
     /// moment the monologue is not chosen by mood but by milestone.
-    fn action_reply(&self, now: u64, stage_before: usize) -> Value {
-        let mut card = self.card(now);
+    fn action_reply(&mut self, now: u64, stage_before: usize) -> Value {
         let stage_now = stage_index(self.max_bond);
+        if stage_now > stage_before {
+            self.diary_pending.push(DiaryEntry {
+                at_ms: now,
+                kind: "stage_up".into(),
+                subject: format!("stage: {}", stage_name(self.max_bond)),
+                body: STAGE_ARRIVAL_LINES[stage_now].to_string(),
+            });
+        }
+        let mut card = self.card(now);
         if stage_now > stage_before
             && let Some(obj) = card.as_object_mut()
         {
@@ -452,10 +547,39 @@ impl PetState {
         card
     }
 
+    /// Take the diary lines whose mail reached the [ai] box. Called by
+    /// the wire half AFTER the files are written; failures requeue
+    /// below (and rotate forward — the diarist never skips a beat).
+    pub fn drain_diary(&mut self) -> Vec<DiaryEntry> {
+        std::mem::take(&mut self.diary_pending)
+    }
+
+    /// Put undelivered entries back: they persist with the state file
+    /// and ride the next sighting to the mailbox.
+    pub fn requeue_diary(&mut self, failed: Vec<DiaryEntry>) {
+        self.diary_pending.extend(failed);
+    }
+
+    /// Long-drift line: deterministic per state+entry (same pet, same
+    /// gap, same pick — no rewound diaries).
+    fn long_mood_line(&self, now: u64, days: u64) -> String {
+        long_mood_line(
+            self.mood_label(),
+            days,
+            self.hatched_ms ^ now ^ (self.talks.wrapping_mul(0x9E37_79B9)),
+        )
+    }
+
     /// Read the stage high-water from the OUTSIDE (the bin's boot log);
     /// rounded, because nobody sees half a bond point in a log line.
     pub fn max_bond(&self) -> u64 {
         self.max_bond.round() as u64
+    }
+
+    /// The stage this pet currently wears (the diary mail's X-Pet-
+    /// Stage header reads it from the wire half).
+    pub fn stage_of(&self) -> &'static str {
+        stage_name(self.max_bond)
     }
 
     pub fn mood_label(&self) -> &'static str {
@@ -542,6 +666,90 @@ pub fn state_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home)
         .join("pet")
         .join("state.json")
+}
+
+// ---------------------------------------------------------------------------
+// The diary's mail half (pure, std-only): civil date math, the two header
+// formats the [ai] archive reader keys on, and one .eml text per entry.
+// The same stamp style the mailhook writes (`YYYYMMDD-HHMMSS-…eml`) so the
+// handwritten summaries sort the pet's mail in with everyone's.
+// ---------------------------------------------------------------------------
+
+/// Civil date + time-of-day from a unix-ms stamp (Howard Hinnant's
+/// civil-from-days; `chrono` would be a whole crate for these six numbers).
+fn civil_from_ms(ms: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let secs = (ms / 1000) % 86_400;
+    let days = (ms / 1000 / 86_400) as i64;
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (
+        y,
+        m,
+        d,
+        (secs / 3600) as u32,
+        (secs / 60 % 60) as u32,
+        (secs % 60) as u32,
+    )
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// RFC 5322 date (all house systems run UTC; the archive stamps are
+/// local-wall — the mailhook's names — so the pet's Date header is
+/// pegged to the UTC reading of the same moment it signed the file).
+pub fn rfc5322_date(ms: u64) -> String {
+    let (y, m, d, h, mi, s) = civil_from_ms(ms);
+    // 1970-01-01 was a Thursday (4)
+    let wd = WEEKDAYS[(((ms / 1000) / 86_400 as u64 + 4) % 7) as usize];
+    format!("{wd}, {d:02} {} {y} {h:02}:{mi:02}:{s:02} +0000", MONTHS[(m - 1) as usize])
+}
+
+/// The archive filename stamp — `YYYYMMDD-HHMMSS`, exactly the shape
+/// the mailhook writes and `mailbox.rs`'s summarize re-reads.
+pub fn mail_stamp(ms: u64) -> String {
+    let (y, m, d, h, mi, s) = civil_from_ms(ms);
+    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
+}
+
+/// One bounded .eml per diary entry, stamped at the EVENT time so the
+/// archive's filename sort tells the pet's life in order, with a
+/// deterministic 4-hex tail (one mail per entry; two entries may share
+/// an event ms — kinds differ, so names don't collide).
+pub fn diary_filename(e: &DiaryEntry, now: u64) -> String {
+    let tail = (splitmix(e.at_ms ^ now) & 0xffff) as u32;
+    format!("{}-pet-{}-{tail:04x}.eml", mail_stamp(e.at_ms), e.kind)
+}
+
+/// The mail text: headers the archive reader + any hand reading later
+/// can key on, then the pet's one line.
+pub fn diary_eml(pet_name: &str, stage: &str, e: &DiaryEntry, now: u64) -> String {
+    format!(
+        "From: {pet_name} <pet@jerith.mesh>\n\
+         To: ai <ai@jerith.mesh>\n\
+         Subject: [pet diary] {}\n\
+         Date: {}\n\
+         X-Pet-Kind: {}\n\
+         X-Pet-Stage: {stage}\n\
+         Message-ID: <{}@jerith.mesh>\n\
+         \n\
+         {}\n",
+        e.subject,
+        rfc5322_date(e.at_ms),
+        e.kind,
+        diary_filename(e, now).trim_end_matches(".eml"),
+        e.body,
+    )
 }
 
 /// Load the life, or hatch one. A corrupt file refuses loud — a life is
@@ -890,6 +1098,109 @@ mod tests {
         assert!(hatched);
         assert_eq!(st.name, "Droplet");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The diary's two event families, end to end in the pure half:
+    /// a stage landing queues its arrival line under the right kind,
+    /// a long silent sighting queues where the drift left the pet.
+    #[test]
+    fn stage_landings_and_long_moods_reach_the_diary() {
+        let t = T0 + MS_DAY * 4;
+        let mut st = PetState::fresh(t);
+        assert!(st.diary_pending.is_empty(), "a fresh pet has written nothing");
+        // Silence is only a mood when a single catch-up is LONG: the
+        // clock-injected reading integrates WHERE YOU RETURN, so short
+        // sightings — even back-to-back — are just sightings.
+        st.look(t, false);                      // the baseline
+        st.look(t + MS_HOUR, false);            // an hour: just an hour
+        assert!(st.diary_pending.is_empty());
+        // One second under a two-day gap also stays below the line.
+        st.look(t + LONG_MOOD_MS - 1000, false);
+        assert!(st.diary_pending.is_empty());
+        // The article rule: eight/eighteen/eleven read "an" (the live
+        // probe wrote "an 8-day drift" — grammar not lore ties it).
+        assert_eq!(drift_article(8), "an");
+        assert_eq!(drift_article(2), "a");
+        assert_eq!(drift_article(30), "a");
+        // Then two days in the dark, and one sighting: ONE honest line
+        // about where the drift left the pet.
+        let back = t + LONG_MOOD_MS * 2;
+        st.look(back, false);
+        assert_eq!(st.diary_pending.len(), 1, "one line per long gap");
+        let e = &st.diary_pending[0];
+        assert_eq!(e.kind, "long_mood");
+        assert_eq!(e.at_ms, back);
+        assert_eq!(e.subject, format!("a 2-day drift → {}", st.mood_label()));
+        assert_eq!(e.body, st.long_mood_line(back, 2));
+        // The same gap is written ONCE: the next small sighting stays
+        // quiet.
+        st.look(back + MS_MINUTE, false);
+        assert_eq!(st.diary_pending.len(), 1);
+
+        // A stage landing queues its kind with the arrival line the
+        // other test already pinned (march bond past 100 with talks).
+        let mut t2 = T0 + MS_DAY * 5;
+        let mut st2 = PetState::fresh(t2);
+        let mut landed = false;
+        for i in 0..40 {
+            t2 += TALK_COOLDOWN_MS * 2;
+            let r = st2.talk(t2, &format!("march {i}")).unwrap();
+            if r.get("stage_up") == Some(&json!(true)) {
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "the stage must land for this test");
+        assert_eq!(st2.stage_of(), "glowcap");
+        let e2 = st2.drain_diary();
+        assert_eq!(e2.len(), 1);
+        assert_eq!(e2[0].kind, "stage_up");
+        assert_eq!(e2[0].subject, "stage: glowcap");
+        assert_eq!(e2[0].body, STAGE_ARRIVAL_LINES[1]);
+        // Drain clears; requeue is what the wire half does when a mail
+        // write fails — the diary never loses a beat, never doubles one.
+        assert!(st2.drain_diary().is_empty());
+        st2.requeue_diary(e2);
+        assert_eq!(st2.diary_pending.len(), 1);
+        assert_eq!(st2.diary_pending[0].subject, "stage: glowcap");
+    }
+
+    /// The archive-side shapes: Hinnant's civil math against known
+    /// walls, the mailhook's filename stamp, and one .eml the [ai]
+    /// reader can key on.
+    #[test]
+    fn diary_mail_shapes_match_the_archive() {
+        // 2026-10-23 08:11:22 UTC: pinned against the live journal of
+        // the day (a Friday; the /status stamps agree).
+        let ms: u64 = ((20_749 * 86_400) + 8 * 3600 + 11 * 60 + 22) * 1000;
+        assert_eq!(rfc5322_date(ms), "Fri, 23 Oct 2026 08:11:22 +0000");
+        assert_eq!(mail_stamp(ms), "20261023-081122");
+        assert_eq!(rfc5322_date(0), "Thu, 01 Jan 1970 00:00:00 +0000");
+
+        let e = DiaryEntry {
+            at_ms: ms,
+            kind: "stage_up".into(),
+            subject: "stage: glowcap".into(),
+            body: "The droplet holds its color today.".into(),
+        };
+        let fname = diary_filename(&e, ms);
+        assert!(fname.starts_with("20261023-081122-pet-stage_up-"), "{fname}");
+        assert!(fname.ends_with(".eml"));
+        let text = diary_eml("Droplet", "glowcap", &e, ms);
+        // Header order the archive reader + a human both key on.
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("From: Droplet <pet@jerith.mesh>"));
+        assert!(lines[1].starts_with("To: ai <ai@jerith.mesh>"));
+        assert_eq!(lines[2], "Subject: [pet diary] stage: glowcap");
+        assert_eq!(lines[3], "Date: Fri, 23 Oct 2026 08:11:22 +0000");
+        assert_eq!(lines[4], "X-Pet-Kind: stage_up");
+        assert_eq!(lines[5], "X-Pet-Stage: glowcap");
+        assert!(lines[6].starts_with("Message-ID: <"), "a Unique mail id per entry");
+        // One blank line at the header/body seam, then one body line.
+        assert!(lines[7].is_empty(), "the header/body seam is one blank line");
+        assert_eq!(lines[8], "The droplet holds its color today.");
+        // Deterministic name/tail: same entry, same now → same mail.
+        assert_eq!(fname, diary_filename(&e, ms));
     }
 
     #[test]

@@ -349,7 +349,13 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     persisted across restarts; `external:pet` gate row). Its build
     also fixed the example's latent manifest-parse boot bug
     (document TOML needs `toml::from_str::<toml::Table>`, now pinned
-    on both crates). Third live consumer ✅ **the house**
+    on both crates). The pet also keeps a DIARY (2026-10-23): stage
+    landings and long silent drifts (≥ 2 days integrated between
+    sightings) are queued into the state file and delivered by the
+    wire half as one .eml each into the house's `[ai]` mailbox —
+    mailhook-stamped filenames, RFC-5322 Date (std-only civil math),
+    `X-Pet-Kind/Stage` headers, written before the save and requeued
+    on delivery failure so a mail is sent once or not lost. Third live consumer ✅ **the house**
     (`crates/house-plugin/`, 2026-10-23): `house.status` answers the
     how-are-you question over the signed contract — the bot unit's
     state, the gateway's health + mesh contribution numbers, and one

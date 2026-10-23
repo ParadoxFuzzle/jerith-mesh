@@ -1433,6 +1433,39 @@ refusal; HMAC-signed probe (`house.status`) → 200 + a full card:
 recent warns. Restarting the bot had the drop picked up without
 house-side changes.
 
+### The pet's diary lane (into the [ai] mailbox, 2026-10-23)
+
+The pet archives its own life now: a **stage landing** (`droplet →
+glowcap → …`) or a **long silent drift** (two or more integrated
+days between sightings) is queued into the state file and delivered
+as ONE .eml per entry into `~/.jerith-mail/inbox-archive/ai/`
+(`$JERITH_MAIL_ARCHIVE` overrides the base) — the same box the
+mailhook writes, readable with `/mail ai`:
+
+```
+From: Droplet <pet@jerith.mesh>
+To: ai <ai@jerith.mesh>
+Subject: [pet diary] stage: glowcap
+Date: Fri, 23 Oct 2026 08:11:22 +0000
+X-Pet-Kind: stage_up
+X-Pet-Stage: glowcap
+
+The droplet holds its color today — orange, holding orange, like sunrise does.
+```
+
+Filename stamps carry the EVENT time (`YYYYMMDD-HHMMSS-pet-<kind>-
+<rand>.eml`, the mailhook's shape), so the archive sort reads the
+pet's life in order even when delivery lagged the event. Delivery is
+in the handler's serving path: mail written BEFORE the save, fails
+requeued into the state for the next sighting — a mail is sent once
+or not lost. Live-fire (2026-10-23): a probe pet (temp state, temp
+archive, unsigned dev manifest on :7799) crossed a stage by talk →
+card said `stage: glowcap, stage_up: true`, and BOTH the stage mail
+and an eight-day-drift mail landed in the [ai] box with clean
+headers; then the real unit restarted on the diary binary and its
+signed `pet.look` card came back unchanged. The real pet's own
+diary starts writing with its next landing or long silence.
+
 ## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is

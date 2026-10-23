@@ -13,13 +13,18 @@
 //!   a life is not "restartable by accident";
 //! - registers the five model-visible skills the manifest declares
 //!   (`pet.look / talk / feed / play / rename`), with honest typed
-//!   refusals the chat model reads and relays.
+//!   refusals the chat model reads and relays;
+//! - delivers the pet's DIARY (`lib.rs` queues stage landings + long
+//!   silent drifts into the state file) as one .eml per entry into the
+//!   house's `[ai]` mailbox archive (`~/.jerith-mail/inbox-archive/ai`,
+//!   `$JERITH_MAIL_ARCHIVE` override) — written before the state is
+//!   saved, failures requeued, so a mail is sent once or not lost.
 //!
 //! Authoring note: this is the Phase 3d story's second citizen — copy
 //! this layout, swap the handlers, sync `plugin.toml`, ship.
 
 use anyhow::{Context as _, Result};
-use jerith_pet_plugin::{PetState, load_or_create, state_path};
+use jerith_pet_plugin::{DiaryEntry, PetState, diary_eml, diary_filename, load_or_create, state_path};
 use jerith_plugin_template::{SkillServer, endpoint_addr, skill};
 use serde_json::Value;
 use std::sync::Arc;
@@ -60,13 +65,63 @@ fn read_manifest(path: &str) -> Result<(std::net::SocketAddr, Option<String>)> {
     Ok((addr, secret))
 }
 
+/// `~/.jerith-mail/inbox-archive` — the SAME base the bot's `/mail`
+/// reader (`mailbox.rs` `default_base_dir`) lists by default. Override
+/// the whole base with `$JERITH_MAIL_ARCHIVE`; the pet writes into the
+/// `[ai]` box, the house's own in-box for things the residents say.
+fn diary_box() -> std::path::PathBuf {
+    let base = std::env::var("JERITH_MAIL_ARCHIVE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            std::path::Path::new(&home).join(".jerith-mail").join("inbox-archive")
+        });
+    base.join("ai")
+}
+
+/// Write every pending diary entry as its own mail; hand back the
+/// failures so the state keeps them for the next sighting. Filenames
+/// carry the event stamp, so the archive sort reads the pet's life in
+/// order even when delivery lagged the event.
+fn write_diary_mail(
+    entries: &[DiaryEntry],
+    dir: &std::path::Path,
+    pet_name: &str,
+    stage: &str,
+    now: u64,
+) -> Vec<DiaryEntry> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        tracing::warn!(target: "mail", dir = %dir.display(), error = %err, "pet diary: [ai] box unavailable");
+        return entries.to_vec();
+    }
+    let mut failed = Vec::new();
+    for e in entries {
+        let path = dir.join(diary_filename(e, now));
+        match std::fs::write(&path, diary_eml(pet_name, stage, e, now)) {
+            Ok(()) => {
+                tracing::info!(target: "mail", path = %path.display(), kind = %e.kind, subject = %e.subject, "pet diary entry delivered");
+            }
+            Err(err) => {
+                tracing::warn!(target: "mail", path = %path.display(), error = %err, "pet diary mail write failed; will retry");
+                failed.push(e.clone());
+            }
+        }
+    }
+    failed
+}
+
 /// The five handlers share one tiny pattern: lock the pet, apply the
-/// verb with the wall clock, save on success, hand the refusal
-/// through on failure. A save failure is NOT swallowed — an unsaved
-/// pet would quietly lie about what it ate.
+/// verb with the wall clock, deliver any diary the verb earned, save,
+/// and hand the refusal through on failure. The save is LAST (diary
+/// failures already put their entries back), and a save failure is NOT
+/// swallowed — an unsaved pet would quietly lie about what it ate.
 async fn with_pet<F>(
     pet: &AsyncMutex<PetState>,
     path: &std::path::Path,
+    diary: &std::path::Path,
     act: F,
 ) -> Result<Value, String>
 where
@@ -75,6 +130,9 @@ where
     let now = now_ms();
     let mut st = pet.lock().await;
     let out = act(&mut st, now)?;
+    let pending = st.drain_diary();
+    let failed = write_diary_mail(&pending, diary, &st.name, st.stage_of(), now);
+    st.requeue_diary(failed);
     st.save(path)
         .map_err(|e| format!("state save failed: {e}"))?;
     Ok(out)
@@ -112,6 +170,7 @@ async fn main() -> Result<()> {
     );
     let pet = Arc::new(AsyncMutex::new(pet));
     let path = Arc::new(path);
+    let diary = Arc::new(diary_box());
 
     SkillServer::new("pet", secret)
         .handler(
@@ -119,11 +178,15 @@ async fn main() -> Result<()> {
             skill({
                 let pet = Arc::clone(&pet);
                 let path = Arc::clone(&path);
+                let diary = Arc::clone(&diary);
                 move |args: Value| {
                     let noteback = args["noteback"].as_bool().unwrap_or(false);
                     let pet = Arc::clone(&pet);
                     let path = Arc::clone(&path);
-                    async move { with_pet(&pet, &path, |st, now| Ok(st.look(now, noteback))).await }
+                    let diary = Arc::clone(&diary);
+                    async move {
+                        with_pet(&pet, &path, &diary, |st, now| Ok(st.look(now, noteback))).await
+                    }
                 }
             }),
         )
@@ -132,12 +195,14 @@ async fn main() -> Result<()> {
             skill({
                 let pet = Arc::clone(&pet);
                 let path = Arc::clone(&path);
+                let diary = Arc::clone(&diary);
                 move |args: Value| {
                     let pet = Arc::clone(&pet);
                     let path = Arc::clone(&path);
+                    let diary = Arc::clone(&diary);
                     async move {
                         let note = args["note"].as_str().unwrap_or_default().to_string();
-                        with_pet(&pet, &path, |st, now| st.talk(now, &note)).await
+                        with_pet(&pet, &path, &diary, |st, now| st.talk(now, &note)).await
                     }
                 }
             }),
@@ -147,10 +212,12 @@ async fn main() -> Result<()> {
             skill({
                 let pet = Arc::clone(&pet);
                 let path = Arc::clone(&path);
+                let diary = Arc::clone(&diary);
                 move |_args: Value| {
                     let pet = Arc::clone(&pet);
                     let path = Arc::clone(&path);
-                    async move { with_pet(&pet, &path, |st, now| st.feed(now)).await }
+                    let diary = Arc::clone(&diary);
+                    async move { with_pet(&pet, &path, &diary, |st, now| st.feed(now)).await }
                 }
             }),
         )
@@ -159,10 +226,12 @@ async fn main() -> Result<()> {
             skill({
                 let pet = Arc::clone(&pet);
                 let path = Arc::clone(&path);
+                let diary = Arc::clone(&diary);
                 move |_args: Value| {
                     let pet = Arc::clone(&pet);
                     let path = Arc::clone(&path);
-                    async move { with_pet(&pet, &path, |st, now| st.play(now)).await }
+                    let diary = Arc::clone(&diary);
+                    async move { with_pet(&pet, &path, &diary, |st, now| st.play(now)).await }
                 }
             }),
         )
@@ -171,12 +240,14 @@ async fn main() -> Result<()> {
             skill({
                 let pet = Arc::clone(&pet);
                 let path = Arc::clone(&path);
+                let diary = Arc::clone(&diary);
                 move |args: Value| {
                     let pet = Arc::clone(&pet);
                     let path = Arc::clone(&path);
+                    let diary = Arc::clone(&diary);
                     async move {
                         let name = args["name"].as_str().unwrap_or_default().to_string();
-                        with_pet(&pet, &path, |st, now| st.rename(now, &name)).await
+                        with_pet(&pet, &path, &diary, |st, now| st.rename(now, &name)).await
                     }
                 }
             }),
