@@ -198,6 +198,13 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
     let (seat_losses, reestablishes) = crate::voice::runtime_facts();
     let mut s = format!("🌅 **Jerith daily self-briefing** — {day}\n");
 
+    // The pet's morning greeting — only when the owner has opted the
+    // drop in AND the pet service answers ("mood to report"); any other
+    // day this line simply isn't there, like an empty pew.
+    if let Some(greeting) = pet_section(cfg).await {
+        s.push_str(&greeting);
+    }
+
     // Mesh (peer truth; a cheap HTTPS GET that degrades with a name).
     s.push_str(&match crate::api::gateway_status(cfg).await {
         Ok(st) => {
@@ -285,6 +292,55 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
     // The journal, drained last (its window ends here).
     s.push_str(&drain_journal_section());
     s
+}
+
+// ---------------------------------------------------------------------------
+// The pet's day-greeting (§ the mesh pet, crates/pet-plugin)
+// ---------------------------------------------------------------------------
+
+/// Is the pet opted in per `[plugins]`? Either row counts: `enabled`
+/// (skills in the shared registry) or `owner_only` (owner-DM only) —
+/// both are the operator explicitly turning the companion on.
+fn pet_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
+    let gate = "external:pet";
+    enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
+}
+
+/// The greeting line from a `pet.look` card — the vault's mood words
+/// straight through (`loop-de-loop`, `orange-cap`, …), pure + testable.
+/// No mood field → no greeting (the pet's honesty, not ours to invent).
+fn render_pet_line(pet: &Value) -> Option<String> {
+    let mood = pet["mood"].as_str()?;
+    let name = pet["name"].as_str().unwrap_or("the companion");
+    let get_pct = |k: &str| pet[k].as_u64().unwrap_or(0);
+    let says = pet["says"]
+        .as_str()
+        .map(|s| clip_line(s, 90))
+        .unwrap_or_default();
+    Some(format!(
+        "🐟 {name}: {mood} · food {}% · energy {}% — “{says}”",
+        get_pct("food_pct"),
+        get_pct("energy_pct")
+    ))
+}
+
+/// Compose the pet's section, or `None` when it has nothing to say.
+/// The call goes over the SAME signed service contract the chat loop
+/// uses (`external::invoke`) — no new trust surface, no direct state
+/// file reads (a state file is the plugin's private business; the
+/// briefing asks its owner's permission to look inside).
+async fn pet_section(cfg: &crate::config::BotConfig) -> Option<String> {
+    if !pet_opted_in(&cfg.plugins.enabled, &cfg.plugins.owner_only) {
+        return None;
+    }
+    let plugin = cfg.external_plugins.iter().find(|p| p.id == "pet")?;
+    match crate::external::invoke(plugin, "pet.look", &serde_json::json!({})).await {
+        Ok(card) => render_pet_line(&card).map(|l| format!("{l}\n")),
+        Err(e) => {
+            tracing::debug!(error = %e, "pet greeting skipped — the pet wasn't answering");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +507,46 @@ mod tests {
         }
         // A second drain says all quiet.
         assert!(drain_journal_section().contains("all quiet"));
+    }
+
+    /// The pet's greeting renderer: shape from a REAL card, honesty
+    /// when the card is silent about mood (no mood → no line — the
+    /// "mood to report" precondition is the card's, not our guess).
+    #[test]
+    fn pet_line_reports_mood_when_the_card_has_one() {
+        let card = serde_json::json!({
+            "name": "Emberwick", "stage": "glowcap", "mood": "orange-cap",
+            "food_pct": 92, "energy_pct": 75, "bond": 15, "says": "Cap glowing like a friendly sunrise — nothing out there wants to argue with that.",
+        });
+        let line = render_pet_line(&card).expect("mood is present");
+        assert!(line.starts_with("🐟 Emberwick: orange-cap "), "{line}");
+        assert!(line.contains("food 92%"), "{line}");
+        assert!(line.contains("energy 75%"), "{line}");
+        assert!(line.contains("“Cap glowing"), "{line}");
+        // A long `says` clips but the numbers always land.
+        let mut long = card.clone();
+        long["says"] = serde_json::Value::String("x".repeat(400));
+        let clipped = render_pet_line(&long).expect("has mood");
+        assert!(clipped.chars().count() < 200, "clipped to one line");
+        // No mood = no greeting.
+        let mut mute = card.clone();
+        mute.as_object_mut().unwrap().remove("mood");
+        assert!(render_pet_line(&mute).is_none());
+    }
+
+    /// The opt-in gate: either `[plugins]` row turns the greeting on,
+    /// and neither row (or the wrong spelling) leaves it off.
+    #[test]
+    fn pet_greeting_requires_an_explicit_gate_row() {
+        let yes = ["memory".to_string(), "external:pet".to_string()];
+        assert!(pet_opted_in(&yes, &[]));
+        assert!(pet_opted_in(
+            &[],
+            &["external:gcp".to_string(), "external:pet".to_string()]
+        ));
+        assert!(!pet_opted_in(&["memory".to_string()], &[]));
+        assert!(!pet_opted_in(&["pet".to_string()], &[])); // bare id never counts
+        assert!(!pet_opted_in(&["external:petx".to_string()], &[]));
     }
 
     /// The fire gate: once-per-day via the state file, catch-up after

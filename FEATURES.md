@@ -1683,6 +1683,17 @@ already owns:
 - **approvals + mesh**: outstanding human-in-the-loop card count, and
   peer aliveness/contribution from the gateway status (unreachable →
   named, with the error, not hidden).
+- **the pet's morning greeting** (2026-10-23, `crates/pet-plugin`): when
+  `external:pet` is opted in per `[plugins]` (either `enabled` or
+  `owner_only` — both are the operator turning the companion on), the
+  briefing opens with one line from `pet.look` over the SAME signed
+  service contract the chat loop uses: name, stage and mood in the
+  house lore's own vocabulary (`droplet → glowcap → drifter →
+  sentinel`; `loop-de-loop / orange-cap / …`), food/energy + one line
+  of the pet's own voice. Honesty rules: no mood in the card → no line
+  (the pet's silence isn't ours to invent); the service down → no line
+  and a DEBUG note, never a fake greeting. No direct state-file reads —
+  the briefing asks, like any chat caller would.
 
 Schedule semantics: hourly cadence; fires once per local day once the
 local hour reaches `hour` (default 08, clamp 0–23). Fire state persists
@@ -1696,10 +1707,11 @@ Delivery rides the same owner resolution the monitor uses
 (`cfg.owner_discord_id`); body is clipped to 1900 chars with the
 honest tail (Discord's 2000-char bound).
 
-Tests: 3 units (journal visitor + ring-drain semantics + state-file
-gate algebra), all pure — the visitor/ring honesty (message first,
-context after, cap, newest-window), and the once-per-day /
-catch-up/before-the-hour gate truth.
+Tests: 6 units — journal visitor + ring-drain semantics, the
+once-per-day / catch-up/before-the-hour gate algebra, the pet greeting
+renderer + its `[plugins]` opt-in gate, and the golden live-DM fixture
+(format conventions pinned against the real 2026-10-22 briefing, so a
+format drift breaks the build, not the owner's DM).
 
 **Seat-hold watcher** (2026-10-21, after an observed silent drop): a
 live seat can be lost between boot's join and the WSS lanes' view —

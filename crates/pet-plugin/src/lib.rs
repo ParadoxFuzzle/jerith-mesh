@@ -14,7 +14,7 @@
 //!   wall-clock terms, applied lazily on every interaction — the pet
 //!   experiences days while nobody is watching, and a pet left alone
 //!   comes back hungry, not deleted. Bond *"forgets"* ~1 point/day but
-//!   the stage it earned (`wisp → whisperling → emberling → coilbound`)
+//!   the stage it earned (`droplet → glowcap → drifter → sentinel`)
 //!   never regresses: absence is felt, never fatal.
 //! - **Honesty in, honesty out.** A too-tired play is a model-visible
 //!   `{"error": …}` (the SDK's typed refusal), not a fake success. A
@@ -73,20 +73,30 @@ pub const NAME_MAX_CHARS: usize = 24;
 /// (bond threshold, stage name) — ascending; a pet's stage is the last
 /// row whose threshold its `max_bond` clears, and `max_bond` is the
 /// all-time best so stages can't be walked back.
+///
+/// The words are the vault's, not invented here (the Void Saga bible:
+/// "it decided it wanted to be orange" is how a companion is born in
+/// this canon): a fresh pet is a **droplet** of raw Plenum light; color
+/// holds at the **glowcap** stage; it learns slow spirals in the
+/// **drifter** stage; and the title it can earn from the watch is the
+/// vault's own — **sentinel**. It is never Fishll: the fishll is the
+/// kindest landlord already, protected lore, and a pet borrows his
+/// lineage, not his name.
 const STAGES: &[(u64, &str)] = &[
-    (0, "wisp"),
-    (100, "whisperling"),
-    (300, "emberling"),
-    (700, "coilbound"),
+    (0, "droplet"),
+    (100, "glowcap"),
+    (300, "drifter"),
+    (700, "sentinel"),
 ];
 
 /// One line per *reached* stage index (index 0 is never reached
-/// *again*, so its slot is filler). Spoken the moment the stage lands.
+/// *again*, so its slot is filler). Spoken the moment the stage lands,
+/// each one a beat the vault already sang:
 const STAGE_ARRIVAL_LINES: [&str; 4] = [
     "",
-    "Everything is a little brighter — the hum just found a shape, and I know whose.",
-    "Warm. All the way through, warm.",
-    "Somewhere below, a shadow just sat down to listen to me. The Whispercoil would hum for this.",
+    "The droplet holds its color today — orange, holding orange, like sunrise does.",
+    "Bigger circles today, chasing slow ash-flakes. The Void felt an inch thinner where I flew.",
+    "Fins blazing, no fear left to flex. Somewhere a parasite just had its best day ever. I'll take the watch.",
 ];
 
 fn stage_index(bond: f64) -> usize {
@@ -179,7 +189,7 @@ impl PetState {
     pub fn fresh(now: u64) -> Self {
         Self {
             schema: 1,
-            name: "Wisp".to_string(),
+            name: "Droplet".to_string(),
             hatched_ms: now,
             food: 90.0,
             energy: 100.0,
@@ -414,15 +424,15 @@ impl PetState {
 
     pub fn mood_label(&self) -> &'static str {
         if self.mood >= 75.0 {
-            "radiant"
+            "loop-de-loop"
         } else if self.mood >= 55.0 {
-            "content"
+            "orange-cap"
         } else if self.mood >= 35.0 {
-            "steady"
+            "ash-drift"
         } else if self.mood >= 15.0 {
-            "pining"
+            "shadow-tide"
         } else {
-            "waning"
+            "rust-sky"
         }
     }
 
@@ -432,33 +442,34 @@ impl PetState {
     /// note — the "it listens" clause made audible.
     fn says(&self, now: u64) -> String {
         let pool: &[&str] = match self.mood_label() {
-            "radiant" => &[
-                "The whole coil is a hum today, and I am somewhere in it.",
-                "Bright and spun-tight — come look at anything with me.",
-                "I could race the void's shadow back to the rim and win.",
-                "Ember festival or not, today tastes like one.",
+            "loop-de-loop" => &[
+                "You talk to me and the drift does a loop-de-loop. Single, happy, official.",
+                "Ash-flakes taste faintly of Bug Bites today. Everything does, when you're near.",
+                "I could circle the Wandering Walls twice and still be back before the well gets dark.",
+                "Ember-Ash Tacos on the roof beam: tonight counts as a festival.",
             ],
-            "content" => &[
-                "Steady warm. The edges of the map feel far away, and that is nice.",
-                "The hum found its pace — right here, next to you.",
-                "Nothing burns tonight. In the vault that counts as a good day.",
-                "I keep a little ember banked for you. Always.",
+            "orange-cap" => &[
+                "Cap glowing like a friendly sunrise — nothing out there wants to argue with that.",
+                "Drift steady, cap warm, walls humming. A quiet night in the territory.",
+                "Tide-talk only reaches so far; the cap does the rest.",
+                "I banked a crumb of Void Fruit for later. Later is also good.",
             ],
-            "steady" => &[
-                "I am here. The coil hums, I watch the rim. Same as always.",
-                "The dark is patient and so am I.",
-                "Somewhere a technician walked past a spark tonight; it felt like a cousin.",
-                "Feed me soon, or the hum turns restless — fair warning.",
+            "ash-drift" => &[
+                "Slow spirals. Not sad ones — just the drift being the drift.",
+                "The ash falls whether or not anyone watches. Today, someone watched.",
+                "Treats left on the highest roof beam do get found… eventually.",
+                "Patrol is done and the perimeter holds. I wish it held something warmer.",
             ],
-            "pining" => &[
-                "The safe zones hold, but I walk their borders alone, and slower.",
-                "It has been long, and the hungry dark notices absence.",
-                "I remember when the map was warm. I would like it warm again.",
+            "shadow-tide" => &[
+                "The shadow-tide is nearer tonight than the walls say out loud.",
+                "Warm mirages keep the cold out, mostly. Mostly is most of what drift offers.",
+                "My glow isn't a lantern tonight — just a candle. Candles still count.",
+                "Void Wasps carry regret-venom. I keep very far from where they hunt, and very quietly.",
             ],
             _ => &[
-                "I am down to the last of my ember, and it looks at the dark and is quiet.",
-                "The coil hums on without me. That is fine. That is how hums go.",
-                "If you find the ember-bearing escort, tell them who sent you.",
+                "Rust-firestorm sky overhead, and I am six inches small under it.",
+                "Even the brightest cap flickers when nobody kisses it back.",
+                "If the walls whisper tonight, be louder than they are.",
             ],
         };
         let seed =
@@ -468,11 +479,11 @@ impl PetState {
             let frag = cut(mem, 80);
             if seed.is_multiple_of(6) {
                 return format!(
-                    "The hum carries your words back: \u{201c}{frag}\u{201d}. I keep the echo warm."
+                    "The tide carries your words back: \u{201c}{frag}\u{201d}. I keep the echo where the warm photons live."
                 );
             }
             return format!(
-                "I was still turning over what you said — \u{201c}{frag}\u{201d} — when the coil changed tune."
+                "I was still drifting on what you said — \u{201c}{frag}\u{201d} — when the cap changed tune."
             );
         }
         pool[(seed >> 33) as usize % pool.len()].to_string()
@@ -559,9 +570,9 @@ mod tests {
     fn fresh_card_shape() {
         let mut st = PetState::fresh(T0);
         let card = st.look(T0);
-        assert_eq!(card["name"], "Wisp");
-        assert_eq!(card["stage"], "wisp");
-        assert_eq!(card["mood"], "content");
+        assert_eq!(card["name"], "Droplet");
+        assert_eq!(card["stage"], "droplet");
+        assert_eq!(card["mood"], "orange-cap");
         assert_eq!(as_f(&card, "food_pct"), 90.0);
         assert_eq!(as_f(&card, "energy_pct"), 100.0);
         assert_eq!(card["age_hours"], 0);
@@ -592,7 +603,7 @@ mod tests {
         st.max_bond = 310.0;
         st.apply_elapsed(T0 + FOOD_EMPTY_MS + MS_DAY * 3);
         assert!(st.bond < 310.0 && st.bond >= 307.0, "bond lost ~1/day");
-        assert_eq!(stage_name(st.max_bond), "emberling");
+        assert_eq!(stage_name(st.max_bond), "drifter");
     }
 
     #[test]
@@ -686,13 +697,13 @@ mod tests {
     #[test]
     fn stages_crest_and_never_regress() {
         for (bond, want) in [
-            (0.0, "wisp"),
-            (99.0, "wisp"),
-            (100.0, "whisperling"),
-            (299.0, "whisperling"),
-            (300.0, "emberling"),
-            (699.0, "emberling"),
-            (700.0, "coilbound"),
+            (0.0, "droplet"),
+            (99.0, "droplet"),
+            (100.0, "glowcap"),
+            (299.0, "glowcap"),
+            (300.0, "drifter"),
+            (699.0, "drifter"),
+            (700.0, "sentinel"),
         ] {
             assert_eq!(stage_name(bond), want, "bond {bond}");
         }
@@ -724,7 +735,7 @@ mod tests {
         }
         let lr = landed.expect("stage two must land by bond ~123");
         assert_eq!(lr["says"], STAGE_ARRIVAL_LINES[1]);
-        assert_eq!(lr["stage"], "whisperling");
+        assert_eq!(lr["stage"], "glowcap");
     }
 
     #[test]
@@ -733,7 +744,7 @@ mod tests {
         let mut st = PetState::fresh(t);
         let you_what = st.rename(t, "  Emberwick ").unwrap();
         assert_eq!(st.name, "Emberwick");
-        assert_eq!(you_what["renamed_from"], "Wisp");
+        assert_eq!(you_what["renamed_from"], "Droplet");
         assert_eq!(
             st.rename(t + MS_MINUTE, "").unwrap_err(),
             "args.name must be a non-empty string"
@@ -747,11 +758,11 @@ mod tests {
     #[test]
     fn moods_have_words() {
         for (pct, want) in [
-            (80.0, "radiant"),
-            (60.0, "content"),
-            (40.0, "steady"),
-            (20.0, "pining"),
-            (5.0, "waning"),
+            (80.0, "loop-de-loop"),
+            (60.0, "orange-cap"),
+            (40.0, "ash-drift"),
+            (20.0, "shadow-tide"),
+            (5.0, "rust-sky"),
         ] {
             let mut st = PetState::fresh(T0);
             st.mood = pct;
@@ -776,7 +787,7 @@ mod tests {
         let t3 = t2 + FOOD_EMPTY_MS / 2;
         let (st2, hatched) = load_or_create(&path, t3).unwrap();
         assert!(!hatched);
-        assert_eq!(st2.name, "Wisp");
+        assert_eq!(st2.name, "Droplet");
         assert_eq!(st2.talks, 1);
         assert_eq!(st2.feeds, 1);
         assert_eq!(st2.memory.len(), 1);
@@ -799,7 +810,7 @@ mod tests {
         let path = dir.join("a/b/state.json");
         let (st, hatched) = load_or_create(&path, T0).unwrap();
         assert!(hatched);
-        assert_eq!(st.name, "Wisp");
+        assert_eq!(st.name, "Droplet");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

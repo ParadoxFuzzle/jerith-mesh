@@ -1381,10 +1381,21 @@ lane in its copyable manifest comment is identical to the example's:
 ```bash
 mkdir -p ~/.jerith-mesh/plugins.d/pet
 cp crates/pet-plugin/plugin.toml ~/.jerith-mesh/plugins.d/pet/
-cargo run -p jerith-pet-plugin --bin jerith-pet &
-edit ~/.jerith-mesh/bot.toml        # add "external:pet" to [plugins] enabled
+cargo run -p jerith-pet-plugin --release --bin jerith-pet &
+edit ~/.jerith-mesh/bot.toml        # add "external:pet" to [plugins] enabled — or to
+                                    # [plugins] owner_only (like gcp: owner-DM skills only)
 systemctl --user restart jerith-bot # then just talk to it in chat
 ```
+
+Live-fire (2026-10-23, this house): drop installed with a rotated
+secret, `external:pet` joined `owner_only` (the owner-DM posture — a
+companion gcp already has), service on `127.0.0.1:7789`, unit
+restarted clean — a malformed drop aborts the start, so the clean boot
+IS the registry proof. Wire-pin: unsigned probe → 403; HMAC-signed
+probe with the manifest's secret → 200 + a full card (`stage:
+droplet, mood: orange-cap`, born same hour, one line in the pet's own
+voice). The daily briefing greets the owner with that card when the
+companion is opted in — see FEATURES §24.
 
 History note for SDK authors: the pet build caught a latent boot bug
 in the example's `read_manifest` — `"…".parse::<toml::Value>()` only
