@@ -1030,6 +1030,65 @@ Known remaining limitations (accepted, bounded):
   `lore` vault dir was shared per-pid so parallel test threads rewrote
   each other's files mid-read (unique temp dir per call now).
 
+Round 5 (2026-10-23 security sweep) — webinbox + parse-layer hardening
+(`db4dd3a` + `241a70b`):
+
+- **GGUF import poisoner** (`db4dd3a`): a crafted tensor-directory
+  offset wrapped `data_start + offset` past 2⁶⁴ in RELEASE builds, the
+  EOF gate then passed, and the file's header bytes decoded as floats
+  into a "valid" expert written to the live store AS A SUCCESS
+  (verified live; debug builds panicked instead). Every unchecked u64
+  on that attack surface (offset add, `at+len`, block/byte sizes, dims
+  product) is now a `checked_*` → typed refusal, with a regression
+  test holding both the wrap-offset and dims-overflow shapes.
+- **WhatsApp webhook replay** (`241a70b`): Meta's `X-Hub-Signature-256`
+  covers the body ONLY — no timestamp, unlike Slack — so a captured
+  legitimate POST re-verified forever and each replay spawned a
+  session spending the bot token on a real channel. A bounded
+  8192-entry seen-id cache now silently acks repeats before any
+  session spawns; messages without an id are passed through with a
+  loud warn (the id is the dedupe key, and Meta always sends one).
+- **Two `Box::leak` warts** (`241a70b`): the Slack `url_verification`
+  challenge and the message chunker's per-boundary remainder are
+  returned/owned now — both used to free nothing for the life of the
+  long-lived bot process.
+
+### Trust-on-first-use: learned bootstrap keys (accepted, understood)
+
+The §10 reputation chain pins a bootstrap's signing key TOFU-style:
+`pin_key(served_by, &key.pubkey)` on the first answering contact per
+configured/learned URL (`ping.rs::pin_and_ingest`), a rotation
+replacing the pin with a journal note. The first contact with a
+bootstrap we did NOT explicitly configure is therefore an unverified
+distance-1 event: if an attacker both advertises a hostile
+`discovery_servers` URL inside a peer ad AND intercepts our first
+dial to it (DNS/HTTP MITM on that URL), the MITM's key becomes our
+"pin" for that URL.
+
+The Exploit CEILING is deliberately small and does not grow with
+time:
+
+- Gossip stamps arriving by peer ad refuse any origin we have not
+  pinned, refuse the ad owner naming itself, and are freshness-
+  capped — so the poison stays ONE bootstrap's reputation view
+  (subjective scores), never code, wallet, or auth state.
+- A lying bootstrap cannot sticky-hold discovery either: an empty
+  answer clears the last-good pin (ping.rs "answered alone does not
+  earn stickiness"), so the next tick rotates to the config order.
+- Everything announced is auditable: every first sight or rotation
+  journals `mesh: bootstrap signing key pinned (reputation stamps
+  verifiable from here)` naming the URL and key.
+
+Operator rule (how to close it): run every bootstrap you plan to
+trust in `[bootstraps]` config so the first contact is your
+infrastructure, not a learned URL. Learned servers are fine for
+failover rotation once their PIN entry is in the journal and looks
+right — check it with
+`journalctl --user -u jerith-node | grep 'signing key pinned'`.
+Re-pin (rotation) after a compromised key is one restart of the
+node against the rotated bootstrap; the old stamp lineage dies with
+the freshness cap.
+
 
 
 ## Escalation pointers
