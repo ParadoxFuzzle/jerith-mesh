@@ -29,18 +29,92 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// File magic + version. Bumping the version is the incompatible change;
-/// the magic alone catches "this is not an expert file at all".
+/// the magic's first four bytes keep catching "this is not an expert file
+/// at all" (the last byte carries the written version — see `MAGIC_V2`).
+/// v1 files stay readable forever (older shards, `experts make`).
 const MAGIC: &[u8; 8] = b"JEXP1\0\0\0";
+const MAGIC_V2: &[u8; 8] = b"JEXP2\0\0\0";
 const VERSION: u32 = 1;
+const VERSION_V2: u32 = 2;
 /// Sanity bound on a single expert file: dims are u32 and an activation
 /// vector on the wire is capped at 65 536 floats (`quic::MAX_EXPERT_INPUT_FLOATS`),
 /// so a legit expert can be big — but not gigabytes-of-dimensions big.
 const MAX_DIM: usize = 1 << 20;
 
+/// What the expert's tensors compute. v1 containers are all SwiGlu; v2
+/// adds the plain-MLP kind real models ship (nomic-bert-moe family) —
+/// two tensors, no gate, and the activation named inside the file rather
+/// than guessed at serve time. A container NEVER fabricates a missing
+/// tensor: an Mlp expert's `gate` stays `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertKind {
+    /// `down(silu(gate·x) * (up·x))` — gate + up + down.
+    SwiGlu,
+    /// `act_tagged_down(up·x)` — up + down, activation tagged.
+    Mlp,
+}
+
+impl ExpertKind {
+    /// Tensor count the kind's on-disk layout carries (layout order below).
+    fn tensor_count(self) -> usize {
+        match self {
+            ExpertKind::SwiGlu => 3,
+            ExpertKind::Mlp => 2,
+        }
+    }
+    fn tag(self) -> u8 {
+        match self {
+            ExpertKind::SwiGlu => 0,
+            ExpertKind::Mlp => 1,
+        }
+    }
+    fn from_tag(t: u8) -> Result<Self> {
+        match t {
+            0 => Ok(ExpertKind::SwiGlu),
+            1 => Ok(ExpertKind::Mlp),
+            other => anyhow::bail!("unknown expert kind tag {other} (this build reads 0/1)"),
+        }
+    }
+}
+
+/// Activation the expert's tensors were trained with — recorded IN the
+/// v2 container (never inferred at serve time). Silu is also SwiGlu's
+/// choice; Gelu is the bert-family MLP default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    Silu,
+    Gelu,
+}
+
+impl Activation {
+    fn tag(self) -> u8 {
+        match self {
+            Activation::Silu => 0,
+            Activation::Gelu => 1,
+        }
+    }
+    fn from_tag(t: u8) -> Result<Self> {
+        match t {
+            0 => Ok(Activation::Silu),
+            1 => Ok(Activation::Gelu),
+            other => anyhow::bail!("unknown activation tag {other} (this build reads 0/1)"),
+        }
+    }
+    /// Apply the activation the container names. Gelu is the standard
+    /// tanh approximation (the one llama.cpp and vLLM serve by default;
+    /// bit-differences vs the erf form are below fp16 quantization noise).
+    pub fn apply(self, v: f32) -> f32 {
+        match self {
+            Activation::Silu => silu(v),
+            Activation::Gelu => gelu(v),
+        }
+    }
+}
+
 /// One expert's weights. Row-major, little-endian f32 on disk and in RAM.
 ///
 /// Shapes for a hidden size `h` and intermediate size `i` (MoE FFN):
-/// - `gate`: `[i × h]`  (gate projection)
+/// - `gate`: `[i × h]`  (gate projection — SwiGlu kind only, `None` otherwise)
 /// - `up`:   `[i × h]`  (up projection)
 /// - `down`: `[h × i]`  (down projection)
 #[derive(Debug, Clone, PartialEq)]
@@ -48,7 +122,9 @@ pub struct ExpertWeights {
     pub id: String,
     pub hidden: usize,
     pub intermediate: usize,
-    pub gate: Vec<f32>,
+    pub kind: ExpertKind,
+    pub activation: Activation,
+    pub gate: Option<Vec<f32>>,
     pub up: Vec<f32>,
     pub down: Vec<f32>,
 }
@@ -77,37 +153,81 @@ impl ExpertWeights {
             id: id.to_string(),
             hidden,
             intermediate,
-            gate: fill(hidden * intermediate),
+            kind: ExpertKind::SwiGlu,
+            activation: Activation::Silu,
+            gate: Some(fill(hidden * intermediate)),
             up: fill(hidden * intermediate),
             down: fill(hidden * intermediate),
+        }
+    }
+
+    /// A deterministic plain-MLP expert (v2 kind): up + down only, gated
+    /// by the activation tag — used by the MLP-kind tests and any tooling
+    /// that needs the second shape without importing a model. Same LCG
+    /// seed rule as [`synthetic`](Self::synthetic).
+    pub fn synthetic_mlp(
+        id: &str,
+        hidden: usize,
+        intermediate: usize,
+        activation: Activation,
+    ) -> Self {
+        Self {
+            kind: ExpertKind::Mlp,
+            activation,
+            gate: None,
+            ..Self::synthetic(id, hidden, intermediate)
         }
     }
 
     /// Bytes this expert occupies resident (payload only; the id string
     /// and Vec headers are noise next to real MoE dimensions).
     pub fn bytes(&self) -> usize {
-        (self.gate.len() + self.up.len() + self.down.len()) * std::mem::size_of::<f32>()
+        self.kind.tensor_count()
+            * self.hidden.saturating_mul(self.intermediate)
+            * std::mem::size_of::<f32>()
     }
 
     /// Validate internal consistency before use (a corrupted file must
-    /// fail here, not by indexing panic in the forward pass).
+    /// fail here, not by indexing panic in the forward pass). Kind-shape
+    /// honesty is checked too: an Mlp container must not carry a gate
+    /// tensor it will never use, and a SwiGlu must carry all three.
     pub fn validate(&self) -> Result<()> {
         let expect = self
             .hidden
             .checked_mul(self.intermediate)
             .context("expert dimensions overflow")?;
-        anyhow::ensure!(
-            self.gate.len() == expect && self.up.len() == expect && self.down.len() == expect,
-            "expert {}: tensor sizes {} {} {} do not match {expect}",
-            self.id,
-            self.gate.len(),
-            self.up.len(),
-            self.down.len()
-        );
+        match self.kind {
+            ExpertKind::SwiGlu => {
+                let gate_len = self.gate.as_ref().map_or(0, |g| g.len());
+                anyhow::ensure!(
+                    gate_len == expect && self.up.len() == expect && self.down.len() == expect,
+                    "expert {}: tensor sizes {gate_len} {} {} do not match {expect}",
+                    self.id,
+                    self.up.len(),
+                    self.down.len()
+                );
+            }
+            ExpertKind::Mlp => {
+                anyhow::ensure!(
+                    self.gate.is_none(),
+                    "expert {}: Mlp container carries a gate tensor — refuse (never a fake gate)",
+                    self.id
+                );
+                anyhow::ensure!(
+                    self.up.len() == expect && self.down.len() == expect,
+                    "expert {}: tensor sizes {} {} do not match {expect}",
+                    self.id,
+                    self.up.len(),
+                    self.down.len()
+                );
+            }
+        }
         Ok(())
     }
 
-    /// SwiGLU forward: `down(silu(gate·x) * (up·x))`.
+    /// Forward pass, kind-aware:
+    /// - SwiGlu: `down(silu(gate·x) * (up·x))`
+    /// - Mlp: `down(act(up·x))`, `act` the tagged [`Activation`]
     ///
     /// `x` is the activation vector for one token (`hidden` wide); the
     /// result is the expert's contribution, also `hidden` wide.
@@ -121,12 +241,23 @@ impl ExpertWeights {
         );
         let h = self.hidden;
         let i = self.intermediate;
-        // h = silu(gate·x) * (up·x), accumulated per intermediate unit.
+        // h-combined values per intermediate unit.
         let mut act = vec![0.0f32; i];
-        for (unit, slot) in act.iter_mut().enumerate() {
-            let g = dot(&self.gate[unit * h..(unit + 1) * h], x);
-            let u = dot(&self.up[unit * h..(unit + 1) * h], x);
-            *slot = silu(g) * u;
+        match self.kind {
+            ExpertKind::SwiGlu => {
+                let gate = self.gate.as_ref().expect("validated SwiGlu carries a gate");
+                for (unit, slot) in act.iter_mut().enumerate() {
+                    let g = dot(&gate[unit * h..(unit + 1) * h], x);
+                    let u = dot(&self.up[unit * h..(unit + 1) * h], x);
+                    *slot = silu(g) * u;
+                }
+            }
+            ExpertKind::Mlp => {
+                for (unit, slot) in act.iter_mut().enumerate() {
+                    let u = dot(&self.up[unit * h..(unit + 1) * h], x);
+                    *slot = self.activation.apply(u);
+                }
+            }
         }
         // y = down·h — each output row of `down` is `i` wide.
         let mut y = vec![0.0f32; h];
@@ -145,7 +276,14 @@ fn silu(v: f32) -> f32 {
     v / (1.0 + (-v).exp())
 }
 
-/// FNV-1a over the bytes preceding the checksum field.
+/// The standard tanh GELU (llama.cpp/vLLM's default gelu) — exact-odd
+/// function, max |diff| vs the erf form ~1e-3 relative at the fp16-scale
+/// weights this format stores.
+fn gelu(v: f32) -> f32 {
+    const K: f32 = 0.797_884_6_f32; // √(2/π)
+    let inner = v * (1.0 + 0.044_715_f32 * v * v) * K;
+    0.5 * v * (1.0 + inner.tanh())
+}
 fn checksum(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in bytes {
@@ -157,19 +295,40 @@ fn checksum(bytes: &[u8]) -> u64 {
 
 impl ExpertWeights {
     /// Serialize into the on-disk container (see the module docs for the
-    /// layout; the checksum covers everything before it).
+    /// layout; the checksum covers everything before it). SwiGlu experts
+    /// write v1 (bit-compatible with older files), Mlp experts require v2.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
+        let (magic, version) = match self.kind {
+            ExpertKind::SwiGlu => (MAGIC, VERSION),
+            ExpertKind::Mlp => (MAGIC_V2, VERSION_V2),
+        };
         let mut out = Vec::with_capacity(64 + self.bytes());
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(magic);
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&(self.id.len() as u32).to_le_bytes());
         out.extend_from_slice(self.id.as_bytes());
         out.extend_from_slice(&(self.hidden as u32).to_le_bytes());
         out.extend_from_slice(&(self.intermediate as u32).to_le_bytes());
-        for t in [&self.gate, &self.up, &self.down] {
-            for v in t {
-                out.extend_from_slice(&v.to_le_bytes());
+        if version == VERSION_V2 {
+            out.push(self.kind.tag());
+            out.push(self.activation.tag());
+        }
+        match self.kind {
+            ExpertKind::SwiGlu => {
+                let gate = self.gate.as_ref().expect("validated SwiGlu carries a gate");
+                for t in [gate, &self.up, &self.down] {
+                    for v in t {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            ExpertKind::Mlp => {
+                for t in [&self.up, &self.down] {
+                    for v in t {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
             }
         }
         let sum = checksum(&out);
@@ -179,7 +338,8 @@ impl ExpertWeights {
 
     /// Parse a container. Every failure mode is a typed error: bad magic,
     /// truncated body, dimensions that overflow, tensor-length mismatch,
-    /// or checksum disagreement (bit rot / partial write).
+    /// unknown kind/activation tags, or checksum disagreement (bit rot /
+    /// partial write). v1 files parse as synthetic SwiGlu/Silu experts.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = 0usize;
         let take = |cur: &mut usize, n: usize| -> Result<&[u8]> {
@@ -192,14 +352,21 @@ impl ExpertWeights {
             *cur += n;
             Ok(s)
         };
+        // Header: the versioned 8-byte magic ("JEXP1\0\0\0" / "JEXP2\0\0\0"),
+        // then the explicit version u32 the writer lays down after both —
+        // v1 shards stay bit-readable forever.
+        let magic8 = take(&mut cur, 8)?;
+        let version = if magic8 == MAGIC {
+            VERSION
+        } else if magic8 == MAGIC_V2 {
+            VERSION_V2
+        } else {
+            anyhow::bail!("not an expert file (bad magic)")
+        };
+        let version_field = u32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap());
         anyhow::ensure!(
-            take(&mut cur, 8)? == MAGIC,
-            "not an expert file (bad magic)"
-        );
-        let version = u32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap());
-        anyhow::ensure!(
-            version == VERSION,
-            "expert file version {version} unsupported (this build reads {VERSION})"
+            version_field == version,
+            "expert file version {version_field} unsupported (this build reads {VERSION}–{VERSION_V2})"
         );
         let id_len = u32::from_le_bytes(take(&mut cur, 4)?.try_into().unwrap()) as usize;
         let id = String::from_utf8(take(&mut cur, id_len)?.to_vec())
@@ -222,7 +389,21 @@ impl ExpertWeights {
                 .map(|c| f32::from_le_bytes(*c))
                 .collect())
         };
-        let gate = read_tensor(&mut cur)?;
+        let mut kind = ExpertKind::SwiGlu;
+        let mut activation = Activation::Silu;
+        if version == VERSION_V2 {
+            let tags = take(&mut cur, 2)?;
+            kind = ExpertKind::from_tag(tags[0])?;
+            activation = Activation::from_tag(tags[1])?;
+        }
+        let gate = if version == VERSION {
+            Some(read_tensor(&mut cur)?)
+        } else {
+            match kind {
+                ExpertKind::SwiGlu => Some(read_tensor(&mut cur)?),
+                ExpertKind::Mlp => None,
+            }
+        };
         let up = read_tensor(&mut cur)?;
         let down = read_tensor(&mut cur)?;
         let sum = u64::from_le_bytes(take(&mut cur, 8)?.try_into().unwrap());
@@ -234,6 +415,8 @@ impl ExpertWeights {
             id,
             hidden,
             intermediate,
+            kind,
+            activation,
             gate,
             up,
             down,
@@ -265,6 +448,220 @@ impl ExpertWeights {
             std::fs::read(path).with_context(|| format!("reading expert {}", path.display()))?;
         Self::from_bytes(&bytes).with_context(|| format!("parsing expert {}", path.display()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Router containers — one MoE layer's real routing weights
+// (`blk.<n>.ffn_gate_inp.weight` from the GGUF, the top-k scorer),
+// separate from the expert files so the store's expert listing/passwords
+// stay experts. `.router` files on disk, kind-1 wire, self-describing.
+// ---------------------------------------------------------------------------
+
+/// Router file magic + version.
+const ROUTER_MAGIC: &[u8; 8] = b"JROUTE1\0";
+
+/// One MoE layer's router: `[e × h]` row-major routing weights that score
+/// each expert for a hidden-wide token (`rows·x` → `e` logits). `used`
+/// records the model's top-k when the GGUF names it — advisory metadata
+/// for walkers, never a serve-time assumption.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouterWeights {
+    /// Layer id, e.g. `L1.router`.
+    pub id: String,
+    /// Expert count = output width.
+    pub experts: usize,
+    /// Hidden width = input width.
+    pub hidden: usize,
+    /// Top-k experts per token, when the source model declares it.
+    pub used: Option<usize>,
+    /// `[e × h]` row-major: row `e` scores expert `e`.
+    pub rows: Vec<f32>,
+}
+
+impl RouterWeights {
+    /// Deterministic synthetic router (same seed family as experts) so
+    /// mesh smoke tests can pace router pulls without a model import.
+    pub fn synthetic(id: &str, experts: usize, hidden: usize, used: Option<usize>) -> Self {
+        fn lcg(seed: &mut u64) -> f32 {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = (*seed >> 33) as u32;
+            (x as f32 / u32::MAX as f32) * 0.2 - 0.1
+        }
+        let mut seed: u64 = 0x5eed;
+        for b in id.as_bytes() {
+            seed = seed.wrapping_mul(0x100000001b3) ^ (*b as u64);
+        }
+        Self {
+            id: id.to_string(),
+            experts,
+            hidden,
+            used,
+            rows: (0..experts * hidden).map(|_| lcg(&mut seed)).collect(),
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.experts.saturating_mul(self.hidden) * std::mem::size_of::<f32>()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let expect = self
+            .experts
+            .checked_mul(self.hidden)
+            .context("router dimensions overflow")?;
+        anyhow::ensure!(
+            self.experts > 0 && self.hidden > 0,
+            "router {}: degenerate dimensions",
+            self.id
+        );
+        anyhow::ensure!(
+            self.rows.len() == expect,
+            "router {}: rows {} do not match {expect}",
+            self.id,
+            self.rows.len()
+        );
+        Ok(())
+    }
+
+    /// Score one token: `rows·x` → `experts` logits (softmax is the
+    /// caller's job — the raw scores are what top-k needs).
+    pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            x.len() == self.hidden,
+            "router {}: input has {} floats, expected hidden={}",
+            self.id,
+            x.len(),
+            self.hidden
+        );
+        Ok(self
+            .rows
+            .chunks(self.hidden)
+            .map(|row| dot(row, x))
+            .collect())
+    }
+
+    /// Expert k's row (`[h]` slice of the routing matrix).
+    pub fn row(&self, expert_k: usize) -> Result<&[f32]> {
+        anyhow::ensure!(
+            expert_k < self.experts,
+            "router {}: expert index {expert_k} out of range ({})",
+            self.id,
+            self.experts
+        );
+        Ok(&self.rows[expert_k * self.hidden..(expert_k + 1) * self.hidden])
+    }
+
+    /// Serialize (same checksum rule as the expert containers).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut out = Vec::with_capacity(48 + self.bytes());
+        out.extend_from_slice(ROUTER_MAGIC);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(self.id.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(&(self.experts as u32).to_le_bytes());
+        out.extend_from_slice(&(self.hidden as u32).to_le_bytes());
+        // u32::MAX = "top-k unknown" (the source model never declared it).
+        out.extend_from_slice(&(self.used.unwrap_or(u32::MAX as usize) as u32).to_le_bytes());
+        for v in &self.rows {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let sum = checksum(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        Ok(out)
+    }
+
+    /// Parse a router container. Typed failures like the expert parser:
+    /// magic, version, truncation, dims, checksum.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = 0usize;
+        let mut take = |n: usize| -> anyhow::Result<&[u8]> {
+            anyhow::ensure!(
+                bytes.len() >= cur + n,
+                "router file truncated: wanted {n} bytes at {cur}, file is {}",
+                bytes.len()
+            );
+            let s = &bytes[cur..cur + n];
+            cur += n;
+            Ok(s)
+        };
+        anyhow::ensure!(take(8)? == ROUTER_MAGIC, "not a router file (bad magic)");
+        let version = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        anyhow::ensure!(
+            version == 1,
+            "router file version {version} unsupported (this build reads 1)"
+        );
+        let id_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let id =
+            String::from_utf8(take(id_len)?.to_vec()).context("router id is not valid UTF-8")?;
+        let experts = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let hidden = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let used_raw = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        let used = if used_raw == u32::MAX {
+            None
+        } else {
+            Some(used_raw as usize)
+        };
+        anyhow::ensure!(
+            experts > 0 && hidden > 0 && experts <= MAX_DIM && hidden <= MAX_DIM,
+            "router {id}: implausible dimensions {experts}×{hidden}"
+        );
+        let expect = experts
+            .checked_mul(hidden)
+            .context("router dimensions overflow")?;
+        let raw = take(expect * 4)?;
+        let rows = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let sum = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        anyhow::ensure!(
+            checksum(&bytes[..cur - 8]) == sum,
+            "router {id}: checksum mismatch (corrupted or partially written file)"
+        );
+        let r = Self {
+            id,
+            experts,
+            hidden,
+            used,
+            rows,
+        };
+        r.validate()?;
+        Ok(r)
+    }
+
+    /// Atomic write, same temp+rename rule as the expert containers.
+    pub fn write_to(&self, path: &Path) -> Result<()> {
+        let bytes = self.to_bytes()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating router dir {}", dir.display()))?;
+        }
+        let tmp = path.with_extension("router.tmp");
+        std::fs::write(&tmp, &bytes)
+            .with_context(|| format!("writing router temp file {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("publishing router file {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Expert / router ids are mesh-supplied strings; keep them to a single
+/// path component so a hostile id can't escape the store dir.
+fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Hit/miss/load counters — the observability surface for `/status` and
@@ -316,6 +713,12 @@ pub struct ExpertStore {
     cache_budget: usize,
     cache: Mutex<ExpertCache>,
     stats: StoreStats,
+    /// §1 phase 2 (draft hot set): the ALWAYS-RESIDENT tier — recomputed
+    /// from `[experts].draft_hot_percent` every replication tick. Pinned
+    /// ids are never eviction victims (the governor's full shed keeps
+    /// them too) and are eagerly loaded from disk when the pin lands, so
+    /// a draft pass never pays first-touch disk.
+    pinned: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ExpertStore {
@@ -331,7 +734,49 @@ impl ExpertStore {
             cache_budget: cache_mb.saturating_mul(1024 * 1024),
             cache: Mutex::new(ExpertCache::default()),
             stats: StoreStats::default(),
+            pinned: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// §1 phase 2: REPLACE the pinned set with `ids` (the knob's current
+    /// derivation — stale pins from an old percent fade out every tick)
+    /// and eagerly load any pinned expert that is not resident yet. Load
+    /// failures are honest no-ops (an unhosted/corrupt id stays pinned
+    /// but never becomes resident; the next tick with a sane set fixes
+    /// the roster). Returns how many pins are now resident.
+    pub fn apply_draft_pins(&self, ids: &[String]) -> usize {
+        *self.pinned.lock().unwrap_or_else(|e| e.into_inner()) = ids.iter().cloned().collect();
+        let mut resident = 0usize;
+        for id in ids {
+            if self.is_resident(id) {
+                resident += 1;
+                continue;
+            }
+            if self.load_from_disk_and_cache(id).is_ok() {
+                resident += 1;
+            }
+        }
+        resident
+    }
+
+    /// The pinned ids (sorted — /status renders them).
+    pub fn pinned_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .pinned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn is_pinned(&self, expert_id: &str) -> bool {
+        self.pinned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(expert_id)
     }
 
     /// `~/.jerith-mesh/experts` — the default store the node wires up.
@@ -351,19 +796,11 @@ impl ExpertStore {
     }
 
     fn path_for(&self, expert_id: &str) -> PathBuf {
-        // Expert ids are mesh-supplied strings; keep them to a single path
-        // component so a hostile id can't escape the store dir.
-        let safe: String = expert_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.dir.join(format!("{safe}.expert"))
+        self.dir.join(format!("{}.expert", sanitize_id(expert_id)))
+    }
+
+    fn router_path_for(&self, router_id: &str) -> PathBuf {
+        self.dir.join(format!("{}.router", sanitize_id(router_id)))
     }
 
     /// Expert ids this node holds — the filename stems (the header id is
@@ -418,11 +855,20 @@ impl ExpertStore {
     pub fn evict_to(&self, max_bytes: usize) -> usize {
         let mut shed = 0usize;
         {
+            // Lock order fixed cache → pinned everywhere (the load path
+            // holds the cache lock while consulting pins — a pinned→cache
+            // take here would deadlock the two paths against each other).
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let pinned = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
             while cache.bytes > max_bytes {
-                let Some(victim) = cache.order.pop_front() else {
+                // Pinned experts are NOT victims: the draft tier survives
+                // even the governor's full shed. When every resident id is
+                // pinned the shed stops — pins may exceed the cache
+                // budget, that is the operator's ask, stated loudly here.
+                let Some(pos) = cache.order.iter().position(|id| !pinned.contains(id)) else {
                     break;
                 };
+                let victim = cache.order.remove(pos).expect("position just checked");
                 if let Some(entry) = cache.entries.remove(&victim) {
                     cache.bytes = cache.bytes.saturating_sub(entry.bytes);
                     shed += entry.bytes;
@@ -504,10 +950,14 @@ impl ExpertStore {
         cache.order.retain(|id| id != expert_id);
         cache.order.push_back(expert_id.to_string());
         cache.bytes += bytes;
+        let pinned = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
         while cache.bytes > self.cache_budget {
-            let Some(victim) = cache.order.pop_front() else {
+            // Same pin rule as `evict_to`: the draft tier is never an
+            // over-budget victim; only pinned entries stop the shedding.
+            let Some(pos) = cache.order.iter().position(|id| !pinned.contains(id)) else {
                 break;
             };
+            let victim = cache.order.remove(pos).expect("position just checked");
             if let Some(entry) = cache.entries.remove(&victim) {
                 cache.bytes = cache.bytes.saturating_sub(entry.bytes);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -548,6 +998,55 @@ impl ExpertStore {
         cache.entries.remove(&weights.id);
         cache.order.retain(|id| id != &weights.id);
         Ok(())
+    }
+
+    /// Router ids this node holds (`.router` filenames; never mixed into
+    /// the expert listing — a router is not a forwardable expert).
+    pub fn routers(&self) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("router") {
+                    return None;
+                }
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Store one router container (atomic write; routers are tiny — reads
+    /// go to disk each time, no LRU entry).
+    pub fn put_router(&self, router: &RouterWeights) -> Result<()> {
+        router.write_to(&self.router_path_for(&router.id))
+    }
+
+    /// Read one router container (filename stem must match the header id,
+    /// the same misname-refusal rule the expert loaders enforce).
+    pub fn get_router(&self, router_id: &str) -> Result<RouterWeights> {
+        let path = self.router_path_for(router_id);
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("reading router {}", path.display()))?;
+        let r = RouterWeights::from_bytes(&bytes)
+            .with_context(|| format!("parsing router {}", path.display()))?;
+        anyhow::ensure!(
+            r.id == router_id,
+            "router file {} holds id {:?}, not {router_id:?} — refusing to serve the wrong router",
+            path.display(),
+            r.id
+        );
+        Ok(r)
+    }
+
+    /// Does this node hold a router for this layer id (early boot / one-stat)?
+    pub fn contains_router(&self, router_id: &str) -> bool {
+        self.router_path_for(router_id).is_file()
     }
 
     /// Raw container bytes for one expert (Phase 2 transfer: a peer
@@ -604,7 +1103,13 @@ mod tests {
     /// explicit loops over sliced rows, no shared helpers.
     fn reference_forward(w: &ExpertWeights, x: &[f32]) -> Vec<f32> {
         let mut act: Vec<f32> = Vec::with_capacity(w.intermediate);
-        for (gate_row, up_row) in w.gate.chunks(w.hidden).zip(w.up.chunks(w.hidden)) {
+        for (gate_row, up_row) in w
+            .gate
+            .as_ref()
+            .unwrap()
+            .chunks(w.hidden)
+            .zip(w.up.chunks(w.hidden))
+        {
             let mut g = 0.0f32;
             let mut u = 0.0f32;
             for (gr, xk) in gate_row.iter().zip(x) {
@@ -744,6 +1249,7 @@ mod tests {
             cache_budget: one + 16,
             cache: Mutex::new(ExpertCache::default()),
             stats: StoreStats::default(),
+            pinned: Mutex::new(std::collections::HashSet::new()),
         };
         store.run("L0.E1", &x).unwrap(); // load
         store.run("L0.E1", &x).unwrap(); // hit
@@ -753,6 +1259,48 @@ mod tests {
         assert!(!store.is_resident("L0.E1"));
         assert!(store.is_resident("L0.E2"));
         assert!(store.resident_bytes() <= store.cache_budget_bytes());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn draft_pins_survive_full_shed_and_budget_pressure_and_clear() {
+        let (dir, store) = tmp_store(16);
+        for id in ["L0.E0", "L0.E1", "L1.E0", "L9.E9"] {
+            store.put(&ExpertWeights::synthetic(id, 4, 3)).unwrap();
+        }
+        // Pin the draft tier (the lowest-layer slice): the pin lands and
+        // all four ids load EAGERLY — a draft pass never pays disk.
+        let resident = store.apply_draft_pins(&["L0.E0".into(), "L0.E1".into()]);
+        assert_eq!(resident, 2, "pinned ids load eagerly on apply");
+        assert!(store.is_resident("L0.E0") && store.is_resident("L0.E1"));
+        assert_eq!(store.pinned_ids(), vec!["L0.E0", "L0.E1"]);
+
+        // Give the eviction some non-pinned residents to shed.
+        store.run("L1.E0", &[1.0f32; 4]).unwrap();
+        store.run("L9.E9", &[1.0f32; 4]).unwrap();
+        assert!(store.is_resident("L1.E0") && store.is_resident("L9.E9"));
+
+        // The resource governor's FULL shed keeps the pins resident.
+        let shed = store.evict_to(0);
+        assert!(shed > 0, "non-pinned resident bytes were shed");
+        assert!(store.is_resident("L0.E0") && store.is_resident("L0.E1"));
+
+        // Budget pressure mid-load behaves the same: an unpinned load
+        // evicts LRU unpinned entries, never a pinned one.
+        store.run("L1.E0", &[1.0f32; 4]).unwrap();
+        store.run("L9.E9", &[1.0f32; 4]).unwrap();
+        assert!(store.is_resident("L0.E0") && store.is_resident("L0.E1"));
+        assert_eq!(
+            store.pinned_ids(),
+            vec!["L0.E0", "L0.E1"],
+            "pins untouched by eviction"
+        );
+
+        // Knob off: the empty re-derivation fades the pins out.
+        store.apply_draft_pins(&[]);
+        assert!(store.pinned_ids().is_empty());
+        store.evict_to(0);
+        assert!(!store.is_resident("L0.E0"), "unpinned shed like any entry");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -947,6 +1495,156 @@ mod tests {
         // next shed evicts exactly it — and the one after is a no-op.
         assert_eq!(store.evict_to(0), 144);
         assert_eq!(store.evict_to(0), 0, "shedding an empty set is a no-op");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- v2: the plain-MLP kind + activation tag + router containers ----
+
+    /// Independent MLP reference (explicit rows, no shared helpers).
+    fn reference_mlp(w: &ExpertWeights, x: &[f32]) -> Vec<f32> {
+        let act: Vec<f32> =
+            w.up.chunks(w.hidden)
+                .map(|up_row| up_row.iter().zip(x).map(|(u, k)| u * k).sum::<f32>())
+                .map(|v| match w.activation {
+                    Activation::Silu => v / (1.0 + (-v).exp()),
+                    Activation::Gelu => {
+                        let inner = v * (1.0 + 0.044_715_f32 * v * v) * 0.797_884_6_f32;
+                        0.5 * v * (1.0 + inner.tanh())
+                    }
+                })
+                .collect();
+        w.down
+            .chunks(w.intermediate)
+            .map(|down_row| down_row.iter().zip(&act).map(|(d, a)| d * a).sum::<f32>())
+            .collect()
+    }
+
+    #[test]
+    fn mlp_experts_forward_match_the_tagged_activation() {
+        let x = vec![0.4f32, -0.7, 1.1, 0.05];
+        for activation in [Activation::Gelu, Activation::Silu] {
+            let w = ExpertWeights::synthetic_mlp("L3.E1", 4, 3, activation);
+            let got = w.forward(&x).unwrap();
+            let want = reference_mlp(&w, &x);
+            for (g, wv) in got.iter().zip(&want) {
+                assert!((g - wv).abs() < 1e-5, "{activation:?}: {g} vs {wv}");
+            }
+            assert_eq!(got.len(), x.len(), "MLP output is hidden-wide");
+        }
+    }
+
+    #[test]
+    fn mlp_container_roundtrips_and_refuses_a_fabricated_gate() {
+        let w = ExpertWeights::synthetic_mlp("L2.E7", 4, 3, Activation::Gelu);
+        let bytes = w.to_bytes().unwrap();
+
+        // v2 round-trip: kind, activation, and the two-tensor shape survive.
+        let parsed = ExpertWeights::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, w);
+        assert_eq!(parsed.kind, ExpertKind::Mlp);
+        assert_eq!(parsed.activation, Activation::Gelu);
+        assert!(parsed.gate.is_none(), "MLP containers never fake a gate");
+
+        // An Mlp container slapped a gate onto: refused at validate, not
+        // served with shape-blind math.
+        let mut forged = w.clone();
+        forged.gate = Some(vec![0.0f32; 12]);
+        let err = forged.validate().unwrap_err().to_string();
+        assert!(err.contains("never a fake gate"), "got {err}");
+
+        // Unknown kind/activation tags are typed refusals (the kind tag
+        // sits right after magic(+8)+version(+4)+id_len(+4)+id(+5 for
+        // "L2.E7")+hidden(+4)+intermediate(+4)).
+        let tag_pos = 8 + 4 + 4 + "L2.E7".len() + 4 + 4;
+        let mut bad_tag = bytes.clone();
+        bad_tag[tag_pos] = 9;
+        let err = ExpertWeights::from_bytes(&bad_tag).unwrap_err().to_string();
+        assert!(err.contains("expert kind tag 9"), "got {err}");
+    }
+
+    #[test]
+    fn v1_files_stay_readable_as_swiglu_experts() {
+        // A v1 container (bit-identical to what `experts make` wrote
+        // before v2 existed) parses as a SwiGlu/Silu expert and still
+        // computes the v1 math.
+        let w = ExpertWeights::synthetic("L0.E1", 4, 3);
+        let bytes = w.to_bytes().unwrap();
+        assert_eq!(&bytes[0..8], b"JEXP1\0\0\0");
+        let parsed = ExpertWeights::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.kind, ExpertKind::SwiGlu);
+        assert_eq!(parsed.activation, Activation::Silu);
+        let x = vec![0.3f32, -0.2, 0.9, 0.4];
+        assert_eq!(parsed.forward(&x).unwrap(), w.forward(&x).unwrap());
+    }
+
+    #[test]
+    fn router_containers_roundtrip_score_and_refuse_mismatches() {
+        let r = RouterWeights::synthetic("L1.router", 6, 4, Some(2));
+        assert_eq!(r.bytes(), 6 * 4 * 4);
+        let parsed = RouterWeights::from_bytes(&r.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed, r, "v1 router container round-trips");
+
+        // Scoring: rows·x, raw logits (softmax is the caller's job).
+        let x = vec![0.5f32, -0.25, 1.0, 0.0];
+        let scores = parsed.forward(&x).unwrap();
+        assert_eq!(scores.len(), 6);
+        for (k, got) in scores.iter().enumerate() {
+            let row = parsed.row(k).unwrap();
+            let want: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+            assert_eq!(*got, want, "row {k}");
+        }
+        assert!(parsed.row(6).is_err(), "out-of-range expert refused");
+        assert!(
+            RouterWeights::synthetic("no-topk", 3, 4, None)
+                .used
+                .is_none()
+        );
+
+        // Wrong input width is a typed refusal.
+        let err = parsed.forward(&[1.0, 2.0]).unwrap_err().to_string();
+        assert!(err.contains("expected hidden=4"), "got {err}");
+
+        // Corrupt body → checksum mismatch; not-a-router → bad magic.
+        let good = r.to_bytes().unwrap();
+        let mut bit_flipped = good.clone();
+        let mid = bit_flipped.len() / 2;
+        bit_flipped[mid] ^= 0x01;
+        let err = format!("{:#}", RouterWeights::from_bytes(&bit_flipped).unwrap_err());
+        assert!(err.contains("checksum mismatch"), "got {err}");
+        let err = format!(
+            "{:#}",
+            RouterWeights::from_bytes(b"nonsense at all____________").unwrap_err()
+        );
+        assert!(err.contains("bad magic"), "got {err}");
+    }
+
+    #[test]
+    fn store_hosts_routers_beside_experts_without_mingling() {
+        let (dir, store) = tmp_store(16);
+        store.put(&ExpertWeights::synthetic("L0.E1", 4, 3)).unwrap();
+        let router = RouterWeights::synthetic("L0.router", 4, 4, None);
+        store.put_router(&router).unwrap();
+
+        assert_eq!(store.hosted(), vec!["L0.E1".to_string()]);
+        assert_eq!(store.routers(), vec!["L0.router".to_string()]);
+        assert!(store.contains("L0.E1"));
+        assert!(store.contains_router("L0.router"));
+        assert!(!store.contains_router("L1.router"));
+        assert!(!store.contains("L0.router"), "a router id is not an expert");
+
+        // Round-trip through the store, with the misname refusal intact.
+        let served = store.get_router("L0.router").unwrap();
+        assert_eq!(served, router);
+        router
+            .write_to(&store.dir().join("L9.router.router"))
+            .unwrap();
+        let err = format!("{:#}", store.get_router("L9.router").unwrap_err());
+        assert!(
+            err.contains("refusing to serve the wrong router"),
+            "got {err}"
+        );
+        let err = format!("{:#}", store.get_router("L1.router").unwrap_err());
+        assert!(err.contains("L1.router"), "got {err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

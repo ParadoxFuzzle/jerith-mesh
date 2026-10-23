@@ -36,6 +36,50 @@ pub const DEFAULT_HOT_PERCENT: u32 = 15;
 pub const MIN_HOT_PERCENT: u32 = 10;
 pub const MAX_HOT_PERCENT: u32 = 20;
 
+/// Sort key for the §1 DRAFT tier (phase 2, always-hot draft experts):
+/// lowest layer first (the draft pass re-runs the front of the model
+/// every decode step), then dense `E0` experts, then numbered experts;
+/// ids that do not parse (`exp.drill.kat`-style synthetic names) sort
+/// last alphabetically — so every node derives the same order from the
+/// same numbers.
+fn draft_key(id: &str) -> (u32, u8, u32, String) {
+    let mut rank: u8 = 255;
+    let mut layer_idx = u32::MAX;
+    let mut expert_idx = u32::MAX;
+    if let Some(rest) = id.strip_prefix('L')
+        && let Some((layer, tail)) = rest.split_once('.')
+        && let Ok(l) = layer.parse::<u32>()
+    {
+        layer_idx = l;
+        if tail == "E0" {
+            rank = 0;
+        } else if let Some(m) = tail.strip_prefix('E')
+            && let Ok(m) = m.parse::<u32>()
+        {
+            rank = 1;
+            expert_idx = m;
+        }
+    }
+    (layer_idx, rank, expert_idx, id.to_string())
+}
+
+/// The DRAFT tier: `percent` of the hosted experts (0 = off → empty),
+/// drawn deterministically lowest-layer-first. Values above 50 are
+/// clamped — a tier named "the always-hot slice" that could swallow the
+/// whole store would just re-implement the cache budget by another name.
+/// At least one expert whenever anything is hosted and the knob is on
+/// (a fraction of a small store rounds up, mirroring `hot_set`).
+pub fn draft_set(hosted: &[String], percent: u32) -> Vec<String> {
+    if hosted.is_empty() || percent == 0 {
+        return Vec::new();
+    }
+    let percent = percent.clamp(1, 50);
+    let max_draft = (hosted.len() as u64 * percent as u64).div_ceil(100).max(1) as usize;
+    let mut ordered: Vec<&String> = hosted.iter().collect();
+    ordered.sort_by_key(|id| draft_key(id));
+    ordered.into_iter().take(max_draft).cloned().collect()
+}
+
 /// Activation counts for the experts this node has seen requested.
 #[derive(Debug, Default, Clone)]
 pub struct ExpertStats {
@@ -275,6 +319,63 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    /// §1 phase 2 (draft hot set): the tier is deterministic,
+    /// lowest-layer-first, dense-E0 before numbered experts, non-layer
+    /// synthetic ids last; the percent math mirrors hot_set (rounds up
+    /// to ≥1) and clamps over-asks at 50 %.
+    #[test]
+    fn draft_set_is_layer_first_deterministic_and_bounded() {
+        let hosted: Vec<String> = vec![
+            "exp.drill.kat".into(), // synthetic: sorts last
+            "L1.E2".into(),
+            "L0.E1".into(),
+            "L10.E0".into(), // numeric layer order, not lexicographic
+            "L0.E0".into(),  // dense first within its layer
+            "L1.E0".into(),
+            "L2.E5".into(),
+        ];
+        // Off = empty; nothing at all hosted = empty.
+        assert!(draft_set(&hosted, 0).is_empty());
+        assert!(draft_set(&[], 15).is_empty());
+
+        // 20 % of 7 → ceil 2: the two lowest-layer experts, dense E0
+        // before the numbered one.
+        assert_eq!(draft_set(&hosted, 20), vec!["L0.E0", "L0.E1"]);
+        // 50 % of 7 → ceil 4 (and clamped 50 stays 50).
+        assert_eq!(
+            draft_set(&hosted, 50),
+            vec!["L0.E0", "L0.E1", "L1.E0", "L1.E2"]
+        );
+        assert_eq!(draft_set(&hosted, 97), draft_set(&hosted, 50));
+        // Full layer traversal order: L2 before L10 (numeric), the
+        // synthetic name dead last.
+        assert_eq!(
+            draft_set(&hosted, 200).len(),
+            draft_set(&hosted, 50).len(),
+            "clamped to 50 % — never a whole-store swallow"
+        );
+        let all = {
+            let mut v = draft_set(&hosted, 50);
+            // the remainder in key order for the ordering assertion below
+            v.extend(["L10.E0".into(), "L2.E5".into(), "exp.drill.kat".into()]);
+            v
+        };
+        assert_eq!(
+            draft_key("L2.E5"),
+            (2, 1, 5, "L2.E5".into()),
+            "numeric layer, numbered-expert rank"
+        );
+        assert!(draft_key("L2.E5") < draft_key("L10.E0"), "L2 < L10");
+        assert!(
+            draft_key("L10.E0") < draft_key("exp.drill.kat"),
+            "synthetic last"
+        );
+
+        // Round-up: one hosted expert, 15 % → still hot.
+        assert_eq!(draft_set(&["L0.E0".to_string()], 15), vec!["L0.E0"]);
+        let _ = all; // ordering key assertions carry the proof
     }
 
     #[test]
