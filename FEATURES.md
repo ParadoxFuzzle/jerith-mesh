@@ -1762,3 +1762,128 @@ requested` is logged but the NEXT cadence's poll is the verdict (the
 truth line is `voice seat back (driver reconnected)`). /voiceleave
 exits the watcher — an operator stop is a full stop; the watcher only
 repairs incidental drops.
+
+## 25. The download-quarantine lane (2026-10-23)
+
+`crates/quarantine-plugin/` + `external:quarantine` — the fourth live
+consumer of the plugin SDK, born of the same day's BetterCraft hand-
+run: a CurseForge-style modpack arrived by DM carrying an obfuscated
+jar-class dropper inside `overrides/mods`; the inspection routine
+(unzip → strings → verdict → hash → refuse, never executed) is now a
+standing lane, and the bot does it BY DEFAULT before the owner ever
+double-clicks.
+
+Four pieces:
+
+- **The scanner** (`crates/quarantine-plugin`): a minimal ZIP
+  central-directory reader (stored + raw-deflate entries, per-entry
+  inflate cap `MAX_ENTRY_INFLATED` = 32 MiB — `miniz_oxide`, pure Rust,
+  no provider ambiguity for the workspace's rustls/ring pin), then the
+  conviction marks — obfuscator fingerprints (`ZKM`/`Allatori`/…),
+  process spawn (`java/lang/Runtime`/`ProcessBuilder`), network
+  bootstrap (`Socket`/`HttpURLConnection`), file plant
+  (`setExecutable`/`FileOutputStream`) — read from the DECODED
+  entries' printable runs: a class's constant pool carries those
+  identifiers whole, so obfuscators cannot frizzle them away. Typed
+  verdicts, honest rules in `Marks::verdict` (one place, tests pin it):
+  `malicious` = a native executable (PE/ELF/Mach-O magic, with the
+  class-file CAFEBABE carve-out) smuggled into an archive, or a
+  dropper COMBINATION (obf+spawn, obf+plant, spawn+plant, net+plant);
+  `suspicious` = a lone strong mark that didn't combo; `benign` =
+  nothing strong — a network-only jar (update checkers) stays quiet,
+  the lane never cries wolf. Every scan is hashed (SHA-256 — the
+  handle for comparing one sample across recipients), every failure is
+  a typed `note` on a completed report, and the file edge respects a
+  512 MiB read cap.
+- **The verdict log**: append-only JSONL at
+  `~/.jerith-mesh/quarantine/verdicts.jsonl` (`$JERITH_QUARANTINE_STATE`
+  override) — the ONE cross-file surface the bot's lanes read from
+  outside the service contract. Tolerant reader, 500-row cap, counts.
+- **The watcher** (30 s poll, `$JERITH_QUARANTINE_WATCH_SECS`): scans
+  the quarantine dir (`$JERITH_QUARANTINE_DIR`, default `~/Downloads`),
+  settles files younger than 10 s (never scans a half-written file),
+  keys scans on path+size+mtime so a re-downloaded name re-scans,
+  forgets deletions, and never double-judges across restarts (the
+  known-set is primed FROM the log). Strong verdicts journal at WARN —
+  the event trail lands in the process journal on its own.
+- **The bot's readings**, both sides of a lane that surfaces its
+  verdicts without any new trust surface:
+  - **monitor `check_quarantine`** (the sender): reads the log std-only;
+    only verdicts whose FILE IS STILL ON DISK rise to warn/fail (a
+    deleted threat is an old threat, never DM news again) — malicious
+    standing FAILS, suspicious standing WARNs, and the DM names path +
+    sha-prefix before the owner could ever open the file;
+  - **briefing `quarantine_section`** (2026-10-23 join): when
+    `external:quarantine` is opted in per `[plugins]` (either
+    `enabled` or `owner_only`), the daily note carries a `🧯` line —
+    standing verdicts lead ("1 malicious · 2 suspicious standing —
+    top: `<path>` (sha …)"), a judged-quiet day shows the watch + the
+    count, an empty day says so. Same signed-contract discipline as
+    the pet's greeting (`external::invoke`, no direct state reads from
+    the briefing; the monitor is the state-file reader).
+
+The two model-visible skills (`quarantine.scan` — deep-inspect a path
+on demand, `~` understood; `quarantine.recent` — counts, standing
+rows, the 8-card tail) let the CHAT re-run the routine live: "scan this
+presentation the stranger sent me" works, bounded at 200 files for a
+directory sweep. Verified live 2026-10-23 in this house: unsigned
+probe → 403; HMAC-signed probe → 200 + card; the deployment's own
+opening tick scanned `~/Downloads` on first poll (1 benign); a
+synthetic dropper-shaped jar (ZKM + ProcessBuilder + HttpURLConnection
++ setExecutable, deflated, dropped by a REAL zip writer) walked in,
+was judged `malicious` inside one poll naming all four marker
+kinds, and left an exactly-shaped JSONL row; deletion kept it quiet on
+the bot side per the standing rule. Bot restarted clean on the
+`external:quarantine` owner_only row, the drop parser accepting it —
+a malformed drop aborts the start, so the clean boot IS the registry
+proof. Full workspace suite green (453 bot + 16 lib tests in the new
+crate among them).
+
+## 26. The task ledger / intentions lane (2026-10-23)
+
+`crates/ledger-plugin/` + `external:ledger` — the fifth live consumer
+of the plugin SDK, and the lane that closes the loop the other
+surfaces can't: goals the owner (or the model on their behalf) VOICES
+in chat are promises today and gone tomorrow in scrollback. This lane
+keeps them as typed entries on disk and stands them back up in the
+morning note — said in chat, briefing tomorrow.
+
+Four pieces, exactly the drop anatomy the pet/house/quarantine proved:
+
+- **The ledger** (`ledger-plugin/lib.rs`, pure + tested): one
+  `state.json` (`$JERITH_LEDGER_STATE` override, else
+  `~/.jerith-mesh/ledger/state.json`), atomic save (temp + rename — a
+  killed process can't halve the file), entries with a monotone id,
+  text (≤ 200 chars), optional one-line note, `added_at_ms`, and
+  `closed_at_ms` (None = open). Honest rules, typed errors: a
+  duplicate of an already-OPEN text refuses with its existing id,
+  blank text is not a goal, the open tail caps at 200 (one more add
+  says close a few first — a ledger of 200 unfinished thoughts is a
+  mood board), and closed entries are KEPT as history capped at 500 —
+  the trim drops only the oldest CLOSED rows, never an open one
+  (tested: a week-old intention does not become archive debris).
+- **Four skills**, one contract: `ledger.add` (manifest tells the
+  model to OFFER it whenever the owner voices an intention),
+  `ledger.list` (open tail: count, oldest id + honest age "2 d" /
+  "90 min" / "just now", closed-today count, the 8 oldest open cards
+  with id + text + note + age), `ledger.done` (close by id — kept,
+  timestamped; closing twice says so in a typed error), `ledger.drop`
+  (delete outright — the "that was a typo, not a goal" lane; no
+  archive row). Ids only ever come from `ledger.list`.
+- **No heartbeat**: unlike quarantine's watcher and the pet's
+  time-decayed pethood, this lane moves only when asked — intentions
+  don't decay on a clock; they decay when the owner closes them. The
+  daily briefing is the clock the owner asked for.
+- **The briefing's `ledger_section`**: when `external:ledger` is
+  opted in per `[plugins]` (either `enabled` or `owner_only` — the
+  lane lives in `owner_only` alongside house/quarantine), the note
+  gains a `📋` line — "4 open (oldest 2 d) — `ship the ledger lane` ·
+  `migrate bot.toml` · `smoke test` · 1 closed today" (texts capped at
+  three; a finished-but-quiet day says "nothing open · 2 closed
+  today"; a clean day says "nothing open"). Same signed-contract
+  discipline as the pet greeting and the quarantine line:
+  `external::invoke` on `ledger.list`, no direct state-file reads —
+  the renderer is pure and pinned by tests against the exact card the
+  live service emits (verified 2026-10-23: unsigned probe 403, signed
+  add/done/drop/list round-trip incl. the typed unknown-id error,
+  smoke rows then closed; bot restarted clean on the gate row).

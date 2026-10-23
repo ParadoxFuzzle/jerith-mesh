@@ -1,0 +1,25 @@
+# jerith-mesh ledger plugin — user-level service (the task-ledger /
+# intentions lane; crates/ledger-plugin).
+# Install:
+#   cp deploy/systemd/jerith-ledger-plugin.service ~/.config/systemd/user/
+#   cp crates/ledger-plugin/plugin.toml ~/.jerith-mesh/plugins.d/ledger/
+#   # rotate the manifest's secret first (openssl rand -hex 16)
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-ledger-plugin
+#   # then add "external:ledger" to [plugins] owner_only in bot.toml + restart jerith-bot
+[Unit]
+Description=jerith-mesh ledger plugin (task ledger / intentions lane, :7792)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith-ledger %h/.jerith-mesh/plugins.d/ledger/plugin.toml
+Restart=always
+RestartSec=5
+# Lane settings (default commented; see crates/ledger-plugin/plugin.toml):
+#Environment=JERITH_LEDGER_STATE=%h/.jerith-mesh/ledger/state.json
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

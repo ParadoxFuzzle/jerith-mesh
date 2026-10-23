@@ -1,0 +1,49 @@
+# The task ledger / intentions lane — a plugin drop over the signed
+# plugin contract (docs/PLUGIN-SDK.md; the SDK's fifth real consumer
+# after the example, the mesh pet, the house card, and the quarantine
+# scanner). The lane the daily briefing reads so a goal said tonight
+# comes back tomorrow: skills to capture (`add`), read (`list`),
+# close (`done`) and delete (`drop`) intentions, one JSON state file.
+# Install:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/ledger
+#   cp crates/ledger-plugin/plugin.toml ~/.jerith-mesh/plugins.d/ledger/
+#   cargo build -p jerith-ledger-plugin --release
+#   systemd-run --user --unit=jerith-ledger-plugin --working-directory=~/.jerith-mesh/plugins.d/ledger \
+#     ./target/release/jerith-ledger ~/.jerith-mesh/plugins.d/ledger/plugin.toml   # rotate the secret first
+#   # then add "external:ledger" to [plugins] owner_only in bot.toml + restart the bot
+#
+# ONE endpoint line binds BOTH sides, same rule as the other drops:
+# the binary reads it and binds that address, so manifest and service
+# cannot drift. Loopback by default; non-loopback must be https (the
+# drop parser enforces this, fail-closed at bot start). State is NOT
+# this file: it lives in ONE save at `$JERITH_LEDGER_STATE` (default
+# `~/.jerith-mesh/ledger/state.json`) — closed entries are kept as
+# history (capped 500), open ones capped at 200 so a ledger of moods
+# can't happen. No daemon heartbeat: this lane only moves when asked.
+
+[plugin]
+id = "ledger"
+endpoint = "http://127.0.0.1:7792/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 10                         # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "add"
+description = "Capture one intention in the standing ledger (task ≤ 200 chars, optional one-line note). OFFER THIS whenever the owner voices a new goal or mentions something they intend to do — that is the lane's whole reason: said tonight, briefing tomorrow. Refuses a duplicate of an already-open task with its id and the open-entry cap honestly."
+parameters = { type = "object", properties = { task = { type = "string", description = "The goal, in the owner's own words, one line" }, note = { type = "string", description = "Optional one-line context (why, where, when)" } }, required = ["task"] }
+
+[[skill]]
+name = "list"
+description = "The ledger's open tail: how many are open, the oldest entry's id and age, how many closed today, and the up to 8 oldest open entries each with id, text, note and age. Prefer over guessing what's standing; the daily briefing renders this same card. Close or delete by these ids only."
+parameters = { type = "object" }
+
+[[skill]]
+name = "done"
+description = "Close one ledger entry by id — kept in the file as history (closed-at recorded), out of the open tail. Ids come from `ledger.list`; closing an already-closed id says so."
+parameters = { type = "object", properties = { id = { type = "integer", description = "Entry id from `ledger.list`" } }, required = ["id"] }
+
+[[skill]]
+name = "drop"
+description = "Delete one ledger entry by id outright — NOT done, removed (the 'that was a typo, not a goal' lane; no archive row). Ids come from `ledger.list`."
+parameters = { type = "object", properties = { id = { type = "integer", description = "Entry id from `ledger.list`" } }, required = ["id"] }

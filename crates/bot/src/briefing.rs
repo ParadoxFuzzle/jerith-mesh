@@ -205,6 +205,21 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
         s.push_str(&greeting);
     }
 
+    // The quarantine lane's morning line — the download watch's tail
+    // (strong verdicts still on disk lead; an opted-in-but-empty day
+    // says so in the same line). Rendered through the signed service
+    // contract, same as the pet's greeting above.
+    if let Some(line) = quarantine_section(cfg).await {
+        s.push_str(&line);
+    }
+
+    // The task ledger's open tail — what the owner said they'd do,
+    // back in the morning note so scrollback can't eat a goal. Same
+    // signed-contract composition rule as the two sections above.
+    if let Some(line) = ledger_section(cfg).await {
+        s.push_str(&line);
+    }
+
     // Mesh (peer truth; a cheap HTTPS GET that degrades with a name).
     s.push_str(&match crate::api::gateway_status(cfg).await {
         Ok(st) => {
@@ -455,6 +470,140 @@ async fn pet_section(cfg: &crate::config::BotConfig) -> Option<String> {
         Ok(card) => render_pet_line(&card).map(|l| format!("{l}\n")),
         Err(e) => {
             tracing::debug!(error = %e, "pet greeting skipped — the pet wasn't answering");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The quarantine lane (§ crates/quarantine-plugin, external:quarantine)
+// ---------------------------------------------------------------------------
+
+fn quarantine_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
+    let gate = "external:quarantine";
+    enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
+}
+
+/// The morning line from a `quarantine.recent` card — pure, so the
+/// shapes stay pinned without a live plugin. Priority order reads the
+/// card's own numbers:
+///   * strong verdicts STILL ON DISK (the `standing` rows) lead — that
+///     is what the owner should not forget;
+///   * a judged-but-quiet day shows the watch + the total;
+///   * an opted-in-but-empty day says watching and nothing judged.
+fn render_quarantine_line(v: &Value) -> Option<String> {
+    let dir = v["watch_dir"].as_str()?;
+    let counts = |k: &str| v["counts_total"][k].as_u64().unwrap_or(0);
+    let standing = v["standing"].as_array()?;
+    let mal_standing = standing
+        .iter()
+        .filter(|r| r["verdict"].as_str() == Some("malicious"))
+        .count() as u64;
+    let sus_standing = standing
+        .iter()
+        .filter(|r| r["verdict"].as_str() == Some("suspicious"))
+        .count() as u64;
+    if mal_standing + sus_standing > 0 {
+        let top = standing
+            .iter()
+            .find(|r| r["verdict"].as_str() == Some("malicious"))
+            .or_else(|| standing.iter().find(|r| r["verdict"].as_str() == Some("suspicious")));
+        let mut line = format!(
+            "🧯 quarantine: {mal_standing} malicious · {sus_standing} suspicious standing",
+        );
+        if let Some(top) = top
+            && let Some(p) = top["path"].as_str()
+        {
+            line.push_str(&format!(
+                " — top: `{}` (sha {})",
+                clip_line(p, 70),
+                top["sha256_prefix"].as_str().unwrap_or("?")
+            ));
+        }
+        Some(line)
+    } else if counts("benign") + counts("malicious") + counts("suspicious") > 0 {
+        Some(format!(
+            "🧯 quarantine: watch `{dir}` — {} judged, none suspect",
+            counts("benign") + counts("malicious") + counts("suspicious")
+        ))
+    } else {
+        Some(format!(
+            "🧯 quarantine: watching `{dir}` — nothing judged yet"
+        ))
+    }
+}
+
+/// Compose the quarantine section, or `None` when the owner hasn't
+/// opted the drop in (or the service isn't answering — an absent lane
+/// is silent in the morning note, like everything else here).
+/// Same discipline as the pet's greeting: the call goes over the SAME
+/// signed contract the chat loop uses; no direct state-file reads
+/// from the briefing (the monitor's check is the state-file reader).
+async fn quarantine_section(cfg: &crate::config::BotConfig) -> Option<String> {
+    if !quarantine_opted_in(&cfg.plugins.enabled, &cfg.plugins.owner_only) {
+        return None;
+    }
+    let plugin = cfg.external_plugins.iter().find(|p| p.id == "quarantine")?;
+    match crate::external::invoke(plugin, "quarantine.recent", &serde_json::json!({})).await {
+        Ok(card) => render_quarantine_line(&card).map(|l| format!("{l}\n")),
+        Err(e) => {
+            tracing::debug!(error = %e, "quarantine line skipped — the scanner wasn't answering");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The task ledger (§ crates/ledger-plugin, external:ledger)
+// ---------------------------------------------------------------------------
+
+fn ledger_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
+    let gate = "external:ledger";
+    enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
+}
+
+/// The morning line from a `ledger.list` card — pure, so the shape
+/// stays pinned without a live plugin. Open intentions lead (with
+/// counts and the oldest entry's age — "2 d" means this has waited);
+/// a finished-but-quiet day says so in the same line; a clean day says
+/// nothing open. The texts shown are the lane's purpose: goals said
+/// in chat come back readable here.
+fn render_ledger_line(v: &Value) -> Option<String> {
+    let open = v["open"].as_array()?;
+    let n = v["open_count"].as_u64().unwrap_or(0) as usize;
+    let closed_today = v["closed_today"].as_u64().unwrap_or(0);
+    let today = if closed_today > 0 {
+        format!(" · {closed_today} closed today")
+    } else {
+        String::new()
+    };
+    if n == 0 {
+        return Some(format!("📋 ledger: nothing open{today}"));
+    }
+    let mut line = format!("📋 ledger: {n} open (oldest {})", v["oldest_age"].as_str()?);
+    let texts: Vec<String> = open
+        .iter()
+        .take(3)
+        .filter_map(|e| e["text"].as_str().map(|t| "`".to_owned() + &clip_line(t, 60) + "`"))
+        .collect();
+    if !texts.is_empty() {
+        line.push_str(&format!(" — {}", texts.join(" · ")));
+    }
+    line.push_str(&today);
+    Some(line)
+}
+
+/// The task-ledger section — same signed contract as every other
+/// drop, keyed on `ledger.list` (the card the chat loop reads too).
+async fn ledger_section(cfg: &crate::config::BotConfig) -> Option<String> {
+    if !ledger_opted_in(&cfg.plugins.enabled, &cfg.plugins.owner_only) {
+        return None;
+    }
+    let plugin = cfg.external_plugins.iter().find(|p| p.id == "ledger")?;
+    match crate::external::invoke(plugin, "ledger.list", &serde_json::json!({})).await {
+        Ok(card) => render_ledger_line(&card).map(|l| format!("{l}\n")),
+        Err(e) => {
+            tracing::debug!(error = %e, "ledger line skipped — the ledger plugin wasn't answering");
             None
         }
     }
@@ -807,6 +956,76 @@ mod tests {
 
     /// The fire gate: once-per-day via the state file, catch-up after
     /// the hour, silent before it.
+    #[test]
+    fn quarantine_line_reads_the_card_shapes() {
+        let opted = ["memory".to_string(), "external:quarantine".to_string()];
+        assert!(quarantine_opted_in(&opted, &[]));
+        assert!(quarantine_opted_in(&["external:quarantine".to_string()], &[]));
+        assert!(!quarantine_opted_in(&["quarantine".to_string()], &[])); // bare id never counts
+        // Strong verdicts standing lead with the strongest card.
+        let standing = serde_json::json!({
+            "watch_dir": "/home/bin/Downloads",
+            "counts_total": {"benign": 12, "suspicious": 1, "malicious": 1},
+            "standing": [
+                {"path": "/home/bin/Downloads/pack.jar", "sha256_prefix": "aa22bb33cc44dd55", "verdict": "malicious"},
+                {"path": "/home/bin/Downloads/mod.jar", "sha256_prefix": "ee55", "verdict": "suspicious"}
+            ]
+        });
+        let l = render_quarantine_line(&standing).unwrap();
+        assert!(l.contains("1 malicious · 1 suspicious standing"), "{l}");
+        assert!(l.contains("pack.jar"), "{l}");
+        assert!(l.contains("aa22bb33cc44dd55"), "{l}");
+        // Judged-but-quiet day: the watch + the total.
+        let quiet = serde_json::json!({
+            "watch_dir": "/home/bin/Downloads",
+            "counts_total": {"benign": 7, "suspicious": 0, "malicious": 0},
+            "standing": []
+        });
+        assert!(render_quarantine_line(&quiet)
+            .unwrap()
+            .contains("watch `/home/bin/Downloads` — 7 judged, none suspect"));
+        // Empty log: watching, honestly nothing yet.
+        let empty = serde_json::json!({
+            "watch_dir": "/home/bin/Downloads",
+            "counts_total": {"benign": 0, "suspicious": 0, "malicious": 0},
+            "standing": []
+        });
+        assert!(render_quarantine_line(&empty).unwrap().contains("nothing judged yet"));
+    }
+
+    #[test]
+    fn ledger_line_reads_the_card_shapes() {
+        let opted = ["gcp".to_string(), "external:ledger".to_string()];
+        assert!(ledger_opted_in(&opted, &[]));
+        assert!(ledger_opted_in(&[], &["external:ledger".to_string()]), "owner_only opt-in counts");
+        assert!(!ledger_opted_in(&["pet".to_string()], &[])); // bare id never counts
+        // Open entries lead: count, oldest age, up to three texts.
+        let card = serde_json::json!({
+            "open_count": 4,
+            "oldest_age": "2 d",
+            "closed_today": 1,
+            "open": [
+                {"id": 1, "text": "ship the ledger lane", "added": "2 d"},
+                {"id": 2, "text": "migrate bot.toml", "added": "1 d"},
+                {"id": 3, "text": "smoke test", "added": "3 h"},
+                {"id": 4, "text": "only in the count, never rendered", "added": "2 h"}
+            ]
+        });
+        let l = render_ledger_line(&card).unwrap();
+        assert!(l.contains("📋 ledger: 4 open (oldest 2 d)"), "{l}");
+        assert!(l.contains("ship the ledger lane"), "{l}");
+        assert!(l.contains("migrate bot.toml"), "{l}");
+        assert!(l.contains("smoke test"), "{l}");
+        assert!(!l.contains("only in the count"), "texts capped at three: {l}");
+        assert!(l.contains("1 closed today"), "{l}");
+        // All quiet but productive: the archive says so.
+        let quiet = serde_json::json!({"open_count": 0, "open": [], "closed_today": 2});
+        assert!(render_ledger_line(&quiet).unwrap().contains("nothing open · 2 closed today"));
+        // Clean day.
+        let clean = serde_json::json!({"open_count": 0, "open": [], "closed_today": 0});
+        assert_eq!(render_ledger_line(&clean).unwrap(), "📋 ledger: nothing open");
+    }
+
     #[test]
     fn briefing_state_round_trip_and_gate() {
         let dir = std::env::temp_dir();

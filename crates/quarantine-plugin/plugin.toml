@@ -1,0 +1,40 @@
+# The download-quarantine lane — a plugin drop over the signed plugin
+# contract (docs/PLUGIN-SDK.md; the SDK's fourth real consumer after
+# the example, the mesh pet, and the house card). Born of the
+# 2026-10-23 BetterCraft hand-run: an obfuscated jar-class dropper
+# arrived by DM inside `overrides/mods`; that hand inspection routine
+# is now a standing lane. Install:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/quarantine
+#   cp crates/quarantine-plugin/plugin.toml ~/.jerith-mesh/plugins.d/quarantine/
+#   cargo build -p jerith-quarantine-plugin --release
+#   systemd-run --user --unit=jerith-quarantine-plugin --working-directory=~/.jerith-mesh/plugins.d/quarantine \
+#     ./target/release/jerith-quarantine ~/.jerith-mesh/plugins.d/quarantine/plugin.toml   # rotate the secret first
+#   # then add "external:quarantine" to [plugins] owner_only in bot.toml + restart the bot
+#
+# ONE endpoint line binds BOTH sides, same rule as the other drops:
+# the binary reads it and binds that address, so manifest and service
+# cannot drift. Loopback by default; non-loopback must be https (the
+# drop parser enforces this, fail-closed at bot start). The scanner's
+# settings are environment, not manifest: `$JERITH_QUARANTINE_DIR`
+# (default `~/Downloads`), `$JERITH_QUARANTINE_WATCH_SECS` (default
+# 30), and the verdict log at `$JERITH_QUARANTINE_STATE` (default
+# `~/.jerith-mesh/quarantine/verdicts.jsonl` — the ONE file the bot's
+# monitor + briefing lanes read; keep any override in sync with the
+# bot side, see docs/RUNBOOK.md's quarantine lane section).
+
+[plugin]
+id = "quarantine"
+endpoint = "http://127.0.0.1:7791/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 10                         # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "scan"
+description = "Quarantine-scan one downloaded file or a whole directory (default: the quarantine watch dir). Real byte inspection: unzips archives (stored + deflate), extracts printable runs from decoded entries, and verdicts benign/suspicious/malicious from the dropper rule table — obfuscator fingerprints, process spawn, network bootstrap, file-plant marks, native executables smuggled inside archives. Returns the verdict card(s) with sha256 prefixes; adds every verdict to the standing log."
+parameters = { type = "object", properties = { path = { type = "string", description = "File or directory to inspect (~ allowed). Omit to sweep the whole watch dir." } } }
+
+[[skill]]
+name = "recent"
+description = "The quarantine lane's verdict log: benign/suspicious/malicious counts, the watch dir, the STRONG-verdict files still standing on disk right now, and the 8 most recent cards. Prefer over guessing what has been inspected; the daily briefing and the bot's monitor lane read the same log."
+parameters = { type = "object" }

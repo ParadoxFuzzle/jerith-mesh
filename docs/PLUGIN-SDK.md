@@ -178,7 +178,17 @@ reactions and message chunking differ per transport).
    health, bot unit state, mesh contribution; `house.journal`: the
    bot's recent journal lines; `JERITH_GATEWAY` bindable, refusal
    to fetch is a card field, never a service error; `external:house`
-   gate row, owner-DM posture like pet).
+   gate row, owner-DM posture like pet). Fourth live consumer: the
+   download-quarantine lane (`crates/quarantine-plugin/`, 2026-10-23 —
+   `quarantine.scan`/`.recent`: the byte-truth inspection of dropped
+   files, verdicts into the JSONL log the bot's monitor + briefing
+   lanes read; `external:quarantine` gate row, owner-DM posture).
+   Fifth live consumer: the task ledger (`crates/ledger-plugin/`,
+   2026-10-23 — `ledger.add`/`.list`/`.done`/`.drop`: the owner's
+   open goals as typed entries on ONE atomic-save state file, the
+   daily briefing's `📋` line rendering the open tail over the same
+   signed contract; `external:ledger` gate row, owner-DM posture;
+   no watcher — the lane moves only when asked).
 
 ## What would falsify this design
 

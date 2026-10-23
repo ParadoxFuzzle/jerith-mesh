@@ -16,7 +16,7 @@
 //! actions stay owner-commanded, and the monitor keeps to the reporting
 //! half of that OpenClaw pattern.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use poise::serenity_prelude as serenityall;
 use serde::Serialize;
@@ -84,6 +84,7 @@ pub fn run_checks(limits: &MonitorLimits) -> Vec<CheckResult> {
         check_temps(limits),
         check_logs(limits),
         check_backups(limits),
+        check_quarantine(),
     ]
     .into_iter()
     {
@@ -424,6 +425,129 @@ fn check_backups(limits: &MonitorLimits) -> CheckResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The quarantine check (the download-quarantine lane, crates/quarantine-plugin)
+// ---------------------------------------------------------------------------
+
+/// One verdict-log row — the CROSS-FILE CONTRACT with the quarantine
+/// plugin's JSONL state (`~/.jerith-mesh/quarantine/verdicts.jsonl`,
+/// `$JERITH_QUARANTINE_STATE` override — keep BOTH sides in lockstep,
+/// the plugin owns the shape, this side only reads). Fields deliberate:
+/// wide enough to verify, narrow enough to leak nothing (no findings
+/// detail is needed to decide warn/fail).
+#[derive(serde::Deserialize)]
+struct QuarantineRow {
+    path: String,
+    sha256: String,
+    /// "archive" | "native-exe" | "other" (unused here, kept honest).
+    kind: String,
+    /// "benign" | "suspicious" | "malicious" — the whole decision.
+    verdict: String,
+}
+
+/// The plugin's verdict log, same derivation BOTH sides document:
+/// `$JERITH_QUARANTINE_STATE` wins, else `$HOME/.jerith-mesh/
+/// quarantine/verdicts.jsonl`.
+fn quarantine_state_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("JERITH_QUARANTINE_STATE") {
+        return Some(PathBuf::from(p));
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    Some(
+        Path::new(&home)
+            .join(".jerith-mesh")
+            .join("quarantine")
+            .join("verdicts.jsonl"),
+    )
+}
+
+/// `check_quarantine` against an explicit log (the testable core).
+/// Freshness rule the plugin keeps: only verdicts whose FILE IS STILL
+/// ON DISK rise to warn/fail — a deleted threat is an old threat,
+/// never news the owner should be DM'd for. Strong-verdict rows come
+/// last in the file (append-only), so the scan runs backward and stops
+/// at the tail of verdicts that matter.
+fn check_quarantine_at(log: Option<&Path>) -> CheckResult {
+    let Some(log) = log.filter(|p| p.exists()) else {
+        return CheckResult {
+            check: "quarantine",
+            level: Level::Ok,
+            detail: "no verdict log yet (quarantine plugin not running)".into(),
+        };
+    };
+    let Ok(raw) = std::fs::read_to_string(log) else {
+        return CheckResult {
+            check: "quarantine",
+            level: Level::Ok,
+            detail: "no verdict log yet (quarantine plugin not running)".into(),
+        };
+    };
+    let rows: Vec<QuarantineRow> = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<QuarantineRow>(l).ok())
+        .collect();
+    if rows.is_empty() {
+        return CheckResult {
+            check: "quarantine",
+            level: Level::Ok,
+            detail: "verdict log present but empty".into(),
+        };
+    }
+    // Standing verdicts: malicious whose file still exists → fail,
+    // suspicious likewise → warn. Newest first (the file's tail).
+    let standing = |v: &str| -> Vec<&QuarantineRow> {
+        rows.iter()
+            .rev()
+            .filter(|r| r.verdict == v)
+            .filter(|r| Path::new(&r.path).exists())
+            .take(3)
+            .collect()
+    };
+    let mal = standing("malicious");
+    let sus = standing("suspicious");
+    let counts = |v: &str| rows.iter().filter(|r| r.verdict == v).count();
+    if !mal.is_empty() {
+        let names: Vec<String> = mal
+            .iter()
+            .map(|r| format!("{} (sha {})", r.path, &r.sha256[..r.sha256.len().min(8)]))
+            .collect();
+        return CheckResult {
+            check: "quarantine",
+            level: Level::Fail,
+            detail: format!(
+                "MALICIOUS file(s) still on disk: {} — do not open, delete or move safely",
+                names.join(", ")
+            ),
+        };
+    }
+    if !sus.is_empty() {
+        let names: Vec<String> = sus
+            .iter()
+            .map(|r| format!("{} (sha {})", r.path, &r.sha256[..r.sha256.len().min(8)]))
+            .collect();
+        return CheckResult {
+            check: "quarantine",
+            level: Level::Warn,
+            detail: format!("suspicious file(s) on disk: {} — inspect before opening", names.join(", ")),
+        };
+    }
+    CheckResult {
+        check: "quarantine",
+        level: Level::Ok,
+        detail: format!(
+            "watch settled ({} benign, {} suspicious, {} malicious judged overall)",
+            counts("benign"),
+            counts("suspicious"),
+            counts("malicious")
+        ),
+    }
+}
+
+/// The live check: reads the plugin's verdict log if one exists.
+fn check_quarantine() -> CheckResult {
+    check_quarantine_at(quarantine_state_path().as_deref())
+}
+
 /// Disk level as a pure decision (testable without spawning `df`):
 /// fail at/above the threshold, warn within 5 points below it, else ok.
 fn disk_level(pct: u64, warn_percent: u64) -> Level {
@@ -516,7 +640,7 @@ mod tests {
             backup_dirs: vec![],
         };
         let results = run_checks(&limits);
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 6);
         assert!(
             render_report(&results).is_none(),
             "got {:?}",
@@ -581,6 +705,58 @@ mod tests {
         assert_eq!(disk_level(90, 90), Level::Fail);
         // Tiny thresholds have no warn band.
         assert_eq!(disk_level(3, 4), Level::Ok);
+    }
+
+    // -- the quarantine check -------------------------------------------
+
+    /// A standing malicious row fails loud; deleted-file verdicts stay
+    /// quiet (a threat gone is not news); suspicious warns; a clean
+    /// log settles; no log at all reads the plugin's absence honestly.
+    #[test]
+    fn quarantine_check_only_reports_threats_still_on_disk() {
+        let dir = std::env::temp_dir().join(format!("q-mon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("dropper.jar");
+        std::fs::write(&live, b"MZ-bait").unwrap();
+        let gone = dir.join("deleted.jar");
+        let row = |p: &Path, verdict: &str, sha: &str| {
+            format!(
+                "{{\"path\":\"{}\",\"sha256\":\"{}\",\"kind\":\"archive\",\"verdict\":\"{}\"}}",
+                p.display(),
+                sha,
+                verdict
+            )
+        };
+        let log = dir.join("verdicts.jsonl");
+        // No log at all (no state file anywhere): the honest quiet.
+        assert_eq!(check_quarantine_at(None).level, Level::Ok);
+        assert_eq!(check_quarantine_at(Some(Path::new("/nope/never.jsonl"))).level, Level::Ok);
+        // Malicious standing → Fail, naming the file. Malicious but the
+        // file was already deleted → NOT news.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{}\n",
+                row(&gone, "malicious", "aa11"),
+                row(&live, "malicious", "bb22")
+            ),
+        )
+        .unwrap();
+        let r = check_quarantine_at(Some(&log));
+        assert_eq!(r.level, Level::Fail, "{r:?}");
+        assert!(r.detail.contains("dropper.jar"), "{r:?}");
+        assert!(!r.detail.contains("deleted.jar"), "{r:?}");
+        // Suspicious-only standing → Warn.
+        std::fs::write(&log, row(&live, "suspicious", "cc33")).unwrap();
+        assert_eq!(check_quarantine_at(Some(&log)).level, Level::Warn);
+        // Deleted suspicious → back to quiet with the tally.
+        std::fs::remove_file(&live).unwrap();
+        std::fs::write(&log, row(&gone, "suspicious", "cc33")).unwrap();
+        let r2 = check_quarantine_at(Some(&log));
+        assert_eq!(r2.level, Level::Ok, "{r2:?}");
+        assert!(r2.detail.contains("1 suspicious"), "{r2:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

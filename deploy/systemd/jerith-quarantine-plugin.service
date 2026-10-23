@@ -1,0 +1,28 @@
+# jerith-mesh quarantine plugin — user-level service (the download-
+# quarantine lane's scanner half; crates/quarantine-plugin).
+# Install:
+#   cp deploy/systemd/jerith-quarantine-plugin.service ~/.config/systemd/user/
+#   cp crates/quarantine-plugin/plugin.toml ~/.jerith-mesh/plugins.d/quarantine/
+#   # rotate the manifest's secret first (openssl rand -hex 16)
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-quarantine-plugin
+#   # then add "external:quarantine" to [plugins] owner_only in bot.toml + restart jerith-bot
+# Was run ad hoc 2026-10-23 via systemd-run (temporary instantiation until reboot); this unit renewal is the standing shape.
+[Unit]
+Description=jerith-mesh quarantine plugin (download scanner, :7791)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith-quarantine %h/.jerith-mesh/plugins.d/quarantine/plugin.toml
+Restart=always
+RestartSec=5
+# Lane settings (defaults commented; see crates/quarantine-plugin/plugin.toml):
+#Environment=JERITH_QUARANTINE_DIR=%h/Downloads
+#Environment=JERITH_QUARANTINE_WATCH_SECS=30
+#Environment=JERITH_QUARANTINE_STATE=%h/.jerith-mesh/quarantine/verdicts.jsonl
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

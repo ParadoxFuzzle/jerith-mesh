@@ -1501,6 +1501,115 @@ the lane signed itself off through the script into the real [ai] box
 (`20261023-032353-handoff-1c28.eml`) — the first mail the surface
 ever had to read.
 
+## The download-quarantine lane (fourth live consumer, 2026-10-23)
+
+`crates/quarantine-plugin/` watches the droppable files lane: new
+files in the watch dir (`$JERITH_QUARANTINE_DIR`, default
+`~/Downloads`) get the BetterCraft treatment — real unzip (stored +
+deflate), marker extraction from decoded class pools, typed
+benign/suspicious/malicious verdicts, SHA-256 on every scan — with
+verdicts appended to ONE JSONL log
+(`~/.jerith-mesh/quarantine/verdicts.jsonl`; `$JERITH_QUARANTINE_STATE`
+override — keep bot.toml-adjacent overrides in lockstep on BOTH
+sides). The bot reads that log two ways: the monitor's
+`check_quarantine` DMs the owner when a MALICIOUS verdict's file is
+STILL on disk (deleted threats stay quiet — old news is not news), and
+the daily briefing carries a quarantined `🧯` line when
+`external:quarantine` is opted in per `[plugins]` (owner_only row,
+like gcp/pet/house).
+
+```bash
+mkdir -p ~/.jerith-mesh/plugins.d/quarantine
+cp crates/quarantine-plugin/plugin.toml ~/.jerith-mesh/plugins.d/quarantine/
+cargo build -p jerith-quarantine-plugin --release
+systemctl --user enable --now jerith-quarantine-plugin   # deploy/systemd/ unit; rotate the manifest secret first
+edit ~/.jerith-mesh/bot.toml        # "external:quarantine" → [plugins] owner_only (owner-DM posture)
+systemctl --user restart jerith-bot
+```
+
+Live-fire (2026-10-23, this house): drop installed with a rotated
+secret, `external:quarantine` joined `owner_only` beside all prior
+consumers, service on `127.0.0.1:7791` (loopback, secret on), unit
+restarted clean — a malformed drop aborts the start, so the clean boot
+IS the registry proof. Wire-pin: unsigned probe → 403; HMAC-signed
+`quarantine.recent` → 200 + card (the opening tick had already judged
+`image.jpg` benign). End-to-end: a synthetic dropper-shaped jar (ZKM +
+ProcessBuilder + HttpURLConnection + setExecutable classes, deflated,
+real zip writer) landed in ~/Downloads and was judged `malicious`
+within one poll, the row naming all four marker kinds with its sha;
+deleting the file kept the monitor quiet per the standing rule, and
+the log keeps the verdict for the record either way.
+
+Operator rules of the lane:
+
+- a MALICIOUS verdict never asks ownership first — the monitor DMs,
+  the owner deletes; the scanner never deletes or moves anything
+  (reporter only, the monitor's privilege boundary);
+- suspicious is suspicion, not a verdict death sentence — the model
+  can read the findings and elaborate; the rules table is deliberate
+  about network-only jars staying benign (update checkers are the
+  norm; the lane never cries wolf);
+- the plugin's skills (`quarantine.scan <path?>`,
+  `quarantine.recent`) are the chat's re-run: any file, any time,
+  verdict card back — the same signed contract as every other drop.
+
+**Reporting a new sample to other recipients** (owner decides when —
+this lane never publishes anything on its own):
+
+1. Pull the conviction row straight from the log, not from memory:
+   `python3 -c "import json,sys; [print(json.dumps(json.loads(l))) for l in open('/home/noodly/.jerith-mesh/quarantine/verdicts.jsonl') if '<SHA256-PREFIX>' in l or '<filename>' in l]"`
+   — one JSON object per hit: path (note the exact filename),
+   sha256, verdict, the marks list, size, both timestamps.
+2. Attach the sample file itself only to a channel that accepts
+   malware for analysis; anything else gets the verdict row + the
+   filename + where it was seen, never a live copy.
+3. Sender-friendly one-liner others can act on: "BetterCraft
+   BetterSurvival-1.21.1.zip from CurseForge reached us; sha256
+   <hash>; verdict malicious, marks <list>."
+4. If the owner is closing the loop on a live compromise too: keep the
+   file, grep downloads for the same hash on other machines, keep the
+   row, and check back after the next briefing for a repeat opinion.
+
+## Task ledger / intentions lane (LIVE 2026-10-23, crates/ledger-plugin)
+
+The fifth plugin drop (port 7792, signed contract, one JSON state
+file at `$JERITH_LEDGER_STATE` default
+`~/.jerith-mesh/ledger/state.json`). Goals the owner voices in chat
+become `ledger.add` entries; the daily briefing stands them back up
+(`📋` line) so nothing said in scrollback evaporates overnight.
+Skills: `ledger.add` / `ledger.list` / `ledger.done <id>` /
+`ledger.drop <id>` — ids only come from `list`.
+
+Install (standing unit, permanent this time):
+
+    cp deploy/systemd/jerith-ledger-plugin.service ~/.config/systemd/user/
+    cp crates/ledger-plugin/plugin.toml ~/.jerith-mesh/plugins.d/ledger/
+    # rotate the manifest's secret first (openssl rand -hex 16)
+    systemctl --user daemon-reload && systemctl --user enable --now jerith-ledger-plugin
+    # then add "external:ledger" to [plugins] owner_only in bot.toml + restart jerith-bot
+
+Survival notes from install day (same shape as the house/quarantine
+drops, so the old gremlin rules hold verbatim):
+
+- **the service carries no heartbeat** — `is-active` and one signed
+  `ledger.list` probe (the 403-goes-200 recipe in this section's
+  quarantine sibling) are the health pair; the lane only moves when
+  asked;
+- **entry ids are stable across restarts but renumber nothing** —
+  `drop` on an unknown id is a typed error naming the miss, and there
+  is no wildcard; if a goal must be amended, `done` or `drop` the
+  old and `add` the new wording;
+- **closed history is the record** — a `done` entry keeps its closed
+  timestamp; the archive cap (500) trims the oldest CLOSED rows only;
+  never edit `state.json` by hand while the service is up (atomic
+  saves mean the plugin wins);
+- **full restart, this time on the permanent unit**: enabled and
+  started explicitly (no systemd-run temporary this time), the bot
+  restarted clean with the gate row, and the live verified round
+  (unsigned 403, signed add→#1, done→#2, drop→#1-unknown-#3-error,
+  list card matching the briefing's pinned keys) holds the boilerplate
+  for relaucher installs.
+
 ## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is
