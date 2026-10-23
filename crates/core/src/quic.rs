@@ -284,6 +284,17 @@ pub struct ExpertRouter {
     /// HOT by the dispatch loop from `[experts].draft_priority`; default
     /// off, so planning is byte-for-byte the pre-feature order.
     draft_priority: std::sync::atomic::AtomicBool,
+    /// §1 phase 3 (budgeted speculation): the speculative arms' OWN
+    /// per-request ledger — `None` (the default) is exact single-ledger
+    /// parity (the pre-flight answers to the honest budget alone, byte
+    /// for byte the pre-feature walk); `Some(spec_budget)` adds an
+    /// INDEPENDENT cap the speculative work must clear. Speculative
+    /// spend is ALSO counted honestly (subset), so the spec gate can
+    /// only refuse FIRST when an operator deliberately tightened it —
+    /// speculation refuses before honest walks starve. Set hot per
+    /// dispatch from the shared `[experts].budgets()` conversion via
+    /// [`Self::set_budgets`] (ping.rs).
+    spec_budget: std::sync::RwLock<Option<crate::pipeline::RequestBudget>>,
 }
 
 /// Borrow-capturing pre-flight attempt: the owning peer plus the RPC that
@@ -312,6 +323,90 @@ enum ChatOutcome {
     Rejected(String),
     /// Transport-level failure (timeout, connect, decode).
     Failed(String),
+    /// §1 per-request budget: the WALK refused to start this dial — no
+    /// fault of the peer's, so it must NOT book a flapping streak. The
+    /// reason is collected into the typed exhaustion error by name.
+    RefusedByBudget(String),
+}
+
+// ---- §1 per-request budget ledger ------------------------------------
+
+/// The ledger the dispatch walk keeps for ONE request: every
+/// request-cause remote dial counts an attempt (the speculative
+/// pre-flight and the replay-verification arbiter included — the
+/// consumed pre-flight counts exactly once, at creation), and wire
+/// bytes are counted as the request ships them (4 B per f32 element,
+/// input when the dial STARTS — conservatively even if the dial later
+/// fails, the bytes were request-cause spend the moment we began
+/// sending — output when the answer lands).
+///
+/// Enforcement is inline like the wall-clock budgets: in-flight work
+/// always lands — the walk refuses to START a NEW remote dial when a
+/// cap would be crossed, never cancels a dial already in the air, and
+/// local hops stay free (the caps bound mesh spend, not local compute).
+/// Reuses the pipeline's typed exhaustion reason (see
+/// [`crate::pipeline::RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON`]) so
+/// /status surfacing greps one string everywhere.
+#[derive(Debug, Default)]
+struct RequestLedger {
+    attempts: usize,
+    wire_bytes: u64,
+}
+
+impl RequestLedger {
+    fn f32_bytes(v: &[f32]) -> u64 {
+        4u64 * v.len() as u64
+    }
+
+    /// Whether ONE more remote dial of `est_in_bytes` fits the caps.
+    /// Attempt caps map 0 → 1 (a zero cap must not silently disable the
+    /// guard — the same internal post-mapping the pipeline walk applies);
+    /// `None` caps never trip.
+    fn dial_allowed(&self, budget: &crate::pipeline::RequestBudget, est_in_bytes: u64) -> bool {
+        if budget
+            .max_remote_attempts
+            .is_some_and(|cap| self.attempts >= cap.max(1))
+        {
+            return false;
+        }
+        if budget
+            .max_wire_bytes
+            .is_some_and(|cap| self.wire_bytes.saturating_add(est_in_bytes) > cap)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn note_dial(&mut self, in_bytes: u64) {
+        self.attempts += 1;
+        self.wire_bytes = self.wire_bytes.saturating_add(in_bytes);
+    }
+
+    fn note_out(&mut self, out_bytes: u64) {
+        self.wire_bytes = self.wire_bytes.saturating_add(out_bytes);
+    }
+}
+
+/// The typed budget-exhausted error: the pipeline's reason, the caps and
+/// where they stand, the hops refused by name, and the best
+/// previously-accumulated failure (the budget never erases the real
+/// evidence the allowed attempts earned).
+fn budget_exhausted_error(
+    budget: &crate::pipeline::RequestBudget,
+    ledger: &RequestLedger,
+    refused: &[String],
+    last_err: &anyhow::Error,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}: {} remote attempt(s) (cap {:?}) · {} wire bytes (cap {:?}) — refused by name: {}; accumulated failure: {last_err:#}",
+        crate::pipeline::RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON,
+        ledger.attempts,
+        budget.max_remote_attempts,
+        ledger.wire_bytes,
+        budget.max_wire_bytes,
+        refused.join(", "),
+    )
 }
 
 impl ExpertRouter {
@@ -349,7 +444,33 @@ impl ExpertRouter {
             expert_store: RwLock::new(None),
             chat_failures: std::sync::Mutex::new(HashMap::new()),
             draft_priority: std::sync::atomic::AtomicBool::new(false),
+            spec_budget: std::sync::RwLock::new(None),
         }
+    }
+
+    /// §1 phase 3: install the speculative arms' sub-budget (the
+    /// dispatch loop re-reads `[experts].spec_budget()` every dispatch,
+    /// same hot shape as the honest budget).
+    pub fn set_spec_budget(&self, spec: Option<crate::pipeline::RequestBudget>) {
+        *self.spec_budget.write().unwrap_or_else(|e| e.into_inner()) = spec;
+    }
+
+    /// THE single production install for a dispatch's budgets (§1 phase
+    /// 3): a [`crate::pipeline::BudgetPair`] converted from ONE config
+    /// snapshot lands BOTH ledgers in lockstep — the honest one is
+    /// handed back for the walk call while the speculative one is kept
+    /// for the pre-flight gate. Call sites cannot install one and
+    /// silently skip the other, so the two budgets cannot drift.
+    pub fn set_budgets(
+        &self,
+        budgets: crate::pipeline::BudgetPair,
+    ) -> crate::pipeline::RequestBudget {
+        self.set_spec_budget(Some(budgets.spec));
+        budgets.honest
+    }
+
+    pub fn spec_budget(&self) -> Option<crate::pipeline::RequestBudget> {
+        *self.spec_budget.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// §1 draft-expert scheduling: set the head-hop priority from live
@@ -663,6 +784,7 @@ impl ExpertRouter {
         messages: &[serde_json::Value],
         peers: &[crate::quic::MeshCandidate],
         local_chat: impl FnOnce() -> anyhow::Result<String>,
+        budget: crate::pipeline::RequestBudget,
     ) -> anyhow::Result<(String, String)> {
         // Returns (content, answering_node_id). Local answers attribute to the
         // empty string (the gateway maps that to mesh_fallback: null);
@@ -716,14 +838,28 @@ impl ExpertRouter {
         let delay_ms = self.options.chat_hedge_delay_ms;
         let in_flight_cap = self.options.chat_hedged_peers.max(1);
         let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(in_flight_cap));
+        let compacted = Self::compact_chat_history(messages);
+        let req_bytes = serde_json::to_vec(&compacted)
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
         let base_req = NodeRpcRequest::ChatQuery {
             req_id: req_id.to_string(),
-            messages: Self::compact_chat_history(messages),
+            messages: compacted,
             from_node_id: identity.node_id(),
             stamp_ms: 0,
             sig: String::new(),
         };
         use futures_util::stream::StreamExt;
+        // §1 per-request budget carried into the chat lane: the SAME caps
+        // the expert dispatch walk runs, counted in CHAT bytes — the
+        // payload the dial ships (the compacted request messages, 4 B per
+        // f32 is the expert shape, here it is the JSON body) at dial
+        // start, and the answer's bytes when one lands. Shared across the
+        // hedge's concurrent futures, so a dial that starts while earlier
+        // dials are in the air still sees their spend.
+        let ledger = std::sync::Arc::new(tokio::sync::Mutex::new(RequestLedger::default()));
+        let budget_refused: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut futs: ChatDials<'_> = futures_util::stream::FuturesUnordered::new();
         for (i, (node_id, _rtt, _res, _rep)) in remotes.into_iter().enumerate() {
             let Some(addr) = peer_addrs.get(&node_id) else {
@@ -735,6 +871,8 @@ impl ExpertRouter {
                 0
             };
             let permits = permits.clone();
+            let ledger = ledger.clone();
+            let budget_refused = budget_refused.clone();
             let base = base_req.clone();
             let node_id = node_id.clone();
             let addr = *addr;
@@ -750,6 +888,25 @@ impl ExpertRouter {
                     .acquire_owned()
                     .await
                     .expect("in-flight semaphore is never closed");
+                // §1 budget, inline like the wall: the refusal decision is
+                // made at DIAL START (the permit is the start), never for
+                // a dial already in the air. A refused dial names its peer
+                // for the typed exhaustion error and books NOTHING — the
+                // peer did nothing wrong.
+                let refused_now = {
+                    let mut l = ledger.lock().await;
+                    if !l.dial_allowed(&budget, req_bytes) {
+                        true
+                    } else {
+                        l.note_dial(req_bytes);
+                        false
+                    }
+                };
+                if refused_now {
+                    let reason = "per-request budget exhausted".to_string();
+                    budget_refused.lock().await.push(node_id.clone());
+                    return (node_id, ChatOutcome::RefusedByBudget(reason));
+                }
                 let mut req = base;
                 sign_request(&mut req, identity);
                 let outcome = match call(
@@ -766,7 +923,15 @@ impl ExpertRouter {
                         req_id: rid,
                         content,
                         node_id: server_id,
-                    }) if rid == req_id && server_id == node_id => ChatOutcome::Answer(content),
+                    }) if rid == req_id && server_id == node_id => {
+                        // The answer's bytes count too — request-cause spend
+                        // even when the walk accepts it mid-flight.
+                        ledger
+                            .lock()
+                            .await
+                            .note_out(content.len() as u64);
+                        ChatOutcome::Answer(content)
+                    }
                     Ok(NodeRpcReply::ChatResult {
                         node_id: server_id, ..
                     }) => ChatOutcome::Rejected(format!(
@@ -788,6 +953,7 @@ impl ExpertRouter {
         let mut last_message = String::from("no peers available for mesh chat fallback");
         let walk = async {
             let mut last_err = anyhow::anyhow!("no peers available for mesh chat fallback");
+            let mut had_real_failure = false;
             while let Some((node_id, outcome)) = futs.next().await {
                 match outcome {
                     ChatOutcome::Answer(content) => {
@@ -799,6 +965,21 @@ impl ExpertRouter {
                         );
                         return Ok((content, node_id));
                     }
+                    ChatOutcome::RefusedByBudget(reason) => {
+                        // Not the peer's fault: no streak, walk continues —
+                        // and if nothing comes back, the typed reason ends
+                        // the request.
+                        tracing::debug!(
+                            target: "mesh",
+                            peer = %node_id,
+                            "chat dial refused by the per-request budget"
+                        );
+                        if !had_real_failure {
+                            last_err = anyhow::anyhow!(
+                                "no dial was attempted past the budget ({reason})"
+                            );
+                        }
+                    }
                     ChatOutcome::Rejected(message) | ChatOutcome::Failed(message) => {
                         tracing::debug!(
                             target: "mesh",
@@ -809,8 +990,22 @@ impl ExpertRouter {
                         self.note_chat_failure(&node_id);
                         last_message = message.clone();
                         last_err = anyhow::anyhow!("{message}");
+                        had_real_failure = true;
                     }
                 }
+            }
+            // §1: a refusals-terminated walk ends with the typed pipeline
+            // reason, the caps' standing, the hops refused by name, and
+            // the best failure the ALLOWED dials earned.
+            let refused = budget_refused.lock().await;
+            if !refused.is_empty() {
+                let ledger_snapshot = ledger.lock().await;
+                return Err(budget_exhausted_error(
+                    &budget,
+                    &ledger_snapshot,
+                    refused.as_slice(),
+                    &last_err,
+                ));
             }
             Err(last_err)
         };
@@ -848,10 +1043,21 @@ impl ExpertRouter {
             "no dispatch candidates for expert {expert_id} (plan empty or all failed)"
         );
         let mut ambiguous_abort: bool = false;
+        // The legacy walker (pre-speculative keep-alive): its request-cause
+        // dials are counted honestly in the ledger the arbiter shares, but
+        // the budget ITSELF is enforced on the walk production runs (the
+        // speculative walker below) — this shape stays uncapped so the
+        // pre-Phase-3 callers keep their exact semantics.
+        let uncapped = crate::pipeline::RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: None,
+        };
+        let mut ledger = RequestLedger::default();
         for (idx, location) in plan.iter().enumerate() {
             let result = match &location {
                 ExpertLocation::Local => local_run(input),
                 ExpertLocation::Remote { node_id, .. } => {
+                    ledger.note_dial(RequestLedger::f32_bytes(input));
                     match self
                         .remote_expert_attempt(
                             endpoint, identity, peer_addrs, req_id, expert_id, input, node_id,
@@ -859,13 +1065,14 @@ impl ExpertRouter {
                         .await
                     {
                         Ok(out) => {
+                            ledger.note_out(RequestLedger::f32_bytes(&out));
                             self.verify.note_expert_result().await;
                             // Phase 4: probabilistic redundant replay before
                             // trusting this remote result.
                             match self
                                 .replay_verify(
                                     endpoint, identity, peer_addrs, req_id, expert_id, input,
-                                    &plan, idx, node_id, &out, &local_run,
+                                    &plan, idx, node_id, &out, &local_run, &uncapped, &mut ledger,
                                 )
                                 .await
                             {
@@ -918,6 +1125,7 @@ impl ExpertRouter {
         Err(last_err)
     }
 
+
     /// Hybrid local + remote expert execution (Phase 2) with speculative
     /// remote pre-flight. Identical plan ordering, commitment and replay
     /// semantics to [`execute_over_quic`]; the difference: when the plan
@@ -940,6 +1148,7 @@ impl ExpertRouter {
         peers: &[crate::quic::MeshCandidate],
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+        budget: crate::pipeline::RequestBudget,
     ) -> anyhow::Result<Vec<f32>> {
         let mut served_by = None;
         self.execute_over_quic_speculative_attributed(
@@ -953,6 +1162,7 @@ impl ExpertRouter {
             completed,
             local_run,
             &mut served_by,
+            budget,
         )
         .await
     }
@@ -975,19 +1185,46 @@ impl ExpertRouter {
         completed: &mut HashMap<String, Vec<f32>>,
         local_run: impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
         served_by: &mut Option<String>,
+        budget: crate::pipeline::RequestBudget,
     ) -> anyhow::Result<Vec<f32>> {
         if let Some(prev) = completed.get(req_id) {
             return Ok(prev.clone());
         }
         let plan = self.plan_dispatch(expert_id, peers).await;
+        let in_bytes = RequestLedger::f32_bytes(input);
+        let mut ledger = RequestLedger::default();
+        // §1 phase 3 (budgeted speculation): when the speculative
+        // sub-budget is installed, the pre-flight additionally answers
+        // to ITS OWN ledger. Unlike the honest ledger there is no typed
+        // exhaustion from a spec refusal — the pre-flight is OPTIONAL
+        // work; when its ledger refuses, it is dropped honestly and the
+        // real walk keeps its full allowance.
+        let spec_budget = self.spec_budget();
+        let mut spec_ledger = RequestLedger::default();
+        // Remote hops the budget refused to START — returned by name in
+        // the typed exhaustion error.
+        let mut budget_refused: Vec<String> = Vec::new();
 
         // Phase 2: build the borrow-capturing pre-flight *before* the
         // local arm runs, so the RPC churns while the local attempt spins.
+        // The pre-flight is speculative EXTRA work — when the budget has
+        // no room for it the headroom rule says drop it (an honest no-op,
+        // never an error): the real walk still runs, exactly like the
+        // pipeline's prefetch-refusal semantics.
         let mut preflight: Option<PreflightAttempt<'_>> = None;
         if self.options.speculative_remote
             && let (Some(ExpertLocation::Local), Some(ExpertLocation::Remote { node_id, .. })) =
                 (plan.first(), plan.get(1))
+            && ledger.dial_allowed(&budget, in_bytes)
+            && spec_budget.is_none_or(|spec| spec_ledger.dial_allowed(&spec, in_bytes))
         {
+            ledger.note_dial(in_bytes);
+            if spec_budget.is_some() {
+                // The same spend counts into BOTH ledgers: honest
+                // accounting is unchanged, speculation merely faces an
+                // independent cap on top.
+                spec_ledger.note_dial(in_bytes);
+            }
             let fut = Self::remote_dispatch_once(
                 &self.verify,
                 self.options.dispatch_timeout,
@@ -1028,11 +1265,13 @@ impl ExpertRouter {
                             consumed.insert(node_id.clone());
                             match fut.as_mut().await {
                                 Ok(out) => {
+                                    ledger.note_out(RequestLedger::f32_bytes(&out));
                                     self.verify.note_expert_result().await;
                                     match self
                                         .replay_verify(
                                             endpoint, identity, peer_addrs, req_id, expert_id,
                                             input, &plan, 1, &node_id, &out, &local_run,
+                                            &budget, &mut ledger,
                                         )
                                         .await
                                     {
@@ -1078,6 +1317,16 @@ impl ExpertRouter {
                         }
                         continue;
                     }
+                    // §1 per-request budget, inline like the wall: when a
+                    // cap would be crossed, the walk refuses to START this
+                    // dial — the peer is refused BY NAME and the walk
+                    // falls through (a later LOCAL hop still runs: the
+                    // caps bound mesh spend, not local compute).
+                    if !ledger.dial_allowed(&budget, in_bytes) {
+                        budget_refused.push(node_id.clone());
+                        continue;
+                    }
+                    ledger.note_dial(in_bytes);
                     match self
                         .remote_expert_attempt(
                             endpoint, identity, peer_addrs, req_id, expert_id, input, node_id,
@@ -1085,11 +1334,12 @@ impl ExpertRouter {
                         .await
                     {
                         Ok(out) => {
+                            ledger.note_out(RequestLedger::f32_bytes(&out));
                             self.verify.note_expert_result().await;
                             match self
                                 .replay_verify(
                                     endpoint, identity, peer_addrs, req_id, expert_id, input,
-                                    &plan, idx, node_id, &out, &local_run,
+                                    &plan, idx, node_id, &out, &local_run, &budget, &mut ledger,
                                 )
                                 .await
                             {
@@ -1138,6 +1388,12 @@ impl ExpertRouter {
                     }
                 }
             }
+        }
+        // §1: a request that outspent its budget ends with the typed
+        // exhaustion reason — the hops the budget refused, by name, and
+        // the best failure the allowed attempts actually earned.
+        if !budget_refused.is_empty() {
+            return Err(budget_exhausted_error(&budget, &ledger, &budget_refused, &last_err));
         }
         Err(last_err)
     }
@@ -1264,6 +1520,8 @@ impl ExpertRouter {
         origin_node_id: &str,
         origin_output: &[f32],
         local_run: &impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+        budget: &crate::pipeline::RequestBudget,
+        ledger: &mut RequestLedger,
     ) -> ReplayVerdict {
         if self.options.verify_percent == 0
             || rand::random::<u32>() % 100 >= self.options.verify_percent
@@ -1272,6 +1530,13 @@ impl ExpertRouter {
         }
 
         // Pick the arbiter: local truth first, else the next remote.
+        // A remote arbiter dial is request-cause mesh spend too — the
+        // ledger gates it. Past a tripped cap the walk refuses to START
+        // new remote dials, so the arbiter loop ends with no arbiter and
+        // the verification fails OPEN (Trust): we never reject work we
+        // cannot prove wrong — and the budget never squeezes an in-flight
+        // result either (the origin answer already landed).
+        let in_bytes = RequestLedger::f32_bytes(input);
         let mut arbiter: Option<(Vec<f32>, Option<String>)> = None;
         if self.hosts_locally(expert_id).await
             && let Ok(local) = local_run(input)
@@ -1280,8 +1545,12 @@ impl ExpertRouter {
         }
         if arbiter.is_none() {
             for loc in plan.iter().skip(origin_idx + 1) {
-                if let ExpertLocation::Remote { node_id, .. } = loc
-                    && let Ok(out) = self
+                if let ExpertLocation::Remote { node_id, .. } = loc {
+                    if !ledger.dial_allowed(budget, in_bytes) {
+                        break;
+                    }
+                    ledger.note_dial(in_bytes);
+                    if let Ok(out) = self
                         .remote_expert_attempt(
                             endpoint,
                             identity,
@@ -1292,10 +1561,12 @@ impl ExpertRouter {
                             node_id,
                         )
                         .await
-                {
-                    self.verify.note_expert_result().await;
-                    arbiter = Some((out, Some(node_id.clone())));
-                    break;
+                    {
+                        ledger.note_out(RequestLedger::f32_bytes(&out));
+                        self.verify.note_expert_result().await;
+                        arbiter = Some((out, Some(node_id.clone())));
+                        break;
+                    }
                 }
             }
         }
@@ -3108,6 +3379,7 @@ mod tests {
                 &mut completed,
                 local_down,
                 &mut served,
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -3129,6 +3401,7 @@ mod tests {
                 &mut completed,
                 local_down,
                 &mut served,
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -3151,6 +3424,7 @@ mod tests {
             "head = nearest, tail = standing order"
         );
     }
+
     #[tokio::test]
     async fn plan_ranks_reported_capacity_above_rtt() {
         // Resource pooling (Phase 1): far-with-free-VRAM beats near-but-full.
@@ -4008,6 +4282,7 @@ mod tests {
                 &peers,
                 &mut HashMap::new(),
                 |input| Ok(input.iter().map(|x| x * 10.0).collect()),
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -4047,12 +4322,236 @@ mod tests {
                 &peers,
                 &mut completed,
                 |_| Err(anyhow::anyhow!("local runtime down")),
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
         assert_eq!(out, vec![28.0]);
         // Memoized under the request id like the plain walk.
         assert!(completed.contains_key("spec-failover"));
+    }
+
+    // --- §1 per-request budget on the real walk -------------------------
+
+    #[tokio::test]
+    async fn request_budget_attempt_cap_refuses_remaining_hops_by_name() {
+        // Two remote peers, the first unaddressable (its dial fails fast):
+        // a one-attempt cap lets the first dial FLY (in-flight work always
+        // lands) and refuses the second BY NAME with the typed pipeline
+        // reason — the request is never silently truncated to a generic
+        // "no candidates" error.
+        let (far_addr, far_identity, far_pins) =
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let far_node_id = far_identity.node_id();
+        let r = router(50);
+        let mut addrs = HashMap::new();
+        addrs.insert(far_node_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let identity = SigningIdentity::generate();
+
+        // near holds the expert at great rtt but has NO QUIC address.
+        let peers = vec![
+            ("near-peer".to_string(), 5, true, true, None, None),
+            (far_node_id.clone(), 200, true, true, None, None),
+        ];
+        let budget = crate::pipeline::RequestBudget {
+            max_remote_attempts: Some(1),
+            max_wire_bytes: None,
+        };
+        let err = r
+            .execute_over_quic_speculative(
+                &client,
+                &identity,
+                &addrs,
+                "budget-attempts-1",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut HashMap::new(),
+                |_| Err(anyhow::anyhow!("no local weights here")),
+                budget,
+            )
+            .await
+            .expect_err("the cap must refuse the second hop");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(crate::pipeline::RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON),
+            "typed reason required: {msg}"
+        );
+        assert!(
+            msg.contains(&far_node_id),
+            "the refused hop is named, never silently dropped: {msg}"
+        );
+        assert!(
+            msg.contains("cap Some(1)"),
+            "the standing cap is part of the error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_budget_wire_cap_refuses_after_bytes_moved() {
+        // A 12-byte wire cap with a 2-f32 input (4 B in / est 8 B out for
+        // the honest d_model width): the first dial may fly and move its
+        // 8 input bytes; the second dial is refused because its est would
+        // cross the cap. Same typed refusal, named hop — and crucially the
+        // ATTEMPT cap is not what tripped here (that one is uncapped).
+        let (far_addr, far_identity, far_pins) =
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let far_node_id = far_identity.node_id();
+        let r = router(50);
+        let mut addrs = HashMap::new();
+        addrs.insert(far_node_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let peers = vec![
+            ("near-peer".to_string(), 5, true, true, None, None),
+            (far_node_id.clone(), 200, true, true, None, None),
+        ];
+        let budget = crate::pipeline::RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: Some(12),
+        };
+        let err = r
+            .execute_over_quic_speculative(
+                &client,
+                &identity,
+                &addrs,
+                "budget-wire-1",
+                "exp.test",
+                &[4.0, 8.0],
+                &peers,
+                &mut HashMap::new(),
+                |_| Err(anyhow::anyhow!("no local weights here")),
+                budget,
+            )
+            .await
+            .expect_err("the wire cap must refuse the second hop");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(crate::pipeline::RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON)
+                && msg.contains(&far_node_id)
+                && msg.contains("cap Some(12)"),
+            "typed reason + named hop + standing cap: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_budget_skips_only_the_speculative_preflight() {
+        // The headroom rule is a hard invariant: when a cap leaves no
+        // room for speculative EXTRA work, the pre-flight is dropped — an
+        // honest no-op — while the real walk keeps its dial budget: local
+        // fails, the loop's remote hop dial succeeds and the request
+        // COMPLETES. Speculation never starves the real walk.
+        let (far_addr, far_identity, far_pins) =
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let far_node_id = far_identity.node_id();
+        let r = router(50).with_speculative_remote(true);
+        r.register_local_expert("exp.test").await;
+        let mut addrs = HashMap::new();
+        addrs.insert(far_node_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let peers = vec![(far_node_id.clone(), 200, true, true, None, None)];
+        let budget = crate::pipeline::RequestBudget {
+            max_remote_attempts: Some(1),
+            max_wire_bytes: None,
+        };
+        let out = r
+            .execute_over_quic_speculative(
+                &client,
+                &identity,
+                &addrs,
+                "budget-preflight-drop",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut HashMap::new(),
+                |_| Err(anyhow::anyhow!("local runtime down")),
+                budget,
+            )
+            .await
+            .expect("the real walk still runs past a preflight drop");
+        assert_eq!(out, vec![28.0]);
+    }
+
+    #[tokio::test]
+    async fn spec_budget_drops_only_the_preflight_and_never_the_walk() {
+        // §1 phase 3 (budgeted speculation): with a deliberately
+        // tightened SPEC sub-budget (below one dial's payload) installed
+        // on the router — the exact shape the dispatch loop installs
+        // from config — the pre-flight is refused BY ITS OWN ledger
+        // while the HONEST ledger has all its room left: the real walk
+        // still dials, still completes, no typed refusal leaks into the
+        // answer. Speculation refuses first; honest walks never starve.
+        let (far_addr, far_identity, far_pins) =
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let far_node_id = far_identity.node_id();
+        let r = router(50).with_speculative_remote(true);
+        r.register_local_expert("exp.test").await;
+        let mut addrs = HashMap::new();
+        addrs.insert(far_node_id.clone(), far_addr);
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let peers = vec![(far_node_id.clone(), 200, true, true, None, None)];
+        let in_bytes = RequestLedger::f32_bytes(&[4.0]);
+        let spec_tight = crate::pipeline::RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: Some(in_bytes.saturating_sub(1)),
+        };
+        r.set_spec_budget(Some(spec_tight));
+        let mut completed = HashMap::new();
+        let mut served = None;
+        let out = r
+            .execute_over_quic_speculative_attributed(
+                &client,
+                &identity,
+                &addrs,
+                "spec-drop-preflight",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut completed,
+                |_| Err(anyhow::anyhow!("local runtime down")),
+                &mut served,
+                crate::pipeline::RequestBudget::default(),
+            )
+            .await
+            .expect("a spec-capped preflight drop never touches the real walk");
+        assert_eq!(out, vec![28.0]);
+        assert_eq!(served.as_deref(), Some(far_node_id.as_str()));
+
+        // Parity leg: the DEFAULT spec budget (equal caps, speculative
+        // spend also honestly recorded — a strict subset) never refuses
+        // first: the same walk completes identically.
+        r.set_spec_budget(Some(crate::pipeline::RequestBudget::default()));
+        let mut completed = HashMap::new();
+        let mut served = None;
+        let out = r
+            .execute_over_quic_speculative_attributed(
+                &client,
+                &identity,
+                &addrs,
+                "spec-parity-preflight",
+                "exp.test",
+                &[4.0],
+                &peers,
+                &mut completed,
+                |_| Err(anyhow::anyhow!("local runtime down")),
+                &mut served,
+                crate::pipeline::RequestBudget::default(),
+            )
+            .await
+            .expect("default spec caps are exact parity");
+        assert_eq!(out, vec![28.0]);
+        assert_eq!(served.as_deref(), Some(far_node_id.as_str()));
     }
 
     #[tokio::test]
@@ -4511,6 +5010,7 @@ mod tests {
                 &msgs,
                 &peers,
                 || Err(anyhow::anyhow!("local runtime down")),
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -4590,6 +5090,7 @@ mod tests {
                 &[serde_json::json!({"role": "user", "content": "hi"})],
                 &peers,
                 || Err(anyhow::anyhow!("local runtime down")),
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -4607,6 +5108,7 @@ mod tests {
                 &[serde_json::json!({"role": "user", "content": "hi"})],
                 &peers,
                 || Ok("local hello".into()),
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -4623,6 +5125,7 @@ mod tests {
                 &[serde_json::json!({"role": "user", "content": "hi"})],
                 &peers,
                 || Err(anyhow::anyhow!("local runtime down")),
+                crate::pipeline::RequestBudget::default(),
             )
             .await;
         assert!(err.is_err());
@@ -4871,6 +5374,7 @@ mod chat_walk_tests {
                 &[serde_json::json!({"role": "user", "content": "hi"})],
                 &peers,
                 || Err(anyhow::anyhow!("local runtime down")),
+                crate::pipeline::RequestBudget::default(),
             )
             .await
             .unwrap();
@@ -4908,5 +5412,180 @@ mod chat_walk_tests {
         router.note_chat_ok("flap");
         assert_eq!(router.chat_failure_streak("flap"), 0);
         assert!(!router.chat_flapping("flap"));
+    }
+
+    /// A chat handler that rejects — the honest-dial-failure lead for the
+    /// budget drills (its Rejection books a streak like any real failure;
+    /// the SPARE peer the budget then refuses must book nothing).
+    struct RejectingChat;
+
+    impl ExpertHandler for RejectingChat {
+        fn run(&self, _expert_id: &str, _input: &[f32]) -> anyhow::Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _messages: &'a [serde_json::Value],
+        ) -> futures_core::future::BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async move { anyhow::bail!("mesh chat refused") })
+        }
+    }
+
+    // --- §1 per-request budget carried into the chat lane ----------------
+
+    #[tokio::test]
+    async fn chat_budget_attempt_cap_refuses_spare_peers_without_booking_them() {
+        // A one-attempt cap: the lead dial FLIES and honestly fails (the
+        // rejecting peer books its streak); the spare peer is then refused
+        // BY NAME — and its streak stays 0: the peer did nothing wrong,
+        // budget refusals are never hysteresis material.
+        let (lead_addr, lead_identity, _lead_pins) =
+            super::tests::test_server_and_pins(Arc::new(RejectingChat))
+                .await
+                .unwrap();
+        let (far_addr, far_identity, far_pins) =
+            super::tests::test_server_and_pins(Arc::new(DelayedChat {
+                delay: Duration::from_millis(5),
+                content: "fast",
+            }))
+            .await
+            .unwrap();
+        let lead_node = lead_identity.node_id();
+        let far_node = far_identity.node_id();
+        // One client trusting BOTH servers: pin the lead into the far map
+        // before the endpoint exists.
+        far_pins
+            .write()
+            .await
+            .insert(lead_node.clone(), lead_addr);
+        let router = ExpertRouter::new(RouterOptions {
+            nearby_rtt_ms: 50,
+            dispatch_timeout: Duration::from_secs(9),
+            speculative_remote: false,
+            verify_percent: 0,
+            verify_tolerance: 0.0,
+            chat_hedged_peers: 1,
+            chat_hedge_delay_ms: 0,
+            chat_walk_budget_ms: 0,
+        });
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut addrs = HashMap::new();
+        addrs.insert(lead_node.clone(), lead_addr);
+        addrs.insert(far_node.clone(), far_addr);
+        let peers = vec![
+            (lead_node.clone(), 1u64, true, true, None, None),
+            (far_node.clone(), 9u64, true, true, None, None),
+        ];
+        let budget = crate::pipeline::RequestBudget {
+            max_remote_attempts: Some(1),
+            max_wire_bytes: None,
+        };
+        let err = router
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "chat-budget-attempts",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
+                budget,
+            )
+            .await
+            .expect_err("the cap must refuse the spare peer");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(crate::pipeline::RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON)
+                && msg.contains(&far_node)
+                && msg.contains("cap Some(1)"),
+            "typed reason + named peer + standing cap: {msg}"
+        );
+        // The allowed dial's real failure is the accumulated error.
+        assert!(
+            msg.contains("mesh chat refused"),
+            "the lead dial's honest failure rides the typed error: {msg}"
+        );
+        // The lead's failure was booked; the REFUSED spare peer never was.
+        assert_eq!(router.chat_failure_streak(&lead_node), 1);
+        assert_eq!(router.chat_failure_streak(&far_node), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_budget_wire_cap_runs_under_defaults_and_trips_on_small_caps() {
+        // Default caps: an honest one-peer fallback walk completes.
+        let (addr, peer_identity, pins) =
+            super::tests::test_server_and_pins(Arc::new(DelayedChat {
+                delay: Duration::from_millis(2),
+                content: "mesh hello",
+            }))
+            .await
+            .unwrap();
+        let peer_node = peer_identity.node_id();
+        let router = ExpertRouter::new(RouterOptions {
+            nearby_rtt_ms: 50,
+            dispatch_timeout: Duration::from_secs(9),
+            speculative_remote: false,
+            verify_percent: 0,
+            verify_tolerance: 0.0,
+            chat_hedged_peers: 1,
+            chat_hedge_delay_ms: 0,
+            chat_walk_budget_ms: 0,
+        });
+        let client = pinned_client_endpoint_dyn(pins).unwrap();
+        let identity = SigningIdentity::generate();
+        let mut addrs = HashMap::new();
+        addrs.insert(peer_node.clone(), addr);
+        let peers = vec![(peer_node.clone(), 5u64, true, true, None, None)];
+        let msg_in = serde_json::json!({"role": "user", "content": "hi"});
+        let n_bytes = serde_json::to_vec(
+            &ExpertRouter::compact_chat_history(&[msg_in.clone()]),
+        )
+        .unwrap()
+        .len() as u64;
+        let (content, served) = router
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "chat-budget-ok",
+                &[msg_in],
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
+                crate::pipeline::RequestBudget::default(),
+            )
+            .await
+            .expect("default caps never squeeze an honest chat walk");
+        assert_eq!(content, "mesh hello");
+        assert_eq!(served, peer_node);
+
+        // Now a cap that the dial's payload alone cannot fit: the walk
+        // refuses the dial BEFORE it starts (bytes in + est checked
+        // together) — typed refusal naming the peer, zero booking.
+        let budget = crate::pipeline::RequestBudget {
+            max_remote_attempts: Some(8),
+            max_wire_bytes: Some(n_bytes.saturating_sub(1)),
+        };
+        let err = router
+            .chat_over_quic(
+                &client,
+                &identity,
+                &addrs,
+                "chat-budget-wire",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+                &peers,
+                || Err(anyhow::anyhow!("local runtime down")),
+                budget,
+            )
+            .await
+            .expect_err("the sub-payload cap must refuse the dial");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(crate::pipeline::RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON)
+                && msg.contains(&peer_node),
+            "typed refusal names the peer: {msg}"
+        );
+        assert_eq!(router.chat_failure_streak(&peer_node), 0);
     }
 }

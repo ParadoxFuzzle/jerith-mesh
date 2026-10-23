@@ -739,6 +739,21 @@ pub struct ExpertStoreConfig {
     /// layer, so 1 is the natural horizon.
     #[serde(default = "default_prefetch_horizon")]
     pub prefetch_horizon: u32,
+    /// §1 per-request expert budget: max REMOTE dial attempts ONE
+    /// dispatch request may start (the speculative pre-flight and replay
+    /// verification dials included — every request-cause remote dial
+    /// counts). 0 = uncapped. The default is sized to fit honest walks
+    /// (one attempt per hop, a full reassignment storm below it) far
+    /// above the honest case, remaining a flood guard, not a squeeze.
+    #[serde(default = "default_max_remote_attempts")]
+    pub max_remote_attempts: usize,
+    /// §1 per-request expert budget: max WIRE payload (bytes, counted as
+    /// the request ships them: 4 B per f32 element, in AND out) ONE
+    /// dispatch request may move. 0 = uncapped. Honest MoE activations
+    /// — d_model-sized f32 vectors over a bounded hop count — sit orders
+    /// of magnitude below; the cap is a flood guard, not a squeeze.
+    #[serde(default = "default_max_wire_bytes")]
+    pub max_wire_bytes: u64,
     /// §1 draft-expert scheduling: when a spec-decoded forward's expert
     /// hops are dispatched, the FIRST remote hop leads by pure RTT (still
     /// reputation-gated; resources order the tail) so the draft never
@@ -746,6 +761,96 @@ pub struct ExpertStoreConfig {
     /// stay byte-for-byte the standing resource-first order.
     #[serde(default)]
     pub draft_priority: bool,
+    /// §1 phase 3 (budgeted speculation): the SPECULATIVE arms' OWN
+    /// per-request budget — the QUIC pre-flight dial and the warm
+    /// pre-pay hooks answer to this ledger SEPARATELY from the honest
+    /// walk's `max_remote_attempts` / `max_wire_bytes`: when this
+    /// ledger's caps trip, speculation refuses (honed no-ops — the
+    /// dropped pre-flight / skipped prefetch are optional work by
+    /// contract) while the REAL walk keeps its full honest allowance —
+    /// speculative work refuses before honest walks starve. Defaults
+    /// equal the honest defaults (and speculative spend is a subset of
+    /// honest spend, since every speculative dial/pull is also counted
+    /// honestly), so a config without these keys behaves exactly like
+    /// the single-ledger budget. 0 = uncapped on either knob.
+    #[serde(default = "default_max_remote_attempts")]
+    pub spec_max_remote_attempts: usize,
+    #[serde(default = "default_max_wire_bytes")]
+    pub spec_max_wire_bytes: u64,
+    /// §1 phase 2 (draft hot set): the percent of HOSTED experts kept
+    /// always-resident (pinned in the byte-budgeted LRU — never an
+    /// eviction victim, eagerly loaded when the pin lands) and replicated
+    /// like hot-expert members (the replication round counts them toward
+    /// the factor). Drawn deterministically lowest-layer-first — the
+    /// draft pass re-runs the front of the model every decode step. 0 =
+    /// off (the default: plans, pins and replication stay exactly the
+    /// pre-feature behavior); values above 50 clamp down.
+    #[serde(default)]
+    pub draft_hot_percent: u32,
+}
+
+fn default_max_remote_attempts() -> usize {
+    crate::pipeline::DEFAULT_MAX_REMOTE_ATTEMPTS
+}
+
+fn default_max_wire_bytes() -> u64 {
+    crate::pipeline::DEFAULT_REQUEST_WIRE_BYTES
+}
+
+impl ExpertStoreConfig {
+    /// The budget these knobs configure: a typed [`RequestBudget`] the
+    /// dispatch walk enforces per request. `0` fields map to `None`
+    /// (uncapped) — the codebase's "0 = unbounded" knob convention (the
+    /// same shape as `chat_walk_budget_ms`), so every field stays
+    /// meaningful and `Default` equates plain defaults exactly matching
+    /// the enforced defaults.
+    pub fn request_budget(&self) -> crate::pipeline::RequestBudget {
+        crate::pipeline::RequestBudget {
+            max_remote_attempts: if self.max_remote_attempts == 0 {
+                None
+            } else {
+                Some(self.max_remote_attempts)
+            },
+            max_wire_bytes: if self.max_wire_bytes == 0 {
+                None
+            } else {
+                Some(self.max_wire_bytes)
+            },
+        }
+    }
+
+    /// The SPECULATIVE arms' own ledger (phase 3 budgeted speculation):
+    /// `0 = uncapped` on each knob, the same convention as
+    /// [`Self::request_budget`]. Defaults equal the honest budget, and
+    /// speculative spend is counted into the honest ledger too, so with
+    /// unconfigured knobs this gate can never refuse first — exact
+    /// parity, speculation just answers to an INDEPENDENT off-switch.
+    pub fn spec_budget(&self) -> crate::pipeline::RequestBudget {
+        crate::pipeline::RequestBudget {
+            max_remote_attempts: if self.spec_max_remote_attempts == 0 {
+                None
+            } else {
+                Some(self.spec_max_remote_attempts)
+            },
+            max_wire_bytes: if self.spec_max_wire_bytes == 0 {
+                None
+            } else {
+                Some(self.spec_max_wire_bytes)
+            },
+        }
+    }
+
+    /// THE shared conversion for ONE config snapshot (§1 phase 3): the
+    /// honest and speculative ledgers derived TOGETHER in one call.
+    /// Production budget reads go through this pair (composed with the
+    /// router's `set_budgets`), so the two budgets are always read from
+    /// the same snapshot and installed together — they cannot drift.
+    pub fn budgets(&self) -> crate::pipeline::BudgetPair {
+        crate::pipeline::BudgetPair {
+            honest: self.request_budget(),
+            spec: self.spec_budget(),
+        }
+    }
 }
 
 fn default_prefetch_per_layer() -> usize {
@@ -798,7 +903,12 @@ impl Default for ExpertStoreConfig {
             prefetch_enabled: default_true(),
             prefetch_per_layer: default_prefetch_per_layer(),
             prefetch_horizon: default_prefetch_horizon(),
+            max_remote_attempts: default_max_remote_attempts(),
+            max_wire_bytes: default_max_wire_bytes(),
+            spec_max_remote_attempts: default_max_remote_attempts(),
+            spec_max_wire_bytes: default_max_wire_bytes(),
             draft_priority: false,
+            draft_hot_percent: 0,
         }
     }
 }
@@ -1201,6 +1311,44 @@ mod tests {
     use super::*;
     use crate::models::ModelSource;
 
+    /// §1 per-request budget knobs: serde defaults equal the pipeline's
+    /// enforced defaults (so a config without the block behaves exactly
+    /// like `RequestBudget::default`), and the `0 = uncapped` convention
+    /// maps a present-but-zero field to `None` — never to the "a zero cap
+    /// must not silently disable the guard" internal mapping.
+    #[test]
+    fn request_budget_knobs_default_and_map_zero_to_uncapped() {
+        let cfg = NodeConfig::default();
+        assert_eq!(
+            cfg.experts.request_budget(),
+            crate::pipeline::RequestBudget::default(),
+            "absent block == enforced defaults"
+        );
+
+        // 0 = uncapped on either knob (the chat_walk_budget_ms convention).
+        let mut uncapped = cfg.clone();
+        uncapped.experts.max_remote_attempts = 0;
+        uncapped.experts.max_wire_bytes = 0;
+        let budget = uncapped.experts.request_budget();
+        assert_eq!(budget.max_remote_attempts, None);
+        assert_eq!(budget.max_wire_bytes, None);
+
+        // A tightened operator value carries through exactly.
+        let mut tight = cfg;
+        tight.experts.max_remote_attempts = 8;
+        tight.experts.max_wire_bytes = 4096;
+        let budget = tight.experts.request_budget();
+        assert_eq!(budget.max_remote_attempts, Some(8));
+        assert_eq!(budget.max_wire_bytes, Some(4096));
+
+        // The TOML round-trip keeps old configs parseable (the fields
+        // deserialize from absence, not from zero).
+        let parsed: ExpertStoreConfig = toml::from_str("[experts]\n").unwrap();
+        assert_eq!(
+            parsed.request_budget(),
+            crate::pipeline::RequestBudget::default()
+        );
+    }
 
     /// §1 draft-expert scheduling knob: off by default (plans stay the
     /// standing resource-first order), TOML-optional both ways.
@@ -1215,7 +1363,70 @@ mod tests {
         // An operator's `draft_priority = true` carries through.
         let parsed: ExpertStoreConfig = toml::from_str("draft_priority = true\n").unwrap();
         assert!(parsed.draft_priority, "an explicit true carries through");
+
+        // §1 phase 2: the draft HOT tier defaults off (0 — no pins, no
+        // replication change) and a present value round-trips.
+        assert_eq!(parsed.draft_hot_percent, 0, "absent key stays off");
+        let parsed: ExpertStoreConfig = toml::from_str("draft_hot_percent = 15\n").unwrap();
+        assert_eq!(parsed.draft_hot_percent, 15);
+        let cfg = NodeConfig::default();
+        assert_eq!(cfg.experts.draft_hot_percent, 0);
     }
+
+    /// §1 phase 3 (budgeted speculation): the speculative arms' knobs
+    /// default to the HONEST defaults (exact single-ledger parity — the
+    /// spec gate can only refuse first when an operator tightens it)
+    /// and the 0 = uncapped convention maps to None like the honest
+    /// budget's.
+    #[test]
+    fn spec_budget_knobs_default_parity_and_map_zero_to_uncapped() {
+        let cfg = NodeConfig::default();
+        assert_eq!(
+            cfg.experts.spec_budget(),
+            cfg.experts.request_budget(),
+            "spec defaults == honest defaults"
+        );
+        let mut uncapped = cfg.clone();
+        uncapped.experts.spec_max_remote_attempts = 0;
+        uncapped.experts.spec_max_wire_bytes = 0;
+        let spec = uncapped.experts.spec_budget();
+        assert_eq!(spec.max_remote_attempts, None);
+        assert_eq!(spec.max_wire_bytes, None);
+
+        // A deliberately tightened spec budget carries through exactly —
+        // this is the phase-3 lever: speculation refuses first.
+        let mut tight = cfg;
+        tight.experts.spec_max_remote_attempts = 2;
+        tight.experts.spec_max_wire_bytes = 4096;
+        let spec = tight.experts.spec_budget();
+        assert_eq!(spec.max_remote_attempts, Some(2));
+        assert_eq!(spec.max_wire_bytes, Some(4096));
+
+        // TOML absence stays parseable (pre-2026-10-23 configs keep).
+        let parsed: ExpertStoreConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            parsed.spec_budget(),
+            crate::pipeline::RequestBudget::default()
+        );
+    }
+
+    #[test]
+    fn budget_pair_is_the_single_conversion_point_for_both_ledgers() {
+        // §1 phase 3 drift guard: `budgets()` — the ONE conversion
+        // production reads route through (ping dispatch, chat fallback,
+        // router `set_budgets`) — must stay EXACTLY the two tested
+        // half-conversions. If either half is retuned here and the other
+        // lags, production honest/spec budgets diverge; this test fails
+        // loudly instead.
+        let mut cfg = ExpertStoreConfig::default();
+        cfg.spec_max_remote_attempts = 7;
+        cfg.spec_max_wire_bytes = 8192;
+        let pair = cfg.budgets();
+        assert_eq!(pair.honest, cfg.request_budget(), "honest parity");
+        assert_eq!(pair.spec, cfg.spec_budget(), "spec parity");
+        assert_ne!(pair.honest, pair.spec, "the pair is NOT one budget aliased twice");
+    }
+
     fn sample_model() -> ModelId {
         ModelId {
             id: "glm-5.3".into(),

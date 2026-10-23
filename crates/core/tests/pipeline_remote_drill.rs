@@ -1108,6 +1108,7 @@ async fn two_node_pipeline_drill() -> anyhow::Result<()> {
             };
             let limits_spec = WalkLimits {
                 budget: RequestBudget::default(),
+                spec_budget: None,
                 prefetch_next: Some(&*prefetch_closure),
                 est_layer_bytes: 1, // unit-tested headroom rule; live rule: always room
             };

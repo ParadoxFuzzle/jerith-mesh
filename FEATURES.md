@@ -43,8 +43,26 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Operator surfaces: `jerith experts list|make|run`, `/status.experts`
     (hosted ids, resident bytes, hit/miss/load/eviction counters), and a
     MeshLoop `dispatch_expert` entry that reports which node answered
-  - Quantized shards (Q4_K/Q8_0 dequant, mmap'd GGUF export) are the next
-    step; the store boundary (`run(expert_id, input) -> Vec<f32>`) holds
+  - ✅ **Real model import — the GGUF layer split** (gguf_import.rs,
+    landed 2026-10-23; the store boundary stays
+    `run(expert_id, input) -> Vec<f32>`): `jerith experts import <gguf>`
+    slices a real GGUF checkpoint's FFN stacks into store containers —
+    MoE 3-D stacks become experts `L<n>.E<k>` (SwiGlu kind for the
+    stacked llama.cpp mixtral/deepseek family, plain-MLP kind with a
+    tagged activation for the nomic-bert family — `--activation`
+    overrides), `ffn_gate_inp` becomes the REAL routers `L<n>.router`,
+    and dense 2-D FFN layers land as one `L<n>.E0` each — F32/F16/BF16/
+    Q4_0/Q8_0 dequantized to f32, one atomic put per container, and an
+    `ImportReport` that names every tensor the file carried that the
+    importer did NOT convert, with reason (an import that silently
+    skipped a tensor would be a lie on the mesh wire). Proven on the
+    real nomic-embed-text-v2-moe Q8_0: imported live into a node's own
+    store (`~/.jerith-mesh/experts` — 57 hosted) and SERVING real
+    forwards; the unit pilot imports the same file and cross-checks EVERY
+    imported expert's served math against an F32-dequant oracle at a
+    banded relative tolerance (honest 8-bit noise, measured — the pilot
+    also caught + fixed a scalar-KV-array seek bug in the reader that
+    left the cursor mid-tensor-data)
 - ✅ Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
   - Demand is *measured*, not guessed: every expert this node serves or
     dispatches is counted (`expert_stats`, persisted to
@@ -729,18 +747,43 @@ gotchas surfaced while building the finished parts.
   bound mesh spend, not local compute), so a walk past a tripped cap
   still finishes its local work. This is the exact path speculative
   replays will reuse, so the budget exists before real speculative runs
-  do; config knobs are deliberately DEFERRED to transport integration
-  (no unread config fields — the cold-field gotcha). Drill-verified
+  do; the CONFIG surface LANDED 2026-10-23 (before transport
+  integration, and with no unread fields — the live dispatch walk
+  enforces it, see below). Still NOT carried by the ChatPath/chat lane,
+  whose budget shape stays ChatResult-flavored. Drill-verified
   through real QUIC (criterion 7 bind: a two-remote-attempt cap walks
   A + B live and refuses the far D hop by name, byte-equal to the two-
   hop reference; default caps end the same A → B → D walk untouched).
-  Still pending: real model shard contents (the Colibri-side layer
-  split — the served containers stay synthetic inside) and real
-  inter-region links (the wide-area RTT is simulated through pricing;
-  the latencies themselves stay loopback-real). What remains is live
-  transport integration (the hop RPC rides `remote_expert_attempt` once
-  the Colibri-side layer split provides real runtime weights);
-  reordering/preemption is downstream.
+  Still pending: mesh-side live transport wiring (the shard
+  contents themselves are REAL now — the gguf import, §1: the real
+  nomic Q8_0 runs in this node's own store; what remains is the hop RPC
+  riding `remote_expert_attempt` over the mesh inter-region links, whose
+  wide-area RTT is simulated through pricing while the latencies stay
+  loopback-real); reordering/preemption is downstream.
+  The budget's LIVE enforcement landed on the real dispatch walk
+  2026-10-23: `execute_over_quic_speculative_attributed` keeps a
+  per-request `RequestLedger` (every request-cause remote dial counts an
+  attempt — pre-flight counted once at creation, the replay-verify
+  arbiter dial included — and wire bytes count as the request ships
+  them: 4 B per f32 in at dial start, out when the answer lands).
+  Enforcement is inline like the wall: in-flight work always lands, past
+  a cap the walk refuses to START new remote dials and ends with the
+  typed `REQUEST_BUDGET_EXHAUSTED_REASON` naming the refused hops + the
+  best accumulated failure; local hops stay free. The pre-flight is
+  speculative extra work — when the ledger has no room for it the
+  headroom rule drops it (honest no-op) while the REAL walk keeps its
+  dial; the replay arbiter past a cap just fails open (no arbiter ⇒
+  Trust, we never reject work we cannot prove wrong).
+  Config: `[experts].max_remote_attempts` / `max_wire_bytes` (0 =
+  uncapped, the chat_walk convention) → `request_budget()` typed
+  conversion; read LIVE at every dispatch (ping.rs) so caps are hot —
+  reload plan classifies them `experts.request_budget` hot. Defaults
+  equal the pipeline's enforced defaults (64 attempts / 256 MiB wire),
+  so a config without the block behaves exactly as before. Tests:
+  knob defaults + 0→uncapped mapping, reload classification, and three
+  real-QUIC walks (attempt cap refuses the second hop by name with the
+  typed reason, wire cap trips after bytes moved, preflight-only drop
+  still COMPLETES the walk).
   Gotcha learned: everything must survive the existing commitment layer —
   a pipeline hop is several `ExpertResult`-shaped exchanges, so the
   anti-tamper plumbing composes rather than replaces.
@@ -787,19 +830,77 @@ gotchas surfaced while building the finished parts.
   probe classifications, stats math with the ≥5 gate, plus the live
   mock-runtime drill (probe admits → hint rides forward 2+, stats
   fill; strict runtime 400s the field → refused → user traffic stays
-  clean). Draft-expert scheduling (the gguf store has real routers + experts to
-  draft from — the engine still owns draft-and-verify) landed phase 1 of 3 on
-  2026-10-23: `[experts].draft_priority` (default off; hot — the dispatch loop
-  re-reads it with the budget every dispatch, and /status.experts publishes
-  it). When on, the FIRST remote hop leads by pure RTT among
-  reputation-gated qualified peers — the draft must not wait behind a
-  slower, resource-richer peer; resources keep ordering the TAIL (retries
-  land resource-first), and a verified-offense peer never heads the hop.
-  Named rule (draft_head), planner unit tests (knob off = byte-for-byte the
-  Phase-1 order; on = head-by-RTT, tail intact; offender gated) plus the
-  real-QUIC drill: with local weights down, a resource-reported far peer
-  serves knob-off (attribution ×7) and the NEAREST named peer serves
-  knob-on (×3) — the fall-through stays intact.
+  clean). The per-request budget's config surface LANDED 2026-10-23
+  (above), and the budget now rides the MESH CHAT lane on the same live
+  read: `chat_over_quic` takes the budget the fallback already built and
+  refuses NEW chat dials past a cap by name with
+  `RouteResult::REQUEST_BUDGET_EXHAUSTED_REASON` — in-flight work always
+  lands, local runtime hops stay free, and a budget refusal never books
+  the refused peer's flapping streak (no fault of theirs). Drill-
+  verified over real QUIC on both edges: a honestly-failing lead books
+  its real streak while the budget-refused spare books nothing, and a
+  sub-payload wire cap refuses the dial before it starts.
+  Draft-expert scheduling (the gguf store has real routers + experts to
+  draft from — the engine still owns draft-and-verify) started landing
+  phase 1 of 3 on 2026-10-23: `[experts].draft_priority` (default off;
+  hot — the dispatch loop re-reads it with the budget every dispatch,
+  and /status.experts publishes it). When on, the FIRST remote hop leads
+  by pure RTT among reputation-gated qualified peers — the draft must
+  not wait behind a slower, resource-richer peer; resources keep
+  ordering the TAIL (retries land resource-first), and a
+  verified-offense peer never heads the hop. Named rule (draft_head),
+  planner unit tests (knob off = byte-for-byte the Phase-1 order; on =
+  head-by-RTT, tail intact; offender gated) plus the real-QUIC drill:
+  with local weights down, a resource-reported far peer serves knob-off
+  (attribution ×7) and the NEAREST named peer serves knob-on (×3) — the
+  fall-through stays intact.
+  Phase 2 — the DRAFT HOT SET — LANDED 2026-10-23: `[experts].
+  draft_hot_percent` (0 = off; hot — the replication round re-derives
+  pins and plan membership from the live knob every interval, and
+  /status.experts publishes `draft_hot_percent` + `draft_pinned`). The
+  tier is % of hosted experts drawn deterministically LOWEST-LAYER-
+  FIRST (the draft pass re-runs the front of the model every decode
+  step; dense E0 before numbered experts, non-layer synthetic ids last,
+  numeric layer order, >50 clamps down). Its members are (a) PINNED
+  always-resident: `apply_draft_pins` eagerly loads them when the pin
+  lands and `pinned` ids are never eviction victims — the governor's
+  FULL shed and the LRU's own budget pressure both stop at them (pins
+  may exceed the budget; that is the operator's stated ask) — and lock
+  order is cache→pinned everywhere (the inverse order would deadlock
+  load against shed); (b) replicated LIKE HOT EXPERTS: the round plans
+  draft members FIRST (their fetches survive the per-round cap) with
+  the demand hot set deduped behind them. An off/knob=0 round derives
+  an empty tier, which fades stale pins within one interval. Tests:
+  draft_set ordering/clamping, pin survival through full shed +
+  pressure + clear, knob 0/default/TOML roundtrip, reload classifies
+  `experts.draft_hot` hot; live drill: dev-e2e.sh E2E_DRAFT_HOT=1 —
+  after node A replicates node B's expert the NEXT round pins it
+  resident (draft_pinned / resident_bytes proven from /status).  Phase 3 — BUDGETED SPECULATION — LANDED 2026-10-23: `[experts].
+  spec_max_wire_bytes` (0/absent = invite-only: byte-identical parities
+  with the honest ledger, the default), together with the honest wire
+  cap, derives `request_spec_budget()` — typed like `request_budget()`
+  — which the dispatch loop installs on the router (`set_spec_budget`)
+  and re-reads LIVE on the same read as the honest budget (reload plan
+  `experts.spec_budget` hot; 0 maps to uncapped like the honest knob).
+  Enforced at the TWO speculative surfaces, always BY ITS OWN ledger so
+  a tightened spec knob can never starve the real walk: the pipeline
+  `WalkLimits` prefetch gate refuses speculative prefetches the honest
+  ledger would still allow, and `execute_over_quic_speculative_
+  attributed` pre-checks its pre-flight dial at walk start and drops it
+  (honest no-op) when the spec ledger has no room — the honest ledger's
+  room and caps are untouched, no typed refusal leaks into the answer,
+  and the walk still dials and completes. A spec entanglement past the
+  cap refuses before it invites any peer's work. Tests: knob
+  defaults + 0→uncapped mapping, reload classification, pipeline spec-
+  gate unit test, and the real-QUIC drill (tightened spec sub-budget
+  drops ONLY the pre-flight — both legs complete byte-equal answers,
+  honest knobs unplugged).
+  Also landed 2026-10-23: dev-e2e.sh PORT PREFLIGHT — any of the six
+  run ports (bootstrap/runtime TCP, gateways TCP, QUIC rpc UDP) held by
+  another process aborts BEFORE the build with the exact
+  E2E_*_PORT override to set (E2E_CHECK_PORTS=0 restores the old
+  silent-garbage behavior); a live 2026-10-23 run reproduced the old
+  5b-replication-timeout failure mode (live node on 8900/9000).
 - ✅ **Asynchronous, timeout-tolerant forward passes + graceful degradation
   (§1)** — the mesh CHAT walk landed async 2026-10-18 (see §2's gateway
   tier notes and §13's config surface for the knobs; the expert walk keeps

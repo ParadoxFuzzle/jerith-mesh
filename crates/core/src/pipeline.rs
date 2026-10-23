@@ -452,6 +452,20 @@ impl Default for RequestBudget {
     }
 }
 
+/// §1 phase 3 budgeted speculation: ONE conversion from ONE config
+/// snapshot carrying both ledgers a dispatch needs — the walk's honest
+/// budget and the speculative arms' independent sub-budget. Production
+/// sites convert via this pair (config `budgets()` → router
+/// `set_budgets`), so the honest and speculative budgets are always
+/// read and installed in lockstep and cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetPair {
+    /// The real walk's ledger (hand this to the walk call).
+    pub honest: RequestBudget,
+    /// The speculative gate's ledger (install on the router).
+    pub spec: RequestBudget,
+}
+
 /// §1 speculative decoding, transport-side: as the walk approaches each
 /// remote hop it may PRE-PAY the NEXT hop's weights into the walking
 /// node's local store (a real mesh fetch) so a dead owner's layers can
@@ -475,6 +489,17 @@ pub type PrefetchHook = dyn Fn(
 
 pub struct WalkLimits<'a> {
     pub budget: RequestBudget,
+    /// §1 phase 3 (budgeted speculation): the PREFETCH hook's own
+    /// ledger. `None` (the `with_budget` default) is exactly the
+    /// single-ledger parity — warm pulls count only into `budget`, the
+    /// headroom rule consults only `budget`, and the honest caps fire
+    /// exactly as before. `Some(spec_budget)` adds an INDEPENDENT gate:
+    /// pre-pays also accrue into a second ledger (they still count
+    /// honestly — speculative spend is a subset), past its caps the
+    /// prefetch skips (an honest no-op; never disables the walk), and
+    /// once tripped the honest ledger keeps room it would otherwise
+    /// have had to give away to a speculation storm.
+    pub spec_budget: Option<RequestBudget>,
     /// The warm-fetch hook (see [`PrefetchHook`]). `None` = no
     /// speculative work.
     pub prefetch_next: Option<&'a PrefetchHook>,
@@ -485,10 +510,12 @@ pub struct WalkLimits<'a> {
 
 impl<'a> WalkLimits<'a> {
     /// Budget-only limits (no prefetch): the shape every M4-era call
-    /// site wants.
+    /// site wants — deterministic single-ledger parity (`spec_budget`:
+    /// None).
     pub fn with_budget(budget: RequestBudget) -> Self {
         Self {
             budget,
+            spec_budget: None,
             prefetch_next: None,
             est_layer_bytes: 0,
         }
@@ -633,6 +660,17 @@ pub async fn execute_route_resilient(
     // cap never disables the guard by accident.
     let mut remote_attempts: usize = 0;
     let mut wire_bytes: u64 = 0;
+    // §1 phase 3 (budgeted speculation): the speculative warm-pull
+    // ledger. Defaults to `None` = single-ledger parity: pulled bytes
+    // count ONLY into `wire_bytes` and no spec gate exists. When Some,
+    // landed pulls accrue into BOTH ledgers and the prefetch gate also
+    // requires spec headroom — speculation refuses first without ever
+    // taking room from the honest walk.
+    let mut spec_bytes: u64 = 0;
+    let mut spec_attempts: usize = 0;
+    let spec_caps = limits
+        .and_then(|l| l.spec_budget.as_ref())
+        .map(|b| b.normalized());
     let caps = limits.map(|WalkLimits { budget, .. }| budget.normalized());
     let mut prefetch_inflight: Option<tokio::task::JoinHandle<anyhow::Result<u64>>> = None;
     let mut prefetches: usize = 0;
@@ -645,6 +683,10 @@ pub async fn execute_route_resilient(
             match handle.await {
                 Ok(Ok(bytes)) => {
                     wire_bytes = wire_bytes.saturating_add(bytes);
+                    if spec_caps.is_some() {
+                        spec_bytes = spec_bytes.saturating_add(bytes);
+                        spec_attempts += 1;
+                    }
                     prefetches += 1;
                 }
                 Ok(Err(e)) => {
@@ -737,7 +779,18 @@ pub async fn execute_route_resilient(
             let room_ok = caps.as_ref().is_none_or(|(_, max_wire)| {
                 max_wire.is_none_or(|cap| cap.saturating_sub(wire_bytes) >= 2 * est)
             });
-            if !tripped && room_ok {
+            // §1 phase 3: the spec ledger gates on top when installed —
+            // its own tripped state skips the pre-pay without touching
+            // the honest ledger (and its own ≥2× headroom rule).
+            let spec_tripped = spec_caps.as_ref().is_some_and(|(h, b)| {
+                h.is_some_and(|x| spec_attempts >= x) || b.is_some_and(|y| spec_bytes >= y)
+            });
+            let spec_room_ok = spec_caps
+                .as_ref()
+                .is_none_or(|(_, max_wire)| {
+                    max_wire.is_none_or(|cap| cap.saturating_sub(spec_bytes) >= 2 * est)
+                });
+            if !tripped && room_ok && !spec_tripped && spec_room_ok {
                 prefetch_inflight = Some(tokio::spawn(hook(next_hop.clone())));
             }
         }
@@ -2088,6 +2141,7 @@ mod budget_enforcement_tests {
             };
         let limits = WalkLimits {
             budget: RequestBudget::default(),
+            spec_budget: None,
             prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
             est_layer_bytes: 50,
         };
@@ -2125,6 +2179,98 @@ mod budget_enforcement_tests {
         );
     }
 
+    /// §1 phase 3 (budgeted speculation): the SPEC ledger gates the
+    /// prefetch on its own — when its caps trip, further pre-pays SKIP
+    /// (honest no-op) while the honest walk keeps its full allowance:
+    /// with the honest budget left generous, identical walks with the
+    /// union budgets land MORE prefetches than with the spec cap.
+    #[tokio::test]
+    async fn spec_budget_refuses_prefetches_the_honest_ledger_would_still_allow() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let route = remote_route(4);
+        let remote_run =
+            move |_expert_id: &str, _node: &str, activation: Vec<f32>, _t: Duration| -> RunFut {
+                Box::pin(async move { Ok((activation, None)) })
+            };
+        // Honest ledger: effectively unbiased — nothing it refuses first.
+        let honest = RequestBudget {
+            max_remote_attempts: None,
+            max_wire_bytes: None,
+        };
+        // Spec ledger: NO bytes cap (spec byte-parity is provably below
+        // an honest uncap), but an ATTEMPT cap of ONE landed pre-pay:
+        // hops 1 fires the first pull, hops 2+ are refused by the SPEC
+        // ledger while the HONEST ledger never moved.
+        let spec_one = RequestBudget {
+            max_remote_attempts: Some(1),
+            max_wire_bytes: None,
+        };
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let limits = WalkLimits {
+            budget: honest,
+            spec_budget: Some(spec_one),
+            prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
+            est_layer_bytes: 50,
+        };
+        let mut stability = RouteStability::new();
+        let result = execute_route_resilient(
+            "mod",
+            "spec-gate-limited",
+            route.clone(),
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&limits),
+            &mut stability,
+            |_l, _d| None,
+        )
+        .await;
+        assert_eq!(result.hops_run, 4, "the honest walk is untouched");
+        assert_eq!(result.prefetches, 1, "only the first pull survives the spec cap");
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            1,
+            "the hook itself was never spawned past the cap"
+        );
+        // The honest inverse: same walk, spec ledger ABSENT — parity —
+        // fires one pull per pre-tail hop (3 remotes → 3 pulls).
+        let pulls2 = Arc::new(AtomicUsize::new(0));
+        let limits2 = WalkLimits {
+            budget: honest,
+            spec_budget: None,
+            prefetch_next: Some(counting_prefetch(Arc::clone(&pulls2))),
+            est_layer_bytes: 50,
+        };
+        let mut stability2 = RouteStability::new();
+        let result2 = execute_route_resilient(
+            "mod",
+            "spec-gate-parity",
+            route,
+            vec![0.5_f32; 8],
+            |_, _| Ok(vec![0.5_f32; 8]),
+            remote_run,
+            |_| 1,
+            BASE,
+            None::<fn(&PipelineHop) -> u64>,
+            None,
+            Some(&limits2),
+            &mut stability2,
+            |_l, _d| None,
+        )
+        .await;
+        assert_eq!(result2.hops_run, 4);
+        assert_eq!(
+            result2.prefetches,
+            3,
+            "without the spec ledger every pre-tail hop pre-pays"
+        );
+    }
+
     /// The headroom rule: when the remaining byte budget cannot cover
     /// 2× the estimate, the prefetch DOES NOT FIRE — speculation must
     /// never starve the real walk.
@@ -2147,6 +2293,7 @@ mod budget_enforcement_tests {
         };
         let limits = WalkLimits {
             budget,
+            spec_budget: None,
             prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
             est_layer_bytes: 10_000,
         };
@@ -2189,6 +2336,7 @@ mod budget_enforcement_tests {
         };
         let limits2 = WalkLimits {
             budget: budget2,
+            spec_budget: None,
             prefetch_next: Some(counting_prefetch(Arc::clone(&pulls2))),
             est_layer_bytes: 10_000,
         };
@@ -2249,6 +2397,7 @@ mod budget_enforcement_tests {
         let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let limits = WalkLimits {
             budget: RequestBudget::default(),
+            spec_budget: None,
             prefetch_next: Some(counting_prefetch(Arc::clone(&pulls))),
             est_layer_bytes: 50,
         };

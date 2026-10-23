@@ -210,6 +210,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
             &mut completed,
             local_run,
             &mut served_by,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect("remote tensor dispatch");
@@ -239,6 +240,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
             &mut completed2,
             local_run,
             &mut served_by2,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect("second dispatch");
@@ -260,6 +262,7 @@ async fn tensor_transport_serves_real_expert_weights_over_quic() {
             &mut completed3,
             local_run,
             &mut err_out,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect_err("unhosted expert must fail, not fabricate");
@@ -354,6 +357,7 @@ async fn kill_switch_tripped_refuses_serving_honestly_over_quic() {
             &mut completed,
             local_run,
             &mut served_by,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect_err("tripped peer must refuse, not serve");
@@ -386,6 +390,7 @@ async fn kill_switch_tripped_refuses_serving_honestly_over_quic() {
             &mut completed2,
             |_x: &[f32]| anyhow::bail!("still no local weights"),
             &mut served_by2,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect("untripped peer must serve again");
@@ -476,6 +481,7 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
             &mut HashMap::new(),
             |_: &[f32]| anyhow::bail!("no local weights here"),
             &mut None,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect_err("blocked requester must be refused");
@@ -504,6 +510,7 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
             &mut HashMap::new(),
             |_: &[f32]| anyhow::bail!("no local weights here"),
             &mut served_by,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect("non-blocked requester must be served");
@@ -524,6 +531,8 @@ async fn peer_block_refuses_listed_requester_and_serves_others() {
 fn reference_swiglu(w: &jerith_mesh_core::expert_store::ExpertWeights, x: &[f32]) -> Vec<f32> {
     let act: Vec<f32> = w
         .gate
+        .as_ref()
+        .unwrap()
         .chunks(w.hidden)
         .zip(w.up.chunks(w.hidden))
         .map(|(gate_row, up_row)| {
@@ -1103,6 +1112,7 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
             &mut HashMap::new(),
             |_: &[f32]| anyhow::bail!("no local weights here"),
             &mut None,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect_err("the gate must refuse with an empty escrow");
@@ -1158,6 +1168,7 @@ async fn stake_gate_refuses_work_until_the_escrow_lands() {
             &mut HashMap::new(),
             |_: &[f32]| anyhow::bail!("no local weights here"),
             &mut served_by,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect("a primed escrow opens the gate");
@@ -1276,6 +1287,7 @@ async fn prefetch_after_serve_preloads_the_next_layer_over_quic() {
             &mut completed,
             move |_: &[f32]| anyhow::bail!("requester holds no local weights"),
             &mut served_by,
+            jerith_mesh_core::pipeline::RequestBudget::default(),
         )
         .await
         .expect("expert query served over the wire");

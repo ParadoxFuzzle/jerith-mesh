@@ -800,11 +800,23 @@ impl MeshFallbackChat {
         // Attribution comes from the router: `served_by` is the node id
         // that actually replied, None when the local weights ran.
         let mut served_by = None;
-        // §1 draft-expert scheduling: read live config EVERY dispatch —
-        // hot like the per-attempt policy knobs (privacy / prefetch), so
-        // the head-hop rule flips within one tick, no restart window.
-        self.router
-            .set_draft_priority(state.config.read().await.experts.draft_priority);
+        // §1 per-request budget AND its speculative sub-budget: read
+        // live config EVERY dispatch (hot like the per-attempt policy
+        // knobs — an operator can tighten or open a cap without a
+        // restart window) and land BOTH ledgers through the shared
+        // conversion (`budgets()` → `set_budgets`): the honest one comes
+        // back for the walk call while the spec one is held for the
+        // pre-flight gate. One snapshot, one install — the two budgets
+        // cannot drift (no separate conversion to forget); defaults stay
+        // exact parity until an operator tightens the spec caps, then
+        // speculation refuses first.
+        let config = state.config.read().await;
+        let budget = self.router.set_budgets(config.experts.budgets());
+        // §1 draft-expert scheduling: the flag rides the SAME live read
+        // as the budgets — one dispatch, one config snapshot.
+        let draft_priority = config.experts.draft_priority;
+        drop(config);
+        self.router.set_draft_priority(draft_priority);
         let dispatch_started = std::time::Instant::now();
         let out = self
             .router
@@ -819,6 +831,7 @@ impl MeshFallbackChat {
                 &mut completed,
                 local_run,
                 &mut served_by,
+                budget,
             )
             .await?;
         let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
@@ -865,9 +878,21 @@ impl MeshFallbackChat {
             return Vec::new();
         }
         let level = state.config.read().await.experts.replication_config();
+        let draft_pct = state.config.read().await.experts.draft_hot_percent;
         let stats = state.expert_stats_snapshot();
         let hot = stats.hot_set(config.hot_percent);
-        if hot.is_empty() {
+        // §1 phase 2 (draft hot set): the draft tier is demand-
+        // INDEPENDENT — derived from the hosted store, lowest-layer-
+        // first — and rides the SAME replication plan as hot members
+        // (draft members first, so their fetches are never dropped by
+        // the per-round action cap) while its pins keep the tier
+        // resident for real (eager load; never an eviction victim).
+        // This runs every round, so a knob flip or a rounding-differs
+        // set fades out pins within one interval, and the latch is
+        // honest when draft_hot_percent is 0 (an empty set clears).
+        let draft = crate::expert_stats::draft_set(&store.hosted(), draft_pct);
+        store.apply_draft_pins(&draft);
+        if hot.is_empty() && draft.is_empty() {
             return Vec::new();
         }
         // Addresses to dial: the expert-agnostic mesh view (chat/None), so
@@ -894,8 +919,15 @@ impl MeshFallbackChat {
             .collect();
         drop(reg);
         let local_hosted = store.hosted();
+        // The plan input: draft members first, then the demand hot set —
+        // deduped (a draft expert may also be demand-hot) but never
+        // reorder the demand tail.
+        let mut planned: Vec<String> = draft;
+        let seen: std::collections::HashSet<String> =
+            planned.iter().cloned().collect();
+        planned.extend(hot.into_iter().filter(|id| !seen.contains(id)));
         let actions = crate::replication::plan_replication(
-            &hot,
+            &planned,
             &local_hosted,
             &replica_peers,
             crate::replication::ReplicationConfig {
@@ -1019,6 +1051,13 @@ impl MeshFallbackChat {
         let endpoint = self.endpoint.clone();
         let identity = state.identity.clone();
         let local_closed = local_attempt.is_err();
+        // §1 per-request budget, carried into the chat lane: read live
+        // config EVERY fallback through the SAME shared conversion the
+        // expert dispatch uses — hot like that read (a cap change lands
+        // within one tick), so chat hops and expert hops live under the
+        // same mesh-spend policy the operator tunes. The chat walk has
+        // no speculative arms, so it takes only the pair's honest half.
+        let budget = state.config.read().await.experts.budgets().honest;
         match router
             .chat_over_quic(
                 &endpoint,
@@ -1028,6 +1067,7 @@ impl MeshFallbackChat {
                 messages,
                 &peers,
                 || local_attempt,
+                budget,
             )
             .await
         {
@@ -1113,11 +1153,32 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
     {
         plan.hot.push("experts.prefetch");
     }
+    // §1 per-request expert budget: read at every dispatch (same hot
+    // path shape), so a cap change lands within one tick.
+    if disk.experts.max_remote_attempts != live.experts.max_remote_attempts
+        || disk.experts.max_wire_bytes != live.experts.max_wire_bytes
+    {
+        plan.hot.push("experts.request_budget");
+    }
+    // §1 phase 3 (budgeted speculation): the speculative arms' sub-
+    // budget is re-installed every dispatch with the honest budget —
+    // same hot path shape.
+    if disk.experts.spec_max_remote_attempts != live.experts.spec_max_remote_attempts
+        || disk.experts.spec_max_wire_bytes != live.experts.spec_max_wire_bytes
+    {
+        plan.hot.push("experts.spec_budget");
+    }
     // §1 draft-expert scheduling: the dispatch loop re-reads the flag at
     // every dispatch (same hot path shape as the budget above), so the
     // head-hop rule flips within one tick.
     if disk.experts.draft_priority != live.experts.draft_priority {
         plan.hot.push("experts.draft_priority");
+    }
+    // §1 phase 2 (draft hot set): the replication round re-derives pins
+    // and plan membership from the live knob every interval, so a flip
+    // lands within one round — hot like the other demand-policy knobs.
+    if disk.experts.draft_hot_percent != live.experts.draft_hot_percent {
+        plan.hot.push("experts.draft_hot");
     }
     // Phase 3 async chat-walk knobs: the router reads them at boot (the
     // walk lives on a boot-built router), so changes warn restart-required
@@ -3151,6 +3212,84 @@ mod tests {
         assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
     }
 
+    #[test]
+    fn config_reload_plan_budget_knobs_are_hot() {
+        // §1 per-request expert budget: read at every dispatch, so a cap
+        // change lands within one tick — hot like privacy/prefetch, cold
+        // like the boot-frozen router knobs.
+        let live = NodeConfig::default();
+        let disk = NodeConfig {
+            experts: crate::config::ExpertStoreConfig {
+                max_remote_attempts: 16,
+                ..live.experts.clone()
+            },
+            ..NodeConfig::default()
+        };
+        let plan = plan_config_reload(&disk, &live);
+        assert!(
+            plan.hot.contains(&"experts.request_budget"),
+            "attempt-cap drift is hot: {plan:?}"
+        );
+        assert!(plan.cold.is_empty(), "no cold leak: {plan:?}");
+
+        let disk = NodeConfig {
+            experts: crate::config::ExpertStoreConfig {
+                max_wire_bytes: 1024,
+                ..live.experts.clone()
+            },
+            ..NodeConfig::default()
+        };
+        assert!(plan_config_reload(&disk, &live)
+            .hot
+            .contains(&"experts.request_budget"));
+
+        // Identical configs stay silent.
+        assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
+    }
+
+    #[test]
+    fn config_reload_plan_draft_hot_is_hot() {
+        // §1 phase 2 (draft hot set): the replication round re-derives
+        // pins + plan membership from the live knob each interval, so a
+        // percent flip is hot — never a restart-required cold key.
+        let live = NodeConfig::default();
+        let disk = NodeConfig {
+            experts: crate::config::ExpertStoreConfig {
+                draft_hot_percent: 20,
+                ..live.experts.clone()
+            },
+            ..NodeConfig::default()
+        };
+        let plan = plan_config_reload(&disk, &live);
+        assert!(
+            plan.hot.contains(&"experts.draft_hot"),
+            "a draft_hot_percent flip is hot: {plan:?}"
+        );
+        assert!(plan.cold.is_empty(), "no cold leak: {plan:?}");
+        assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
+    }
+
+    #[test]
+    fn config_reload_plan_spec_budget_is_hot() {
+        // §1 phase 3 (budgeted speculation): the speculative arms'
+        // sub-budget is re-installed with the honest budget at every
+        // dispatch, so a spec-cap change lands within one tick — hot.
+        let live = NodeConfig::default();
+        let disk = NodeConfig {
+            experts: crate::config::ExpertStoreConfig {
+                spec_max_wire_bytes: 1024,
+                ..live.experts.clone()
+            },
+            ..NodeConfig::default()
+        };
+        let plan = plan_config_reload(&disk, &live);
+        assert!(
+            plan.hot.contains(&"experts.spec_budget"),
+            "a spec-cap drift is hot: {plan:?}"
+        );
+        assert!(plan.cold.is_empty(), "no cold leak: {plan:?}");
+        assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
+    }
 
     #[test]
     fn config_reload_plan_draft_priority_is_hot() {
@@ -3174,6 +3313,7 @@ mod tests {
         // Identical configs stay silent.
         assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
     }
+
     #[test]
     fn meters_snapshot_resets() {
         let mut m = Meters {
