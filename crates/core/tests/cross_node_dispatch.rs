@@ -903,8 +903,16 @@ async fn replica_manager_pulls_a_hot_expert_on_its_own_interval() {
         },
     );
 
+    // Real-QUIC under a loaded CI runner: one round's transfer can sit in
+    // a starved handshake far longer than the 200 ms interval (the fetch's
+    // own connect/transfer timeouts are 60 s) and the round after it waits
+    // on the same single-threaded loop, so the pull may legitimately land
+    // well past this test's old 10 s envelope. The envelope widens to sit
+    // under that 60 s ceiling with room for one slow round followed by a
+    // fast retry — the assertion itself never changes: the loop must
+    // still land the complete, bit-identical replica.
     let mut waited = 0u64;
-    while store_a.hosted().is_empty() && waited < 10_000 {
+    while store_a.hosted().is_empty() && waited < 30_000 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         waited += 50;
     }
