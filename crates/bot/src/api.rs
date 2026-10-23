@@ -565,6 +565,33 @@ pub async fn chat_with_usage_live(
     let mut tools_enabled = cfg.web.enabled && prompt_requests_web(prompt)
         || (owner_privileged && !registry.enabled_skill_names().is_empty());
 
+    // Capability self-knowledge (2026-10-23 report: "the bot doesn't seem
+    // to realize it has vision models and other tools like web search").
+    // Two generated system lines, both honest by construction:
+    // 1. The STANDING multimodal note — every round, tools or not. The
+    //    bot-side lanes (converse.rs / audio.rs / video.rs) process
+    //    attachments before the model sees the turn, so the model walking
+    //    in has historically claimed it "cannot see images" while its own
+    //    vision tier was literally what produced the context it read.
+    // 2. When tools attach THIS request, the live registry's exact
+    //    callable-skill set (same generator as the payload's tools
+    //    array) — the model gets those names in prose, not just in the
+    //    declarations it loosely reads. On a tools-free round NOTHING is
+    //    advertised: a phantom claim is what the intent-JSON slop lives
+    //    on.
+    let capability_content = {
+        let mut s = String::from(CAPABILITY_NOTE);
+        if tools_enabled && let Some(skills) = registry.capabilities_prompt() {
+            s.push_str("\n\n");
+            s.push_str(&skills);
+        }
+        s
+    };
+    messages.insert(
+        persona_first as usize,
+        json!({"role": "system", "content": capability_content}),
+    );
+
     let mut rounds = 0usize;
     // One retry against a degenerate answer, whichever lane produced it.
     // The old `rounds == 0` gate skipped the retry whenever a tool round
@@ -945,6 +972,14 @@ pub const TRUNCATED_AT_CAP_NOTE: &str = "\n\n_(the reply hit the node's token ca
 /// never persists into caller history), converts those rounds back into
 /// plain-prose attempts.
 pub const PROSE_ANSWER_NUDGE: &str = "You must now answer the user in plain readable prose. Do not use any tools, and do not output JSON or object syntax — reply with the answer text itself.";
+
+/// The standing capability note every chat carries (first system block,
+/// right after the persona): what the bot-side lanes do to attachments
+/// BEFORE the model sees the turn, phrased as the bot's own senses. The
+/// honest-failure shape is included so the model treats `[file] (could
+/// not read: reason)` context lines as its own bot telling it the truth,
+/// consistent with the always-present skills section when one attaches.
+pub const CAPABILITY_NOTE: &str = "Senses note. The bot processes chat attachments before the conversation reaches the text model: images and videos are described frame-by-frame through the node's local VISION MODELS, audio is transcribed by local whisper, and other files are read in a disposable sandbox. Context lines shaped like `[ghost.png] (…description…)` or `[clip.mp4] frame 00:02: (…)` are what those models produced — treat them as what you actually SAW. When such a line says a file could not be read, report that honestly instead of guessing. Never claim you cannot see images: you can, through exactly that pipeline.";
 
 pub fn answer_is_degenerate(content: &str) -> bool {
     let t = content.trim();
@@ -1574,10 +1609,21 @@ mod tests {
             .route(
                 "/v1/chat/completions",
                 axum::routing::post(|axum::Json(req): axum::Json<Value>| async move {
+                    // The retry round is the one carrying HISTORY (the
+                    // "prior turn" assistant message) — round identity is
+                    // NOT message count: the standing capability system
+                    // block adds one system message to every round.
                     let reason = if req
                         .get("messages")
                         .and_then(|m| m.as_array())
-                        .is_some_and(|ms| ms.len() > 1)
+                        .is_some_and(|ms| {
+                            ms.iter().any(|m| {
+                                m["role"] == json!("assistant")
+                                    && m["content"]
+                                        .as_str()
+                                        .is_some_and(|c| c.contains("prior turn"))
+                            })
+                        })
                     {
                         // The retry round (history attached): a normal stop.
                         "stop"
@@ -2043,6 +2089,109 @@ mod tests {
             both.contains("\"title\":\"K\"") && both.contains("kiln spec text"),
             "search + fetch results flowed back: {both}"
         );
+    }
+
+    /// Capability self-knowledge (2026-10-23 report): every chat carries
+    /// the standing senses note, and a tools-attached chat ALSO carries
+    /// the exact callable-skill list generated from the payload's own
+    /// tools array — while a tools-free chat advertises nothing (a skill
+    /// named without its declaration is phantom-intent material).
+    #[tokio::test]
+    async fn chat_announces_its_capabilities_in_the_system_block() {
+        let seen_chat: std::sync::Arc<tokio::sync::Mutex<Vec<Value>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = seen_chat.clone();
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get(|| async { axum::Json(json!({ "model": "mock:8b" })) }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(req): axum::Json<Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().await.push(req.clone());
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(json!({
+                                "choices": [{
+                                    "message": {"role": "assistant", "content": "short answer"}
+                                }]
+                            })),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg =
+            crate::config::BotConfig::from_parts(&format!("http://{addr}"), "http://127.0.0.1:1");
+        // Factual opener → tools attach → the system block carries the
+        // senses note AND the live skill list (wire names only).
+        chat_with_usage(&cfg, "what is a kiln", &[])
+            .await
+            .expect("tools-attached chat");
+        {
+            let seen = seen_chat.lock().await;
+            let sys: Vec<String> = seen[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == json!("system"))
+                .filter_map(|m| m["content"].as_str().map(|s| s.to_string()))
+                .collect();
+            assert!(
+                sys.iter().any(|s| s.starts_with("Senses note")),
+                "the senses note rides every chat: {sys:?}"
+            );
+            let skills = sys
+                .iter()
+                .find(|s| s.contains("The skills below are attached to THIS chat"))
+                .expect("tools-attached chat advertises its skills");
+            for expect in ["- web_search —", "- web_fetch —"] {
+                assert!(skills.contains(expect), "advertised {expect}: {skills}");
+            }
+            // Same generator as the payload: every advertised name is
+            // declared in the same request's tools array.
+            let declared: Vec<String> = seen[0]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            assert!(declared.iter().any(|n| n == "web_search"));
+        }
+
+        // Web off: the note still rides, the skills section does NOT —
+        // never advertise a skill the payload does not declare.
+        cfg.web.enabled = false;
+        chat_with_usage(&cfg, "just say hi to your friends", &[])
+            .await
+            .expect("plain chat");
+        {
+            let seen = seen_chat.lock().await;
+            let last = &seen[seen.len() - 1];
+            let msgs = last["messages"].as_array().unwrap();
+            assert!(msgs.iter().any(|m| {
+                m["role"] == json!("system")
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with("Senses note"))
+            }));
+            assert!(
+                !msgs.iter().any(|m| m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("The skills below are attached"))),
+                "no phantom skill advertising on a tools-free round"
+            );
+        }
     }
 
     /// Runtime answers tool intents as plain JSON content (qwen3:8b via

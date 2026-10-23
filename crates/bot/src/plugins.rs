@@ -703,6 +703,49 @@ impl SkillRegistry {
             .collect()
     }
 
+    /// The system-prompt section that TELLS the model what it can summon —
+    /// generated from the SAME source the payload's `tools` array comes
+    /// from ([`Self::tool_defs`]), so prompt and declarations can never
+    /// disagree (2026-10-23 report: "the bot doesn't realize it has web
+    /// search": the workspace persona advertised the OpenClaw-era shell
+    /// tools, so the only truthful picture of the real surface was the
+    /// bare tools array, which many runtimes read loosely). Call it ONLY
+    /// when the chat actually attaches the tools array — advertising a
+    /// skill whose declaration is absent invites phantom intent JSON that
+    /// the degenerate-retry path must mop up. `None` when nothing is
+    /// attached.
+    pub fn capabilities_prompt(&self) -> Option<String> {
+        let defs = self.tool_defs();
+        if defs.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "The skills below are attached to THIS chat as callable tools. \
+Use one whenever it helps the answer — call it as a standard function \
+call (the wire name is given) and treat the returned text as context \
+you gathered:\n",
+        );
+        for def in &defs {
+            let f = def.get("function");
+            let name = f
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let desc = f
+                .and_then(|f| f.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            out.push_str("- ");
+            out.push_str(name);
+            if !desc.is_empty() {
+                out.push_str(" — ");
+                out.push_str(desc);
+            }
+            out.push('\n');
+        }
+        Some(out)
+    }
+
     /// Names of enabled skills — the dispatch whitelist (the model can
     /// never summon a disabled or unknown tool). In-tree names come back
     /// first, then the enabled external ones.
@@ -845,6 +888,41 @@ mod tests {
         assert_eq!(names.len(), 13);
         assert!(!names.iter().any(|n| n.contains("squeeze")));
         assert!(!names.iter().any(|n| n.starts_with("workflow.")));
+    }
+
+    #[test]
+    fn capabilities_prompt_lists_enabled_skills_and_respects_gating() {
+        let full = SkillRegistry::standard(PREPACKAGED_PLUGINS);
+        let prompt = full
+            .capabilities_prompt()
+            .expect("a live gate yields a section");
+        // Wire names (what the tool declarations carry), not dot names.
+        for expect in [
+            "- web_search —",
+            "- web_fetch —",
+            "- vision_describe —",
+            "- memory_embed —",
+        ] {
+            assert!(prompt.contains(expect), "advertised {expect}: {prompt}");
+        }
+        assert!(
+            !prompt.contains("memory.embed"),
+            "the model must never be shown an unreachable dot name"
+        );
+        assert!(
+            prompt.contains("Search the public web (Brave Search API)"),
+            "each line carries the skill's own description"
+        );
+
+        // Disabled plugin → its skills are never advertised.
+        let partial = SkillRegistry::standard(["websearch"]);
+        let p = partial.capabilities_prompt().unwrap();
+        assert!(p.contains("- web_search —"));
+        assert!(!p.contains("memory"));
+
+        // Nothing enabled → no section at all (never advertise air).
+        let off = SkillRegistry::standard(Vec::<String>::new());
+        assert!(off.capabilities_prompt().is_none());
     }
 
     #[test]
