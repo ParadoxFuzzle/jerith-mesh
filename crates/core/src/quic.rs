@@ -3394,49 +3394,91 @@ mod tests {
         ];
         let local_down =
             |_: &[f32]| -> anyhow::Result<Vec<f32>> { anyhow::bail!("no local weights here") };
+        // Each leg is a REAL-QUIC race on a loaded CI runner: the
+        // intended hop's dial must beat the hedge-staggered contender
+        // inside one connection setup. One unlucky slow handshake flips
+        // WHICH peer answered (loaded-runner flake family, macOS parity
+        // green the same run) and is exactly the scheduling noise the
+        // other realtime routing tests tolerate with bounds. So each leg
+        // retries with a FRESH req_id; every attempt keeps the full
+        // assertions (intended peer + intended math) — a retry never
+        // accepts a wrong serve, it only absorbs transient loss.
+        #[allow(clippy::too_many_arguments)]
+        async fn leg(
+            r: &ExpertRouter,
+            client: &quinn::Endpoint,
+            identity: &SigningIdentity,
+            addrs: &HashMap<String, std::net::SocketAddr>,
+            peers: &[crate::quic::MeshCandidate],
+            local_down: &impl Fn(&[f32]) -> anyhow::Result<Vec<f32>>,
+            req_id: &str,
+            draft_on: bool,
+            want: &str,
+            want_out: &[f32],
+        ) {
+            {
+                for attempt in 0..3usize {
+                    let mut completed = HashMap::new();
+                    let mut served = None;
+                    // Explicit per attempt (not order-dependent): the knob
+                    // is process-global, so each leg pins its own position.
+                    r.set_draft_priority(draft_on);
+                    let out = r
+                        .execute_over_quic_speculative_attributed(
+                            client,
+                            identity,
+                            addrs,
+                            &format!("{req_id}-{attempt}"),
+                            "exp.test",
+                            &[2.0],
+                            peers,
+                            &mut completed,
+                            local_down,
+                            &mut served,
+                            crate::pipeline::RequestBudget::default(),
+                        )
+                        .await
+                        .unwrap();
+                    if served.as_deref() == Some(want) {
+                        assert_eq!(out, want_out);
+                        return;
+                    }
+                    eprintln!(
+                        "leg {req_id}: attempt {attempt} answered from {:?} (want {want}) — retrying",
+                        served
+                    );
+                }
+                panic!("leg {req_id}: intended hop {want} never served the answer in 3 attempts");
+            }
+        }
         // Knob off: the resource-rich FAR peer leads and serves.
-        let mut completed = HashMap::new();
-        let mut served = None;
-        let out = r
-            .execute_over_quic_speculative_attributed(
-                &client,
-                &identity,
-                &addrs,
-                "draft-off",
-                "exp.test",
-                &[2.0],
-                &peers,
-                &mut completed,
-                local_down,
-                &mut served,
-                crate::pipeline::RequestBudget::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(served.as_deref(), Some(far_node.as_str()));
-        assert_eq!(out, vec![14.0], "the far peer's ×7 math served it");
+        leg(
+            &r,
+            &client,
+            &identity,
+            &addrs,
+            &peers,
+            &local_down,
+            "draft-off",
+            false,
+            far_node.as_str(),
+            &[14.0],
+        )
+        .await;
         // Knob on: the NEAREST holder leads and serves.
-        r.set_draft_priority(true);
-        let mut completed = HashMap::new();
-        let mut served = None;
-        let out = r
-            .execute_over_quic_speculative_attributed(
-                &client,
-                &identity,
-                &addrs,
-                "draft-on",
-                "exp.test",
-                &[2.0],
-                &peers,
-                &mut completed,
-                local_down,
-                &mut served,
-                crate::pipeline::RequestBudget::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(served.as_deref(), Some(near_node.as_str()));
-        assert_eq!(out, vec![6.0], "the near peer's ×3 math served it");
+        leg(
+            &r,
+            &client,
+            &identity,
+            &addrs,
+            &peers,
+            &local_down,
+            "draft-on",
+            true,
+            near_node.as_str(),
+            &[6.0],
+        )
+        .await;
         // The fall-through stays intact: only the HEAD moved, the far
         // peer is still in the plan behind the near one.
         let plan_ids: Vec<String> = r
