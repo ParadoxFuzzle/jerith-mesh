@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/node", "crates/bot", "crates/gcp-bridge", "crates/plugin-template"]
+members = ["crates/node", "crates/bot", "crates/gcp-bridge", "crates/plugin-template", "crates/pet-plugin"]
 resolver = "2"
 
 [workspace.package]

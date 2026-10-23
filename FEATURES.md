@@ -343,6 +343,13 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     + `jerith-plugin-example` demo + copyable `plugin.toml`); Python:
     `sdk/python/jerith_plugin.py` (stdlib-only single file). CI pins
     template ⇄ parser agreement; RUNBOOK has the five-minute lane.
+    Second live consumer ✅ **the mesh pet** (`crates/pet-plugin/`,
+    2026-10-23): a persistent void-companion over the same contract
+    (`pet.look/talk/feed/play/rename`, state decayed in real time and
+    persisted across restarts; `external:pet` gate row). Its build
+    also fixed the example's latent manifest-parse boot bug
+    (document TOML needs `toml::from_str::<toml::Table>`, now pinned
+    on both crates).
   - Model-tool registry dispatch is whitelist-only: a disabled or unknown
     skill is refused to the model (fed back as an error it can recover
     from), never a chat failure — unit-tested (registry, gating, dispatch,

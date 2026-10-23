@@ -2306,6 +2306,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jerith-pet-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jerith-plugin-template",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "jerith-plugin-template"
 version = "0.1.0"
 dependencies = [

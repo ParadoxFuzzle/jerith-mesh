@@ -59,9 +59,13 @@ async fn roll(args: Value) -> Result<Value, String> {
 /// straight out of the manifest — one file rules both halves.
 fn read_manifest(path: &str) -> Result<(std::net::SocketAddr, Option<String>)> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("reading manifest {path}"))?;
-    let file: toml::Value = raw
-        .parse()
-        .with_context(|| format!("{path}: not valid TOML"))?;
+    // Document parse (toml::Table), NOT `raw.parse::<toml::Value>()` —
+    // a Value's FromStr only accepts ONE value, so a whole manifest
+    // string fails with «unexpected content, expected nothing» and the
+    // example could never boot (found live 2026-10-23 while building
+    // the pet, the SDK's second consumer).
+    let file: toml::Table =
+        toml::from_str(&raw).with_context(|| format!("{path}: not valid TOML"))?;
     let plugin = file
         .get("plugin")
         .and_then(toml::Value::as_table)
@@ -97,4 +101,50 @@ async fn main() -> Result<()> {
         .handler("example.roll", skill(roll))
         .serve(addr)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SHIPPED manifest must stay servable by THIS binary: document
+    /// parses, the endpoint binds (loopback literal), the secret is
+    /// set, and the two declared rows are the two handlers registered
+    /// above. Boot-time failures are boot-time failures forever after.
+    #[test]
+    fn shipped_manifest_fits_this_binary() {
+        let raw = include_str!("../plugin.toml");
+        let file: toml::Table =
+            toml::from_str(raw).expect("shipped manifest is valid TOML (document parse)");
+        let plugin = file
+            .get("plugin")
+            .expect("[plugin] table")
+            .as_table()
+            .expect("[plugin] is a table");
+        assert_eq!(
+            plugin.get("id").and_then(toml::Value::as_str),
+            Some("example")
+        );
+        let addr = endpoint_addr(
+            plugin
+                .get("endpoint")
+                .and_then(toml::Value::as_str)
+                .expect("endpoint line"),
+        )
+        .expect("endpoint binds");
+        assert!(addr.ip().is_loopback(), "loopback by contract");
+        assert!(addr.port() != 7789, "the pet's port belongs to the pet");
+        assert!(
+            plugin.get("secret").and_then(toml::Value::as_str).is_some(),
+            "ships signed by default"
+        );
+        let names: Vec<&str> = file
+            .get("skill")
+            .and_then(toml::Value::as_array)
+            .expect("[[skill]] rows")
+            .iter()
+            .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["echo", "roll"], "the two demo handlers");
+    }
 }

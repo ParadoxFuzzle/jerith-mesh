@@ -1369,6 +1369,30 @@ shipped template manifest is pinned by a bot test
 and parser cannot drift silently. Reference plugin in production:
 `crates/gcp-bridge` (the same contract at fleet scale).
 
+A lived-in second consumer to crib from beyond the demos — **the mesh
+pet**, `crates/pet-plugin/` (2026-10-23): a persistent void-companion
+over the same signed `/rpc` contract. Five skills (`pet.look / talk /
+feed / play / rename`), one small JSON state file whose experience
+decays in real time between calls and survives restarts. The manifest
+discipline is the same as above — and its own tests pin the other
+half (declared rows = registered handlers). The five-min
+lane in its copyable manifest comment is identical to the example's:
+
+```bash
+mkdir -p ~/.jerith-mesh/plugins.d/pet
+cp crates/pet-plugin/plugin.toml ~/.jerith-mesh/plugins.d/pet/
+cargo run -p jerith-pet-plugin --bin jerith-pet &
+edit ~/.jerith-mesh/bot.toml        # add "external:pet" to [plugins] enabled
+systemctl --user restart jerith-bot # then just talk to it in chat
+```
+
+History note for SDK authors: the pet build caught a latent boot bug
+in the example's `read_manifest` — `"…".parse::<toml::Value>()` only
+accepts ONE value, so a whole manifest document failed "unexpected
+content, expected nothing". Document parsing is
+`toml::from_str::<toml::Table>`; both crates' main.rs now do that and
+pin their shipped manifests by test (2026-10-23).
+
 ## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is

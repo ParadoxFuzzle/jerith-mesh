@@ -422,6 +422,28 @@ description = "Multi-day forecast."
         assert!(p.secret.is_some(), "template ships signed by default");
     }
 
+    /// Same pin discipline for the mesh pet (`crates/pet-plugin/`, the
+    /// SDK's second real consumer): the pet's shipped manifest must
+    /// parse under today's drop rules — five skills, gated as
+    /// `external:pet`, signed by default. The pet plugin's OWN test
+    /// pins the other direction (its declared rows = the handlers its
+    /// bin registers), so neither half can drift the union away.
+    #[test]
+    fn shipped_pet_manifest_parses_under_todays_rules() {
+        let raw = include_str!("../../pet-plugin/plugin.toml");
+        let p = ExternalPlugin::parse(Path::new("pet-plugin/plugin.toml"), raw)
+            .expect("the shipped pet manifest must stay valid");
+        assert_eq!(p.id, "pet");
+        assert_eq!(p.gate_id(), "external:pet");
+        let mut names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["pet.feed", "pet.look", "pet.play", "pet.rename", "pet.talk"]
+        );
+        assert!(p.secret.is_some(), "pet ships signed by default");
+    }
+
     #[test]
     fn missing_drop_dir_is_empty_not_error() {
         let ghost = std::env::temp_dir().join("jerith-ext-nope-does-not-exist");

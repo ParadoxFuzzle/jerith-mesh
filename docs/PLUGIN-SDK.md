@@ -166,7 +166,13 @@ reactions and message chunking differ per transport).
    test (`shipped_template_manifest_parses_under_todays_rules`) parses
    the shipped manifest with the drop parser — template and parser
    cannot drift silently. The community README is RUNBOOK's "Author a
-   plugin" section.
+   plugin" section. Second live consumer: the mesh pet
+   (`crates/pet-plugin/`, 2026-10-23 — `pet.look/talk/feed/play/rename`
+   on the same signed contract with persisted, time-decayed state).
+   Its build caught the example's latent `parse::<toml::Value>()`
+   manifest-parse boot bug (full-document manifests must be
+   `toml::from_str::<toml::Table>`); fixed and pinned by tests in
+   both crates' binaries the same day.
 
 ## What would falsify this design
 

@@ -1,0 +1,46 @@
+# The mesh pet — a void-companion that lives over the signed plugin
+# contract (docs/PLUGIN-SDK.md; the SDK's second real consumer after the
+# example). Install:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/pet
+#   cp crates/pet-plugin/plugin.toml ~/.jerith-mesh/plugins.d/pet/
+#   cargo run -p jerith-pet-plugin --bin jerith-pet   # from the repo
+#   # then add "external:pet" to [plugins] enabled in bot.toml + restart
+#
+# ONE endpoint line binds BOTH sides, same rule as the example: the
+# binary reads it and binds that address, so manifest and service
+# cannot drift. Loopback by default; non-loopback must be https (the
+# drop parser enforces this, fail-closed at bot start). State is NOT
+# this file: it lives at `$JERITH_PET_STATE` or
+# `<home>/.jerith-mesh/pet/state.json`.
+
+[plugin]
+id = "pet"
+endpoint = "http://127.0.0.1:7789/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 10                         # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "look"
+description = "Look in on the pet: full state card (name, stage, mood, food, energy, bond, memories) plus one line in its own voice. Costs nothing, asks nothing, but time passes."
+parameters = { type = "object" }
+
+[[skill]]
+name = "talk"
+description = "Pass the owner's last words down as one short note (≤ 200 chars). The pet keeps the last eight and weaves them into what it says back; a repeated note earns nothing."
+parameters = { type = "object", properties = { note = { type = "string", description = "What the owner just said, summarized in their voice" } }, required = ["note"] }
+
+[[skill]]
+name = "feed"
+description = "Feed the pet one treat: +30 satiation (refuses when nearly full). Cooldown ~5 minutes, enforced over the wire as a typed error."
+parameters = { type = "object" }
+
+[[skill]]
+name = "play"
+description = "Play one game: bond +12, mood up, but a quarter of the pet's energy spent and it gets hungrier. Refuses honestly when too tired. Cooldown ~30 minutes."
+parameters = { type = "object" }
+
+[[skill]]
+name = "rename"
+description = "Name or rename the pet (≤ 24 characters). A name given in the dark is kept."
+parameters = { type = "object", properties = { name = { type = "string" } }, required = ["name"] }

@@ -177,11 +177,11 @@ pub fn router(state: Arc<ServerConfig>) -> Router {
 
 async fn rpc(State(cfg): State<Arc<ServerConfig>>, headers: HeaderMap, body: String) -> Response {
     // ---- 1. Auth (before anything else runs) --------------------------
-    if let Some(secret) = &cfg.secret {
-        if let Err(msg) = verify_request(secret, &headers, &body) {
-            tracing::warn!(plugin = %cfg.id, msg = %msg, "unsigned/refused request");
-            return (StatusCode::FORBIDDEN, error_json(&msg)).into_response();
-        }
+    if let Some(secret) = &cfg.secret
+        && let Err(msg) = verify_request(secret, &headers, &body)
+    {
+        tracing::warn!(plugin = %cfg.id, msg = %msg, "unsigned/refused request");
+        return (StatusCode::FORBIDDEN, error_json(&msg)).into_response();
     }
 
     // ---- 2. Parse the one round trip --------------------------------
