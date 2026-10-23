@@ -1302,9 +1302,18 @@ async fn prefetch_after_serve_preloads_the_next_layer_over_quic() {
     assert_eq!(served_by.as_deref(), Some(identity.node_id().as_str()));
     assert!(!out.is_empty());
 
-    // The prefetch walk is spawned, not awaited; give it a moment, then
-    // prove the outcome on the store.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The prefetch walk is spawned, not awaited; PROVE the outcome on
+    // the store instead of sleeping a fixed beat: a loaded CI runner can
+    // starve the spawned walk well past any fixed delay (the same
+    // loaded-runner family the other timing envelopes tolerate). Poll
+    // until the LAST ranked prefetch (L1.E2) is resident — that proves
+    // the cap-firing walk got to its second action — then assert the
+    // full bundle.
+    let mut waited = 0u64;
+    while !store.is_resident("L1.E2") && waited < 10_000 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 50;
+    }
     let s = store.stats();
     assert_eq!(s.prefetches, 2, "L1.E1 then L1.E2 preloaded (demand-rank)");
     assert!(store.is_resident("L1.E1"));

@@ -5453,8 +5453,14 @@ mod chat_walk_tests {
         let elapsed = started.elapsed();
         assert_eq!(served_by, fast_node, "the fast contender must win");
         assert_eq!(content, "fast");
+        // Loaded-runner envelope: the point is NOT the 2 s number, it is
+        // that the hedge never pays the serial walk's ~8–9 s price. A
+        // starved handshake can legitimately push the fast answer past a
+        // tight 2 s box while the (7.7 s) race window stays decisive, so
+        // the envelope sits at half the slow peer's delay — still strictly
+        // below what serial walking costs.
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < Duration::from_secs(4),
             "hedged walk answered in {elapsed:?}; the serial walk would pay ~8s"
         );
         // The winner is booked clean and the cancelled slow dial booked
