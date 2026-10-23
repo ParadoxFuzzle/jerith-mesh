@@ -134,20 +134,19 @@ pub struct ScanReport {
 // ---------------------------------------------------------------------------
 
 /// Obfuscator fingerprints (the 2026-10-23 sample was ZKM-packed).
-pub const OBFUSCATOR_MARKS: &[&'static str] =
-    &["ZKM", "Allatori", "Karakuri", "Stringer", "yGuard"];
+pub const OBFUSCATOR_MARKS: &[&str] = &["ZKM", "Allatori", "Karakuri", "Stringer", "yGuard"];
 
 /// Process spawn — `Runtime`/`ProcessBuilder` identifiers travel WHOLE
 /// inside a class's constant pool, so an inflated class exposes them
 /// as contiguous strings even when its own literals are noise.
-pub const SPAWN_MARKS: &[&'static str] = &[
+pub const SPAWN_MARKS: &[&str] = &[
     "java/lang/ProcessBuilder",
     "java/lang/Runtime",
     "getRuntime",
 ];
 
 /// Network bootstrap (`Socket`, `HttpURLConnection`, raw `java/net/URL`).
-pub const NET_MARKS: &[&'static str] = &[
+pub const NET_MARKS: &[&str] = &[
     "java/net/Socket",
     "java/net/HttpURLConnection",
     "java/net/URL",
@@ -155,7 +154,7 @@ pub const NET_MARKS: &[&'static str] = &[
 
 /// File-plant / persistence — `setExecutable` and `FileOutputStream`
 /// are the plant-and-stage half of every Java dropper chain.
-pub const PLANT_MARKS: &[&'static str] = &["setExecutable", "java/io/FileOutputStream"];
+pub const PLANT_MARKS: &[&str] = &["setExecutable", "java/io/FileOutputStream"];
 
 /// Native-executable magic at file/entry offset 0. Java classes carry
 /// the CAFEBABE magic too, but a scanned ENTRY keeps its own magic
@@ -185,16 +184,16 @@ pub fn runs_of_printable(bytes: &[u8], min: usize) -> Vec<String> {
             if start.is_none() {
                 start = Some(i);
             }
-        } else if let Some(s) = start.take() {
-            if i - s >= min {
-                out.push(String::from_utf8_lossy(&bytes[s..i]).into_owned());
-            }
+        } else if let Some(s) = start.take()
+            && i - s >= min
+        {
+            out.push(String::from_utf8_lossy(&bytes[s..i]).into_owned());
         }
     }
-    if let Some(s) = start {
-        if bytes.len() - s >= min {
-            out.push(String::from_utf8_lossy(&bytes[s..]).into_owned());
-        }
+    if let Some(s) = start
+        && bytes.len() - s >= min
+    {
+        out.push(String::from_utf8_lossy(&bytes[s..]).into_owned());
     }
     out
 }
@@ -208,7 +207,7 @@ pub fn contains_marks(content: &[u8], marks: &[&'static str]) -> Vec<&'static st
     // than a stray two-letter spill but shorter than API identifiers.
     for run in runs_of_printable(content, 3) {
         for m in marks {
-            if run.contains(m) && !hits.contains(&m) {
+            if run.contains(m) && !hits.contains(m) {
                 hits.push(m);
             }
         }
@@ -936,7 +935,7 @@ mod tests {
         }
         let rows = load_reports(&p, 5);
         assert_eq!(rows.len(), 5);
-        assert_eq!(rows.iter().next().unwrap().path, "row-2");
+        assert_eq!(rows.first().unwrap().path, "row-2");
         assert_eq!(rows.iter().last().unwrap().path, "row-6");
         let _ = std::fs::remove_file(&p);
     }

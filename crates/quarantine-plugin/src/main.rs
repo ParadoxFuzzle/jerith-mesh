@@ -31,7 +31,7 @@ use jerith_quarantine_plugin::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
@@ -84,8 +84,8 @@ pub fn watch_dir() -> PathBuf {
 /// log, log-loud anything strong. Returns what landed (tested via the
 /// lib; here it is only bookkeeping).
 async fn tick(
-    dir: &PathBuf,
-    state: &PathBuf,
+    dir: &Path,
+    state: &Path,
     known: &AsyncMutex<HashMap<(String, u64, u64), ScanReport>>,
 ) -> Vec<ScanReport> {
     let mut k = known.lock().await;
@@ -127,10 +127,10 @@ fn report_card(r: &ScanReport) -> Value {
 /// Scan a path the chat names: single file → one report; directory →
 /// an on-demand sweep with the same settle/known semantics as the
 /// watcher (bounded at 200 files so one invite can't bloat the lane).
-async fn do_scan(path: Option<&str>, dir: &PathBuf, state: &PathBuf) -> Result<Value, String> {
+async fn do_scan(path: Option<&str>, dir: &Path, state: &Path) -> Result<Value, String> {
     let target: PathBuf = match path {
         Some(p) if !p.trim().is_empty() => PathBuf::from(shellexpand(p.trim())),
-        None | Some(_) => dir.clone(),
+        None | Some(_) => dir.to_path_buf(),
     };
     let now = now_ms();
     if target.is_file() {
@@ -211,17 +211,17 @@ async fn do_scan(path: Option<&str>, dir: &PathBuf, state: &PathBuf) -> Result<V
 /// `~` for the brief handed-down path (a convenience skill arg, not a
 /// prefix expansion — anything else passes through untouched).
 fn shellexpand(p: &str) -> String {
-    if p == "~" || p.starts_with("~/") {
-        if let Some(home) = std::env::var("HOME").ok() {
-            return p.replacen('~', &home, 1);
-        }
+    if (p == "~" || p.starts_with("~/"))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return p.replacen('~', &home, 1);
     }
     p.to_string()
 }
 
 /// The verdict log's tail + counts — the shape the briefing's section
 /// renders and the owner's monotree/journal reads back.
-async fn do_recent(state: &PathBuf, dir: &PathBuf) -> Result<Value, String> {
+async fn do_recent(state: &Path, dir: &Path) -> Result<Value, String> {
     let all = load_reports(state, 500);
     let (b, s, m) = counts(&all);
     let tail: Vec<Value> = all.iter().rev().take(8).map(report_card).collect();
@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
 /// restart rescan would DOUBLE every verdict line — the log itself is
 /// the memory of what's been judged (name+size+mtime keys ride the
 /// rows' own fields).
-fn primed(state: &PathBuf, dir: &PathBuf) -> HashMap<(String, u64, u64), ScanReport> {
+fn primed(state: &Path, dir: &Path) -> HashMap<(String, u64, u64), ScanReport> {
     let mut known: HashMap<(String, u64, u64), ScanReport> = HashMap::new();
     for r in load_reports(state, 500) {
         // The row's path+size is the identity; mtime is re-read live

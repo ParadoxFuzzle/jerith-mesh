@@ -709,7 +709,7 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 pub fn rfc5322_date(ms: u64) -> String {
     let (y, m, d, h, mi, s) = civil_from_ms(ms);
     // 1970-01-01 was a Thursday (4)
-    let wd = WEEKDAYS[(((ms / 1000) / 86_400 as u64 + 4) % 7) as usize];
+    let wd = WEEKDAYS[(((ms / 1000) / 86_400 + 4) % 7) as usize];
     format!(
         "{wd}, {d:02} {} {y} {h:02}:{mi:02}:{s:02} +0000",
         MONTHS[(m - 1) as usize]

@@ -25,7 +25,7 @@ use jerith_plugin_template::{SkillServer, endpoint_addr, skill};
 
 use jerith_ledger_plugin::{LedgerError, age_word, civil_day_of, load, save, state_path};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -82,7 +82,7 @@ fn entry_card(e: &jerith_ledger_plugin::Entry, now: u64) -> Value {
 }
 
 /// The list card — the briefing renders from exactly this (+ capped).
-fn do_list(state: &PathBuf) -> Result<Value, String> {
+fn do_list(state: &Path) -> Result<Value, String> {
     let now = now_ms();
     let l = load(state);
     let open: Vec<Value> = l
@@ -101,7 +101,7 @@ fn do_list(state: &PathBuf) -> Result<Value, String> {
     }))
 }
 
-async fn do_add(state: &PathBuf, args: &Value) -> Result<Value, String> {
+async fn do_add(state: &Path, args: &Value) -> Result<Value, String> {
     let task = args["task"].as_str().unwrap_or("");
     let note = args["note"].as_str().map(str::to_string);
     let mut l = load(state);
@@ -129,7 +129,7 @@ async fn do_add(state: &PathBuf, args: &Value) -> Result<Value, String> {
     }
 }
 
-async fn do_close(state: &PathBuf, args: &Value, drop_instead: bool) -> Result<Value, String> {
+async fn do_close(state: &Path, args: &Value, drop_instead: bool) -> Result<Value, String> {
     let id = match args["id"].as_u64() {
         Some(i) => i,
         None => return Err("an entry id is required (from `ledger.list`)".into()),
