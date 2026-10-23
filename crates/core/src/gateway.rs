@@ -1003,6 +1003,13 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
                 // hop leads by pure RTT (the draft must not wait behind
                 // a slower, resource-richer peer).
                 "draft_priority": cfg.experts.draft_priority,
+                // §1 phase 2 (draft hot set): the always-resident tier —
+                // the knob and the ids actually pinned right now (the
+                // lowest-layer slice the replication round derives from
+                // the hosted store when the knob is on).
+                "draft_hot_percent": cfg.experts.draft_hot_percent,
+                "draft_pinned": store.pinned_ids(),
+                "pinned_resident_bytes": store.resident_bytes(),
                 "cold_placements": cold_placements,
                 "shard_ring_nodes": ring.members().len(),
                 "replication": {

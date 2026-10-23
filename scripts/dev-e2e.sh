@@ -38,6 +38,52 @@ B_GW="${E2E_B_GATEWAY_PORT:-8910}"
 B_RPC="${E2E_B_RPC_PORT:-8911}"
 PIDS=()
 
+# ==> 0: port preflight — fail FAST, not at step 5b.
+#
+# A busy default port used to surface far downstream as a silent,
+# misleading failure (node A never binds → the replication leg waits out
+# its full timeout against a node that was never alive — 2026-10-23,
+# live mesh node holding 8900/9000). Preflight instead: any of THIS
+# run's six ports (bootstrap/runtime TCP, gateways TCP, QUIC rpc UDP)
+# held by something else aborts with the exact override to set.
+preflight_ports() {
+  command -v ss >/dev/null 2>&1 || return 0  # no listener table → skip best-effort
+  local tcp udp spec name port proto def e hit
+  tcp="$(ss -ltnH 2>/dev/null | awk '{print $4}' || true)"
+  udp="$(ss -lnuH 2>/dev/null | awk '{print $4}' || true)"
+  spec=(
+    "bootstrap $BOOT_PORT E2E_BOOT_PORT tcp"
+    "runtime $RUNTIME_PORT E2E_RUNTIME_PORT tcp"
+    "node A gateway $A_GW E2E_A_GATEWAY_PORT tcp"
+    "node A rpc(quic) $A_RPC E2E_A_RPC_PORT udp"
+    "node B gateway $B_GW E2E_B_GATEWAY_PORT tcp"
+    "node B rpc(quic) $B_RPC E2E_B_RPC_PORT udp"
+  )
+  for e in "${spec[@]}"; do
+    read -r name port def proto <<<"$e"
+    if [ "$proto" = tcp ]; then
+      grep -qE "[.:]${port}"$ <<<"$tcp" && hit=1 || hit=0
+    else
+      grep -qE "[.:]${port}"$ <<<"$udp" && hit=1 || hit=0
+    fi
+    [ "$hit" = 1 ] || continue
+    if [ -n "${!def:-}" ]; then
+      echo "FATAL: $name port $port (you set $def) is already held — pick a free port." >&2
+    else
+      echo "FATAL: $name port $port is already HELD (your live node, most likely)." >&2
+      echo "       Override it, e.g.: $def=$((port + 10000)) — the same for the other E2E_*_PORT" >&2
+      echo "       vars you leave on defaults, or stop the live service. Set" >&2
+      echo "       E2E_CHECK_PORTS=0 to run the default ports anyway (the old" >&2
+      echo "       silent-garbage behavior)." >&2
+    fi
+    exit 1
+  done
+  echo "   ports clear: $BOOT_PORT/$RUNTIME_PORT tcp, $A_GW+$A_RPC, $B_GW+$B_RPC"
+}
+if [ "${E2E_CHECK_PORTS:-1}" = 1 ]; then
+  preflight_ports
+fi
+
 cleanup() {
   if [ "$KEEP" = "1" ]; then
     echo "==> E2E_KEEP=1: leaving the stack up (PIDs: ${PIDS[*]})"
@@ -158,6 +204,17 @@ JSON
   else
     printf '\n[experts]\nreplication_interval_secs = 30\n' >> "$home/config.toml"
   fi
+  # E2E_DRAFT_HOT=1 arms the §1 phase-2 draft hot set for this run: 50 %
+  # of hosted (one expert here) pinned always-resident + replicated. The
+  # knob is already serialized by setup (all defaults round-trip), so
+  # REPLACE it — inserting would duplicate the key and refuse to parse.
+  if [ "${E2E_DRAFT_HOT:-0}" = 1 ]; then
+    if grep -q '^draft_hot_percent = ' "$home/config.toml"; then
+      sed -i 's/^draft_hot_percent = .*/draft_hot_percent = 50/' "$home/config.toml"
+    else
+      sed -i '0,/^^\[experts\]$/s//&\ndraft_hot_percent = 50/' "$home/config.toml"
+    fi
+  fi
 done
 
 echo "==> 4/6 start nodes"
@@ -252,6 +309,34 @@ PY
 echo "   both nodes derive the same cold-shard owners independently"
 
 echo "==> 6/6 live verification counters (from the loop's ping/ringer ticks)"
+if [ "${E2E_DRAFT_HOT:-0}" = 1 ]; then
+  # The draft tier, live: A's replication round derives the pin set from
+  # its hosted store, and the pin for the just-fetched expert lands on
+  # the round AFTER the fetch — poll for it instead of racing the
+  # replication_interval.
+  waited=0
+  until python3 -c '
+import json, urllib.request, sys
+s = json.load(urllib.request.urlopen("http://127.0.0.1:'"$A_GW"'/status"))
+e = s["experts"]
+assert e["draft_hot_percent"] == 50, e["draft_hot_percent"]
+sys.exit(0 if "L3.E17" in e["draft_pinned"] and e["resident_bytes"] > 0 else 1)
+' 2>/dev/null; do
+    if [ "$waited" -ge 90 ]; then echo "timeout: A never PINNED L3.E17 resident (draft tier)" >&2; exit 1; fi
+    sleep 2; waited=$((waited + 2))
+  done
+  python3 -c '
+import json, urllib.request
+s = json.load(urllib.request.urlopen("http://127.0.0.1:'"$A_GW"'/status"))
+e = s["experts"]
+estimated = e["hosted_ids"]
+assert "L3.E17" in e["draft_pinned"], e["draft_pinned"]
+assert e["resident_bytes"] > 0
+print("   draft tier live: draft_hot_percent=", e["draft_hot_percent"],
+      "pinned=", e["draft_pinned"], "resident_bytes=", e["resident_bytes"],
+      "cold-shard recomputation sees:", estimated[:3])
+'
+fi
 for port in "$A_GW" "$B_GW"; do
   echo "--- node :$port"
   curl -sf "http://127.0.0.1:$port/status" | python3 -c '

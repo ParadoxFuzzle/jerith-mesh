@@ -211,6 +211,26 @@ enum BackupCmd {
     },
 }
 
+/// The `--activation` override for `jerith experts import`: auto follows
+/// the arch tag (bert-family → gelu, else silu); the rest force one tag.
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum ImportActivation {
+    Auto,
+    Silu,
+    Gelu,
+}
+
+impl ImportActivation {
+    fn into_core(self) -> Option<jerith_mesh_core::expert_store::Activation> {
+        use jerith_mesh_core::expert_store::Activation;
+        match self {
+            Self::Auto => None,
+            Self::Silu => Some(Activation::Silu),
+            Self::Gelu => Some(Activation::Gelu),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ExpertsCmd {
     /// List the experts this node serves, plus cache/store stats.
@@ -233,6 +253,18 @@ enum ExpertsCmd {
         /// Comma-separated input floats (must be `hidden` wide).
         #[arg(long, value_delimiter = ',')]
         input: Vec<f32>,
+    },
+    /// Import a GGUF model file: split its MoE stacks / dense FFN layers
+    /// into expert containers + routers (FEATURES §13, the Colibri-side
+    /// layer split). Every un-importable layer is REPORTED by name — the
+    /// store never keeps a half-written expert.
+    Import {
+        /// Path to the .gguf file (F32/F16/BF16/Q4_0/Q8_0).
+        path: PathBuf,
+        /// Force the activation tagging for plain-MLP experts
+        /// (default: bert-family archs → gelu, everything else → silu).
+        #[arg(long, value_enum, default_value_t = ImportActivation::Auto)]
+        activation: ImportActivation,
     },
 }
 
@@ -453,6 +485,38 @@ async fn experts_cmd(cmd: ExpertsCmd) -> anyhow::Result<()> {
                 bytes as f64 / 1024.0,
                 store.dir().join(format!("{id}.expert")).display()
             );
+        }
+        ExpertsCmd::Import { path, activation } => {
+            let report =
+                jerith_mesh_core::gguf_import::import_gguf(&path, &store, activation.into_core())?;
+            println!("arch: {}", report.arch);
+            println!(
+                "moe layers: {} · dense layers: {}",
+                report
+                    .moe_layers
+                    .iter()
+                    .map(|l| format!("blk.{l}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                report
+                    .dense_layers
+                    .iter()
+                    .map(|l| format!("blk.{l}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            println!(
+                "experts written ({}): {}",
+                report.experts_written.len(),
+                report.experts_written.join(", ")
+            );
+            println!("routers written ({})", report.routers_written.len());
+            if !report.notes.is_empty() {
+                println!("notes ({}):", report.notes.len());
+                for n in &report.notes {
+                    println!("  ⚠ {n}");
+                }
+            }
         }
         ExpertsCmd::Run { id, input } => {
             let out = store.run(&id, &input)?;

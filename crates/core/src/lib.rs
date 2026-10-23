@@ -13,6 +13,7 @@ pub mod expert_stats;
 pub mod expert_store;
 pub mod freerider;
 pub mod gateway;
+pub mod gguf_import;
 pub mod guard;
 pub mod http;
 pub mod hw;

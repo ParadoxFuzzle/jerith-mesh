@@ -10,3 +10,4 @@ Cargo.lock.orig
 config.toml
 __pycache__/
 *.pyc
+models/
