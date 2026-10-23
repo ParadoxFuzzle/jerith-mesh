@@ -1418,9 +1418,11 @@ mod tests {
         // half-conversions. If either half is retuned here and the other
         // lags, production honest/spec budgets diverge; this test fails
         // loudly instead.
-        let mut cfg = ExpertStoreConfig::default();
-        cfg.spec_max_remote_attempts = 7;
-        cfg.spec_max_wire_bytes = 8192;
+        let cfg = ExpertStoreConfig {
+            spec_max_remote_attempts: 7,
+            spec_max_wire_bytes: 8192,
+            ..Default::default()
+        };
         let pair = cfg.budgets();
         assert_eq!(pair.honest, cfg.request_budget(), "honest parity");
         assert_eq!(pair.spec, cfg.spec_budget(), "spec parity");

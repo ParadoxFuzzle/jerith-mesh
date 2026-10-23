@@ -276,7 +276,7 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
     // The handoff note — the agent's structured sign-off from the [ai]
     // box, surfaced while fresh so the owner starts the day holding what
     // the last working session left behind.
-    if let Some(h) = handoff_section_in(&crate::mailbox::default_base_dir(), &day) {
+    if let Some(h) = handoff_section_in(&crate::mailbox::default_base_dir(), day) {
         s.push_str(&h);
     }
 
@@ -329,7 +329,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
     let doy = (153 * mp + 2) / 5 + u64::from(d) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era as i64 * 146_097 + doe as i64 - 719_468
+    era * 146_097 + doe as i64 - 719_468
 }
 
 /// Parse `YYYYMMDD` (the archive stamp's leading half) into epoch days.
@@ -399,13 +399,13 @@ fn handoff_section_in(base: &std::path::Path, today: &str) -> Option<String> {
 }
 
 
-/// Is the pet opted in per `[plugins]`? Either row counts: `enabled`
-/// (skills in the shared registry) or `owner_only` (owner-DM only) —
-/// both are the operator explicitly turning the companion on.
 // ---------------------------------------------------------------------------
 // The pet's day-greeting (§ the mesh pet, crates/pet-plugin)
 // ---------------------------------------------------------------------------
 
+/// Is the pet opted in per `[plugins]`? Either row counts: `enabled`
+/// (skills in the shared registry) or `owner_only` (owner-DM only) —
+/// both are the operator explicitly turning the companion on.
 fn pet_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
     let gate = "external:pet";
     enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)

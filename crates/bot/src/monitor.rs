@@ -440,6 +440,7 @@ struct QuarantineRow {
     path: String,
     sha256: String,
     /// "archive" | "native-exe" | "other" (unused here, kept honest).
+    #[expect(dead_code)]
     kind: String,
     /// "benign" | "suspicious" | "malicious" — the whole decision.
     verdict: String,

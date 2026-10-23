@@ -5540,7 +5540,7 @@ mod chat_walk_tests {
         let peers = vec![(peer_node.clone(), 5u64, true, true, None, None)];
         let msg_in = serde_json::json!({"role": "user", "content": "hi"});
         let n_bytes = serde_json::to_vec(
-            &ExpertRouter::compact_chat_history(&[msg_in.clone()]),
+            &ExpertRouter::compact_chat_history(std::slice::from_ref(&msg_in)),
         )
         .unwrap()
         .len() as u64;
