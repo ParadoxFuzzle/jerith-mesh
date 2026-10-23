@@ -787,10 +787,19 @@ gotchas surfaced while building the finished parts.
   probe classifications, stats math with the ≥5 gate, plus the live
   mock-runtime drill (probe admits → hint rides forward 2+, stats
   fill; strict runtime 400s the field → refused → user traffic stays
-  clean). Still open: the per-request budget's CONFIG surface
-  (deferred until real speculative runs ride the transport — the caps
-  exist and are enforced at generous defaults meanwhile) and
-  draft-expert scheduling once Colibri's layer split lands.
+  clean). Draft-expert scheduling (the gguf store has real routers + experts to
+  draft from — the engine still owns draft-and-verify) landed phase 1 of 3 on
+  2026-10-23: `[experts].draft_priority` (default off; hot — the dispatch loop
+  re-reads it with the budget every dispatch, and /status.experts publishes
+  it). When on, the FIRST remote hop leads by pure RTT among
+  reputation-gated qualified peers — the draft must not wait behind a
+  slower, resource-richer peer; resources keep ordering the TAIL (retries
+  land resource-first), and a verified-offense peer never heads the hop.
+  Named rule (draft_head), planner unit tests (knob off = byte-for-byte the
+  Phase-1 order; on = head-by-RTT, tail intact; offender gated) plus the
+  real-QUIC drill: with local weights down, a resource-reported far peer
+  serves knob-off (attribution ×7) and the NEAREST named peer serves
+  knob-on (×3) — the fall-through stays intact.
 - ✅ **Asynchronous, timeout-tolerant forward passes + graceful degradation
   (§1)** — the mesh CHAT walk landed async 2026-10-18 (see §2's gateway
   tier notes and §13's config surface for the knobs; the expert walk keeps

@@ -800,6 +800,11 @@ impl MeshFallbackChat {
         // Attribution comes from the router: `served_by` is the node id
         // that actually replied, None when the local weights ran.
         let mut served_by = None;
+        // §1 draft-expert scheduling: read live config EVERY dispatch —
+        // hot like the per-attempt policy knobs (privacy / prefetch), so
+        // the head-hop rule flips within one tick, no restart window.
+        self.router
+            .set_draft_priority(state.config.read().await.experts.draft_priority);
         let dispatch_started = std::time::Instant::now();
         let out = self
             .router
@@ -1107,6 +1112,12 @@ pub fn plan_config_reload(disk: &NodeConfig, live: &NodeConfig) -> ConfigReloadP
         || disk.experts.prefetch_horizon != live.experts.prefetch_horizon
     {
         plan.hot.push("experts.prefetch");
+    }
+    // §1 draft-expert scheduling: the dispatch loop re-reads the flag at
+    // every dispatch (same hot path shape as the budget above), so the
+    // head-hop rule flips within one tick.
+    if disk.experts.draft_priority != live.experts.draft_priority {
+        plan.hot.push("experts.draft_priority");
     }
     // Phase 3 async chat-walk knobs: the router reads them at boot (the
     // walk lives on a boot-built router), so changes warn restart-required
@@ -3140,6 +3151,29 @@ mod tests {
         assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
     }
 
+
+    #[test]
+    fn config_reload_plan_draft_priority_is_hot() {
+        // §1 draft-expert scheduling: the dispatch loop re-reads the flag
+        // at every dispatch, so a flip lands within one tick — hot like
+        // the budget/prefetch knobs, never a restart-required cold key.
+        let live = NodeConfig::default();
+        let disk = NodeConfig {
+            experts: crate::config::ExpertStoreConfig {
+                draft_priority: true,
+                ..live.experts.clone()
+            },
+            ..NodeConfig::default()
+        };
+        let plan = plan_config_reload(&disk, &live);
+        assert!(
+            plan.hot.contains(&"experts.draft_priority"),
+            "a draft_priority flip is hot: {plan:?}"
+        );
+        assert!(plan.cold.is_empty(), "no cold leak: {plan:?}");
+        // Identical configs stay silent.
+        assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());
+    }
     #[test]
     fn meters_snapshot_resets() {
         let mut m = Meters {

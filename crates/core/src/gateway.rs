@@ -999,6 +999,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
                 "hot_percent": percent,
                 "hot": hot,
                 "cold": cold.len(),
+                // §1 draft-expert scheduling: whether the first remote
+                // hop leads by pure RTT (the draft must not wait behind
+                // a slower, resource-richer peer).
+                "draft_priority": cfg.experts.draft_priority,
                 "cold_placements": cold_placements,
                 "shard_ring_nodes": ring.members().len(),
                 "replication": {

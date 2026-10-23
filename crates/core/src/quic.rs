@@ -277,6 +277,13 @@ pub struct ExpertRouter {
     /// `hosts_locally` consults it, so the plan puts Local first exactly
     /// when the tensors are on this disk.
     expert_store: RwLock<Option<Arc<crate::expert_store::ExpertStore>>>,
+    /// §1 draft-expert scheduling: when a spec-decoded forward's experts
+    /// are dispatched, the FIRST remote hop is chosen by pure RTT (stays
+    /// reputation-gated; resources order the TAIL instead) — the draft
+    /// must never lag the verify on a resource-rich-but-slow peer. Read
+    /// HOT by the dispatch loop from `[experts].draft_priority`; default
+    /// off, so planning is byte-for-byte the pre-feature order.
+    draft_priority: std::sync::atomic::AtomicBool,
 }
 
 /// Borrow-capturing pre-flight attempt: the owning peer plus the RPC that
@@ -341,7 +348,40 @@ impl ExpertRouter {
             verify,
             expert_store: RwLock::new(None),
             chat_failures: std::sync::Mutex::new(HashMap::new()),
+            draft_priority: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// §1 draft-expert scheduling: set the head-hop priority from live
+    /// config (the dispatch loop re-reads `[experts].draft_priority`
+    /// every dispatch — same hot shape as the per-request budget).
+    pub fn set_draft_priority(&self, on: bool) {
+        self.draft_priority
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn draft_priority(&self) -> bool {
+        self.draft_priority
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The named draft-first rule: among QUALIFIED peers (holder + alive)
+    /// the first-hop head is the pure min-RTT one — reputation gates the
+    /// pool exactly as the standing order does (a verified-offense peer
+    /// never leads the draft hop), but resource capacity does NOT head
+    /// the draft: resources order the tail, where retries land. The
+    /// standing order (resources first, RTT tiebreak — Phase 1 resource
+    /// pooling) keeps everything else.
+    fn draft_head_index(
+        remotes: &[(String, u64, Option<crate::hw::ResourceSample>, Option<i32>)],
+    ) -> Option<usize> {
+        remotes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (id, rtt, _, rep))| {
+                (reputation_tier(*rep), *rtt, id.clone())
+            })
+            .map(|(i, _)| i)
     }
 
     /// Book one chat-walk failure for `node_id` (streak +1, timer reset).
@@ -454,6 +494,21 @@ impl ExpertRouter {
                 id.clone(),
             )
         });
+        // §1 draft-expert scheduling: when the live knob is on the FIRST
+        // remote hop leads with pure RTT — the draft must not wait behind
+        // a slower, resource-richer peer. The head is spliced out of the
+        // standing order and re-put first; the tail keeps that order.
+        if self.draft_priority()
+            && let Some(head) = Self::draft_head_index(&remotes)
+        {
+            // `remove` (not `swap_remove`): the TAIL must keep the
+            // standing resource-first order — retries land there.
+            let (head_id, head_rtt, _, _) = remotes.remove(head);
+            plan.push(ExpertLocation::Remote {
+                node_id: head_id,
+                rtt_ms: head_rtt,
+            });
+        }
         for (id, rtt, _, _) in remotes {
             plan.push(ExpertLocation::Remote {
                 node_id: id,
@@ -2930,6 +2985,172 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn draft_first_head_rule_is_pure_rtt_within_reputation() {
+        // §1 draft-expert scheduling: the FIRST remote hop leads by pure
+        // RTT (the draft must not wait behind a slower, resource-richer
+        // peer) — reputation still gates it, resources stop heading it.
+        let r = router(50);
+        let rich = crate::hw::ResourceSample {
+            gpus: vec![crate::hw::GpuSample {
+                name: "A".into(),
+                vram_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                vram_used_bytes: Some(2 * 1024 * 1024 * 1024),
+                vram_free_bytes: Some(6 * 1024 * 1024 * 1024),
+            }],
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+            ram_available_bytes: 24 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let poor = crate::hw::ResourceSample {
+            gpus: vec![crate::hw::GpuSample {
+                name: "B".into(),
+                vram_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                vram_used_bytes: Some(7 * 1024 * 1024 * 1024),
+                vram_free_bytes: Some(1024 * 1024 * 1024),
+            }],
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+            ram_available_bytes: 4 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let peers = vec![
+            ("rich-far".into(), 190, true, true, Some(rich.clone()), None),
+            ("poor-near".into(), 12, true, true, Some(poor.clone()), None),
+            ("no-report".into(), 5, true, true, None, None),
+        ];
+        let ids = |plan: &[ExpertLocation]| {
+            plan.iter()
+                .filter_map(|l| match l {
+                    ExpertLocation::Remote { node_id, .. } => Some(node_id.as_str().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Knob off: byte-for-byte the standing Phase-1 order.
+        assert_eq!(
+            ids(&r.plan_dispatch("exp-1", &peers).await),
+            vec!["rich-far", "poor-near", "no-report"]
+        );
+        // Knob on: the nearest qualified peer leads; the STANDING order
+        // (resources first) keeps the tail — retries land resource-first.
+        r.set_draft_priority(true);
+        assert_eq!(
+            ids(&r.plan_dispatch("exp-1", &peers).await),
+            vec!["no-report", "rich-far", "poor-near"]
+        );
+        // A VERIFIED offense still gates the head: the offender is the
+        // nearest peer here, yet never leads the draft hop.
+        let peers = vec![
+            ("offender".into(), 5, true, true, None, Some(-1)),
+            ("poor-near".into(), 12, true, true, Some(poor.clone()), None),
+            ("rich-far".into(), 190, true, true, Some(rich.clone()), None),
+        ];
+        assert_eq!(
+            ids(&r.plan_dispatch("exp-1", &peers).await),
+            vec!["poor-near", "rich-far", "offender"]
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_priority_leads_the_nearest_holder_over_real_quic() {
+        // The drill through the REAL walk: local weights fail, two real
+        // QUIC servers answer (a near ×3 and a resource-reported far ×7).
+        // Knob off the standing order serves from FAR; knob on the draft
+        // hop must beat it and serve from NEAR — which peer ACTUALLY
+        // computed the answer (attribution) is measured, not guessed.
+        let (near_addr, near_identity, _near_pins) =
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 3.0 }))
+                .await
+                .unwrap();
+        let (far_addr, far_identity, far_pins) =
+            super::tests::test_server_and_pins(Arc::new(Multiplier { factor: 7.0 }))
+                .await
+                .unwrap();
+        let near_node = near_identity.node_id();
+        let far_node = far_identity.node_id();
+        // One client trusting BOTH servers.
+        far_pins.write().await.insert(near_node.clone(), near_addr);
+        let client = pinned_client_endpoint_dyn(far_pins).unwrap();
+        let r = router(50);
+        let identity = SigningIdentity::generate();
+        let mut addrs = HashMap::new();
+        addrs.insert(near_node.clone(), near_addr);
+        addrs.insert(far_node.clone(), far_addr);
+        let rich = crate::hw::ResourceSample {
+            gpus: vec![crate::hw::GpuSample {
+                name: "A".into(),
+                vram_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                vram_used_bytes: Some(2 * 1024 * 1024 * 1024),
+                vram_free_bytes: Some(6 * 1024 * 1024 * 1024),
+            }],
+            ram_total_bytes: 32 * 1024 * 1024 * 1024,
+            ram_available_bytes: 24 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let peers = vec![
+            (far_node.clone(), 190, true, true, Some(rich), None),
+            (near_node.clone(), 12, true, true, None, None),
+        ];
+        let local_down =
+            |_: &[f32]| -> anyhow::Result<Vec<f32>> { anyhow::bail!("no local weights here") };
+        // Knob off: the resource-rich FAR peer leads and serves.
+        let mut completed = HashMap::new();
+        let mut served = None;
+        let out = r
+            .execute_over_quic_speculative_attributed(
+                &client,
+                &identity,
+                &addrs,
+                "draft-off",
+                "exp.test",
+                &[2.0],
+                &peers,
+                &mut completed,
+                local_down,
+                &mut served,
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.as_deref(), Some(far_node.as_str()));
+        assert_eq!(out, vec![14.0], "the far peer's ×7 math served it");
+        // Knob on: the NEAREST holder leads and serves.
+        r.set_draft_priority(true);
+        let mut completed = HashMap::new();
+        let mut served = None;
+        let out = r
+            .execute_over_quic_speculative_attributed(
+                &client,
+                &identity,
+                &addrs,
+                "draft-on",
+                "exp.test",
+                &[2.0],
+                &peers,
+                &mut completed,
+                local_down,
+                &mut served,
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.as_deref(), Some(near_node.as_str()));
+        assert_eq!(out, vec![6.0], "the near peer's ×3 math served it");
+        // The fall-through stays intact: only the HEAD moved, the far
+        // peer is still in the plan behind the near one.
+        let plan_ids: Vec<String> = r
+            .plan_dispatch("exp.test", &peers)
+            .await
+            .into_iter()
+            .filter_map(|l| match l {
+                ExpertLocation::Remote { node_id, .. } => Some(node_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            plan_ids,
+            vec![near_node.clone(), far_node.clone()],
+            "head = nearest, tail = standing order"
+        );
+    }
     #[tokio::test]
     async fn plan_ranks_reported_capacity_above_rtt() {
         // Resource pooling (Phase 1): far-with-free-VRAM beats near-but-full.

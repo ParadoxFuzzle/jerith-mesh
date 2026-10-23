@@ -739,6 +739,13 @@ pub struct ExpertStoreConfig {
     /// layer, so 1 is the natural horizon.
     #[serde(default = "default_prefetch_horizon")]
     pub prefetch_horizon: u32,
+    /// §1 draft-expert scheduling: when a spec-decoded forward's expert
+    /// hops are dispatched, the FIRST remote hop leads by pure RTT (still
+    /// reputation-gated; resources order the tail) so the draft never
+    /// waits behind a slower, resource-richer peer. Default off: plans
+    /// stay byte-for-byte the standing resource-first order.
+    #[serde(default)]
+    pub draft_priority: bool,
 }
 
 fn default_prefetch_per_layer() -> usize {
@@ -791,6 +798,7 @@ impl Default for ExpertStoreConfig {
             prefetch_enabled: default_true(),
             prefetch_per_layer: default_prefetch_per_layer(),
             prefetch_horizon: default_prefetch_horizon(),
+            draft_priority: false,
         }
     }
 }
@@ -1193,6 +1201,21 @@ mod tests {
     use super::*;
     use crate::models::ModelSource;
 
+
+    /// §1 draft-expert scheduling knob: off by default (plans stay the
+    /// standing resource-first order), TOML-optional both ways.
+    #[test]
+    fn draft_priority_knob_defaults_off_and_roundtrips() {
+        let cfg = NodeConfig::default();
+        assert!(!cfg.experts.draft_priority, "off by default");
+        // The struct parses as the CONTENTS of the `[experts]` table, so
+        // an absent key must stay false — the knob never defaults on.
+        let parsed: ExpertStoreConfig = toml::from_str("").unwrap();
+        assert!(!parsed.draft_priority, "absent key stays off");
+        // An operator's `draft_priority = true` carries through.
+        let parsed: ExpertStoreConfig = toml::from_str("draft_priority = true\n").unwrap();
+        assert!(parsed.draft_priority, "an explicit true carries through");
+    }
     fn sample_model() -> ModelId {
         ModelId {
             id: "glm-5.3".into(),
