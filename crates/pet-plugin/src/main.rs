@@ -24,7 +24,9 @@
 //! this layout, swap the handlers, sync `plugin.toml`, ship.
 
 use anyhow::{Context as _, Result};
-use jerith_pet_plugin::{DiaryEntry, PetState, diary_eml, diary_filename, load_or_create, state_path};
+use jerith_pet_plugin::{
+    DiaryEntry, PetState, diary_eml, diary_filename, load_or_create, state_path,
+};
 use jerith_plugin_template::{SkillServer, endpoint_addr, skill};
 use serde_json::Value;
 use std::sync::Arc;
@@ -74,7 +76,9 @@ fn diary_box() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            std::path::Path::new(&home).join(".jerith-mail").join("inbox-archive")
+            std::path::Path::new(&home)
+                .join(".jerith-mail")
+                .join("inbox-archive")
         });
     base.join("ai")
 }

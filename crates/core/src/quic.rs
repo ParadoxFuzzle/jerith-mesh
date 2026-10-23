@@ -499,9 +499,7 @@ impl ExpertRouter {
         remotes
             .iter()
             .enumerate()
-            .min_by_key(|(_, (id, rtt, _, rep))| {
-                (reputation_tier(*rep), *rtt, id.clone())
-            })
+            .min_by_key(|(_, (id, rtt, _, rep))| (reputation_tier(*rep), *rtt, id.clone()))
             .map(|(i, _)| i)
     }
 
@@ -926,10 +924,7 @@ impl ExpertRouter {
                     }) if rid == req_id && server_id == node_id => {
                         // The answer's bytes count too — request-cause spend
                         // even when the walk accepts it mid-flight.
-                        ledger
-                            .lock()
-                            .await
-                            .note_out(content.len() as u64);
+                        ledger.lock().await.note_out(content.len() as u64);
                         ChatOutcome::Answer(content)
                     }
                     Ok(NodeRpcReply::ChatResult {
@@ -975,9 +970,8 @@ impl ExpertRouter {
                             "chat dial refused by the per-request budget"
                         );
                         if !had_real_failure {
-                            last_err = anyhow::anyhow!(
-                                "no dial was attempted past the budget ({reason})"
-                            );
+                            last_err =
+                                anyhow::anyhow!("no dial was attempted past the budget ({reason})");
                         }
                     }
                     ChatOutcome::Rejected(message) | ChatOutcome::Failed(message) => {
@@ -1071,8 +1065,19 @@ impl ExpertRouter {
                             // trusting this remote result.
                             match self
                                 .replay_verify(
-                                    endpoint, identity, peer_addrs, req_id, expert_id, input,
-                                    &plan, idx, node_id, &out, &local_run, &uncapped, &mut ledger,
+                                    endpoint,
+                                    identity,
+                                    peer_addrs,
+                                    req_id,
+                                    expert_id,
+                                    input,
+                                    &plan,
+                                    idx,
+                                    node_id,
+                                    &out,
+                                    &local_run,
+                                    &uncapped,
+                                    &mut ledger,
                                 )
                                 .await
                             {
@@ -1124,7 +1129,6 @@ impl ExpertRouter {
         }
         Err(last_err)
     }
-
 
     /// Hybrid local + remote expert execution (Phase 2) with speculative
     /// remote pre-flight. Identical plan ordering, commitment and replay
@@ -1269,9 +1273,19 @@ impl ExpertRouter {
                                     self.verify.note_expert_result().await;
                                     match self
                                         .replay_verify(
-                                            endpoint, identity, peer_addrs, req_id, expert_id,
-                                            input, &plan, 1, &node_id, &out, &local_run,
-                                            &budget, &mut ledger,
+                                            endpoint,
+                                            identity,
+                                            peer_addrs,
+                                            req_id,
+                                            expert_id,
+                                            input,
+                                            &plan,
+                                            1,
+                                            &node_id,
+                                            &out,
+                                            &local_run,
+                                            &budget,
+                                            &mut ledger,
                                         )
                                         .await
                                     {
@@ -1338,8 +1352,19 @@ impl ExpertRouter {
                             self.verify.note_expert_result().await;
                             match self
                                 .replay_verify(
-                                    endpoint, identity, peer_addrs, req_id, expert_id, input,
-                                    &plan, idx, node_id, &out, &local_run, &budget, &mut ledger,
+                                    endpoint,
+                                    identity,
+                                    peer_addrs,
+                                    req_id,
+                                    expert_id,
+                                    input,
+                                    &plan,
+                                    idx,
+                                    node_id,
+                                    &out,
+                                    &local_run,
+                                    &budget,
+                                    &mut ledger,
                                 )
                                 .await
                             {
@@ -1393,7 +1418,12 @@ impl ExpertRouter {
         // exhaustion reason — the hops the budget refused, by name, and
         // the best failure the allowed attempts actually earned.
         if !budget_refused.is_empty() {
-            return Err(budget_exhausted_error(&budget, &ledger, &budget_refused, &last_err));
+            return Err(budget_exhausted_error(
+                &budget,
+                &ledger,
+                &budget_refused,
+                &last_err,
+            ));
         }
         Err(last_err)
     }
@@ -5455,10 +5485,7 @@ mod chat_walk_tests {
         let far_node = far_identity.node_id();
         // One client trusting BOTH servers: pin the lead into the far map
         // before the endpoint exists.
-        far_pins
-            .write()
-            .await
-            .insert(lead_node.clone(), lead_addr);
+        far_pins.write().await.insert(lead_node.clone(), lead_addr);
         let router = ExpertRouter::new(RouterOptions {
             nearby_rtt_ms: 50,
             dispatch_timeout: Duration::from_secs(9),
@@ -5539,9 +5566,9 @@ mod chat_walk_tests {
         addrs.insert(peer_node.clone(), addr);
         let peers = vec![(peer_node.clone(), 5u64, true, true, None, None)];
         let msg_in = serde_json::json!({"role": "user", "content": "hi"});
-        let n_bytes = serde_json::to_vec(
-            &ExpertRouter::compact_chat_history(std::slice::from_ref(&msg_in)),
-        )
+        let n_bytes = serde_json::to_vec(&ExpertRouter::compact_chat_history(std::slice::from_ref(
+            &msg_in,
+        )))
         .unwrap()
         .len() as u64;
         let (content, served) = router

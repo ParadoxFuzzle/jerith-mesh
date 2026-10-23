@@ -1426,7 +1426,10 @@ mod tests {
         let pair = cfg.budgets();
         assert_eq!(pair.honest, cfg.request_budget(), "honest parity");
         assert_eq!(pair.spec, cfg.spec_budget(), "spec parity");
-        assert_ne!(pair.honest, pair.spec, "the pair is NOT one budget aliased twice");
+        assert_ne!(
+            pair.honest, pair.spec,
+            "the pair is NOT one budget aliased twice"
+        );
     }
 
     fn sample_model() -> ModelId {

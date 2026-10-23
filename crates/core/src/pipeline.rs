@@ -785,11 +785,9 @@ pub async fn execute_route_resilient(
             let spec_tripped = spec_caps.as_ref().is_some_and(|(h, b)| {
                 h.is_some_and(|x| spec_attempts >= x) || b.is_some_and(|y| spec_bytes >= y)
             });
-            let spec_room_ok = spec_caps
-                .as_ref()
-                .is_none_or(|(_, max_wire)| {
-                    max_wire.is_none_or(|cap| cap.saturating_sub(spec_bytes) >= 2 * est)
-                });
+            let spec_room_ok = spec_caps.as_ref().is_none_or(|(_, max_wire)| {
+                max_wire.is_none_or(|cap| cap.saturating_sub(spec_bytes) >= 2 * est)
+            });
             if !tripped && room_ok && !spec_tripped && spec_room_ok {
                 prefetch_inflight = Some(tokio::spawn(hook(next_hop.clone())));
             }
@@ -2231,7 +2229,10 @@ mod budget_enforcement_tests {
         )
         .await;
         assert_eq!(result.hops_run, 4, "the honest walk is untouched");
-        assert_eq!(result.prefetches, 1, "only the first pull survives the spec cap");
+        assert_eq!(
+            result.prefetches, 1,
+            "only the first pull survives the spec cap"
+        );
         assert_eq!(
             pulls.load(Ordering::SeqCst),
             1,
@@ -2265,8 +2266,7 @@ mod budget_enforcement_tests {
         .await;
         assert_eq!(result2.hops_run, 4);
         assert_eq!(
-            result2.prefetches,
-            3,
+            result2.prefetches, 3,
             "without the spec ledger every pre-tail hop pre-pays"
         );
     }

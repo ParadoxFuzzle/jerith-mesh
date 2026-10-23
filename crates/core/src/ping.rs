@@ -923,8 +923,7 @@ impl MeshFallbackChat {
         // deduped (a draft expert may also be demand-hot) but never
         // reorder the demand tail.
         let mut planned: Vec<String> = draft;
-        let seen: std::collections::HashSet<String> =
-            planned.iter().cloned().collect();
+        let seen: std::collections::HashSet<String> = planned.iter().cloned().collect();
         planned.extend(hot.into_iter().filter(|id| !seen.contains(id)));
         let actions = crate::replication::plan_replication(
             &planned,
@@ -3239,9 +3238,11 @@ mod tests {
             },
             ..NodeConfig::default()
         };
-        assert!(plan_config_reload(&disk, &live)
-            .hot
-            .contains(&"experts.request_budget"));
+        assert!(
+            plan_config_reload(&disk, &live)
+                .hot
+                .contains(&"experts.request_budget")
+        );
 
         // Identical configs stay silent.
         assert!(plan_config_reload(&live, &live) == ConfigReloadPlan::default());

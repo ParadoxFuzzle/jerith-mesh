@@ -398,7 +398,6 @@ fn handoff_section_in(base: &std::path::Path, today: &str) -> Option<String> {
     Some(s)
 }
 
-
 // ---------------------------------------------------------------------------
 // The pet's day-greeting (§ the mesh pet, crates/pet-plugin)
 // ---------------------------------------------------------------------------
@@ -507,7 +506,11 @@ fn render_quarantine_line(v: &Value) -> Option<String> {
         let top = standing
             .iter()
             .find(|r| r["verdict"].as_str() == Some("malicious"))
-            .or_else(|| standing.iter().find(|r| r["verdict"].as_str() == Some("suspicious")));
+            .or_else(|| {
+                standing
+                    .iter()
+                    .find(|r| r["verdict"].as_str() == Some("suspicious"))
+            });
         let mut line = format!(
             "🧯 quarantine: {mal_standing} malicious · {sus_standing} suspicious standing",
         );
@@ -584,7 +587,11 @@ fn render_ledger_line(v: &Value) -> Option<String> {
     let texts: Vec<String> = open
         .iter()
         .take(3)
-        .filter_map(|e| e["text"].as_str().map(|t| "`".to_owned() + &clip_line(t, 60) + "`"))
+        .filter_map(|e| {
+            e["text"]
+                .as_str()
+                .map(|t| "`".to_owned() + &clip_line(t, 60) + "`")
+        })
         .collect();
     if !texts.is_empty() {
         line.push_str(&format!(" — {}", texts.join(" · ")));
@@ -738,12 +745,21 @@ mod tests {
         // NOT parse the rest of the filename (the pet's tails ride
         // along fine).
         assert!(handoff_stamp_is_fresh("20261023-081100", today));
-        assert!(handoff_stamp_is_fresh("20261023-081122-pet-long_mood-a797", today));
-        assert!(handoff_stamp_is_fresh("20261022-235900", today), "yesterday's sign-off is the morning's brief");
+        assert!(handoff_stamp_is_fresh(
+            "20261023-081122-pet-long_mood-a797",
+            today
+        ));
+        assert!(
+            handoff_stamp_is_fresh("20261022-235900", today),
+            "yesterday's sign-off is the morning's brief"
+        );
         assert!(!handoff_stamp_is_fresh("20261021-235900", today));
         assert!(!handoff_stamp_is_fresh("20240101-000000", today));
         assert!(!handoff_stamp_is_fresh("garbage-in-the-dir", today));
-        assert!(!handoff_stamp_is_fresh("20261301-000000", today), "month 13 is not a month");
+        assert!(
+            !handoff_stamp_is_fresh("20261301-000000", today),
+            "month 13 is not a month"
+        );
         // civil math pins: 1970-01-01 == day 0; the leap-era math
         // agrees with the pet's inverse against the same known wall.
         assert_eq!(days_from_civil(1970, 1, 1), 0);
@@ -785,10 +801,20 @@ mod tests {
         let today = "2026-10-23";
         let s = handoff_section_in(&dir, today).expect("the handoff surfaces");
         assert!(s.starts_with("🤝 handoff (20261023-015500"), "{s}");
-        assert!(s.contains("[handoff] house card + pet diary live".trim_start_matches("[handoff]")) || s.contains("house card + pet diary live"), "{s}");
-        assert!(s.contains("house.status answers on the signed contract"), "{s}");
+        assert!(
+            s.contains("[handoff] house card + pet diary live".trim_start_matches("[handoff]"))
+                || s.contains("house card + pet diary live"),
+            "{s}"
+        );
+        assert!(
+            s.contains("house.status answers on the signed contract"),
+            "{s}"
+        );
         assert!(s.contains("pet diary delivers to [ai]"), "{s}");
-        assert!(!s.contains("Next steps"), "only the first three body lines surface: {s}");
+        assert!(
+            !s.contains("Next steps"),
+            "only the first three body lines surface: {s}"
+        );
 
         // Stale handoff: one pointer line, no body surfacing.
         std::fs::remove_file(ai.join("20261023-015500-agent1.eml")).unwrap();
@@ -960,7 +986,10 @@ mod tests {
     fn quarantine_line_reads_the_card_shapes() {
         let opted = ["memory".to_string(), "external:quarantine".to_string()];
         assert!(quarantine_opted_in(&opted, &[]));
-        assert!(quarantine_opted_in(&["external:quarantine".to_string()], &[]));
+        assert!(quarantine_opted_in(
+            &["external:quarantine".to_string()],
+            &[]
+        ));
         assert!(!quarantine_opted_in(&["quarantine".to_string()], &[])); // bare id never counts
         // Strong verdicts standing lead with the strongest card.
         let standing = serde_json::json!({
@@ -981,23 +1010,32 @@ mod tests {
             "counts_total": {"benign": 7, "suspicious": 0, "malicious": 0},
             "standing": []
         });
-        assert!(render_quarantine_line(&quiet)
-            .unwrap()
-            .contains("watch `/home/bin/Downloads` — 7 judged, none suspect"));
+        assert!(
+            render_quarantine_line(&quiet)
+                .unwrap()
+                .contains("watch `/home/bin/Downloads` — 7 judged, none suspect")
+        );
         // Empty log: watching, honestly nothing yet.
         let empty = serde_json::json!({
             "watch_dir": "/home/bin/Downloads",
             "counts_total": {"benign": 0, "suspicious": 0, "malicious": 0},
             "standing": []
         });
-        assert!(render_quarantine_line(&empty).unwrap().contains("nothing judged yet"));
+        assert!(
+            render_quarantine_line(&empty)
+                .unwrap()
+                .contains("nothing judged yet")
+        );
     }
 
     #[test]
     fn ledger_line_reads_the_card_shapes() {
         let opted = ["gcp".to_string(), "external:ledger".to_string()];
         assert!(ledger_opted_in(&opted, &[]));
-        assert!(ledger_opted_in(&[], &["external:ledger".to_string()]), "owner_only opt-in counts");
+        assert!(
+            ledger_opted_in(&[], &["external:ledger".to_string()]),
+            "owner_only opt-in counts"
+        );
         assert!(!ledger_opted_in(&["pet".to_string()], &[])); // bare id never counts
         // Open entries lead: count, oldest age, up to three texts.
         let card = serde_json::json!({
@@ -1016,14 +1054,24 @@ mod tests {
         assert!(l.contains("ship the ledger lane"), "{l}");
         assert!(l.contains("migrate bot.toml"), "{l}");
         assert!(l.contains("smoke test"), "{l}");
-        assert!(!l.contains("only in the count"), "texts capped at three: {l}");
+        assert!(
+            !l.contains("only in the count"),
+            "texts capped at three: {l}"
+        );
         assert!(l.contains("1 closed today"), "{l}");
         // All quiet but productive: the archive says so.
         let quiet = serde_json::json!({"open_count": 0, "open": [], "closed_today": 2});
-        assert!(render_ledger_line(&quiet).unwrap().contains("nothing open · 2 closed today"));
+        assert!(
+            render_ledger_line(&quiet)
+                .unwrap()
+                .contains("nothing open · 2 closed today")
+        );
         // Clean day.
         let clean = serde_json::json!({"open_count": 0, "open": [], "closed_today": 0});
-        assert_eq!(render_ledger_line(&clean).unwrap(), "📋 ledger: nothing open");
+        assert_eq!(
+            render_ledger_line(&clean).unwrap(),
+            "📋 ledger: nothing open"
+        );
     }
 
     #[test]

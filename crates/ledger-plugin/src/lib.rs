@@ -92,17 +92,22 @@ impl Ledger {
     /// Add one intention. Duplicate-guard is on the OPEN text only
     /// (doing the same thing next week is normal; redoing an open one
     /// means the entry already says it).
-    pub fn add(&mut self, text: &str, note: Option<String>, now_ms: u64) -> Result<Entry, LedgerError> {
+    pub fn add(
+        &mut self,
+        text: &str,
+        note: Option<String>,
+        now_ms: u64,
+    ) -> Result<Entry, LedgerError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(LedgerError::Empty);
         }
-        let text = if text.len() > TEXT_CAP { &text[..TEXT_CAP] } else { text };
-        if let Some(e) = self
-            .entries
-            .iter()
-            .find(|e| e.open() && e.text == text)
-        {
+        let text = if text.len() > TEXT_CAP {
+            &text[..TEXT_CAP]
+        } else {
+            text
+        };
+        if let Some(e) = self.entries.iter().find(|e| e.open() && e.text == text) {
             return Err(LedgerError::Duplicate(e.id));
         }
         if self.open_count() >= OPEN_CAP {
@@ -215,7 +220,8 @@ pub fn save(path: &Path, ledger: &Ledger) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let body = serde_json::to_string_pretty(&ledger.trimmed_to_save()).map_err(std::io::Error::other)?;
+    let body =
+        serde_json::to_string_pretty(&ledger.trimmed_to_save()).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -273,7 +279,13 @@ mod tests {
     fn add_done_drop_roundtrip() {
         let mut l = Ledger::new();
         let a = l.add("ship the node", None, 100 * DAY).unwrap();
-        let b = l.add("migrate bot.toml", Some("with the rotated secret".into()), 100 * DAY + HOUR).unwrap();
+        let b = l
+            .add(
+                "migrate bot.toml",
+                Some("with the rotated secret".into()),
+                100 * DAY + HOUR,
+            )
+            .unwrap();
         assert_eq!(a.id, 1); // ids monotone from 1
         assert_eq!(b.id, 2);
         assert_eq!(l.open_sorted().len(), 2);
@@ -304,7 +316,10 @@ mod tests {
         let mut l = Ledger::new();
         let e = l.add("x", None, 0).unwrap();
         l.done(e.id, DAY).unwrap();
-        assert!(matches!(l.done(e.id, 2 * DAY), Err(LedgerError::Duplicate(_))));
+        assert!(matches!(
+            l.done(e.id, 2 * DAY),
+            Err(LedgerError::Duplicate(_))
+        ));
         assert_eq!(l.drop(999), Err(LedgerError::UnknownId(999)));
     }
 
@@ -313,7 +328,10 @@ mod tests {
         let mut l = Ledger::new();
         let e = l.add(&"y".repeat(300), None, 0).unwrap();
         assert_eq!(e.text.len(), TEXT_CAP);
-        assert!(matches!(l.add("   ", None, 0), Err(LedgerError::Empty)), "blank text is not a goal");
+        assert!(
+            matches!(l.add("   ", None, 0), Err(LedgerError::Empty)),
+            "blank text is not a goal"
+        );
     }
 
     #[test]
@@ -334,17 +352,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         let mut l = Ledger::new();
-        l.add("persist me", Some("note rides too".into()), 0).unwrap();
+        l.add("persist me", Some("note rides too".into()), 0)
+            .unwrap();
 
         // Push past the archive cap, close them all.
         for i in 0..(ARCHIVE_CAP as u64 + 3) {
-            let e = l.add(&format!("old {i}"), None, (i * 60_000).saturating_sub(1)).unwrap();
+            let e = l
+                .add(&format!("old {i}"), None, (i * 60_000).saturating_sub(1))
+                .unwrap();
             l.done(e.id, i * 60_000 + 1).unwrap();
         }
         save(&path, &l).unwrap();
         let back = load(&path);
         assert_eq!(back.open_sorted()[0].text, "persist me");
-        assert_eq!(back.open_sorted()[0].note.as_deref(), Some("note rides too"));
+        assert_eq!(
+            back.open_sorted()[0].note.as_deref(),
+            Some("note rides too")
+        );
         assert_eq!(
             back.entries.iter().filter(|e| !e.open()).count(),
             ARCHIVE_CAP,

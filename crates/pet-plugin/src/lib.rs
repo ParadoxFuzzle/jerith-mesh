@@ -168,9 +168,7 @@ fn long_mood_line(label: &str, days: u64, seed: u64) -> String {
             "Flew the whole gap alone and came back still loop-de-loop. Some circuits are mine, not the distance's.",
             "Long way around, and the drift stayed loop-de-loop the whole way. I'll file that under happy.",
         ],
-        "orange-cap" => &[
-            "Long silence, and the cap still holds its warm. Steady is a mood too.",
-        ],
+        "orange-cap" => &["Long silence, and the cap still holds its warm. Steady is a mood too."],
         "ash-drift" => &[
             "The spirals kept slow all those days without you. Not sad ones — just the drift being the drift.",
             "Alone-time measured in slow spirals. The ash falls either way; I still catch a flake now and then.",
@@ -288,13 +286,13 @@ impl PetState {
         }
     }
 
-/// Apply everything that happened since the last tick. One big,
-/// honest integration step: food burns, energy rests (fed only),
-/// mood drifts toward its target, bond forgets a hair. Stage never
-/// regresses because decay touches `bond`, never `max_bond`.
-pub fn apply_elapsed(&mut self, now: u64) {
-    let dt = now.saturating_sub(self.last_tick_ms).min(MAX_TICK_MS);
-    self.last_tick_ms = now;
+    /// Apply everything that happened since the last tick. One big,
+    /// honest integration step: food burns, energy rests (fed only),
+    /// mood drifts toward its target, bond forgets a hair. Stage never
+    /// regresses because decay touches `bond`, never `max_bond`.
+    pub fn apply_elapsed(&mut self, now: u64) {
+        let dt = now.saturating_sub(self.last_tick_ms).min(MAX_TICK_MS);
+        self.last_tick_ms = now;
         if dt == 0 {
             return;
         }
@@ -712,7 +710,10 @@ pub fn rfc5322_date(ms: u64) -> String {
     let (y, m, d, h, mi, s) = civil_from_ms(ms);
     // 1970-01-01 was a Thursday (4)
     let wd = WEEKDAYS[(((ms / 1000) / 86_400 as u64 + 4) % 7) as usize];
-    format!("{wd}, {d:02} {} {y} {h:02}:{mi:02}:{s:02} +0000", MONTHS[(m - 1) as usize])
+    format!(
+        "{wd}, {d:02} {} {y} {h:02}:{mi:02}:{s:02} +0000",
+        MONTHS[(m - 1) as usize]
+    )
 }
 
 /// The archive filename stamp — `YYYYMMDD-HHMMSS`, exactly the shape
@@ -1107,12 +1108,15 @@ mod tests {
     fn stage_landings_and_long_moods_reach_the_diary() {
         let t = T0 + MS_DAY * 4;
         let mut st = PetState::fresh(t);
-        assert!(st.diary_pending.is_empty(), "a fresh pet has written nothing");
+        assert!(
+            st.diary_pending.is_empty(),
+            "a fresh pet has written nothing"
+        );
         // Silence is only a mood when a single catch-up is LONG: the
         // clock-injected reading integrates WHERE YOU RETURN, so short
         // sightings — even back-to-back — are just sightings.
-        st.look(t, false);                      // the baseline
-        st.look(t + MS_HOUR, false);            // an hour: just an hour
+        st.look(t, false); // the baseline
+        st.look(t + MS_HOUR, false); // an hour: just an hour
         assert!(st.diary_pending.is_empty());
         // One second under a two-day gap also stays below the line.
         st.look(t + LONG_MOOD_MS - 1000, false);
@@ -1184,7 +1188,10 @@ mod tests {
             body: "The droplet holds its color today.".into(),
         };
         let fname = diary_filename(&e, ms);
-        assert!(fname.starts_with("20261023-081122-pet-stage_up-"), "{fname}");
+        assert!(
+            fname.starts_with("20261023-081122-pet-stage_up-"),
+            "{fname}"
+        );
         assert!(fname.ends_with(".eml"));
         let text = diary_eml("Droplet", "glowcap", &e, ms);
         // Header order the archive reader + a human both key on.
@@ -1195,9 +1202,15 @@ mod tests {
         assert_eq!(lines[3], "Date: Fri, 23 Oct 2026 08:11:22 +0000");
         assert_eq!(lines[4], "X-Pet-Kind: stage_up");
         assert_eq!(lines[5], "X-Pet-Stage: glowcap");
-        assert!(lines[6].starts_with("Message-ID: <"), "a Unique mail id per entry");
+        assert!(
+            lines[6].starts_with("Message-ID: <"),
+            "a Unique mail id per entry"
+        );
         // One blank line at the header/body seam, then one body line.
-        assert!(lines[7].is_empty(), "the header/body seam is one blank line");
+        assert!(
+            lines[7].is_empty(),
+            "the header/body seam is one blank line"
+        );
         assert_eq!(lines[8], "The droplet holds its color today.");
         // Deterministic name/tail: same entry, same now → same mail.
         assert_eq!(fname, diary_filename(&e, ms));

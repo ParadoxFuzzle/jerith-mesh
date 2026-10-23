@@ -134,15 +134,24 @@ pub struct ScanReport {
 // ---------------------------------------------------------------------------
 
 /// Obfuscator fingerprints (the 2026-10-23 sample was ZKM-packed).
-pub const OBFUSCATOR_MARKS: &[&'static str] = &["ZKM", "Allatori", "Karakuri", "Stringer", "yGuard"];
+pub const OBFUSCATOR_MARKS: &[&'static str] =
+    &["ZKM", "Allatori", "Karakuri", "Stringer", "yGuard"];
 
 /// Process spawn — `Runtime`/`ProcessBuilder` identifiers travel WHOLE
 /// inside a class's constant pool, so an inflated class exposes them
 /// as contiguous strings even when its own literals are noise.
-pub const SPAWN_MARKS: &[&'static str] = &["java/lang/ProcessBuilder", "java/lang/Runtime", "getRuntime"];
+pub const SPAWN_MARKS: &[&'static str] = &[
+    "java/lang/ProcessBuilder",
+    "java/lang/Runtime",
+    "getRuntime",
+];
 
 /// Network bootstrap (`Socket`, `HttpURLConnection`, raw `java/net/URL`).
-pub const NET_MARKS: &[&'static str] = &["java/net/Socket", "java/net/HttpURLConnection", "java/net/URL"];
+pub const NET_MARKS: &[&'static str] = &[
+    "java/net/Socket",
+    "java/net/HttpURLConnection",
+    "java/net/URL",
+];
 
 /// File-plant / persistence — `setExecutable` and `FileOutputStream`
 /// are the plant-and-stage half of every Java dropper chain.
@@ -378,7 +387,9 @@ fn read_zip(data: &[u8]) -> Result<Vec<ZipEntry>, String> {
                 }
             },
             m => {
-                bad(&format!("entry method {m} unsupported (not stored/deflate)"));
+                bad(&format!(
+                    "entry method {m} unsupported (not stored/deflate)"
+                ));
                 continue;
             }
         };
@@ -434,7 +445,9 @@ pub fn scan_file(path: &Path, now_ms: u64) -> ScanReport {
     let size = meta.len();
     r.size_bytes = size;
     if size > MAX_FILE_BYTES {
-        r.note = Some(format!("too large ({size} bytes > {MAX_FILE_BYTES}) — not scanned"));
+        r.note = Some(format!(
+            "too large ({size} bytes > {MAX_FILE_BYTES}) — not scanned"
+        ));
         return r;
     }
     let Ok(bytes) = std::fs::read(path) else {
@@ -809,9 +822,7 @@ mod tests {
         let zip = build_zip(&[("Mod.class", true, &[0xca, 0xfe, 0xba, 0xbe, 0x00, 0x01])]);
         let r = scan_fixture(&zip, "class-in-zip.java");
         assert!(
-            !r.findings
-                .iter()
-                .any(|f| f.kind == "native-in-archive"),
+            !r.findings.iter().any(|f| f.kind == "native-in-archive"),
             "CAFEBABE is javac's magic, not Mach-O: {r:?}"
         );
     }
@@ -985,8 +996,11 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0], "com/sneaky/Main");
         assert!(
-            contains_marks(b"\x00java/lang/ProcessBuilder\x00", &["java/lang/ProcessBuilder"])
-                .len()
+            contains_marks(
+                b"\x00java/lang/ProcessBuilder\x00",
+                &["java/lang/ProcessBuilder"]
+            )
+            .len()
                 == 1
         );
         assert!(

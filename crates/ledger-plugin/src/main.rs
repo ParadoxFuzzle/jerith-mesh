@@ -101,10 +101,7 @@ fn do_list(state: &PathBuf) -> Result<Value, String> {
     }))
 }
 
-async fn do_add(
-    state: &PathBuf,
-    args: &Value,
-) -> Result<Value, String> {
+async fn do_add(state: &PathBuf, args: &Value) -> Result<Value, String> {
     let task = args["task"].as_str().unwrap_or("");
     let note = args["note"].as_str().map(str::to_string);
     let mut l = load(state);
@@ -121,7 +118,9 @@ async fn do_add(
         Err(LedgerError::Duplicate(id)) => Err(format!(
             "already open as #{id} — close that one or reword this"
         )),
-        Err(LedgerError::Empty) => Err("an empty string is not a goal — what is it, in one line?".into()),
+        Err(LedgerError::Empty) => {
+            Err("an empty string is not a goal — what is it, in one line?".into())
+        }
         Err(LedgerError::Cap) => Err(format!(
             "the ledger is at its {} open-entry cap — close a few before adding more",
             jerith_ledger_plugin::OPEN_CAP
@@ -130,18 +129,18 @@ async fn do_add(
     }
 }
 
-async fn do_close(
-    state: &PathBuf,
-    args: &Value,
-    drop_instead: bool,
-) -> Result<Value, String> {
+async fn do_close(state: &PathBuf, args: &Value, drop_instead: bool) -> Result<Value, String> {
     let id = match args["id"].as_u64() {
         Some(i) => i,
         None => return Err("an entry id is required (from `ledger.list`)".into()),
     };
     let mut l = load(state);
     let verb = if drop_instead { "dropped" } else { "closed" };
-    let r = if drop_instead { l.drop(id) } else { l.done(id, now_ms()) };
+    let r = if drop_instead {
+        l.drop(id)
+    } else {
+        l.done(id, now_ms())
+    };
     match r {
         Ok(e) => {
             if let Err(io) = save(state, &l) {
@@ -156,9 +155,9 @@ async fn do_close(
         Err(LedgerError::Duplicate(closed_id)) if !drop_instead => Err(format!(
             "#{closed_id} is already done — `ledger.list` shows what's open"
         )),
-        Err(LedgerError::UnknownId(i)) => Err(format!(
-            "no entry #{i} — ids come from `ledger.list`"
-        )),
+        Err(LedgerError::UnknownId(i)) => {
+            Err(format!("no entry #{i} — ids come from `ledger.list`"))
+        }
         Err(e) => Err(format!("{verb} failed: {e:?}")),
     }
 }
@@ -246,7 +245,10 @@ mod tests {
             .expect("[plugin] table")
             .as_table()
             .expect("[plugin] is a table");
-        assert_eq!(plugin.get("id").and_then(toml::Value::as_str), Some("ledger"));
+        assert_eq!(
+            plugin.get("id").and_then(toml::Value::as_str),
+            Some("ledger")
+        );
         let endpoint = plugin
             .get("endpoint")
             .and_then(toml::Value::as_str)
@@ -267,7 +269,11 @@ mod tests {
             .iter()
             .filter_map(|s| s.get("name").and_then(toml::Value::as_str))
             .collect();
-        assert_eq!(names, vec!["add", "list", "done", "drop"], "the four handlers");
+        assert_eq!(
+            names,
+            vec!["add", "list", "done", "drop"],
+            "the four handlers"
+        );
     }
 
     /// The list card's pin: the briefing renders these exact keys.
@@ -277,11 +283,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = dir.join("state.json");
         let mut l = Ledger::new();
-        l.add("a pinned goal", Some("why: tests".into()), 86_400_000).unwrap();
+        l.add("a pinned goal", Some("why: tests".into()), 86_400_000)
+            .unwrap();
         save(&state, &l).unwrap();
         let card: Value = do_list(&state).unwrap();
         let s = serde_json::to_string(&card).unwrap();
-        for key in ["state_file", "open_count", "oldest_id", "oldest_age", "closed_today", "open"] {
+        for key in [
+            "state_file",
+            "open_count",
+            "oldest_id",
+            "oldest_age",
+            "closed_today",
+            "open",
+        ] {
             assert!(card.get(key).is_some(), "the briefing keys on {key}: {s}");
         }
         assert_eq!(card["open"][0]["text"], "a pinned goal");

@@ -26,8 +26,8 @@
 use anyhow::{Context as _, Result};
 use jerith_plugin_template::{SkillServer, endpoint_addr, skill};
 use jerith_quarantine_plugin::{
-    ScanReport, Verdict, WATCH_INTERVAL_SECS, append_report, counts, load_reports, scan_file,
-    state_path, watch_once, WRITE_SETTLE_MS,
+    ScanReport, Verdict, WATCH_INTERVAL_SECS, WRITE_SETTLE_MS, append_report, counts, load_reports,
+    scan_file, state_path, watch_once,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -156,7 +156,9 @@ async fn do_scan(path: Option<&str>, dir: &PathBuf, state: &PathBuf) -> Result<V
     let mut files: Vec<PathBuf> = Vec::new();
     let mut stack = vec![target.clone()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let Ok(meta) = e.metadata() else { continue };
             if meta.is_dir() {
@@ -172,7 +174,9 @@ async fn do_scan(path: Option<&str>, dir: &PathBuf, state: &PathBuf) -> Result<V
     files.truncate(200);
     let mut owned: Vec<ScanReport> = Vec::new();
     for p in files {
-        let Ok(meta) = std::fs::metadata(&p) else { continue };
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
         let mtime = meta
             .modified()
             .ok()
@@ -188,7 +192,12 @@ async fn do_scan(path: Option<&str>, dir: &PathBuf, state: &PathBuf) -> Result<V
         }
         owned.push(r);
     }
-    owned.sort_by_key(|r| (r.verdict == Verdict::Benign, std::cmp::Reverse(r.scanned_at_ms)));
+    owned.sort_by_key(|r| {
+        (
+            r.verdict == Verdict::Benign,
+            std::cmp::Reverse(r.scanned_at_ms),
+        )
+    });
     let (b, s, m) = counts(&owned);
     let head: Vec<Value> = owned.iter().take(20).map(report_card).collect();
     Ok(json!({
@@ -313,10 +322,7 @@ async fn main() -> Result<()> {
 /// restart rescan would DOUBLE every verdict line — the log itself is
 /// the memory of what's been judged (name+size+mtime keys ride the
 /// rows' own fields).
-fn primed(
-    state: &PathBuf,
-    dir: &PathBuf,
-) -> HashMap<(String, u64, u64), ScanReport> {
+fn primed(state: &PathBuf, dir: &PathBuf) -> HashMap<(String, u64, u64), ScanReport> {
     let mut known: HashMap<(String, u64, u64), ScanReport> = HashMap::new();
     for r in load_reports(state, 500) {
         // The row's path+size is the identity; mtime is re-read live
@@ -356,7 +362,10 @@ mod tests {
             .expect("[plugin] table")
             .as_table()
             .expect("[plugin] is a table");
-        assert_eq!(plugin.get("id").and_then(toml::Value::as_str), Some("quarantine"));
+        assert_eq!(
+            plugin.get("id").and_then(toml::Value::as_str),
+            Some("quarantine")
+        );
         let endpoint = plugin
             .get("endpoint")
             .and_then(toml::Value::as_str)
@@ -364,11 +373,7 @@ mod tests {
         let addr = endpoint_addr(endpoint).expect("endpoint binds");
         assert!(addr.ip().is_loopback(), "loopback by contract");
         for taken in [7788, 7789, 7790] {
-            assert_ne!(
-                addr.port(),
-                taken,
-                "the {taken} drop has that port"
-            );
+            assert_ne!(addr.port(), taken, "the {taken} drop has that port");
         }
         assert!(
             plugin.get("secret").and_then(toml::Value::as_str).is_some(),
@@ -387,7 +392,10 @@ mod tests {
     #[test]
     fn shellexpand_homes_only_the_bare_tilde() {
         let home = std::env::var("HOME").unwrap_or_default();
-        assert_eq!(shellexpand("~/Downloads/x.zip"), format!("{home}/Downloads/x.zip"));
+        assert_eq!(
+            shellexpand("~/Downloads/x.zip"),
+            format!("{home}/Downloads/x.zip")
+        );
         assert_eq!(shellexpand("/tmp/x.zip"), "/tmp/x.zip");
         assert_eq!(shellexpand("weird~name.zip"), "weird~name.zip");
     }
@@ -402,7 +410,10 @@ mod tests {
         let card = report_card(&r);
         let s = serde_json::to_string(&card).unwrap();
         assert!(s.contains("\"verdict\":\"benign\""), "{s}");
-        assert!(!s.contains("\"sha256\""), "full hash never rides the card, prefix only: {s}");
+        assert!(
+            !s.contains("\"sha256\""),
+            "full hash never rides the card, prefix only: {s}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

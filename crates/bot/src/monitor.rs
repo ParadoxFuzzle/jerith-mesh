@@ -529,7 +529,10 @@ fn check_quarantine_at(log: Option<&Path>) -> CheckResult {
         return CheckResult {
             check: "quarantine",
             level: Level::Warn,
-            detail: format!("suspicious file(s) on disk: {} — inspect before opening", names.join(", ")),
+            detail: format!(
+                "suspicious file(s) on disk: {} — inspect before opening",
+                names.join(", ")
+            ),
         };
     }
     CheckResult {
@@ -732,7 +735,10 @@ mod tests {
         let log = dir.join("verdicts.jsonl");
         // No log at all (no state file anywhere): the honest quiet.
         assert_eq!(check_quarantine_at(None).level, Level::Ok);
-        assert_eq!(check_quarantine_at(Some(Path::new("/nope/never.jsonl"))).level, Level::Ok);
+        assert_eq!(
+            check_quarantine_at(Some(Path::new("/nope/never.jsonl"))).level,
+            Level::Ok
+        );
         // Malicious standing → Fail, naming the file. Malicious but the
         // file was already deleted → NOT news.
         std::fs::write(
