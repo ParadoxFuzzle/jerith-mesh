@@ -63,6 +63,19 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     banded relative tolerance (honest 8-bit noise, measured — the pilot
     also caught + fixed a scalar-KV-array seek bug in the reader that
     left the cursor mid-tensor-data)
+    Live-run notes from repeating the import on this box (2026-10-23):
+    the same Q8_0 re-imports identically (~51 s, 54 experts + 6 routers,
+    the bert-family GELU auto-tag and the 12 `ffn_*` bias tensors
+    reported as unrecognized notes). A SYNTHETIC Q4_0 GGUF (valid v3
+    header, hand-named tensors, no llama-family metadata) refuses FAST
+    with the exact missing key (`llama.embedding_length missing or not
+    an integer`) and writes nothing — the no-half-written rule holding at
+    the front door, not just the tensor table. Gotcha: nomic's
+    `L<n>.E<k>` ids collide with the drill fixtures' synthetic ids, so an
+    import RETIRES any same-named drill expert (a 768-wide real one
+    replaced the drill's 4-wide `L1.E0`; drills rebuild their fixtures
+    procedurally, so this is benign — but don't hand-data a store that
+    pins names you mean to keep).
 - ✅ Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
   - Demand is *measured*, not guessed: every expert this node serves or
     dispatches is counted (`expert_stats`, persisted to
