@@ -1734,6 +1734,16 @@ renderer + its `[plugins]` opt-in gate, and the golden live-DM fixture
 (format conventions pinned against the real 2026-10-22 briefing, so a
 format drift breaks the build, not the owner's DM).
 
+**Handoff note lane** (2026-10-23): an agent signs a working session
+off with ONE structured mail (`scripts/write-handoff.py`, stdlib
+only: `What shipped` / `Left live / wounds` / `Next steps`) into the
+`[ai]` mailbox, and the briefing surfaces the newest `[handoff]`
+subject while fresh (today/yesterday by archive stamp — Hinnant civil
+math, no chrono): `🤝 handoff` + the first three body lines; stale →
+one quiet pointer line; empty → the section isn't there. The first
+mail the lane read was written by the session that built the lane
+(RUNBOOK has the live-fire shape).
+
 **Seat-hold watcher** (2026-10-21, after an observed silent drop): a
 live seat can be lost between boot's join and the WSS lanes' view —
 the day's evidence was the bot disappearing from the VC roster while

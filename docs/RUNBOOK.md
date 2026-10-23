@@ -1466,6 +1466,41 @@ headers; then the real unit restarted on the diary binary and its
 signed `pet.look` card came back unchanged. The real pet's own
 diary starts writing with its next landing or long silence.
 
+### The handoff note lane (agent sign-offs, 2026-10-23)
+
+Before an agent signs off (a working session, an upgrade, a repair),
+it writes ONE structured mail into the `[ai]` box and the daily
+briefing surfaces the newest one while fresh (today/yesterday by
+archive stamp). The writer is stdlib-only:
+
+```bash
+scripts/write-handoff.py --by "<agent name>" --line "<one-line what>" <<'BODY'
+What shipped
+: one line per landed thing, each with the WHY
+Left live / wounds
+: services started, pins changed, what the next session must know
+Next steps
+: one sentence per follow-up
+BODY
+```
+
+The mail lands as `YYYYMMDD-HHMMSS-handoff-<rand>.eml` (mailhook
+stamp shape, local wall; `Date:` is UTC RFC-5322), subject tagged
+`[handoff]`, and sections say exactly:
+
+- **What shipped** — what landed this session;
+- **Left live / wounds** — what is running or raw right now;
+- **Next steps** — the follow-ups, one line each.
+
+Briefing render (`briefing.rs handoff_section_in`): fresh →
+`🤝 handoff (<stamp>) <subject>` + the first three body lines;
+stale → one quiet pointer line (`no fresh handoff — last signed off
+…`); empty box → the section simply isn't there (same empty-pew rule
+as the pet's greeting). Live-fire (2026-10-23): the session that BUILT
+the lane signed itself off through the script into the real [ai] box
+(`20261023-032353-handoff-1c28.eml`) — the first mail the surface
+ever had to read.
+
 ## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is

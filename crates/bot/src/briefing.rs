@@ -258,6 +258,13 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
         ));
     }
 
+    // The handoff note — the agent's structured sign-off from the [ai]
+    // box, surfaced while fresh so the owner starts the day holding what
+    // the last working session left behind.
+    if let Some(h) = handoff_section_in(&crate::mailbox::default_base_dir(), &day) {
+        s.push_str(&h);
+    }
+
     // Monitor, fresh at brief time (ward/fail lead, ok counted). The
     // icons are re-derived here because monitor's Level::icon is private.
     let limits = crate::monitor::MonitorLimits {
@@ -295,12 +302,95 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The pet's day-greeting (§ the mesh pet, crates/pet-plugin)
+// The handoff note lane (§ the [ai] mailbox, scripts/write-handoff.py)
 // ---------------------------------------------------------------------------
+
+/// Days-since-epoch for a civil date (Howard Hinnant's days_from_civil;
+/// the workspace pinned no chrono — same std-only math the pet uses).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + u64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe as i64 - 719_468
+}
+
+/// Parse `YYYYMMDD` (the archive stamp's leading half) into epoch days.
+fn stamp_day(stamp: &str) -> Option<i64> {
+    let d = stamp.get(..8)?;
+    if !d.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = d.get(..4)?.parse().ok()?;
+    let m: u32 = d.get(4..6)?.parse().ok()?;
+    let dd: u32 = d.get(6..8)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&dd) {
+        return None;
+    }
+    Some(days_from_civil(y, m, dd))
+}
+
+/// Is a handoff fresh? Written today or yesterday — the sign-off-to-
+/// morning-briefing cadence. An older handoff reads as a quiet
+/// "last handoff" pointer, never stale news as fresh news.
+fn handoff_stamp_is_fresh(arrived: &str, today: &str) -> bool {
+    let Some(s) = stamp_day(arrived) else {
+        return false;
+    };
+    let today = today.replace('-', "");
+    matches!(stamp_day(&today), Some(t) if s >= t - 1)
+}
+
+/// The handoff section: the newest `[handoff]` mail in the [ai] box.
+/// Fresh (today/yesterday) → the structured body's first lines; the
+/// box empty of handoffs → nothing (like the pet's greeting); an
+/// older handoff → one pointer line so the lane never wears new.
+fn handoff_section_in(base: &std::path::Path, today: &str) -> Option<String> {
+    let mail = crate::mailbox::list_messages_in(base, Some("ai"), 200);
+    let handoffs: Vec<&crate::mailbox::MailSummary> = mail
+        .iter()
+        .filter(|m| m.subject.trim_start().starts_with("[handoff]"))
+        .collect();
+    let m = handoffs.first()?;
+    if !handoff_stamp_is_fresh(&m.arrived, today) {
+        return Some(format!(
+            "🤝 no fresh handoff — last signed off `{} {}`\n",
+            m.arrived,
+            clip_line(&m.subject, 60)
+        ));
+    }
+    // First structured lines of the body: a handoff says what shipped,
+    // what's live, and what's next — those exact lines to the owner.
+    let body = std::fs::read_to_string(&m.path).unwrap_or_default();
+    let after = match body.find("\r\n\r\n") {
+        Some(i) => &body[i + 4..],
+        None => match body.find("\n\n") {
+            Some(i) => &body[i + 2..],
+            None => "",
+        },
+    };
+    let lines: Vec<String> = after
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with(">"))
+        .take(3)
+        .map(|l| format!("   · {}\n", clip_line(l, 110)))
+        .collect();
+    let mut s = format!("🤝 handoff ({}) {}\n", m.arrived, clip_line(&m.subject, 74));
+    s.push_str(&lines.join(""));
+    Some(s)
+}
+
 
 /// Is the pet opted in per `[plugins]`? Either row counts: `enabled`
 /// (skills in the shared registry) or `owner_only` (owner-DM only) —
 /// both are the operator explicitly turning the companion on.
+// ---------------------------------------------------------------------------
+// The pet's day-greeting (§ the mesh pet, crates/pet-plugin)
+// ---------------------------------------------------------------------------
+
 fn pet_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
     let gate = "external:pet";
     enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
@@ -489,6 +579,91 @@ pub async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Freshness arithmetic: today and yesterday are fresh, older
+    /// stamps are not, garbage is not (garbage never reads as fresh).
+    #[test]
+    fn handoff_freshness_is_today_or_yesterday() {
+        let today = "2026-10-23";
+        // The helper reads the stamp's leading YYYYMMDD half and does
+        // NOT parse the rest of the filename (the pet's tails ride
+        // along fine).
+        assert!(handoff_stamp_is_fresh("20261023-081100", today));
+        assert!(handoff_stamp_is_fresh("20261023-081122-pet-long_mood-a797", today));
+        assert!(handoff_stamp_is_fresh("20261022-235900", today), "yesterday's sign-off is the morning's brief");
+        assert!(!handoff_stamp_is_fresh("20261021-235900", today));
+        assert!(!handoff_stamp_is_fresh("20240101-000000", today));
+        assert!(!handoff_stamp_is_fresh("garbage-in-the-dir", today));
+        assert!(!handoff_stamp_is_fresh("20261301-000000", today), "month 13 is not a month");
+        // civil math pins: 1970-01-01 == day 0; the leap-era math
+        // agrees with the pet's inverse against the same known wall.
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2026, 10, 23), 20_749);
+        // 2000-01-01 is day 10957 (30y + 7 leaps); +60 through the
+        // leap-February to March 1.
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+    }
+
+    /// The lane end-to-end over a real (temp) [ai] box: a structured
+    /// `write-handoff`-shaped mail surfaces its first body lines; a
+    /// non-handoff neighbor doesn't promote itself; a stale handoff
+    /// degrades to one pointer line; an empty box contributes nothing.
+    #[test]
+    fn handoff_section_reads_the_ai_box() {
+        let dir = std::env::temp_dir().join(format!("jerith-handoff-{}", std::process::id()));
+        let ai = dir.join("ai");
+        std::fs::create_dir_all(&ai).unwrap();
+        std::fs::write(
+            ai.join("20261023-015500-agent1.eml"),
+            "From: agent <agent@jerith.mesh>\n\
+                To: ai <ai@jerith.mesh>\n\
+                Subject: [handoff] house card + pet diary live\n\
+                Date: Fri, 23 Oct 2026 01:55:00 +0000\n\
+                \n\
+                What shipped\n\
+                : house.status answers on the signed contract\n\
+                : pet diary delivers to [ai]\n\
+                Next steps\n\
+                : rebuild the release bot after briefing pin\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ai.join("20261023-020000-not-a-handoff.eml"),
+            "From: someone <x@y>\n\nSubject: [pet diary] stage: glowcap\n\nnot handoff\n",
+        )
+        .unwrap();
+
+        let today = "2026-10-23";
+        let s = handoff_section_in(&dir, today).expect("the handoff surfaces");
+        assert!(s.starts_with("🤝 handoff (20261023-015500"), "{s}");
+        assert!(s.contains("[handoff] house card + pet diary live".trim_start_matches("[handoff]")) || s.contains("house card + pet diary live"), "{s}");
+        assert!(s.contains("house.status answers on the signed contract"), "{s}");
+        assert!(s.contains("pet diary delivers to [ai]"), "{s}");
+        assert!(!s.contains("Next steps"), "only the first three body lines surface: {s}");
+
+        // Stale handoff: one pointer line, no body surfacing.
+        std::fs::remove_file(ai.join("20261023-015500-agent1.eml")).unwrap();
+        std::fs::remove_file(ai.join("20261023-020000-not-a-handoff.eml")).unwrap();
+        std::fs::write(
+            ai.join("20261020-235900-oldsignoff.eml"),
+            "From: agent <agent@jerith.mesh>\n\
+                To: ai <ai@jerith.mesh>\n\
+                Subject: [handoff] last week\n\
+                Date: Tue, 20 Oct 2026 23:59:00 +0000\n\
+                \n\
+                old body\n",
+        )
+        .unwrap();
+        let s = handoff_section_in(&dir, today).expect("stale still reads a pointer");
+        assert!(s.starts_with("🤝 no fresh handoff"), "{s}");
+        assert!(s.contains("20261020-235900"), "{s}");
+        assert!(!s.contains("old body"), "{s}");
+
+        // Empty mailbox: the section simply isn't there.
+        std::fs::remove_file(ai.join("20261020-235900-oldsignoff.eml")).unwrap();
+        assert!(handoff_section_in(&dir, today).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The visitor's honesty: message first, context after, clipped.
     #[test]
@@ -687,9 +862,10 @@ mod tests {
     fn golden_live_dm_matches_report_format() {
         let lines: Vec<&str> = GOLDEN_LIVE_DM.lines().collect();
 
-        // The seven sections in the exact order build_report assembles:
-        // header → mesh → voice → approvals → mail(+detail) → monitor →
-        // journal. Order never shuffles.
+        // The sections in the exact order build_report assembles:
+        // header → mesh → voice → approvals → mail(+detail) →
+        // [🤝 handoff (when the [ai] box has one — GOLDEN_LIVE_DM predates
+        // the lane)] → monitor → journal. Order never shuffles.
         let prefixes = [
             "🌅 **Jerith daily self-briefing** — ",
             "🕸️ mesh: peers ",
