@@ -266,16 +266,37 @@ impl GgufFile {
                 )
             })?
             .clone();
-        let n_floats: u64 = t.dims.iter().product();
+        // Eery arithmetic below is attacker-controlled via the tensor
+        // directory. UNCHECKED u64 math here has real release-mode teeth
+        // (2026-10-23 audit): data_start + offset wrapped past 2⁶⁴, an
+        // absurd 'at' sailed through the EOF gate, and the header bytes
+        // were decoded as floats into a 'valid' expert the caller never
+        // questioned. Every sum/product a crafted file can drive past
+        // 2⁶⁴ is checked → typed refusal.
+        let n_floats = t
+            .dims
+            .iter()
+            .try_fold(1u64, |a, d| a.checked_mul(*d))
+            .with_context(|| format!("tensor {name}: dims {:?} overflow", t.dims))?;
         anyhow::ensure!(
             n_floats > 0 && n_floats <= usize::MAX as u64,
             "tensor {name}: empty or overflowing element count"
         );
+        // The read position: data-section base + the directory-carried
+        // offset. Overflowing here is the silent-poison shape, refused.
+        let at = self.data_start.checked_add(t.offset).with_context(|| {
+            format!(
+                "tensor {name}: data offset {} wraps past the data section",
+                t.offset
+            )
+        })?;
         let mut buf: Vec<u8>;
         match t.dtype {
             GGML_F32 | GGML_F16 | GGML_BF16 => {
-                let size = n_floats * dtype_flat_size(t.dtype).unwrap() as u64;
-                read_exact_at(&mut self.file, self.data_start + t.offset, size)?;
+                let size = n_floats
+                    .checked_mul(dtype_flat_size(t.dtype).unwrap() as u64)
+                    .with_context(|| format!("tensor {name}: byte size overflows"))?;
+                read_exact_at(&mut self.file, at, size)?;
                 buf = vec![0u8; size as usize];
                 self.file.read_exact(&mut buf)?;
             }
@@ -289,12 +310,11 @@ impl GgufFile {
                     if t.dtype == GGML_Q8_0 { "Q8_0" } else { "Q4_0" }
                 );
                 let n_blocks = n_floats / per_block;
-                read_exact_at(
-                    &mut self.file,
-                    self.data_start + t.offset,
-                    n_blocks * block_bytes,
-                )?;
-                buf = vec![0u8; (n_blocks * block_bytes) as usize];
+                let size = n_blocks
+                    .checked_mul(block_bytes)
+                    .with_context(|| format!("tensor {name}: byte size overflows"))?;
+                read_exact_at(&mut self.file, at, size)?;
+                buf = vec![0u8; size as usize];
                 self.file.read_exact(&mut buf)?;
             }
             other => bail!(
@@ -398,8 +418,13 @@ fn read_kv(f: &mut File, vtype: u32, path: &Path) -> Result<GgufKv> {
 }
 
 fn read_exact_at(f: &mut File, at: u64, len: u64) -> Result<()> {
+    // Both operands carry untrusted values; an unchecked at+len wraps in
+    // release and can turn an out-of-file range into a passing check.
+    let end = at
+        .checked_add(len)
+        .context("tensor data range overflows u64")?;
     anyhow::ensure!(
-        f.metadata()?.len() >= at + len,
+        f.metadata()?.len() >= end,
         "tensor data {at}..+{len} runs past EOF"
     );
     f.seek(SeekFrom::Start(at))?;
@@ -1110,6 +1135,59 @@ mod tests {
         let f = GgufFile::open(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         f
+    }
+
+    /// Regression (2026-10-23 audit): the release-mode poisoner. A dir row
+    /// whose `offset` wraps `data_start + offset` past 2⁶⁴ used to land the
+    /// read INSIDE the header (the EOF gate then passed), so the header
+    /// bytes decoded as floats into a "valid" expert the importer wrote to
+    /// the live store AS A SUCCESS. In a debug build the same file panicked
+    /// on the unchecked add. Both shapes must now be typed refusals.
+    #[test]
+    fn overflow_tensor_arithmetic_is_refused_not_silently_poisoning() {
+        // A minimal-but-valid container: arch kv + two F32 dense FFN
+        // tensors laid out like the helper writes them — except the up
+        // tensor's dir-row offset is u64::MAX (guaranteed wrap) and the
+        // down tensor's dims overflow (2⁴⁰ × 2⁴⁰ ≫ 2⁶⁴).
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&2u64.to_le_bytes()); // n_tensors
+        b.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+        b.extend_from_slice(&(20u64).to_le_bytes());
+        b.extend_from_slice(b"general.architecture");
+        b.extend_from_slice(&KV_STR.to_le_bytes());
+        b.extend_from_slice(&(1u64).to_le_bytes());
+        b.extend_from_slice(b"x");
+        for (name, dims, offset) in [
+            ("blk.0.ffn_up.weight", vec![8u64, 4], u64::MAX),
+            ("blk.0.ffn_down.weight", vec![1u64 << 40, 1u64 << 40], 0),
+        ] {
+            b.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&F32_T.to_le_bytes());
+            b.extend_from_slice(&offset.to_le_bytes());
+        }
+        let pad = (32 - (b.len() as u64 % 32)) % 32;
+        b.extend(std::iter::repeat_n(0u8, pad as usize));
+        b.extend(std::iter::repeat_n(0x41u8, 8 * 4 * 4)); // up
+        b.extend(std::iter::repeat_n(0x42u8, 4 * 8 * 4)); // down
+
+        let mut f = write_and_open(&b);
+        let err = f.tensor("blk.0.ffn_up.weight").unwrap_err().to_string();
+        assert!(
+            err.contains("wraps past the data section"),
+            "wrap offset must be a typed refusal, got: {err}"
+        );
+        let err = f.tensor("blk.0.ffn_down.weight").unwrap_err().to_string();
+        assert!(
+            err.contains("dims [1099511627776, 1099511627776] overflow"),
+            "overflowing dims must be a typed refusal, got: {err}"
+        );
     }
 
     #[test]
