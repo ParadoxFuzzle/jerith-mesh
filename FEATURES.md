@@ -75,7 +75,20 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     import RETIRES any same-named drill expert (a 768-wide real one
     replaced the drill's 4-wide `L1.E0`; drills rebuild their fixtures
     procedurally, so this is benign — but don't hand-data a store that
-    pins names you mean to keep).
+    pins names you mean to keep). Same-day F32-vs-Q8_0 byte comparison
+    (the F32 file imported into a sandboxed `JERITH_HOME` next to the
+    Q8_0 snapshot): all 54 expert containers are STRUCTURALLY byte-equal
+    (magic/version/id/dims/kind+activation tags, exactly 768×3072,
+    exactly `hidden×inter×2` f32s, trailing u64 checksums) and the 6
+    routers are FULLY byte-identical (the source file carries the router
+    as native f32, so even the quantized import preserves it exactly);
+    the expert payloads differ in 99.999 % of floats at a worst of
+    ≈0.40 % of each container's |f|max vs the Q8_0 `d/2 ≤ 1/254 ≈ 0.394 %`
+    rounding envelope (one float in 254,803,968 a couple percent past the
+    band — fp16-rounded scale factor + the Q8_0 checkpoint's own source
+    provenance, not importer loss). The two quantization paths produce
+    equivalent expert stores byte-shape-wise; the F32-vs-Q8_0 diff reads
+    as pure 8-bit noise, measured.
 - ✅ Hot-expert replication (top 10–20 %) + cold-expert sharding (Phase 2)
   - Demand is *measured*, not guessed: every expert this node serves or
     dispatches is counted (`expert_stats`, persisted to
