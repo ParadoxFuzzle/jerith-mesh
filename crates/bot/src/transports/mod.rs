@@ -122,11 +122,14 @@ pub fn chunk_utf8(text: &str, max_chars: usize) -> Vec<String> {
         "chunk cap {max_chars} is too small to be sane"
     );
     let mut out = Vec::new();
-    let mut rest = text;
+    // Owned remainder, not a leak: the old loop handed the leftover tail
+    // to `Box::leak`, freeing nothing per chunk boundary for the life of
+    // the (long-lived) bot process. Same rune-for-rune splits.
+    let mut rest = text.to_string();
     loop {
         if rest.chars().count() <= max_chars {
             if !rest.is_empty() {
-                out.push(rest.to_string());
+                out.push(rest);
             }
             return out;
         }
@@ -150,7 +153,7 @@ pub fn chunk_utf8(text: &str, max_chars: usize) -> Vec<String> {
         if next.is_empty() {
             return out;
         }
-        rest = Box::leak(next.into_boxed_str());
+        rest = next;
     }
 }
 

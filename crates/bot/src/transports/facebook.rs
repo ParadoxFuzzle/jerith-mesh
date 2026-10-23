@@ -104,11 +104,13 @@ pub fn make_deliverer(wcfg: WhatsappConfig) -> DeliveryFn {
 /// entry → changes[0].value → messages[0] with from/text.body). Returns
 /// None for statuses (delivery receipts), unsupported message types,
 /// and pings.
-pub fn parse_message(v: &Value) -> Option<(String, String, String)> {
-    // (from, display, text)
+pub fn parse_message(v: &Value) -> Option<(String, String, String, String)> {
+    // (message id, from, display, text) — the id is the webhook replay
+    // defense's uniqueness key (empty when the payload omits it).
     let entry = v["entry"].as_array()?.first()?;
     let value = &entry["changes"].as_array()?.first()?["value"];
     let msg = value["messages"].as_array()?.first()?;
+    let msg_id = msg["id"].as_str().unwrap_or_default().to_string();
     let from = msg["from"].as_str()?.to_string();
     if from.is_empty() {
         return None;
@@ -122,7 +124,7 @@ pub fn parse_message(v: &Value) -> Option<(String, String, String)> {
     if text.is_empty() {
         return None;
     }
-    Some((from, profile, text))
+    Some((msg_id, from, profile, text))
 }
 
 pub async fn run(
@@ -154,14 +156,19 @@ mod tests {
                 "changes": [{
                     "value": {
                         "contacts": [{ "profile": { "name": "Noodly" }, "wa_id": "15559998888" }],
-                        "messages": [{ "from": "15559998888", "type": "text", "text": { "body": "hey mesh" } }]
+                        "messages": [{ "id": "wamid.abc123", "from": "15559998888", "type": "text", "text": { "body": "hey mesh" } }]
                     }
                 }]
             }]
         });
         assert_eq!(
             parse_message(&v),
-            Some(("15559998888".into(), "Noodly".into(), "hey mesh".into()))
+            Some((
+                "wamid.abc123".into(),
+                "15559998888".into(),
+                "Noodly".into(),
+                "hey mesh".into()
+            ))
         );
         // Status notifications (no messages array) → None.
         let st =

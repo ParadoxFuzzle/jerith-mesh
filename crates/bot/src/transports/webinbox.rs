@@ -82,7 +82,15 @@ struct Wb {
     state: BotState,
     wcfg: WebinboxConfig,
     owner: Option<u64>,
+    /// WhatsApp webhook replay defense (see `in_whatsapp`). Arc so the
+    /// `Clone` the state carriers demand stays cheap.
+    wa_seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
+
+/// Bounded seen-id cache for the WhatsApp replay defense: at the cap the
+/// whole set drops (the worst case costs an old-id replay window, never
+/// correctness — the id the platform itself re-sends is the measly key).
+const WA_SEEN_CAP: usize = 8_192;
 
 /// HMAC-SHA256 hex — the one signing primitive every route shares.
 fn hmac_hex(secret: &str, data: &[u8]) -> String {
@@ -109,6 +117,7 @@ pub async fn run(cfg: Arc<BotConfig>, wcfg: &WebinboxConfig) {
             state,
             wcfg: wcfg.clone(),
             owner,
+            wa_seen: Arc::new(std::sync::Mutex::new(Default::default())),
         });
     let listener = match tokio::net::TcpListener::bind(&wcfg.bind).await {
         Ok(l) => l,
@@ -185,9 +194,30 @@ async fn in_whatsapp(
             format!("bad json: {e}"),
         )
     })?;
-    let Some((from, display, text)) = crate::transports::facebook::parse_message(&v) else {
+    let Some((msg_id, from, display, text)) = crate::transports::facebook::parse_message(&v) else {
         return Ok(""); // status notifications etc. — ack silently
     };
+    // Replay defense: Meta's X-Hub-Signature-256 covers the BODY only —
+    // there is no timestamp in it, unlike Slack's — so a captured
+    // legitimate POST stays verifiable forever, and each replay would
+    // spawn a session that SPENDS THE BOT TOKEN answering a real
+    // channel. The platform's message id is the uniqueness key; any
+    // seen id is a silent ack.
+    if msg_id.is_empty() {
+        tracing::warn!(
+            target: "webinbox",
+            "whatsapp webhook message carried no id — cannot replay-dedupe"
+        );
+    } else {
+        let mut seen = wb.wa_seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&msg_id) {
+            return Ok("");
+        }
+        if seen.len() >= WA_SEEN_CAP {
+            seen.clear();
+        }
+        seen.insert(msg_id);
+    }
     let deliverer = crate::transports::facebook::make_deliverer(wcfg);
     let inc = crate::transports::Incoming {
         platform: "whatsapp",
@@ -239,7 +269,7 @@ async fn in_slack(
     AxState(wb): AxState<Wb>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<&'static str, (axum::http::StatusCode, String)> {
+) -> Result<String, (axum::http::StatusCode, String)> {
     let Some(secret) = wb.wcfg.slack_signing_secret.clone() else {
         return Err((
             axum::http::StatusCode::FORBIDDEN,
@@ -285,11 +315,10 @@ async fn in_slack(
     })?;
     if v["type"].as_str() == Some("url_verification") {
         let challenge = v["challenge"].as_str().unwrap_or_default().to_string();
-        // (axum response String; the caller sees it raw)
-        return Ok(Box::leak(challenge.into_boxed_str()));
+        return Ok(challenge);
     }
     if v["type"].as_str() != Some("event_callback") {
-        return Ok("");
+        return Ok(String::new());
     }
     let ev = &v["event"];
     // Slack Events-API shares the message envelope: skip bots/subtypes,
@@ -298,7 +327,7 @@ async fn in_slack(
         || ev["subtype"].as_str().is_some()
         || ev["bot_id"].is_string()
     {
-        return Ok("");
+        return Ok(String::new());
     }
     let channel = ev["channel"].as_str().map(str::to_string);
     let user = ev["user"].as_str().map(str::to_string);
@@ -306,7 +335,7 @@ async fn in_slack(
         .as_str()
         .and_then(|t| (!t.trim().is_empty()).then(|| t.to_string()));
     let (Some(channel), Some(user), Some(text)) = (channel, user, text) else {
-        return Ok("");
+        return Ok(String::new());
     };
     let deliverer: crate::transports::DeliveryFn = {
         let token = wb
@@ -333,7 +362,7 @@ async fn in_slack(
         wb.owner,
         deliverer,
     );
-    Ok("")
+    Ok(String::new())
 }
 
 // ---------------------------------------------------------------------------
