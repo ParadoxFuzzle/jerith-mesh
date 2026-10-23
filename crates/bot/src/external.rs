@@ -444,6 +444,23 @@ description = "Multi-day forecast."
         assert!(p.secret.is_some(), "pet ships signed by default");
     }
 
+    /// Same pin discipline for the house card (`crates/house-plugin/`,
+    /// the SDK's third consumer — answeneurs «how are you doing» over
+    /// the same signed contract): two skills (`house.status` /
+    /// `house.journal`), gated as `external:house`, signed by default.
+    #[test]
+    fn shipped_house_manifest_parses_under_todays_rules() {
+        let raw = include_str!("../../house-plugin/plugin.toml");
+        let p = ExternalPlugin::parse(Path::new("house-plugin/plugin.toml"), raw)
+            .expect("the shipped house manifest must stay valid");
+        assert_eq!(p.id, "house");
+        assert_eq!(p.gate_id(), "external:house");
+        let mut names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["house.journal", "house.status"]);
+        assert!(p.secret.is_some(), "house ships signed by default");
+    }
+
     #[test]
     fn missing_drop_dir_is_empty_not_error() {
         let ghost = std::env::temp_dir().join("jerith-ext-nope-does-not-exist");

@@ -172,7 +172,13 @@ reactions and message chunking differ per transport).
    Its build caught the example's latent `parse::<toml::Value>()`
    manifest-parse boot bug (full-document manifests must be
    `toml::from_str::<toml::Table>`); fixed and pinned by tests in
-   both crates' binaries the same day.
+   both crates' binaries the same day. Third live consumer: the
+   house (`crates/house-plugin/`, 2026-10-23 — `house.status`: the
+   how-are-you card answering over the signed contract — gateway
+   health, bot unit state, mesh contribution; `house.journal`: the
+   bot's recent journal lines; `JERITH_GATEWAY` bindable, refusal
+   to fetch is a card field, never a service error; `external:house`
+   gate row, owner-DM posture like pet).
 
 ## What would falsify this design
 

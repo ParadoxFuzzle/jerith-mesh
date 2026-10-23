@@ -349,7 +349,14 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     persisted across restarts; `external:pet` gate row). Its build
     also fixed the example's latent manifest-parse boot bug
     (document TOML needs `toml::from_str::<toml::Table>`, now pinned
-    on both crates).
+    on both crates). Third live consumer ✅ **the house**
+    (`crates/house-plugin/`, 2026-10-23): `house.status` answers the
+    how-are-you question over the signed contract — the bot unit's
+    state, the gateway's health + mesh contribution numbers, and one
+    recent-warn scan, degraded fields marked in the card rather than
+    failing the call; `house.journal` reads the bot's recent journal
+    lines. `JERITH_GATEWAY`/`JERITH_BOT_UNIT` bindable; the bot pin
+    test (manifest ⇄ drop parser) holds for all three drops.
   - Model-tool registry dispatch is whitelist-only: a disabled or unknown
     skill is refused to the model (fed back as an error it can recover
     from), never a chat failure — unit-tested (registry, gating, dispatch,

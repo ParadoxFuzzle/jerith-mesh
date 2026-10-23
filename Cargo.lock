@@ -2225,6 +2225,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jerith-house-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jerith-plugin-template",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "jerith-mesh-bot"
 version = "0.1.0"
 dependencies = [

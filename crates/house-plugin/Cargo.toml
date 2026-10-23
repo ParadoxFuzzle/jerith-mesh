@@ -1,0 +1,20 @@
+[package]
+name = "jerith-house-plugin"
+version.workspace = true
+edition.workspace = true
+description = "The mesh house's own card: the third plugin drop (docs/PLUGIN-SDK.md) — answers «how are you doing» over the signed /rpc contract from surfaces the house already owns (gateway /status, the bot unit, the drop clock, the process journal)."
+
+[[bin]]
+name = "jerith-house"
+path = "src/main.rs"
+
+[dependencies]
+jerith-plugin-template = { path = "../plugin-template" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+reqwest = { workspace = true }

@@ -1404,6 +1404,35 @@ content, expected nothing". Document parsing is
 `toml::from_str::<toml::Table>`; both crates' main.rs now do that and
 pin their shipped manifests by test (2026-10-23).
 
+## The house card (third live consumer, 2026-10-23)
+
+`crates/house-plugin/` answers the owner's "how are you doing" over
+the same signed contract as pet: `house.status` = one card (bot unit
+state, gateway health, mesh contribution %, recent warns, one word);
+`house.journal` = the bot's recent journal lines (5–1440 min window).
+Gateway/unreachability degrade to card fields — a speaking card is
+worth more than a refused one. Eponymous manifest rules apply, and
+its shipped-manifest bot-side pin test is third in the row:
+
+```bash
+mkdir -p ~/.jerith-mesh/plugins.d/house
+cp crates/house-plugin/plugin.toml ~/.jerith-mesh/plugins.d/house/
+cargo build -p jerith-house-plugin --release
+systemd-run --user --unit=jerith-house-plugin --working-directory=~/.jerith-mesh/plugins.d/house \
+  ./target/release/jerith-house ~/.jerith-mesh/plugins.d/house/plugin.toml   # rotate the secret first
+edit ~/.jerith-mesh/bot.toml        # "external:house" → [plugins] owner_only (owner-DM posture)
+systemctl --user restart jerith-bot
+```
+
+Live-fire (2026-10-23, this house): drop installed with a rotated
+secret, `external:house` joined `owner_only` with both prior
+consumers, service on `127.0.0.1:7790` (loopback, secret on) via unit
+`jerith-house-plugin`, bot restarted clean. Unsigned probe → 403
+refusal; HMAC-signed probe (`house.status`) → 200 + a full card:
+`word: steady`, bot active, 1 peer alive, contribution 40%, zero
+recent warns. Restarting the bot had the drop picked up without
+house-side changes.
+
 ## MongoDB Atlas lane (native driver, LIVE 2026-10-21)
 
 `crates/bot/src/mongo.rs` + `[mongo]` in bot.toml (0600). The wiring is

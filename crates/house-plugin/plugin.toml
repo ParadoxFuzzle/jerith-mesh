@@ -1,0 +1,32 @@
+# The mesh house's own card — a plugin drop over the signed plugin
+# contract (docs/PLUGIN-SDK.md; the SDK's third real consumer after the
+# example and the mesh pet). Install:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/house
+#   cp crates/house-plugin/plugin.toml ~/.jerith-mesh/plugins.d/house/
+#   cargo run -p jerith-house-plugin --release --bin jerith-house   # from the repo
+#   # then add "external:house" to [plugins] owner_only in bot.toml + restart
+#
+# ONE endpoint line binds BOTH sides, same rule as the other drops: the
+# binary reads it and binds that address, so manifest and service
+# cannot drift. Loopback by default; non-loopback must be https (the
+# drop parser enforces this, fail-closed at bot start). State is NOT
+# kept: the card is composed fresh per call from surfaces the house
+# already owns (gateway /status, systemctl, bot.toml names only, the
+# process journal) — nothing here invents or remembers.
+
+[plugin]
+id = "house"
+endpoint = "http://127.0.0.1:7790/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 10                         # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "status"
+description = "The house's «how are you doing» card: a one-word verdict (steady / a bit loud / needs you) plus the honest layers — bot unit state and uptime, mesh peers and contribution from the gateway, configured chat-surface names, the commit this house runs from, and recent warnings. Composed, never invented; unreachable layers say so."
+parameters = { type = "object" }
+
+[[skill]]
+name = "journal"
+description = "The bot unit's recent WARN/ERROR journal lines. Optional since_minutes (5–1440, default 120). Honest typed error when journalctl is unreachable. Prefer over inventing a health guess when the owner asks what lately went wrong."
+parameters = { type = "object", properties = { since_minutes = { type = "integer", minimum = 5, maximum = 1440, description = "Look this many minutes back (default 120)." } } }
