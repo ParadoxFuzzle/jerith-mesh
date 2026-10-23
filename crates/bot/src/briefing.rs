@@ -306,9 +306,18 @@ fn pet_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
     enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
 }
 
+/// Milestone days: the hatchdays the briefing makes a little festival
+/// of. Any other day just counts quietly.
+const HATCHDAY_MARKS: [u64; 5] = [1, 7, 30, 100, 365];
+
 /// The greeting line from a `pet.look` card — the vault's mood words
 /// straight through (`loop-de-loop`, `orange-cap`, …), pure + testable.
 /// No mood field → no greeting (the pet's honesty, not ours to invent).
+/// Additions read the card's own numbers: `age_days` appends the day
+/// count (a quiet `· day N`), a milestone day becomes a small 🎂
+/// hatchday, and a `noteback` card adds a second line — the pet bringing
+/// one kept word back out of its vault of self. `noteback`'s caption is
+/// the pet's phrasing of keeping; the briefing adds none of its own.
 fn render_pet_line(pet: &Value) -> Option<String> {
     let mood = pet["mood"].as_str()?;
     let name = pet["name"].as_str().unwrap_or("the companion");
@@ -317,11 +326,28 @@ fn render_pet_line(pet: &Value) -> Option<String> {
         .as_str()
         .map(|s| clip_line(s, 90))
         .unwrap_or_default();
-    Some(format!(
-        "🐟 {name}: {mood} · food {}% · energy {}% — “{says}”",
+    let age_days = pet["age_days"].as_u64().unwrap_or(0);
+    let head = match HATCHDAY_MARKS.contains(&age_days) {
+        true => format!("🐟 🎂 {name}: day {age_days} of the territory — {mood}"),
+        false if age_days > 0 => format!("🐟 {name}: {mood} · day {age_days}"),
+        false => format!("🐟 {name}: {mood}"),
+    };
+    let mut out = format!(
+        "{head} · food {}% · energy {}% — “{says}”",
         get_pct("food_pct"),
         get_pct("energy_pct")
-    ))
+    );
+    if let Some(nb) = pet["noteback"].as_object()
+        && let Some(note) = nb.get("note").and_then(Value::as_str)
+        && let Some(caption) = nb.get("personal").and_then(Value::as_str)
+    {
+        out.push_str(&format!(
+            "\n   ↪ from its vault of self: “{}” — “{}”",
+            clip_line(note, 80),
+            clip_line(caption, 90)
+        ));
+    }
+    Some(out)
 }
 
 /// Compose the pet's section, or `None` when it has nothing to say.
@@ -334,7 +360,8 @@ async fn pet_section(cfg: &crate::config::BotConfig) -> Option<String> {
         return None;
     }
     let plugin = cfg.external_plugins.iter().find(|p| p.id == "pet")?;
-    match crate::external::invoke(plugin, "pet.look", &serde_json::json!({})).await {
+    match crate::external::invoke(plugin, "pet.look", &serde_json::json!({"noteback": true})).await
+    {
         Ok(card) => render_pet_line(&card).map(|l| format!("{l}\n")),
         Err(e) => {
             tracing::debug!(error = %e, "pet greeting skipped — the pet wasn't answering");
@@ -532,6 +559,60 @@ mod tests {
         let mut mute = card.clone();
         mute.as_object_mut().unwrap().remove("mood");
         assert!(render_pet_line(&mute).is_none());
+    }
+
+    /// The day count and the hatchday festival, straight from the card's
+    /// own `age_days`: quiet counting any day, 🎂 on the milestones, and
+    /// a `noteback` card renders its second line (the pet keeps, the
+    /// briefing just prints) — never invented when the pet stayed silent.
+    #[test]
+    fn pet_line_counts_days_and_festivals_milestones_and_noteback() {
+        let base = serde_json::json!({
+            "name": "Droplet", "mood": "orange-cap",
+            "food_pct": 90, "energy_pct": 100,
+        });
+        let set_days = |base: &Value, d: u64| {
+            let mut c = base.clone();
+            c["age_days"] = serde_json::json!(d);
+            render_pet_line(&c).unwrap()
+        };
+        // Day 0 (a hatchday itself): no day suffix, no 🎂 — the base shape.
+        let fresh = set_days(&base, 0);
+        assert!(fresh.starts_with("🐟 Droplet: orange-cap "), "{fresh}");
+        assert!(!fresh.contains("day"), "{fresh}");
+        // Day 5: a quiet count.
+        let five = set_days(&base, 5);
+        assert!(five.contains("· day 5 · food"), "{five}");
+        assert!(!five.contains("🎂"), "{five}");
+        // Milestones: festival wording, count promoted into the head.
+        for d in [1u64, 7, 30, 100, 365] {
+            let m = set_days(&base, d);
+            assert!(
+                m.starts_with(&format!(
+                    "🐟 🎂 Droplet: day {d} of the territory — orange-cap"
+                )),
+                "{m}"
+            );
+        }
+        // noteback: the kept word + the pet's own caption, its own line.
+        let mut nb = base.clone();
+        nb["age_days"] = serde_json::json!(3);
+        nb["noteback"] = serde_json::json!({
+            "note": "pancakes were excellent today",
+            "personal": "Kept that one with the bread crumbs, same shelf.",
+        });
+        let with_nb = render_pet_line(&nb).unwrap();
+        assert!(
+            with_nb.contains("\n   ↪ from its vault of self"),
+            "{with_nb}"
+        );
+        assert!(with_nb.contains("bread crumbs"), "{with_nb}");
+        // A half-written noteback (no caption) renders without the line —
+        // the brief never invents the pet's half.
+        let mut ghost = base.clone();
+        ghost["noteback"] = serde_json::json!({"note": "only this"});
+        let ghost_line = render_pet_line(&ghost).unwrap();
+        assert_eq!(ghost_line.lines().count(), 1, "{ghost_line}");
     }
 
     /// The opt-in gate: either `[plugins]` row turns the greeting on,

@@ -22,8 +22,8 @@ timeout_secs = 10                         # clamped 1-30 (hook discipline)
 
 [[skill]]
 name = "look"
-description = "Look in on the pet: full state card (name, stage, mood, food, energy, bond, memories) plus one line in its own voice. Costs nothing, asks nothing, but time passes."
-parameters = { type = "object" }
+description = "Look in on the pet: full state card (name, stage, mood, food, energy, bond, memories) plus one line in its own voice. Time passes while you look. Optional `noteback: true` — what the daily brief uses — also brings ONE kept note back out of its vault of self, with a line about where it lives; worth surfacing verbatim when present."
+parameters = { type = "object", properties = { noteback = { type = "boolean", description = "Also return one remembered note from the vault of self, with a caption." } } }
 
 [[skill]]
 name = "talk"

@@ -1693,7 +1693,15 @@ already owns:
   of the pet's own voice. Honesty rules: no mood in the card → no line
   (the pet's silence isn't ours to invent); the service down → no line
   and a DEBUG note, never a fake greeting. No direct state-file reads —
-  the briefing asks, like any chat caller would.
+  the briefing asks, like any chat caller would. The card's own
+  `age_days` counts the days: a quiet `· day N` suffix on any day, a
+  small `🎂` festival on the milestones (1, 7, 30, 100, 365) — the
+  count comes from the card, never from the briefing's own clock. And
+  each brief asks for `noteback` — one kept word brought back out of
+  the vault of self (`pet.look`'s optional pick, deterministic per
+  minute, always captioned with the pet's own phrasing of keeping, no
+  recency claims) rendered as a second indented line when the pet kept
+  anything at all; silence stays silence.
 
 Schedule semantics: hourly cadence; fires once per local day once the
 local hour reaches `hour` (default 08, clamp 0–23). Fire state persists

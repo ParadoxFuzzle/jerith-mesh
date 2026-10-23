@@ -70,6 +70,18 @@ pub const REMEMBER_CAP: usize = 8;
 pub const NOTE_MAX_CHARS: usize = 200;
 pub const NAME_MAX_CHARS: usize = 24;
 
+/// When `pet.look` is asked to bring a note back out of the vault of
+/// self, one of these captions carries it. Never a recency claim — the
+/// vault keeps words, not calendars — only the honesty of keeping.
+const NOTEBACK_LINES: [&str; 6] = [
+    "Kept that one with the bread crumbs, same shelf.",
+    "Filed where the tide brings in the good things.",
+    "The cap warmed a whole degree when you said it.",
+    "It still loops. A happy loop-de-loop of the mind.",
+    "I trade crumbs of Void Fruit for words like that. Fair market.",
+    "That one goes on the highest roof beam with the festival treats.",
+];
+
 /// (bond threshold, stage name) — ascending; a pet's stage is the last
 /// row whose threshold its `max_bond` clears, and `max_bond` is the
 /// all-time best so stages can't be walked back.
@@ -240,9 +252,32 @@ impl PetState {
 
     /// `pet.look` — the full card. Costs nothing, asks nothing, and does
     /// advance the clock: looking at someone is an interaction with time.
-    pub fn look(&mut self, now: u64) -> Value {
+    /// With `noteback`, the pet also brings one note back out of the
+    /// vault of self — a kept word plus its own caption. Honestly
+    /// deterministic per minute (same state, same minute → same pick),
+    /// and honestly silent when nothing was ever kept.
+    pub fn look(&mut self, now: u64, noteback: bool) -> Value {
         self.apply_elapsed(now);
-        self.card(now)
+        let mut card = self.card(now);
+        if noteback
+            && !self.memory.is_empty()
+            && let Some(obj) = card.as_object_mut()
+        {
+            let seed = splitmix(
+                self.hatched_ms
+                    ^ (self.memory.len() as u64).wrapping_mul(0x5163_3E19_7776_0F14)
+                    ^ (now / MS_MINUTE),
+            );
+            let pick = &self.memory[(seed >> 11) as usize % self.memory.len()];
+            obj.insert(
+                "noteback".into(),
+                json!({
+                    "note": cut(pick, 80),
+                    "personal": NOTEBACK_LINES[(seed >> 7) as usize % NOTEBACK_LINES.len()],
+                }),
+            );
+        }
+        card
     }
 
     /// `pet.talk` — one short note of what the owner just said. Bond +
@@ -391,6 +426,7 @@ impl PetState {
             "feeds": self.feeds,
             "plays": self.plays,
             "age_hours": now.saturating_sub(self.hatched_ms) / MS_HOUR,
+            "age_days": now.saturating_sub(self.hatched_ms) / MS_DAY,
             "remembers": remembers,
             "says": self.says(now),
             "next_talk_in_s": cooldown_remaining(self.last_talk_ms, now, TALK_COOLDOWN_MS)
@@ -569,19 +605,61 @@ mod tests {
     #[test]
     fn fresh_card_shape() {
         let mut st = PetState::fresh(T0);
-        let card = st.look(T0);
+        let card = st.look(T0, false);
         assert_eq!(card["name"], "Droplet");
         assert_eq!(card["stage"], "droplet");
         assert_eq!(card["mood"], "orange-cap");
         assert_eq!(as_f(&card, "food_pct"), 90.0);
         assert_eq!(as_f(&card, "energy_pct"), 100.0);
         assert_eq!(card["age_hours"], 0);
+        assert_eq!(card["age_days"], 0);
         assert_eq!(card["next_stage_bond"], 100);
         assert_eq!(as_f(&card, "bond"), 0.0);
         assert_eq!(card["remembers"], json!([]));
         assert!(card["says"].as_str().unwrap().len() > 8);
         // Cooldown fields read as null, not absent (bounded shape).
         assert!(card["next_talk_in_s"].is_null());
+    }
+
+    /// The hatchday arithmetic: full days lived, floor. 29 h is one —
+    /// the same reading at brief-time and chat-time.
+    #[test]
+    fn age_days_is_the_floor_of_full_days() {
+        let mut st = PetState::fresh(T0);
+        assert_eq!(st.look(T0, false)["age_days"], 0);
+        assert_eq!(st.look(T0 + MS_DAY - 1, false)["age_days"], 0);
+        assert_eq!(st.look(T0 + MS_DAY, false)["age_days"], 1);
+        assert_eq!(st.look(T0 + MS_DAY * 7 + MS_HOUR * 5, false)["age_days"], 7);
+    }
+
+    /// The noteback ritual: nothing spoken yet → nothing sent back; a
+    /// kept word → the pick is deterministic within a minute and carries
+    /// NO recency claim (the vault keeps words, not calendars);
+    /// `noteback:false` keeps the chat-loop card lean.
+    #[test]
+    fn noteback_brings_one_kept_word_back_deterministically() {
+        let mut t = T0 + MS_DAY * 2;
+        let mut st = PetState::fresh(t);
+        // The vault is empty → the card is silent about it.
+        assert!(st.look(t, true).get("noteback").is_none());
+        st.talk(t, "the well hums a different note on festival days")
+            .unwrap();
+        t += TALK_COOLDOWN_MS;
+        st.talk(t, "pancakes were excellent today").unwrap();
+        t += TALK_COOLDOWN_MS;
+        let a = st.look(t, true);
+        let b = st.look(t, true);
+        let na = &a["noteback"];
+        assert_eq!(na, &b["noteback"], "same minute → same pick");
+        let note = na["note"].as_str().expect("note text");
+        assert!(
+            note.contains("festival days") || note.contains("pancakes"),
+            "picked from what was kept: {note}"
+        );
+        let personal = na["personal"].as_str().expect("caption");
+        assert!(personal.len() > 8, "{personal}");
+        // Not asked → not there (the chat loop's card stays lean).
+        assert!(st.look(t, false).get("noteback").is_none());
     }
 
     #[test]

@@ -119,10 +119,11 @@ async fn main() -> Result<()> {
             skill({
                 let pet = Arc::clone(&pet);
                 let path = Arc::clone(&path);
-                move |_args: Value| {
+                move |args: Value| {
+                    let noteback = args["noteback"].as_bool().unwrap_or(false);
                     let pet = Arc::clone(&pet);
                     let path = Arc::clone(&path);
-                    async move { with_pet(&pet, &path, |st, now| Ok(st.look(now))).await }
+                    async move { with_pet(&pet, &path, |st, now| Ok(st.look(now, noteback))).await }
                 }
             }),
         )
