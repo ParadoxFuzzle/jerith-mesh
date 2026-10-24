@@ -12,7 +12,7 @@
 //! split. Each adapter is DORMANT until its `[transports.<platform>]`
 //! table lands in bot.toml (no table = no task spawned, zero cost); a
 //! typed startup refusal — never a silent guess — states what a platform
-//! cannot offer this build (see gg.rs, teams.rs / google_chat.rs ingest).
+//! cannot offer this build (see teams.rs / google_chat.rs ingest).
 //!
 //! History/cooldown keys: platforms assign a stable u64 user key via
 //! [`user_key`] (FNV-1a over `platform:user`), so per-user histories
@@ -29,7 +29,6 @@
 
 pub(crate) mod facebook;
 pub(crate) mod feishu;
-pub(crate) mod gg;
 pub(crate) mod google_chat;
 pub(crate) mod irc;
 pub(crate) mod mattermost;
@@ -318,7 +317,6 @@ fn trait_cfg_dispatch(
     spawn_if!(google_chat, google_chat, "google_chat");
     spawn_if!(feishu, feishu, "feishu");
     spawn_if!(whatsapp, facebook, "whatsapp");
-    spawn_if!(gg, gg, "gg");
 }
 
 /// Restart-supervision: transpORY tasks disconnect eventually (net wobble,
@@ -382,8 +380,6 @@ pub struct TransportsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub whatsapp: Option<facebook::WhatsappConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gg: Option<gg::GgConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webinbox: Option<webinbox::WebinboxConfig>,
 }
 
@@ -423,9 +419,6 @@ impl TransportsConfig {
         }
         if self.whatsapp.is_some() {
             v.push("whatsapp");
-        }
-        if self.gg.is_some() {
-            v.push("gg");
         }
         if self.webinbox.is_some() {
             v.push("webinbox");

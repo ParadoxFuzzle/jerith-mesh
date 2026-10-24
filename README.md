@@ -47,7 +47,6 @@ internet gives you 30–300 ms per hop. **jerith-mesh** restructures the problem
 | `/briefing` (what-did-i-miss port) | ✅ | Recent decision/note lines across the watched threads + a 3-line mesh digest, on demand |
 | Owner-DM trust model | ✅ | OpenClaw `ownerAllowFrom` port: commands outside the user-level list are refused for everyone; system-level actions need a DM from the bot owner (default-deny for unclassified commands) |
 | JerithChain co-hosted node | ✅ | The local JerithChain node (FastAPI :8322, SQLite ledger, api token shared at `~/.jerith-mesh/keys/api.token`) is part of the mesh install: shared auth, `jerith chain …` CLI, chain section on the node's `/status` |
-| OpenClaw migration | ✅ | `scripts/migrate-from-openclaw.sh` — stops the stack, reuses model + bot token, starts node/bot, and stages workspace scripts/plugin-skills/extensions/docs into `~/.jerith-mesh/openclaw-migrated/` with cron + service manifests |
 | OpenAI-compatible API | ✅ MVP | `/v1/chat/completions`, `/v1/models` |
 | Telegram / WhatsApp etc. | 📋 Plugin SDK | user-contributed modules |
 
