@@ -11,9 +11,10 @@
 //!   missing files only: user edits are never overwritten, and `~/.openclaw`
 //!   is never written to.
 //! - **`compose_persona()`** builds the bot's system prompt from the
-//!   workspace canon in OpenClaw's own doc order (IDENTITY → SOUL → USER
-//!   → USER_MODEL → AGENTS → MEMORY), replacing the older flat
-//!   `persona.md` read (which stays the fallback when no canon exists).
+//!   workspace canon in OpenClaw's own doc order (IDENTITY → SOUL →
+//!   soul/* → USER → USER_MODEL → AGENTS → MEMORY), replacing the older
+//!   flat `persona.md` read (which stays the fallback when no canon
+//!   exists).
 //! - Docs are capped individually so one bloated doc degrades gracefully
 //!   instead of blowing the runtime context (main.rs applies the final
 //!   hard cap over the combined prompt + known-users).
@@ -22,9 +23,22 @@ use std::path::{Path, PathBuf};
 
 /// The canon docs the mesh bot consumes, in compose order. A doc missing
 /// from the workspace is simply skipped.
-pub const CANON_ORDER: [&str; 6] = [
+///
+/// The `soul/*.md` entries are the persona sub-docs that the OpenClaw
+/// gateway composed implicitly and the 2026-10 migration left behind
+/// (IDENTITY.md/SOUL.md still name `soul/model-identity.md` in their
+/// text). They sit right after SOUL.md — they extend it. The other soul
+/// sub-docs from the old stack are deliberately NOT canon: response-style/
+/// trust/security duplicate SOUL.md's own sections, execute-tools/
+/// local-tools describe an unreachable shell, and grounding-protocol's
+/// people-file mechanics were replaced by the registry (its rules survive
+/// distilled inside response-approach.md).
+pub const CANON_ORDER: [&str; 9] = [
     "IDENTITY.md",
     "SOUL.md",
+    "soul/model-identity.md",
+    "soul/response-approach.md",
+    "soul/self-improving.md",
     "USER.md",
     "USER_MODEL.md",
     "AGENTS.md",
@@ -61,6 +75,9 @@ Personality + canon docs for the mesh bot (OpenClaw workspace pattern).
 | `USER_MODEL.md` | how the bot models people / relationships |
 | `AGENTS.md` | operating rules, routing notes |
 | `MEMORY.md` | standing knowledge the bot carries every turn |
+| `soul/model-identity.md` | honest model/stack identity rules |
+| `soul/response-approach.md` | anti-autopilot response approach + pre-send self-check |
+| `soul/self-improving.md` | how corrections land on the mesh (registry-based) |
 
 Missing canon docs are staged from the migrated OpenClaw workspace on
 startup; existing files are never overwritten. **Edit these files
@@ -206,6 +223,25 @@ mod tests {
         assert!(soul_pos < mem_pos);
         // The oversized doc carries the truncation marker.
         assert!(persona.contains("persona truncated at 800 chars"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&oc);
+    }
+
+    #[test]
+    fn soul_subdocs_compose_between_soul_and_user() {
+        let (ws, oc) = setup();
+        std::fs::write(ws.join("IDENTITY.md"), "id").unwrap();
+        std::fs::write(ws.join("SOUL.md"), "soul").unwrap();
+        std::fs::create_dir_all(ws.join("soul")).unwrap();
+        std::fs::write(ws.join("soul/model-identity.md"), "model truth").unwrap();
+        // gaps are skipped, never fatal — response-approach absent here
+        std::fs::write(ws.join("USER.md"), "user").unwrap();
+        let persona = compose_persona(&ws, 6000).expect("canon docs exist");
+        let soul_pos = persona.find("## SOUL.md").unwrap();
+        let mi_pos = persona.find("## soul/model-identity.md").unwrap();
+        let user_pos = persona.find("## USER.md").unwrap();
+        assert!(soul_pos < mi_pos && mi_pos < user_pos);
+        assert!(!persona.contains("response-approach"));
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&oc);
     }
