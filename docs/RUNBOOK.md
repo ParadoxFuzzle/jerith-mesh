@@ -2138,20 +2138,25 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   `credentials-file` at a missing file, or two units claim the same
   `tunnel:` id. CI can't see host systemd units, so this is the
   enforcement point.
-- **Same pattern, main site (found 2026-10-27, needs a dashboard
-  click)**: `jerithai.com` / `www.jerithai.com` return a body-less 404
-  from the Cloudflare edge — the DNS records point at a tunnel whose
-  catch-all is `http_status:404` (nmonit or jerith-bootstrap), NOT the
-  jerith-wordpress tunnel that is supposed to serve them. The binding
-  is proven good on both ends: Jetson WordPress answers **200** for
-  both vhosts locally (`curl -H 'Host: jerithai.com' localhost:80`) and
-  the wordpress tunnel's ingress already declares both hostnames →
-  `http://localhost:80`. Fix is the nmonit fix rerun: point the two
-  CNAME records at `401207aa-9250-4236-bfda-b18cf8a0873b.cfargotunnel.com`
-  (proxied), then re-curl — expect 200, not 404. Diagnosis discriminator
-  to remember: tunnel routing says hello through DNS/hostname, so
-  compare Jetson-local vhost response vs the tunneled one + body size;
-  an empty 404 is edge catch-all, an HTML 404 is WP itself.
+- **Main site restored 2026-10-27 evening — the DNS was NEVER wrong**
+  (correction to the earlier read of the same day): the dashboard rows
+  for `jerithai.com`/`www.jerithai.com` say `Tunnel: nmonit`, and that
+  was always intentional — the desktop's site (`/var/www/jerithai`,
+  nginx `:80`, title "Jerith Mesh + Jerith Coin (JER) — JerithAI") got
+  to the internet through the nmonit tunnel, per
+  `config.yml.bak-prejerithai`/`bak-prenmonit2`. The morning nmonit.yml
+  restoration carried only the `nmonit.jerithai.com` rule, dropping the
+  two apex/www rules — hence the body-less 404s. Fix was local only:
+  re-added `jerithai.com` + `www.jerithai.com` → `http://localhost:80`
+  to nmonit.yml; all three nmonit-tunnel hostnames now 200 from the
+  edge. Meanwhile the marker-probe tooling (200-line in the candidate
+  tunnel's ingress + restart + curl) remains the correct discriminator
+  for "which tunnel does this hostname really hit" — the dashboard rows
+  are evidence but the edge is truth. The Jetson-side
+  `cloudflared-wordpress` tunnel still declares apex/www in its local
+  ingress that DNS never routes to it — harmless duplication, on the
+  Jetson as `~/.config/systemd/user/cloudflared-wordpress.service` if
+  anyone ever repoints the rows again.
 - **Revert**: `nmonit.yml` back to
   `config.yml.bak-prenmonit2` ingress rules, and the unit's ExecStart
   back to bare `tunnel run nmonit` — recreates the wrong-tunnel bug if
