@@ -2138,6 +2138,20 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   `credentials-file` at a missing file, or two units claim the same
   `tunnel:` id. CI can't see host systemd units, so this is the
   enforcement point.
+- **Same pattern, main site (found 2026-10-27, needs a dashboard
+  click)**: `jerithai.com` / `www.jerithai.com` return a body-less 404
+  from the Cloudflare edge — the DNS records point at a tunnel whose
+  catch-all is `http_status:404` (nmonit or jerith-bootstrap), NOT the
+  jerith-wordpress tunnel that is supposed to serve them. The binding
+  is proven good on both ends: Jetson WordPress answers **200** for
+  both vhosts locally (`curl -H 'Host: jerithai.com' localhost:80`) and
+  the wordpress tunnel's ingress already declares both hostnames →
+  `http://localhost:80`. Fix is the nmonit fix rerun: point the two
+  CNAME records at `401207aa-9250-4236-bfda-b18cf8a0873b.cfargotunnel.com`
+  (proxied), then re-curl — expect 200, not 404. Diagnosis discriminator
+  to remember: tunnel routing says hello through DNS/hostname, so
+  compare Jetson-local vhost response vs the tunneled one + body size;
+  an empty 404 is edge catch-all, an HTML 404 is WP itself.
 - **Revert**: `nmonit.yml` back to
   `config.yml.bak-prenmonit2` ingress rules, and the unit's ExecStart
   back to bare `tunnel run nmonit` — recreates the wrong-tunnel bug if
