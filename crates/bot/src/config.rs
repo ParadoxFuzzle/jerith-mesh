@@ -91,6 +91,10 @@ pub struct BotConfig {
     /// Daily owner self-briefing: one owner DM per day stitching journal,
     /// monitor, mail, voice and approvals (`[briefing]`, see briefing.rs).
     pub briefing: BriefingConfig,
+    /// Welcome-DM lane (`[welcome]` in bot.toml): the OpenClaw
+    /// guild-watcher port — three embeds + local GIF pool + DM to every
+    /// human joining a scoped guild (welcome.rs). Off by default.
+    pub welcome: crate::welcome::WelcomeConfig,
     /// Webhook / event hooks for plugin authors (FEATURES §8): fire-
     /// and-forget signed JSON events POSTed to operator URLs. Empty
     /// `urls` (the default) keeps it off; see hooks.rs.
@@ -484,6 +488,7 @@ impl BotConfig {
             squeeze: file.squeeze.unwrap_or_default(),
             monitor: file.monitor.unwrap_or_default(),
             briefing: file.briefing.unwrap_or_default(),
+            welcome: file.welcome.unwrap_or_default(),
             hooks: {
                 let cfg = file.hooks.unwrap_or_default();
                 cfg.validate()
@@ -599,6 +604,7 @@ impl BotConfig {
             squeeze: SqueezeConfig::default(),
             monitor: MonitorConfig::default(),
             briefing: BriefingConfig::default(),
+            welcome: crate::welcome::WelcomeConfig::default(),
             hooks: crate::hooks::HooksConfig::default(),
             external_plugins: Vec::new(),
             chat_timeout_secs: DEFAULT_CHAT_TIMEOUT_SECS,
@@ -911,6 +917,9 @@ struct FileConfig {
     /// Optional `[briefing]` table — the daily owner self-briefing (see
     /// briefing.rs).
     briefing: Option<BriefingConfig>,
+    /// Optional `[welcome]` table — the welcome-DM lane (OpenClaw
+    /// guild-watcher port, see welcome.rs).
+    welcome: Option<crate::welcome::WelcomeConfig>,
     /// Optional `[hooks]` table — webhook event hooks for plugin authors
     /// (FEATURES §8, see hooks.rs). Empty = disabled.
     hooks: Option<crate::hooks::HooksConfig>,

@@ -2165,3 +2165,39 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   back to bare `tunnel run nmonit` — recreates the wrong-tunnel bug if
   done without ALSO restoring the old config.yml, which is the trap
   that caused this. Do it atomically.
+
+## The weather skill (echo consumer, 2026-10-27)
+
+`crates/weather-plugin/` gives the room a REAL weather lane over the
+same signed contract — public by design (open-meteo upstream, no api
+key), gated via `[plugins] enabled` and NEVER `owner_only`:
+`weather.now` = current conditions at any place on Earth;
+`weather.forecast` = 1-7 day series. Pure parsing lives in its lib.rs
+(9 tests), wire glue in main.rs (manifest row/handler pin), and a
+bot-side manifest pin is fourth in external.rs's row.
+
+```bash
+mkdir -p ~/.jerith-mesh/plugins.d/weather
+cp crates/weather-plugin/plugin.toml ~/.jerith-mesh/plugins.d/weather/   # rotate the secret first
+cp deploy/systemd/jerith-weather-plugin.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now jerith-weather-plugin
+edit ~/.jerith-mesh/bot.toml   # 'external:weather' → [plugins] enabled (public surface)
+systemctl --user restart jerith-bot
+```
+
+Live-fire (2026-10-27, this house): unit `jerith-weather-plugin`
+serving `127.0.0.1:7793` (signed), bot restarted clean with the drop
+gating on. HMAC-signed probe (`weather.forecast`, place=Prague,
+days=2) → 200: `open-meteo` card with real values (14.2 °C / 3.9 °C,
+overcast, next 2 days); unknown place (`Zzzzxcvbnope`) → the typed
+refusal `no place matched — check the spelling` the model relays
+verbatim.
+
+Same session, the guild-watcher retired: the welcome-DM lane moved
+into `crates/bot/src/welcome.rs` (`[welcome]` in bot.toml — the
+OpenClaw guild-watcher port: same three embeds, the red-panda GIF pool
+migrated to `~/.jerith-mesh/workspace/gifworkshop/redpandas/`, members
+intent unioned in main.rs). The OpenClaw-era Python unit
+(`guild-admin-watcher.service`) is stopped + disabled 2026-10-27
+(reversible with `systemctl --user start`); both lanes firing at once
+would double-DM — keep only one up.

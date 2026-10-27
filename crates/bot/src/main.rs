@@ -38,6 +38,7 @@ mod state;
 mod transports;
 mod video;
 mod voice;
+mod welcome;
 mod workflows;
 mod workspace;
 
@@ -254,6 +255,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let intents = serenityall::GatewayIntents::non_privileged();
+    //Guild-member lane (welcome.rs, OpenClaw guild-watcher port): widen
+    // with the privileged GUILD_MEMBERS intent so joins are seen. No
+    // dev-portal change needed: the app already carries the member intents
+    // — the watcher connected with intents.members on this same token.
+    let intents = intents.union(serenityall::GatewayIntents::GUILD_MEMBERS);
     // Voice lane (voice.rs): songbird installs into the client builder
     // (voice side of Discord); the lane itself spawns post-ready when
     // `[voice]` says so. No-op otherwise.

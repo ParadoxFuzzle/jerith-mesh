@@ -852,6 +852,7 @@ mod tests {
             router: crate::router::RouterConfig::default(),
             transports: crate::transports::TransportsConfig::default(),
             mongo: crate::mongo::MongoConfig::default(),
+            welcome: crate::welcome::WelcomeConfig::default(),
         }
     }
 

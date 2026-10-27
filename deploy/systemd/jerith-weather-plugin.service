@@ -1,0 +1,24 @@
+# jerith-mesh weather plugin — user-level service (crates/weather-plugin,
+# served over the signed /rpc contract on :7793, open-meteo upstream).
+# Install:
+#   cp deploy/systemd/jerith-weather-plugin.service ~/.config/systemd/user/
+#   mkdir -p ~/.jerith-mesh/plugins.d/weather
+#   cp crates/weather-plugin/plugin.toml ~/.jerith-mesh/plugins.d/weather/
+#   # rotate the manifest's secret first (openssl rand -hex 16)
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-weather-plugin
+#   # then add "external:weather" to [plugins] enabled in bot.toml + restart jerith-bot
+[Unit]
+Description=jerith-mesh weather plugin (open-meteo skills, :7793)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith-weather %h/.jerith-mesh/plugins.d/weather/plugin.toml
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -444,6 +444,23 @@ description = "Multi-day forecast."
         assert!(p.secret.is_some(), "pet ships signed by default");
     }
 
+    /// Same pin discipline for the quarantine scanner
+    /// (`crates/quarantine-plugin/`, download checker over the same
+    /// signed contract): its shipped manifest parses under today's
+    /// rules.
+    #[test]
+    fn shipped_quarantine_manifest_parses_under_todays_rules() {
+        let raw = include_str!("../../quarantine-plugin/plugin.toml");
+        let p = ExternalPlugin::parse(
+            Path::new("quarantine-plugin/plugin.toml"),
+            raw,
+        )
+        .expect("the shipped quarantine manifest must stay valid");
+        assert_eq!(p.id, "quarantine");
+        assert_eq!(p.gate_id(), "external:quarantine");
+        assert!(p.secret.is_some(), "quarantine ships signed by default");
+    }
+
     /// Same pin discipline for the house card (`crates/house-plugin/`,
     /// the SDK's third consumer — answeneurs «how are you doing» over
     /// the same signed contract): two skills (`house.status` /
@@ -459,6 +476,27 @@ description = "Multi-day forecast."
         names.sort_unstable();
         assert_eq!(names, vec!["house.journal", "house.status"]);
         assert!(p.secret.is_some(), "house ships signed by default");
+    }
+
+    /// Same pin discipline for the weather skill
+    /// (`crates/weather-plugin/`, open-meteo forecast skills over the
+    /// same signed contract; a PUBLIC skill — gated via
+    /// `[plugins] enabled`, never `owner_only`, by design). Two skills
+    /// (`weather.now` / `weather.forecast`), signed by default.
+    #[test]
+    fn shipped_weather_manifest_parses_under_todays_rules() {
+        let raw = include_str!("../../weather-plugin/plugin.toml");
+        let p = ExternalPlugin::parse(
+            Path::new("weather-plugin/plugin.toml"),
+            raw,
+        )
+        .expect("the shipped weather manifest must stay valid");
+        assert_eq!(p.id, "weather");
+        assert_eq!(p.gate_id(), "external:weather");
+        let mut names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["weather.forecast", "weather.now"]);
+        assert!(p.secret.is_some(), "weather ships signed by default");
     }
 
     #[test]

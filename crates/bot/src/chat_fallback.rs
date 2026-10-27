@@ -38,6 +38,18 @@ pub async fn handle(
     {
         return Ok(());
     }
+    // Welcome-DM lane (welcome.rs, the OpenClaw guild-watcher port): DM
+    // one of three embeds + a local GIF to a scoped-server join. Cheap
+    // filter first, spawn inside — the dispatch loop never waits.
+    if let serenityall::FullEvent::GuildMemberAddition { new_member, .. } = event {
+        let welcome_cfg = ctx.user_data().await.cfg.welcome.clone();
+        crate::welcome::on_member_add(
+            ctx.serenity_context.http.clone(),
+            welcome_cfg,
+            new_member.clone(),
+        );
+        return Ok(());
+    }
     let serenityall::FullEvent::Message { new_message: msg } = event else {
         return Ok(());
     };

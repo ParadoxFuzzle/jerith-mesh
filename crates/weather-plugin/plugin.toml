@@ -1,0 +1,31 @@
+# The weather skill — real open-meteo.com data (geocoding + forecast,
+# no api key) over the signed plugin contract (docs/PLUGIN-SDK.md; the
+# SDK's consumer after pet/house/quarantine/ledger). Install:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/weather
+#   cp crates/weather-plugin/plugin.toml ~/.jerith-mesh/plugins.d/weather/
+#   cargo run -p jerith-weather-plugin --bin jerith-weather   # from the repo
+#   # then gate "external:weather" in [plugins] enabled in bot.toml +
+#   # restart the bot (chat users dispatch it; NOT owner_only).
+#
+# ONE endpoint line binds BOTH sides, same rule as the pet: the binary
+# reads it and binds that address, so manifest and service cannot
+# drift. Loopback by default; non-loopback must be https (the drop
+# parser enforces this, fail-closed at bot start). Upstream tempo is
+# open-meteo's (~100-300 ms); timeout_secs = 10 covers a cold resolve.
+
+[plugin]
+id = "weather"
+endpoint = "http://127.0.0.1:7793/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 10                          # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "now"
+description = "Current weather at a named place anywhere on Earth: temperature, feels-like, humidity, wind, sky condition. Pass a city name (\"Prague\", \"Tokyo\"); ambiguous names resolve to their most-populous match."
+parameters = { type = "object", properties = { place = { type = "string", description = "Place name to geocode" } }, required = ["place"] }
+
+[[skill]]
+name = "forecast"
+description = "Daily forecast for a named place: per-day high/low, precipitation probability, sky condition for the next N days (1-7, default 3)."
+parameters = { type = "object", properties = { place = { type = "string", description = "Place name to geocode" }, days = { type = "integer", description = "Days 1-7 (default 3)" } }, required = ["place"] }
