@@ -2089,10 +2089,13 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   the DNS/CNAME record, which moved the error 1016 → 1033 (edge
   propagation), which is how it looked "half-fixed" for a few minutes.
 - **Fix**: dedicated `~/.cloudflared/nmonit.yml` (tunnel id + creds +
-  ingress only for `nmonit.jerithai.com`; stale `grpc-nmonit →
+  ingress for `nmonit.jerithai.com`; stale `grpc-nmonit →
   https://127.0.0.1:9000` route dropped — :9000 now binds
-  `192.168.1.6:9000` and no longer speaks TLS on loopback — and
-  `jerithai.com/www → :80` dropped with it). Unit ExecStart now pins
+  `192.168.1.6:9000` and no longer speaks TLS on loopback).
+  `grpc-nmonit.jerithai.com`'s DNS record was itself deleted from the
+  zone 2026-10-27 evening — authoritative NS answers NXDOMAIN for it,
+  and a reference sweep of both hosts found zero clients resolving it
+  before deletion. Unit ExecStart now pins
   `--config ~/.cloudflared/nmonit.yml`. **Rule going forward: one
   config file per connector; never let `tunnel run <name>` inherit a
   default config that belongs to a different tunnel.**
