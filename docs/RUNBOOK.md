@@ -2117,10 +2117,19 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   aarch64; same LAN WAN IP 66.168.170.18). SSH-verified 2026-10-27:
   `cloudflared 2026.5.2` from `/usr/local/bin`, process
   `tunnel --config /home/noodlypanda/.cloudflared/config.yml run` —
-  own config, own tunnel, healthy. **Open action from the advisory**:
-  that binary predates the 2026.10.2 security floor — upgrade the
-  Jetson (`cloudflared-linux-arm64.deb`), same `dpkg -i` + connector
-  restart as above.
+  own config, own tunnel, healthy. **Jetson action from the advisory
+  closed 2026-10-27**: `cloudflared-linux-arm64.deb` 2026.10.3
+  installed (dpkg-switched `/usr/local/bin/cloudflared` to a symlink;
+  the old 2026.5.2 binary kept at `…/cloudflared-2026.5.2`). The
+  unsupervised orphan process was replaced by a supervised user unit
+  `~/.config/systemd/user/cloudflared-wordpress.service` (linger was
+  already on) — `tunnel info` now shows only 2026.10.3 connectors,
+  8 connections, unit active after the orphan handoff.
+  The guard is installed there too as a user unit
+  (`jerith-cloudflared-guard.service`; script at
+  `~/.local/bin/check-cloudflared-units.sh` — deliberately outside the
+  Jetson's `~/jerith-mesh` clone to keep its tree clean), runs at boot
+  and currently checks the new pinned unit: PASS.
 - **Regression guard (this host)**: `scripts/check-cloudflared-units.sh`
   + oneshot user unit `deploy/systemd/jerith-cloudflared-guard.service`
   (install: cp to `~/.config/systemd/user/`, `enable --now`). Runs at
@@ -2128,7 +2137,7 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   tunnel without its own `--config`, points `--config`/
   `credentials-file` at a missing file, or two units claim the same
   `tunnel:` id. CI can't see host systemd units, so this is the
-  enforcement point — worth installing on the Jetson too.
+  enforcement point.
 - **Revert**: `nmonit.yml` back to
   `config.yml.bak-prenmonit2` ingress rules, and the unit's ExecStart
   back to bare `tunnel run nmonit` — recreates the wrong-tunnel bug if
