@@ -1,0 +1,27 @@
+# jerith-mesh cloudflared unit guard — user-level oneshot service.
+# Catches the wrong-tunnel config-inheritance bug (RUNBOOK 2026-10-27:
+# the nmonit unit had no --config, so cloudflared read the shared
+# default config.yml and silently joined the jerith-bootstrap tunnel;
+# nmonit.jerithai.com 530'd for weeks). CI cannot see host systemd
+# units, so this on-host check is the enforcement point.
+# Install:
+#   cp deploy/systemd/jerith-cloudflared-guard.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-cloudflared-guard
+# Runs at every boot and whenever invoked by hand after editing a
+# cloudflared unit; turns the unit red on any violation:
+#   - a unit running `cloudflared tunnel` without its own --config
+#   - a pinned --config / credentials-file that does not exist
+#   - two units claiming the same tunnel id
+[Unit]
+Description=guard: every cloudflared unit pins its own tunnel config (see RUNBOOK)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Documents/Projects/jerith-mesh/scripts/check-cloudflared-units.sh
+# Read-only check
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -2058,3 +2058,79 @@ NOT for voice NOTES — those stay on the audio attachment lane above.
 - **Revert**: `[voice] enabled = false` (or delete the section) leaves
   the bot exactly as before — no voice code starts unless the section
   says so.
+
+## Cloudflare Tunnel hardening + the two-week nmonit 530 (2026-10-27)
+
+Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates with weak keys; `cloudflared` < 2026.10.2 still trusts them.
+
+- **State found**: both connectors (`cloudflared-jerith.service`,
+  `nmonit-cloudflared.service` — both systemd *user* units under
+  `~/.config/systemd/user/`, easy to miss with plain `systemctl`) ran
+  the dpkg-managed binary at `2026.10.0`. `/usr/local/bin/cloudflared`
+  is a symlink to `/usr/bin/cloudflared`, so one package covers both.
+- **Upgrade**: official `cloudflared-linux-amd64.deb` 2026.10.3 →
+  `dpkg -i`, then restart per unit. Newer 2026.10.5 exists; cloudflared
+  will warn whether we're current — check before assuming an upgrade.
+- **Origin sweep (advisory asks: no `noTLSVerify`, no origin chaining
+  to the affected CAs)**: the bootstrap tunnel's origins are plain
+  `http://localhost:8126`/`:8901` — no TLS surface at all. nmonit
+  however had two HTTPS loopback origins pinned with
+  `noTLSVerify: true`; see below for the fix.
+- **Root cause of the weeks-old `nmonit.jerithai.com` 530** (NOT the
+  advisory, and predates it): on Oct 16 the mesh rewrite turned
+  `~/.cloudflared/config.yml` into the *bootstrap* tunnel's config
+  (`tunnel: fa81a9d9…`). The nmonit unit is
+  `cloudflared tunnel run nmonit` with **no `--config`**, and without it
+  cloudflared reads that default file — its `tunnel:` key wins, so the
+  process silently joined the WRONG tunnel. `cloudflared tunnel list`
+  told the truth: `nmonit` (c4139072…) had zero connections while
+  jerith-bootstrap carried 8 (2 processes × 4). The dashboard-side
+  hostname URL was fine; the tunnel behind it was empty. The user fixed
+  the DNS/CNAME record, which moved the error 1016 → 1033 (edge
+  propagation), which is how it looked "half-fixed" for a few minutes.
+- **Fix**: dedicated `~/.cloudflared/nmonit.yml` (tunnel id + creds +
+  ingress only for `nmonit.jerithai.com`; stale `grpc-nmonit →
+  https://127.0.0.1:9000` route dropped — :9000 now binds
+  `192.168.1.6:9000` and no longer speaks TLS on loopback — and
+  `jerithai.com/www → :80` dropped with it). Unit ExecStart now pins
+  `--config ~/.cloudflared/nmonit.yml`. **Rule going forward: one
+  config file per connector; never let `tunnel run <name>` inherit a
+  default config that belongs to a different tunnel.**
+- **TLS verification restored, not disabled**: origin is the nmonit
+  control-plane on `https://127.0.0.1:8080` — cert CN
+  `control-plane`, issued by the private root
+  `~/Documents/Projects/nmonit/deploy/certs/ca.crt` (SANs:
+  `control-plane`, `localhost`, host, `127.0.0.1`, `192.168.1.6`).
+  `nmonit.yml` sets `originRequest.caPool` to that root and
+  `originServerName: control-plane` — verification passes with
+  nothing  disabled, which is what the advisory wants instead of
+  `noTLSVerify`. Affected-CAs check: the local root is unrelated to
+  the emSign/eMudhra intermediates.
+- **Verified**: `cloudflared tunnel list` → c4139072 nmonit 4×http2 conns,
+  jerith-bootstrap back to its own 4; `curl https://nmonit.jerithai.com`
+  → 200; `p2p.jerithai.com` still 404-from-origin at `/` (normal).
+  Remaining noise only: ICMP proxy warning (`ping_group_range`),
+  pre-existing.
+- **Oddity resolved** (was "to watch"): the dead `jerith-wordpress`
+  tunnel (401207aa…) reports live connectors not accounted for on this
+  box — **it's the Jetson Orin Nano** (`noodlypanda@192.168.1.150`,
+  aarch64; same LAN WAN IP 66.168.170.18). SSH-verified 2026-10-27:
+  `cloudflared 2026.5.2` from `/usr/local/bin`, process
+  `tunnel --config /home/noodlypanda/.cloudflared/config.yml run` —
+  own config, own tunnel, healthy. **Open action from the advisory**:
+  that binary predates the 2026.10.2 security floor — upgrade the
+  Jetson (`cloudflared-linux-arm64.deb`), same `dpkg -i` + connector
+  restart as above.
+- **Regression guard (this host)**: `scripts/check-cloudflared-units.sh`
+  + oneshot user unit `deploy/systemd/jerith-cloudflared-guard.service`
+  (install: cp to `~/.config/systemd/user/`, `enable --now`). Runs at
+  every boot and fails hard if any `*cloudflared*.service` unit runs a
+  tunnel without its own `--config`, points `--config`/
+  `credentials-file` at a missing file, or two units claim the same
+  `tunnel:` id. CI can't see host systemd units, so this is the
+  enforcement point — worth installing on the Jetson too.
+- **Revert**: `nmonit.yml` back to
+  `config.yml.bak-prenmonit2` ingress rules, and the unit's ExecStart
+  back to bare `tunnel run nmonit` — recreates the wrong-tunnel bug if
+  done without ALSO restoring the old config.yml, which is the trap
+  that caused this. Do it atomically.
