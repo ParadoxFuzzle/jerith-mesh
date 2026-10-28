@@ -11,3 +11,12 @@ config.toml
 __pycache__/
 *.pyc
 models/
+
+# First-party plugin-release signing key: private half stays local,
+# public half ships as keys/plugin-releases.pub
+/keys/*
+!/keys/README.md
+!/keys/plugin-releases.pub
+
+# Plugin bundle artifacts ship via releases, never the repo tree
+/dist/

@@ -85,7 +85,8 @@ struct BundleFile {
 /// (ASCII letter start, then letters/digits/`._-`). The bot's rule is
 /// authoritative and pinned by its own tests; this mirrors it for the
 /// install-time pre-check.
-fn valid_name(name: &str) -> bool {
+/// Wire-safe identifier rule (also used by the channel index rows).
+pub fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -167,7 +168,8 @@ pub fn fresh_secret() -> String {
 }
 
 /// Exactly 64 lowercase hex chars.
-fn hex_strict(s: &str) -> Result<(), String> {
+/// Strict 64-hex (lowercase enforced; also used by the channel index rows).
+pub fn hex_strict(s: &str) -> Result<(), String> {
     if s.len() != 64
         || !s
             .chars()

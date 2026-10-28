@@ -3,15 +3,28 @@
 Status: **Phase 2 ✅ implemented** (2026-10-28) — the `.jbundle`
 engine lives in `crates/core/src/pluginbundle.rs` (build / the strict
 verify chain / extract / stage, home-injectable and fully test-pinned)
-and the human surface is `jerith plugin install|verify|remove` in
-crates/node. The keys/trust flow of Phase 3 (repo-committed
-`keys/plugin-releases.pub`, `trusted_publishers` in bot.toml, rotation
-commands) and the release.yml signing job stay **design, not built**.
-Phase 4 (signed channel index) likewise. Authored 2026-10-28,
-immediately after the release-artifact scope decision in
-`.github/workflows/release.yml` settled that plugin binaries
-deliberately DON'T ride releases — this channel is the revisit
-trigger's real answer.
+and the human surface is `jerith plugin install|verify|remove|build`.
+**Phase 4 ✅ implemented same day** — the signed channel index lives in
+`crates/core/src/pluginchannel.rs` (build/sign/verify with key pinning
++ a freshness window) behind `jerith plugin channel build|verify`, and
+`release.yml` carries the full tag pipeline: `plugin-bundles` (both
+platforms sign the weather triple) and `channel-index` (one signed
+index over the gathered rows, self-verified against the committed
+anchor before upload). The FIRST-PARTY KEY IS LIVE: the public half is
+the committed trust anchor `keys/plugin-releases.pub`
+(1e715b6671b3c2de4d3f64849cdc07cafcba30c11a29d5738fe8c7f25cc3538f),
+the private hex seed rides `keys/plugin-releases.hex` (0600,
+gitignored — see `keys/README.md`) and the GitHub secret
+`PLUGIN_RELEASE_SIGNING_KEY`; the generator is
+`scripts/first-party-bundle.sh` (build + sign + self-verify against a
+throwaway home pinned to the committed pub — CI runs the same script,
+so what ships is what was verified). The weather sample was produced
+and locally verified on 2026-10-28 (dist/, gitignored — artifacts are
+release-side, not repo-side). REMAINING unbuilt: the Phase 3
+`trusted_publishers` bot.toml table + `jerith plugin trust rotate`
+(the pins-file → bot.toml migration), `jerith plugin search` riding
+the channel index, and the actual release cut that publishes the
+sample triple.
 
 Phase 2 CLI reality notes (differs from the early draft, deliberately):
 
@@ -197,21 +210,26 @@ across versions unless `--rotate` also passed).
 ## Rollout phases
 
 1. **Now (this doc)**: ~~decisions + shape; no binary code changes~~ ✅.
-2. **First-party bundles**: ✅ engine + CLI + test pins (happy path,
-   tampered tarball, wrong key, unpinned publisher, platform/contract
-   refusal, downgrade ordering, trash-removal — all in
-   `pluginbundle.rs`'s test mod; end-to-end smoke: openssl-signed
-   bundle → verify → install → downgrade guard → remove). REMAINING:
-   the `keys/plugin-releases.pub` first-party key + release.yml
-   signing job (needs the maintainer's private half in a GitHub secret
-   when CI signs), and the shipped weather bundle as the first public
-   sample.
+2. **First-party bundles**: ✅ engine + CLI + key + release.yml
+   signing job + the weather sample built and verified (despite the
+   doc's early draft — the sample ships on the next tag cut, not from
+   this repo branch).
 3. **Third-party publishers**: `trusted_publishers` config, per-id pins,
    key rotation flow, plugin removal/re-download journey documented in
    RUNBOOK under "Author a plugin".
-4. **Signed channel index**: one `channel.json` per publisher (signed
-   with the same identity, contains a list of bundle URLs + digests),
-   enabling `jerith plugin search` WITHOUT becoming a registry service.
+4. **Signed channel index**: ✅ `pluginchannel.rs` + `jerith plugin
+   channel build|verify` + the release.yml `channel-index` gather job.
+   `channel.json` + `channel.json.sig` per publisher: the canonical
+   payload is `jerith-chidx1|<publisher>|<generated_ms>|<sha256(bytes)>`
+   — the sig binds the EXACT received bytes; the freshness window (24 h
+   default, `--max-age-ms`; future-stamps beyond a 10 min tolerance
+   refuse) keeps an abandoned lane from posing as a maintained one; and
+   the anchor NEVER rides the wire (`--anchor` or the committed
+   `keys/plugin-releases.pub` — the file's own `publisher` field must
+   equal it; a self-signed index is worthless by construction). The
+   index is a CLAIM SHEET: installing a row still runs the full bundle
+   verify chain against the actual artifact. `jerith plugin search` on
+   top of it remains for a later wave.
 
 ## Open questions (deliberately unresolved)
 

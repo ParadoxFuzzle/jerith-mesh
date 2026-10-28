@@ -10,7 +10,7 @@
 //!   stake       show or drive the stake escrow (status | lock | unlock)
 
 use std::io::{BufRead, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -215,6 +215,67 @@ enum PluginCmd {
     Remove {
         /// Plugin id (the drop dir name under plugins.d/).
         id: String,
+    },
+    /// Signed channel index (Phase 4): publish a channel.json + sig
+    /// pair over a dist dir, or fetch + verify one. The index NAMES
+    /// bundles; installing still runs the full verify chain — the
+    /// channel shortens the list step, it never replaces the checks.
+    Channel {
+        #[command(subcommand)]
+        cmd: ChannelCmd,
+    },
+    /// Build a signed .jbundle from a prepared staging dir — the
+    /// publisher's shape in docs/PLUGIN-CHANNEL.md: `bundle.toml`,
+    /// `plugin.toml`, `README.md`, `bin/<binary>`. Writes the bundle
+    /// plus its `.sha256` and `.sig` companions. The signing key is the
+    /// 32-byte hex seed file, 0600 and gitignored per the key model in
+    /// docs/PLUGIN-CHANNEL.md, and `bundle.toml`'s `publisher` field
+    /// MUST equal that key's pubkey.
+    Build {
+        /// Prepared staging dir.
+        source: PathBuf,
+        /// Output .jbundle path (companions land beside it).
+        out: PathBuf,
+        /// Signing key: 32-byte hex seed file. Default:
+        /// keys/plugin-releases.hex (JERITH_BUNDLE_KEY overrides).
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelCmd {
+    /// Build + sign a publisher's channel.json (+ .sig) from the signed
+    /// bundle triples in a directory (default: dist/). Every triple
+    /// there (id-version-os-arch.jbundle with .sha256 + .sig beside it)
+    /// becomes a row; the anchor-of-record is dist's own key.
+    Build {
+        /// Directory holding the *-.jbundle triples (default: dist).
+        dir: Option<PathBuf>,
+        /// https prefix for each row's artifact URL (e.g. a release's
+        /// .../releases/latest/download).
+        #[arg(long)]
+        url_base: String,
+        /// Signing key: 32-byte hex seed file (JERITH_BUNDLE_KEY / the
+        /// bundle-build default apply).
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Fetch (https) or read (local dir) a channel pair and verify it:
+    /// key pinning (--anchor; default the committed
+    /// keys/plugin-releases.pub in the repo checkout, because the
+    /// first-party channel outranks no source the operator hasn't
+    /// pinned), freshness window, then row parity.
+    Verify {
+        /// A channel.json URL (https) a directory containing the pair.
+        source: String,
+        /// Pinned publisher anchor: 64-hex pubkey. Default:
+        /// keys/plugin-releases.pub (JERITH_CHANNEL_ANCHOR overrides).
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Freshness window ms (0 = the 24 h default).
+        #[arg(long, default_value_t = 0)]
+        max_age_ms: u64,
     },
 }
 
@@ -1996,6 +2057,26 @@ fn run_verify(
     Ok(v)
 }
 
+/// The publisher signing seed: explicit `--key`, $JERITH_BUNDLE_KEY, or
+/// the repo-relative `keys/plugin-releases.hex` (0600, gitignored — the
+/// first-party format; docs/PLUGIN-CHANNEL.md key model).
+fn load_signing_seed(
+    key: Option<&Path>,
+) -> anyhow::Result<jerith_mesh_core::signing::SigningIdentity> {
+    let key = key
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var("JERITH_BUNDLE_KEY").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("keys/plugin-releases.hex"));
+    let raw = std::fs::read_to_string(&key).with_context(|| {
+        format!(
+            "signing key {}: missing (generate the pair once; keep the hex file 0600 + gitignored)",
+            key.display()
+        )
+    })?;
+    jerith_mesh_core::signing::SigningIdentity::from_secret_hex(raw.trim())
+        .with_context(|| format!("signing key {}: not a 32-byte hex seed", key.display()))
+}
+
 /// First 8 hex of a publisher key + last 4 — a thumbprint to display.
 fn publisher_thumb(hex: &str) -> String {
     let n = hex.len();
@@ -2072,6 +2153,29 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        PluginCmd::Build { source, out, key } => {
+            let identity = load_signing_seed(key.as_deref())?;
+            let report = pb::build(&source, &out, &identity)?;
+            println!(
+                "built {}  ({} {} · publisher {}…)",
+                report.bundle_path.display(),
+                report.meta.id,
+                report.meta.version,
+                publisher_thumb(&report.meta.publisher),
+            );
+            println!("sha256: {}", report.tarball_sha256);
+            println!(
+                "companions: {} , {}",
+                report.sha_path.display(),
+                report.sig_path.display()
+            );
+            println!(
+                "next: attach all three to the release (or host them), then \
+                 'jerith plugin channel build' to list them in the signed index"
+            );
+            Ok(())
+        }
+        PluginCmd::Channel { cmd } => channel_cmd(cmd).await,
         PluginCmd::Remove { id } => {
             match pb::trash_drop(&id)? {
                 Some(trash) => {
@@ -2095,6 +2199,186 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// `jerith plugin channel …` — the signed publisher index (Phase 4):
+/// build + sign a pair over a dist dir, or fetch + verify a published
+/// one. The index is a claim sheet: installing an entry still runs the
+/// full bundle verify chain against the actual artifact.
+async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginbundle as pb;
+    use jerith_mesh_core::pluginchannel as pc;
+    match cmd {
+        ChannelCmd::Build { dir, url_base, key } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("dist"));
+            anyhow::ensure!(
+                url_base.starts_with("https://") && !url_base.contains(char::is_whitespace),
+                "channel: --url-base must be https and whitespace-free (rows inherit it)"
+            );
+            let identity = load_signing_seed(key.as_deref())?;
+
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .with_context(|| format!("channel: reading {}", dir.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "jbundle"))
+                .collect();
+            paths.sort();
+            anyhow::ensure!(
+                !paths.is_empty(),
+                "channel: no .jbundle triples in {} — build the bundles first",
+                dir.display()
+            );
+
+            let mut rows = Vec::new();
+            for path in paths {
+                let raw = std::fs::read(&path)?;
+                let (id, version, publisher) = pb::peek_identity(&raw)
+                    .with_context(|| format!("channel: reading {}", path.display()))?;
+                anyhow::ensure!(
+                    publisher == identity.pubkey_hex(),
+                    "channel: {} was published by {}… but the signing key is {}… — a channel may only name its own publisher's bundles",
+                    path.display(),
+                    publisher_thumb(&publisher),
+                    publisher_thumb(&identity.pubkey_hex())
+                );
+                let stem = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .trim_end_matches(".jbundle")
+                    .to_string();
+                // <id>-<version>-<os>-<arch>: peel the known head, then
+                // the tail's LAST dash separates os|arch (none of today's
+                // os/arch tokens contain dashes: linux, macos, x86_64, aarch64).
+                let tail = stem
+                    .strip_prefix(&format!("{id}-{version}-"))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "channel: {} does not match the <id>-<version>-<os>-<arch>.jbundle name",
+                        path.display()
+                    ))?;
+                let (os, arch) = tail.rsplit_once('-').ok_or_else(|| {
+                    anyhow::anyhow!("channel: {} lacks an <os>-<arch> tail", path.display())
+                })?;
+                let sha_raw = std::fs::read_to_string(format!("{}.sha256", path.display()))
+                    .with_context(|| {
+                        format!("channel: missing companion for {}", path.display())
+                    })?;
+                let sha = pb::parse_sha256_file(&sha_raw)?;
+                let url = format!("{url_base}/{}", stem);
+                rows.push(pc::ChannelEntry {
+                    id,
+                    version,
+                    os: os.to_string(),
+                    arch: arch.to_string(),
+                    url,
+                    sha256: sha,
+                    notes: String::new(),
+                });
+            }
+            let row_count = rows.len();
+            let (json, sig) = pc::build_channel(rows, &identity, crate_now_ms())?;
+            let json_path = dir.join(pc::CHANNEL_FILE);
+            let sig_path = dir.join(pc::CHANNEL_SIG_FILE);
+            std::fs::write(&json_path, &json)?;
+            std::fs::write(&sig_path, sig.trim())?;
+            println!("channel: {} row(s)", row_count);
+            println!("wrote {} + {}", json_path.display(), sig_path.display());
+            println!(
+                "next: upload BOTH files beside the bundles; operators verify via \
+                 'jerith plugin channel verify <url> --anchor <pub hex>'"
+            );
+            Ok(())
+        }
+        ChannelCmd::Verify {
+            source,
+            anchor,
+            max_age_ms,
+        } => {
+            let (json, sig) = if source.starts_with("https://") {
+                anyhow::ensure!(
+                    !source.contains(char::is_whitespace),
+                    "channel: source url contains whitespace"
+                );
+                let client = jerith_mesh_core::http::mesh_http();
+                let get = |url: String, cap: usize| {
+                    let client = client.clone();
+                    async move {
+                        let resp = client
+                            .get(&url)
+                            .send()
+                            .await
+                            .with_context(|| format!("fetching {url}"))?;
+                        let resp = resp
+                            .error_for_status()
+                            .with_context(|| format!("fetching {url}"))?;
+                        let bytes = resp
+                            .bytes()
+                            .await
+                            .with_context(|| format!("reading {url}"))?;
+                        anyhow::ensure!(
+                            bytes.len() <= cap,
+                            "{url}: {} bytes — over the {cap}-byte cap",
+                            bytes.len()
+                        );
+                        Ok::<_, anyhow::Error>(bytes)
+                    }
+                };
+                let json = get(source.clone(), 256 * 1024).await?;
+                let sigb = get(format!("{source}.sig"), 4096).await?;
+                (
+                    String::from_utf8(json.to_vec())
+                        .map_err(|e| anyhow::anyhow!("channel.json is not utf-8 ({e})"))?,
+                    String::from_utf8(sigb.to_vec())
+                        .map_err(|e| anyhow::anyhow!("channel.json.sig is not utf-8 ({e})"))?,
+                )
+            } else {
+                let sel = PathBuf::from(&source);
+                anyhow::ensure!(
+                    sel.is_dir(),
+                    "channel: local source must be a DIRECTORY holding the {} pair (https urls are the other form)",
+                    pc::CHANNEL_FILE
+                );
+                pc::load_channel_pair(&sel)?
+            };
+            let anchor = anchor
+                .or_else(|| std::env::var("JERITH_CHANNEL_ANCHOR").ok())
+                .or_else(|| std::fs::read_to_string("keys/plugin-releases.pub").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "channel: no anchor — pass --anchor <64-hex publisher pubkey> or set \
+                     JERITH_CHANNEL_ANCHOR; verify runs only against a key the OPERATOR pinned"
+                    )
+                })?;
+            let index = pc::verify_channel(&json, &sig, &anchor, max_age_ms)?;
+            println!(
+                "✓ channel verified: publisher {}… · generated {} ms ago · {} row(s)",
+                publisher_thumb(&index.publisher),
+                crate_now_ms().saturating_sub(index.generated_ms),
+                index.bundles.len()
+            );
+            for e in &index.bundles {
+                println!(
+                    "  {:<10} {:<8} {:<13} {}",
+                    e.id,
+                    e.version,
+                    format!("{}/{}", e.os, e.arch),
+                    e.url
+                );
+            }
+            println!(
+                "install any row: jerith plugin install <url>  (the full verify \
+                 chain runs against the artifact regardless of the index)"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn crate_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `jerith stack …` — the optional AI companion stack + small-model

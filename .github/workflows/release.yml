@@ -103,3 +103,125 @@ jobs:
           gh release upload "$TAG" "${UPLOAD[@]}" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+  plugin-bundles:
+    # First-party PLUGIN bundles ride the same release (docs/
+    # PLUGIN-CHANNEL.md Phase 2→3): the weather .jbundle + its .sha256
+    # + .sig companions, signed by the first-party Ed25519 key. This is
+    # the deliberate revisit of the artifact-scope call above: the
+    # bundle CHANNEL exists, so the plugin artifacts ship — as complete
+    # signed triples, never as bare binaries.
+    #
+    # Signing: PLUGIN_RELEASE_SIGNING_KEY holds the 32-byte hex SEED of
+    # the key whose public half is the committed keys/plugin-releases.pub
+    # (the trust anchor operators pin). Both halves MUST move together —
+    # a secret that stops matching the committed pub fails every
+    # operator install at the signature step.
+    #
+    # The job runs the repo's OWN script (scripts/first-party-bundle.sh),
+    # which self-verifies each built bundle against a throwaway home
+    # pinned to the committed pub before anything uploads — CI proves
+    # the operator chain, not just the artifact existence.
+    needs: dependency-audit
+    name: plugin bundles + signatures (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the plugin + CLI release binaries
+        run: cargo build --release -p jerith-weather-plugin -p jerith-mesh-node
+      - name: Write the signing seed from the secret
+        env:
+          PLUGIN_RELEASE_SIGNING_KEY: ${{ secrets.PLUGIN_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 0600 /dev/null keys/plugin-releases.hex
+          printf '%s\n' "${PLUGIN_RELEASE_SIGNING_KEY}" > keys/plugin-releases.hex
+      - name: Build + sign + self-verify the weather bundle
+        # The script derives id/binary/manifest paths by family convention
+        # and tries `sha256sum`/`shasum -a 256` in turn (macOS has no
+        # sha256sum). Version comes from the tag; a dispatch dry-run
+        # simply uses "0.0.0-dryrun" without ever uploading.
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          [ -n "$VER" ] && [ "$VER" != "${GITHUB_REF_NAME}" ] || VER="0.0.0-dryrun"
+          bash scripts/first-party-bundle.sh weather "$VER" \
+            "First-party weather skill: weather.now + weather.forecast over open-meteo (no API key). Install via 'jerith plugin install'; pin keys/plugin-releases.pub."
+      - name: Upload bundle triple to the tag's release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Usually created by the binaries job; fall back to creating it
+          # here (both use --verify-tag, so a race lands on view).
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag \
+              --title "jerith-mesh $TAG" \
+              --notes "Automated release binaries for $TAG (source of truth: this tag; checksums per asset)."
+          gh release upload "$TAG" \
+            dist/weather-*.jbundle \
+            dist/weather-*.jbundle.sha256 \
+            dist/weather-*.jbundle.sig \
+            --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  channel-index:
+    # Phase 4 (docs/PLUGIN-CHANNEL.md): the SIGNED CHANNEL INDEX — one
+    # channel.json + sig over ALL gathered platform rows, published once
+    # per tag (NOT per matrix job; a one-OS index is a lie). Gathers the
+    # bundles this workflow just uploaded, lists them with their artifact
+    # digests, signs with the SAME first-party key, and self-verifies
+    # against the committed anchor before upload. Operators then run
+    # `jerith plugin channel verify <channel-url>` to LIST, and
+    # `jerith plugin install <row-url>` for the real chain.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [binaries, plugin-bundles]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI (the channel signer ships with it)
+        run: cargo build --release -p jerith-mesh-node
+      - name: Write the signing seed from the secret
+        env:
+          PLUGIN_RELEASE_SIGNING_KEY: ${{ secrets.PLUGIN_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 0600 /dev/null keys/plugin-releases.hex
+          printf '%s\n' "${PLUGIN_RELEASE_SIGNING_KEY}" > keys/plugin-releases.hex
+      - name: Gather every platform's bundle triples from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "weather-*.jbundle" \
+            --pattern "weather-*.jbundle.sha256" \
+            --dir dist
+          ls dist
+      - name: Build + sign + self-verify the channel index
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          target/release/jerith plugin channel build dist \
+            --url-base "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}" \
+            --key keys/plugin-releases.hex
+          target/release/jerith plugin channel verify dist \
+            --anchor "$(cat keys/plugin-releases.pub)"
+      - name: Upload the channel pair to the release
+        run: gh release upload "$GITHUB_REF_NAME" dist/channel.json dist/channel.json.sig --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

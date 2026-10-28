@@ -95,6 +95,16 @@ impl SigningIdentity {
         })
     }
 
+    /// Derive from a 32-byte hex seed string (the plugin-release key
+    /// file format, docs/PLUGIN-CHANNEL.md: `keys/plugin-releases.hex`,
+    /// 0600 + gitignored; the committed `keys/plugin-releases.pub` is
+    /// `pubkey_hex()`).
+    pub fn from_secret_hex(seed_hex: &str) -> anyhow::Result<Self> {
+        let seed =
+            hex::decode(seed_hex.trim()).map_err(|_| anyhow::anyhow!("seed is not valid hex"))?;
+        Self::from_secret_bytes(&seed)
+    }
+
     /// Fresh random keypair.
     pub fn generate() -> Self {
         let secret: [u8; 32] = rand::random();
@@ -145,6 +155,18 @@ pub const PLUGIN_BUNDLE_PREFIX: &str = "jerith-plbun-1";
 
 pub fn plugin_bundle_payload(plugin_id: &str, version: &str, tarball_sha256: &str) -> String {
     format!("{PLUGIN_BUNDLE_PREFIX}|{plugin_id}|{version}|{tarball_sha256}")
+}
+
+/// Canonical SIGNED CHANNEL INDEX payload (docs/PLUGIN-CHANNEL.md
+/// Phase 4): the channel publisher signs
+/// `prefix|publisher_hex|generated_ms|sha256(channel.json bytes)` — the
+/// index's own identity fields are rebuilt from the received JSON, so
+/// the detached `channel.json.sig` binds the EXACT received bytes and
+/// the freshness anchor in one canonical string.
+pub const PLUGIN_CHANNEL_PREFIX: &str = "jerith-chidx1";
+
+pub fn plugin_channel_payload(publisher_hex: &str, generated_ms: u64, json_sha256: &str) -> String {
+    format!("{PLUGIN_CHANNEL_PREFIX}|{publisher_hex}|{generated_ms}|{json_sha256}")
 }
 
 /// Canonical ping payload.
