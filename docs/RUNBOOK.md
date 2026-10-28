@@ -1598,7 +1598,10 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   verdict first — `chain intact` (with how many lines are signature-
   verified) or `⚠ CHAIN BROKEN (edited / spliced / bad signature /
   mid-log key change) / LOG TRUNCATED` with the entries still shown
-  as-found (evidence, not truth). For
+  as-found (evidence, not truth). Scripted checks use
+  `jerith plugin receipts --verdict` — one verdict line, exit 0 only
+  when the chain stands (so a systemd check or shell can gate on it
+  without parsing entries). For
   freshness-in-enforcement, `jerith plugin install <bundle> --channel
   <url|dir>` requires the bundle to BE a row of the verified index
   (artifact-digest match) — the install receipt then carries the

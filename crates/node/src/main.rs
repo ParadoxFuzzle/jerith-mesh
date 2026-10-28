@@ -297,6 +297,11 @@ enum PluginCmd {
         /// Print the whole log instead of the tail.
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// One-line verdict, scriptable: exit 0 = chain intact, exit 1
+        /// = Broken/Truncated. Mutually exclusive with the human
+        /// printout flags (docs/PLUGIN-CHANNEL.md receipt verdicts).
+        #[arg(long, default_value_t = false, conflicts_with_all = ["all", "count"])]
+        verdict: bool,
     },
 }
 
@@ -2490,7 +2495,11 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
         } => search_channel(query, channel, anchor, max_age_ms).await,
         PluginCmd::Trust { cmd } => trust_cmd(cmd).await,
         PluginCmd::Channel { cmd } => channel_cmd(cmd).await,
-        PluginCmd::Receipts { count, all } => receipts_cmd(count, all).await,
+        PluginCmd::Receipts {
+            count,
+            all,
+            verdict,
+        } => receipts_cmd(count, all, verdict).await,
         PluginCmd::Remove { id } => {
             match pb::trash_drop(&id)? {
                 Some(trash) => {
@@ -2970,9 +2979,21 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
 }
 
 /// `jerith plugin receipts` — read back the audit log, newest tail last.
-async fn receipts_cmd(count: usize, all: bool) -> anyhow::Result<()> {
+/// `--verdict` is the scriptable form: one line, exit 0 only when the
+/// chain stands (no human table, nothing else to parse).
+async fn receipts_cmd(count: usize, all: bool, verdict: bool) -> anyhow::Result<()> {
     use jerith_mesh_core::pluginreceipt::{self as jr, LogIntegrity, read_verified};
     let log = read_verified();
+    if verdict {
+        // Ok = Intact, Err = Broken/Truncated (the one-liner carries the
+        // same words the human printout uses).
+        let line = receipt_verdict_line(&log);
+        println!("{}", line.as_deref().unwrap_or_else(|e| e));
+        if line.is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let entries = &log.entries;
     let path = jr::receipts_path();
     if entries.is_empty() {
@@ -3111,6 +3132,34 @@ fn receipt_gate_under(home: &Path, allow_override: bool) -> anyhow::Result<()> {
     }
 }
 
+/// The `--verdict` one-liner for the receipt log — the scriptable form
+/// of the same verdict `receipts_cmd` prints for humans. `Ok(line)` = the
+/// chain stands; `Err(line)` = Broken/Truncated (the caller prints the
+/// line and exits nonzero). Kept a pure function so the words are
+/// unit-pinned without a real exit.
+fn receipt_verdict_line(log: &jerith_mesh_core::pluginreceipt::Verdict) -> Result<String, String> {
+    use jerith_mesh_core::pluginreceipt::{LogIntegrity, RECEIPT_PUB_FILE};
+    match &log.integrity {
+        LogIntegrity::Intact => {
+            let sig_note = if log.signed > 0 {
+                format!(", {} signed ({RECEIPT_PUB_FILE})", log.signed)
+            } else {
+                String::new()
+            };
+            Ok(format!(
+                "chain intact: {} chained, hash-linked (head in sync){sig_note}",
+                log.chained
+            ))
+        }
+        LogIntegrity::Truncated { head, last } => Err(format!(
+            "LOG TRUNCATED: head file expects {}… but the log ends at {}…",
+            &head[..8],
+            &last[..8]
+        )),
+        LogIntegrity::Broken { at, why } => Err(format!("CHAIN BROKEN at entry #{at}: {why}")),
+    }
+}
+
 fn crate_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3216,6 +3265,42 @@ mod receipt_lane_tests {
             v.integrity,
             jerith_mesh_core::pluginreceipt::LogIntegrity::Broken { .. }
         ));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `--verdict`'s words: the three integrity shapes read exactly as
+    /// the human printout does, so scripts and operators see one truth.
+    #[test]
+    fn verdict_line_tracks_the_integrity_verdict() {
+        let home = gh("verdict-line");
+        std::fs::create_dir_all(&home).unwrap();
+        // Empty log → intact.
+        std::fs::write(
+            jerith_mesh_core::pluginreceipt::receipts_path_under(&home),
+            "",
+        )
+        .unwrap();
+        let log = jerith_mesh_core::pluginreceipt::read_verified_under(&home);
+        let line = receipt_verdict_line(&log);
+        assert!(
+            line.as_deref().unwrap_or("err").contains("chain intact"),
+            "{line:?}"
+        );
+        // In-place edit → CHAIN BROKEN with the entry number.
+        receipt("one").record_under(&home).unwrap();
+        receipt("two").record_under(&home).unwrap();
+        let path = jerith_mesh_core::pluginreceipt::receipts_path_under(&home);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace("two", "tampered")).unwrap();
+        let log = jerith_mesh_core::pluginreceipt::read_verified_under(&home);
+        let line = receipt_verdict_line(&log).unwrap_err();
+        assert!(line.contains("CHAIN BROKEN"), "{line}");
+        assert!(line.contains("entry #1"), "{line}");
+        // Tail removal → LOG TRUNCATED naming both digests.
+        std::fs::write(&path, format!("{}\n", raw.lines().next().unwrap())).unwrap();
+        let log = jerith_mesh_core::pluginreceipt::read_verified_under(&home);
+        let line = receipt_verdict_line(&log).unwrap_err();
+        assert!(line.contains("LOG TRUNCATED"), "{line}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -267,7 +267,8 @@ across versions unless `--rotate` also passed).
  `jerith plugin receipts` prints the verdict (`chain intact` / `⚠
  CHAIN BROKEN at #N` / `⚠ LOG TRUNCATED`) above the entries, and keeps
  showing them as-found (hiding the entries would be its own kind of
- tampering). Truncation — the one attack a per-line hash chain cannot
+ tampering); `--verdict` is the scriptable one-liner (exit 0 only on
+ an intact chain). Truncation — the one attack a per-line hash chain cannot
  see — is covered by the sibling `<home>/plugin.json.head` witness
  file: the file's tail can be deleted but the witness still names the
  real last digest.

@@ -165,15 +165,24 @@ on the node except the model calls you route through the mesh.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Phases, wire protocol, MoE routing, anti-fraud, economics |
 | [docs/PLUGINS.md](docs/PLUGINS.md) | Plugin/skill system: registry, gating, authoring a skill, hooks |
 | [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md) | Design (Phase 3+): external-process plugins, Telegram/WhatsApp transports |
+| [docs/PLUGIN-CHANNEL.md](docs/PLUGIN-CHANNEL.md) | Signed `.jbundle` distribution: install chain, signed channel index, receipt audit log, fail-closed gates |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Operator runbook: post-deploy verification, rollback, plugin-channel ops |
+| [docs/UPGRADE.md](docs/UPGRADE.md) | Upgrading a node + bootstrap (ordering rule, wire-contract checks, bump protocol) |
 | docs/SETUP.md | Setup walkthrough (planned) |
 
 ## Repo layout
 
 ```
 crates/
-  node/       the `jerith` CLI binary (setup, run, status, peers, stack)
+  node/       the `jerith` CLI binary (setup, run, status, peers, stack,
+              + the plugin lane: `plugin install/verify/remove/trust/
+              search/channel/receipts` — docs/PLUGIN-CHANNEL.md)
   bot/        the `jerith-bot` Discord bot (slash commands → gateway + JerithChain)
   core/       hardware probe, config, peer registry, ping loop, model gateway
+  weather-plugin/  the public weather plugin (weather.now/forecast; the
+              signed `.jbundle` channel's first-party row)
+  …           pet, house, quarantine and ledger plugins, the
+              `plugin-template` SDK scaffold, `gcp-bridge`
 integrations/
   langchain/  LangChain/LangGraph integration package (uses the local gateway)
 proto/        wire protocol (planned Phase 1)

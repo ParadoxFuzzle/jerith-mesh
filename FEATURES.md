@@ -442,8 +442,33 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   (`discord_id`, `amount_uj`). HMAC-SHA256 over `"{ts_ms}.{body}"` in
   `x-jerith-signature` (+ `x-jerith-timestamp` for replay windows), linear
   backoff, 1–5 attempts, global in-flight cap; empty `urls` = the whole
-  subsystem is a no-op. See hooks.rs (unit + live local-receiver tests:
-  signature recomputation, payload schema, retry bound, disabled no-op).
+  subsystem is a no-op. See hooks.rs (unit + live local-receiver tests:   signature recomputation, payload schema, retry bound, disabled no-op).
+- ✅ Signed plugin distribution + audit receipts (Phase 3d→4 lane,
+  2026-10-27/28; full docs: [docs/PLUGIN-CHANNEL.md](docs/PLUGIN-CHANNEL.md)):
+  - Install chain — `jerith plugin install <bundle|channel-row>` runs
+    checksum → Ed25519 signature (pinned publisher or the committed
+    `keys/plugin-releases.pub` anchor) → pin → platform → node-contract
+    checks **before extract/stage**; `plugin verify|remove|trust
+    show|trust rotate` complete the local surface
+  - Signed channel index — `jerith plugin channel build|verify` over a
+    dist dir; one `channel.json`+sig pair per release, gathered + signed
+    + self-verified by the release workflow's `channel-index` job.
+    `channel verify` is the pinning + freshness gate; `plugin search`
+    rides that full gate (verify first, list second)
+  - Receipt audit log — every install/remove/pin-rotation/channel
+    verification appends a hash-chained receipt, per-entry Ed25519 by a
+    per-box receipts key (`plugin-receipts.pub`). `jerith plugin
+    receipts` prints the verdict + tail; `--verdict` is the one-liner,
+    exit 0 only on an intact chain (scriptable gate state)
+  - Fail-closed receipt gates — `plugin install` REFUSES while the log
+    shows `CHAIN BROKEN`/`LOG TRUNCATED` (override
+    `--receipt-allow-broken`: truncation self-heals via the next
+    receipt's head re-sync, a broken chain never hides); the bot restart
+    refuses external plugin drops on the same verdict (escape
+    `JERITH_BOT_ALLOW_BROKEN_RECEIPTS=1`, loudly); removal paths stay
+    deliberately ungated — they are the countermeasures. Also: a
+    set-but-empty `JERITH_CHANNEL_ANCHOR` fails fast at resolution with
+    an "no anchor … (non-empty)" hint naming the shell footgun
 
 ## 9. Incentives & Economics
 - ✅ Native JerithChain integration (default chain) — a native Rust flow against the
