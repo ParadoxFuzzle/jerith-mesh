@@ -5,12 +5,24 @@ name: release
 # automated macOS binaries come from here — the macos test job proved the
 # debug profile; this workflow proves the release profile (lto = thin).
 #
+# Artifact scope (decision 2026-10-28): the TWO first-party daemons ship
+# — the mesh node (`jerith`) and the Discord bot (`jerith-bot`) — one
+# artifact each per OS+arch. Nothing else from the workspace's nine
+# binaries ships, and for once there's a reason rather than momentum:
+# the plugin binaries are meaningless outside their per-host signed
+# manifest + `[plugins]` row in bot.toml (PLUGINS.md's contract),
+# `plugin-template` is an author's scaffold, and `gcp-bridge` is a
+# box-local ops utility. The read for anyone wanting_more: if the plugin
+# lane grows a real distribution channel (downloadable signed bundles),
+# THAT is the trigger to revisit shipping plugin artifacts — not
+# "workspace builds more binaries".
+#
 # workflow_dispatch (invoked without a tag ref) dry-runs the same builds
 # WITHOUT touching any release — use it to validate a platform change
 # before cutting a tag:
 #   gh workflow run release.yml --repo ParadoxFuzzle/jerith-mesh --ref main
 #
-# Operators verify via `sha256sum -c jerith-<os>-<arch>.sha256`.
+# Operators verify via `sha256sum -c jerith[-bot]-<os>-<arch>.sha256`.
 
 on:
   push:
@@ -41,15 +53,15 @@ jobs:
 
   binaries:
     needs: dependency-audit
-    name: build ${{ matrix.artifact }}
+    name: build ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
-            artifact: jerith-linux-x86_64
+            arch: linux-x86_64
           - os: macos-latest
-            artifact: jerith-macos-aarch64
+            arch: macos-aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -60,17 +72,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries (workspace)
         run: cargo build --release --workspace
-      - name: Stage artifact + sha256
+      - name: Stage artifacts + sha256
         # sha256sum is not a native macOS binary — fall back to perl
         # shasum with identical output format; either way the verify
         # re-check must fail the step on a mismatch.
         run: |
-          cp target/release/jerith "${{ matrix.artifact }}"
-          ( sha256sum "${{ matrix.artifact }}" || shasum -a 256 "${{ matrix.artifact }}" ) \
-            > "${{ matrix.artifact }}.sha256"
-          ( sha256sum -c "${{ matrix.artifact }}.sha256" || shasum -a 256 -c "${{ matrix.artifact }}.sha256" )
-          cat "${{ matrix.artifact }}.sha256"
-      - name: Upload binary + checksum to the tag's release
+          set -euo pipefail
+          for BIN in jerith jerith-bot; do
+            ART="${BIN}-${{ matrix.arch }}"
+            cp "target/release/${BIN}" "${ART}"
+            ( sha256sum "${ART}" || shasum -a 256 "${ART}" ) > "${ART}.sha256"
+            ( sha256sum -c "${ART}.sha256" || shasum -a 256 -c "${ART}.sha256" )
+            cat "${ART}.sha256"
+          done
+      - name: Upload binaries + checksums to the tag's release
         # Real releases only — a dispatch dry-run from a branch ref has no
         # tag and must not touch any release object.
         if: startsWith(github.ref, 'refs/tags/')
@@ -80,7 +95,11 @@ jobs:
             gh release create "$TAG" --verify-tag \
               --title "jerith-mesh $TAG" \
               --notes "Automated release binaries for $TAG (source of truth: this tag; checksums per asset)."
-          gh release upload "$TAG" \
-            "${{ matrix.artifact }}" "${{ matrix.artifact }}.sha256" --clobber
+          UPLOAD=()
+          for BIN in jerith jerith-bot; do
+            ART="${BIN}-${{ matrix.arch }}"
+            UPLOAD+=("${ART}" "${ART}.sha256")
+          done
+          gh release upload "$TAG" "${UPLOAD[@]}" --clobber
         env:
           GH_TOKEN: ${{ github.token }}

@@ -449,6 +449,27 @@ jerith-node-dev`). Its state lives in `data/` + `keys/` and survives
 restarts; schema migrations are additive (`CREATE TABLE IF NOT EXISTS`),
 so older binaries reading a newer DB must be reviewed before a downgrade.
 
+## Release artifact scope (decision, 2026-10-28)
+
+Tag releases ship exactly two binaries per platform — `jerith-<os>-<arch>`
+(the mesh node) and `jerith-bot-<os>-<arch>` (the Discord bot) — because
+the two are structurally siblings: standalone, long-running daemons
+whose box-local behavior lives in config (`~/.jerith-mesh/config.toml` /
+`bot.toml`), so a prebuilt binary is enough to receive a config. The
+workspace's other seven binaries deliberately DON'T ship: the plugin
+binaries are meaningless outside their per-host signed manifest plus the
+`[plugins]` row in bot.toml (a downloaded plugin binary cannot pass the
+external-plugin gate without that pair), `plugin-template` is an
+author's scaffold rather than a product, and `gcp-bridge` is a
+box-local ops utility. This box's own update path stays
+clone-and-build (`cargo build --release --workspace` — the
+versioning guarantee comes from the tag, not from a downloaded asset);
+the tag artifacts are for OTHER machines: fire-and-run node/bot
+deployments and the sha256-verify discipline. Revisit trigger if anyone
+wants plugin artifacts: a real distribution channel (downloadable
+signed plugin bundles with a verify path), not "the workspace builds
+more binaries".
+
 ## Secrets handling (Discord token)
 
 The bot token lives **not** in bot.toml but in a 0600 env file the user
@@ -1271,6 +1292,21 @@ and with it nine advisories, accepted the day they tripped the CI gate:
 Both facts were checked against the resolved tree, not assumed. The
 `.cargo/audit.toml` voice-lane block holds the entries with the same
 revisit trigger (next songbird release): delete it then.
+
+Upstream watch, checked 2026-10-28: **no fix chain yet.** songbird's
+newest crates.io release is still 0.6.1 (2026-10-10) — the version we
+pin — and its `driver` feature still drags `davey` unconditionally.
+davey itself just shipped **0.2.0-beta / 0.2.0-beta.1 (2026-10-26/27)**,
+which does drop its direct libcrux-aesgcm usage in favor of plain
+RustCrypto crates (aes/ghash/ctr/hmac/scrypt) — sign of the rewrite
+moving the right direction — but the beta still pins
+`openmls_rust_crypto 0.5.1` (the hpke-rs 0.6 line that carries the
+libcrux subtree) and `p256 0.13` (the crypto-bigint 0.5 pin), so even
+that beta would NOT clear RUSTSEC-2026-0387 or the libcrux chain.
+Pre-release, unmapped by any songbird version: wait for the stable
+davey 0.2 AND a songbird release consuming it. The next songbird
+release is still the day to re-run `cargo audit` clean and delete the
+voice-lane block.
 
 Verified upstream facts (2026-10-15): **serenity 0.13 does not exist
 yet** —   0.12.5 (2025-12-20) is the newest release and it pins
