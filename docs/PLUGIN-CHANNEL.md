@@ -253,14 +253,13 @@ across versions unless `--rotate` also passed).
 - Does Phase 2 sign the audit chain? — The RECEIPT LOG now exists
  (2026-10-28) and is TAMPER-EVIDENT via a hash chain: every CLI action
  appends one JSON line to `<home>/plugin.json` — installs and removals
- with the bundle digest and the PIN + its SOURCE, pin rotations (old →
- new), and channel verifications stamped with the index's
+ with the bundle digest and the PIN + its SOURCE, pin rotations (old → new), and channel verifications stamped with the index's
  `generated_ms`, the age OBSERVED at check time and the window
  enforced. Freshness is also wired into the enforcement lane:
  `jerith plugin install <bundle> --channel <url|dir>` requires the
  bundle to BE a row of the verified index (artifact-digest match) so
  the install receipt carries the freshness it ran under.
- 
+
  The chain: each line carries `prev` (the previous chained line's
  digest; 64 zeros for the first) and `chain` (SHA-256 over the line's
  own canonical content), so an in-place edit fails re-verification at
@@ -271,14 +270,26 @@ across versions unless `--rotate` also passed).
  tampering). Truncation — the one attack a per-line hash chain cannot
  see — is covered by the sibling `<home>/plugin.json.head` witness
  file: the file's tail can be deleted but the witness still names the
- real last digest. STILL not a security boundary, and still NOT
- VERIFIED against a key — an operator with root can rewrite log AND
- head coherently (hash chains are secret-less); enforcement stays the
- verify chain + pin table + the bot's fail-closed gate. The receipts
- bind CONTENT, not identity — the open remainder is per-entry
- Ed25519 signatures (binding a KEY, not a process), deliberately
- left open: they add signer-key management for little extra against
- the root-forge case the chain already documents.
+ real last digest.
+
+ The SIGNATURES (2026-10-28): every chained line also carries
+ `signer` + `sig` — an Ed25519 signature by a per-box RECEIPTS key
+ (`<home>/plugin-receipts.key`, auto-generated 0600 on first receipt;
+ public half in `plugin-receipts.pub`) over
+ `jerith-recpt1|<chain digest>`, so the signature binds the same
+ content + linkage the digest does but with a KEY. The reader verdict
+ now also counts the verified signatures, and any of these is a
+ Broken verdict: an invalid signature, a half-signed line, or a
+ signer-key change mid-log (a re-key splice). This still does not
+ make the log a security boundary against root — an attacker with the
+ seed can re-sign anything, and a whole-log re-key is invisible to
+ the box itself. What it buys: every signerless or foreign-signed
+ line is now evidence-loud, and the `plugin-receipts.pub` file is an
+ independently copyable anchor — keep a copy anywhere safer than the
+ box (a note, a repo) and any whole-log re-key attempt would conflict
+ with your copy. The remaining root capability (re-sign EVERYTHING
+ including the .pub you copied) requires rewriting your copy too —
+ that is the honest limit, not a gap this lane closes.
 - Does the CLI auto-download from a pinned URL (the mesh bootstrap CDN
   URL?) or fetch ONLY from operator-supplied URLs? Phase 2's default
   is: operator-supplied URLs only; no automatic remote trust.

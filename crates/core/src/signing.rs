@@ -169,6 +169,16 @@ pub fn plugin_channel_payload(publisher_hex: &str, generated_ms: u64, json_sha25
     format!("{PLUGIN_CHANNEL_PREFIX}|{publisher_hex}|{generated_ms}|{json_sha256}")
 }
 
+/// Canonical RECEIPT-ENTRY signature payload (pluginreceipt.rs): the
+/// per-box receipts key signs `prefix|<chain digest>` — the digest
+/// already binds that line's content and prev linkage, so the Ed25519
+/// signature binds the log to a KEY rather than to a process.
+pub const RECEIPT_PREFIX: &str = "jerith-recpt1";
+
+pub fn receipt_payload(chain_digest_hex: &str) -> String {
+    format!("{RECEIPT_PREFIX}|{chain_digest_hex}")
+}
+
 /// Canonical ping payload.
 pub fn ping_payload(from_node_id: &str, to_node_id: &str, stamp_ms: u64) -> String {
     format!("{PING_PREFIX}|{stamp_ms}|{from_node_id}|{to_node_id}")
@@ -554,6 +564,23 @@ mod tests {
             auth.validate(msg.as_bytes(), &id.node_id()),
             Err(AuthError::FutureStamp)
         );
+    }
+
+    #[test]
+    fn receipt_payload_is_domain_separated_and_deterministic() {
+        let id = SigningIdentity::generate();
+        let digest = "ab".repeat(32);
+        let payload = receipt_payload(&digest);
+        assert!(payload.starts_with(RECEIPT_PREFIX), "{payload}");
+        assert_eq!(payload, receipt_payload(&digest));
+        let sig = id.sign(payload.as_bytes());
+        assert!(verify(&id.pubkey_hex(), payload.as_bytes(), &sig));
+        // Any other digest (or prefix) fails verification.
+        assert!(!verify(
+            &id.pubkey_hex(),
+            receipt_payload(&"cd".repeat(32)).as_bytes(),
+            &sig
+        ));
     }
 
     #[test]

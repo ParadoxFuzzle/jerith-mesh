@@ -24,13 +24,24 @@
 //!
 //! A sibling `<home>/plugin.json.head` file carries the last digest:
 //! the log truncated while the head stayed gets flagged (covers
-//! deletes-the-tail attacks the hash chain alone cannot see). What it
-//! does NOT cover, said plainly in docs/PLUGIN-CHANNEL.md: a rewrite
-//! that rebuilds the chain AND the head — an operator with root can
-//! always forge the receipt log, and the honest answer is the verify
-//! chain + pin table + the bot's fail-closed gate, not these receipts.
-//! Per-entry Ed25519 signatures stay the open question (they'd bind a
-//! KEY, not a process; chain-hash detects what matters silently).
+//! deletes-the-tail attacks the hash chain alone cannot see).
+//!
+//! SIGNATURES (2026-10-28, the old open question landed): each chained
+//! line can additionally carry `signer` (a per-box RECEIPTS key's
+//! pubkey, 64-hex) and `sig` — Ed25519 over
+//! `jerith-recpt1|<chain digest>`, so the signature transitively binds
+//! the same content+linkage the digest does, but with a KEY: rewrite
+//! the log coherently and the digests line up, yet the signatures must
+//! come from the receipts key recorded in the lines. The key lives in
+//! `<home>/plugin-receipts.key` (32-hex seed, 0600, auto-generated on
+//! first receipt) with its public half in `plugin-receipts.pub` — an
+//! independently-copyable anchor: a whole-log re-key (attacker deletes
+//! the seed and re-signs everything) is invisible to the log itself
+//! but detectable against ANY copy of the pubkey the operator kept,//! since the log's first signer thumbprint changes too. Reader rules:
+//! a signed entry verifies or the verdict is Broken at that line; a
+//! signed log that suddenly changes signer mid-log is Broken (re-key
+//! splice); entirely UNSIGNED chains (pre-0.1.3 logs) stay Intact since
+//! sig-less lines are simply not covered by the signature lane.
 //!
 //! Appends only; a torn/missing line skips on read rather than
 //! blackholing the file, but malformed LOGGED shapes should not occur —
@@ -42,6 +53,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::NodeConfig;
+use crate::signing::{self, SigningIdentity};
 
 /// The receipt log lives at the node home root — siblings of
 /// config.toml / bot.toml, NOT under `plugins/` (an id may legally be
@@ -52,6 +64,13 @@ pub const RECEIPT_FILE: &str = "plugin.json";
 pub const RECEIPT_HEAD_FILE: &str = "plugin.json.head";
 /// The first chained line's `prev` (64 zeros — there is no zero digest).
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// The per-box RECEIPTS signing key (32-hex Ed25519 seed, 0600,
+/// auto-generated on first receipt; NOT the publisher key — this one
+/// never leaves the box and signs only this log).
+pub const RECEIPT_SEED_FILE: &str = "plugin-receipts.key";
+/// The receipts key's public half (the knock-off anchor: compare any
+/// independent copy against the log's `signer` thumbprints).
+pub const RECEIPT_PUB_FILE: &str = "plugin-receipts.pub";
 
 pub fn receipts_path_under(home: &Path) -> PathBuf {
     home.join(RECEIPT_FILE)
@@ -63,6 +82,48 @@ pub fn receipts_path() -> PathBuf {
 
 pub fn head_path_under(home: &Path) -> PathBuf {
     home.join(RECEIPT_HEAD_FILE)
+}
+
+pub fn seed_path_under(home: &Path) -> PathBuf {
+    home.join(RECEIPT_SEED_FILE)
+}
+
+pub fn pub_path_under(home: &Path) -> PathBuf {
+    home.join(RECEIPT_PUB_FILE)
+}
+
+/// Load (or mint) the per-box receipts key: the seed file is the truth;
+/// the .pub file is (re)written from it on every load so the anchor can
+/// never drift from the log's actual signer. 0600 both — the .pub is
+/// not a secret, but nothing else in this home rides world-readable.
+fn load_or_create_identity(home: &Path) -> anyhow::Result<SigningIdentity> {
+    let seed_path = seed_path_under(home);
+    let identity = if let Ok(seed_hex) = std::fs::read_to_string(&seed_path) {
+        SigningIdentity::from_secret_hex(&seed_hex)?
+    } else {
+        if let Some(parent) = seed_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let identity = SigningIdentity::generate();
+        std::fs::write(
+            &seed_path,
+            format!("{}\n", hex::encode(identity.secret_bytes())),
+        )?;
+        #[cfg(unix)]
+        crate::config::NodeConfig::restrict_file_permissions(&seed_path);
+        identity
+    };
+    let pub_hex = identity.pubkey_hex();
+    let pub_path = pub_path_under(home);
+    if std::fs::read_to_string(&pub_path)
+        .map(|t| t.trim() != pub_hex)
+        .unwrap_or(true)
+    {
+        std::fs::write(&pub_path, format!("{pub_hex}\n"))?;
+        #[cfg(unix)]
+        crate::config::NodeConfig::restrict_file_permissions(&pub_path);
+    }
+    Ok(identity)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +152,11 @@ pub struct ReceiptEntry {
     /// Free-form specifics (trash path, row count, rotate edges).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The RECEIPTS key's pubkey (64-hex) that signed this line. Sits
+    /// BEFORE `prev` in declaration order — the signer is CONTENT the
+    /// chain digest covers, so the digest pins which key signed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
     /// The previous CHAINED line's digest (orphans: `GENESIS_HASH`).
     /// Written by record; included in THIS line's hash input — the
     /// splice order IS the content. Never written by hand. MUST stay
@@ -102,6 +168,13 @@ pub struct ReceiptEntry {
     /// `chain` itself. MUST stay the LAST field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<String>,
+    /// Ed25519 over `jerith-recpt1|<chain digest>` by `signer` — only
+    /// meaningful WITH `chain` (the digest is what gets signed). Sits
+    /// AFTER `chain` and is EXCLUDED from the digest input (chain_hash
+    /// zeroes it), so legacy digest bytes stay byte-equal across this
+    /// field's introduction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 /// The pin that authorized an action, with its SOURCE — the audit
@@ -130,12 +203,14 @@ pub struct ChannelReceipt {
 }
 
 /// The digest of one entry: canonical serialization (declaration-order
-/// fields, `chain` omitted) hashed. The order contract is why `prev`
-/// and `chain` sit LAST in the struct — the hash input of line N is
-/// exactly the bytes appended for line N minus its own digest.
+/// fields, `chain` AND `sig` omitted) hashed. The order contract is
+/// why `prev` and `chain` sit LAST in the struct (with `sig` after
+/// both) — the hash input of line N is exactly the bytes appended for
+/// line N minus its own digest and signature.
 fn chain_hash(entry: &ReceiptEntry) -> anyhow::Result<String> {
     let mut w = entry.clone();
     w.chain = None;
+    w.sig = None;
     let text = serde_json::to_string(&w).map_err(|e| anyhow::anyhow!("receipt {e}"))?;
     Ok(hex::encode(Sha256::digest(text.as_bytes())))
 }
@@ -172,8 +247,16 @@ impl ReceiptEntry {
         }
         let mut chained = self.clone();
         chained.prev = Some(last_chain_hash(&path));
+        // SIGN it: the per-box receipts key goes in FIRST (it is content
+        // the chain digest covers), then the digest, then the Ed25519
+        // signature over that digest — so the sig binds content +
+        // linkage + signer with a KEY. Seed file is created on first
+        // receipt (pub file kept in sync).
+        let identity = load_or_create_identity(home)?;
+        chained.signer = Some(identity.pubkey_hex());
         let digest = chain_hash(&chained)?;
         chained.chain = Some(digest.clone());
+        chained.sig = Some(identity.sign(signing::receipt_payload(&digest).as_bytes()));
         let line = serde_json::to_string(&chained).map_err(|e| anyhow::anyhow!("receipt {e}"))?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -233,14 +316,22 @@ pub struct Verdict {
     /// the ones the chain covers — pre-chain/legacy lines ride along
     /// uncovered, historically labeled).
     pub chained: usize,
+    /// How many parsed entries carry a complete signer+sig trio that
+    /// VERIFIED (a pre-sigs chained log reads 0 here without a).
+    pub signed: usize,
 }
 
 /// Read the log under an explicit home and verify the chain + head.
 pub fn read_verified_under(home: &Path) -> Verdict {
     let entries = read_under(home);
     let mut chained = 0usize;
+    let mut signed = 0usize;
     let mut expected_prev = GENESIS_HASH.to_string();
     let mut chain_started = false;
+    // The receipts key: the FIRST signed entry de-senses it; every
+    // later signed entry must match — a mid-log key change is an
+    // insertion/replacement, not an operator action.
+    let mut first_signer: Option<String> = None;
     let mut integrity = LogIntegrity::Intact;
     for (i, e) in entries.iter().enumerate() {
         match (&e.chain, &e.prev) {
@@ -263,6 +354,54 @@ pub fn read_verified_under(home: &Path) -> Verdict {
                         expected_prev = d;
                         chain_started = true;
                         chained += 1;
+                        // Signature lane: complete trios verify (key pin
+                        // + Ed25519 over the domain-separated digest);
+                        // half-filled ones are shaped like forgeries.
+                        let trio = (e.signer.as_deref(), e.sig.as_deref(), e.chain.as_deref());
+                        match trio {
+                            (Some(signer), Some(sig), Some(digest)) => {
+                                if let Some(first) = &first_signer
+                                    && first != signer
+                                {
+                                    integrity = LogIntegrity::Broken {
+                                        at: i,
+                                        why: format!(
+                                            "signer key changed mid-log ({s0}… → {sn}…) — re-key splice?",
+                                            s0 = &first[..8],
+                                            sn = &signer[..8]
+                                        ),
+                                    };
+                                    break;
+                                }
+                                if !signing::verify(
+                                    signer,
+                                    signing::receipt_payload(digest).as_bytes(),
+                                    sig,
+                                ) {
+                                    integrity = LogIntegrity::Broken {
+                                        at: i,
+                                        why: "receipt signature does not verify".into(),
+                                    };
+                                    break;
+                                }
+                                if first_signer.is_none() {
+                                    first_signer = Some(signer.to_string());
+                                }
+                                signed += 1;
+                            }
+                            (Some(_), None, _) | (None, Some(_), _) => {
+                                integrity = LogIntegrity::Broken {
+                                    at: i,
+                                    why: "half-signed line (signer/sig must come as a pair)".into(),
+                                };
+                                break;
+                            }
+                            // A chained-but-unsigned line: legal legacy
+                            // shape (pre-signature logs) — the digest and
+                            // linkage already verified; the signature lane
+                            // simply does not cover it.
+                            _ => {}
+                        }
                     }
                     Ok(_) => {
                         integrity = LogIntegrity::Broken {
@@ -304,16 +443,24 @@ pub fn read_verified_under(home: &Path) -> Verdict {
     if let Ok(head) = std::fs::read_to_string(head_path_under(home)) {
         let head = head.trim().to_string();
         if !head.is_empty() && head != last_digest {
-            integrity = LogIntegrity::Truncated {
-                head,
-                last: last_digest,
-            };
+            // A specific Break outranks the witness: the mismatch is
+            // the more precise evidence (and often just a CONSEQUENCE
+            // of the same rewrite that broke the chain). Truncation is
+            // reported when the chain walked clean but the log's tail
+            // was removed underneath the head file.
+            if matches!(integrity, LogIntegrity::Intact) {
+                integrity = LogIntegrity::Truncated {
+                    head,
+                    last: last_digest,
+                };
+            }
         }
     }
     Verdict {
         entries,
         integrity,
         chained,
+        signed,
     }
 }
 
@@ -368,8 +515,10 @@ mod tests {
                 max_age_ms: 86_400_000,
             }),
             detail: Some(detail.into()),
+            signer: None,
             prev: None,
             chain: None,
+            sig: None,
         }
     }
 
@@ -404,6 +553,71 @@ mod tests {
         // Optional fields survive the JSONL round-trip.
         assert_eq!(entries[0].pin.as_ref().unwrap().source, "bot.toml");
         assert_eq!(entries[0].channel.as_ref().unwrap().observed_age_ms, 10_000);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn receipts_are_signed_and_sigs_verify() {
+        let home = tmp("signed-ok");
+        entry("install", "weather", "a")
+            .record_under(&home)
+            .unwrap();
+        entry("pin-rotate", "weather", "b")
+            .record_under(&home)
+            .unwrap();
+        let v = read_verified_under(&home);
+        assert!(matches!(v.integrity, LogIntegrity::Intact));
+        assert_eq!(v.signed, 2);
+        // Every appended line carries signer + sig; the per-box key
+        // file pair exists and its .pub matches the signer.
+        let ls = lines(&home);
+        for l in &ls {
+            let e: ReceiptEntry = serde_json::from_str(l).unwrap();
+            assert!(e.signer.is_some() && e.sig.is_some(), "unsigned line: {l}");
+            let signer = e.signer.as_deref().unwrap();
+            assert!(signing::verify(
+                signer,
+                signing::receipt_payload(e.chain.as_deref().unwrap()).as_bytes(),
+                e.sig.as_deref().unwrap()
+            ));
+        }
+        let pub_hex = std::fs::read_to_string(pub_path_under(&home)).unwrap();
+        let signer0: ReceiptEntry = serde_json::from_str(&ls[0]).unwrap();
+        assert_eq!(pub_hex.trim(), signer0.signer.as_deref().unwrap());
+        // Key files are 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [seed_path_under(&home), pub_path_under(&home)] {
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} mode {mode:o}", p.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tampered_signature_breaks_the_verdict_at_that_line() {
+        let home = tmp("signed-tamper");
+        entry("install", "weather", "a")
+            .record_under(&home)
+            .unwrap();
+        entry("pin-rotate", "weather", "b")
+            .record_under(&home)
+            .unwrap();
+        // Flip sig hex on line 1 in place (content + digests untouched).
+        let mut ls = lines(&home);
+        assert!(ls[1].contains("\"sig\""), "{}", ls[1]);
+        ls[1] = ls[1].replacen("sig\":\"", "sig\":\"ffff", 1);
+        rewrite_lines(&home, &ls);
+        let v = read_verified_under(&home);
+        match v.integrity {
+            LogIntegrity::Broken { at, why } => {
+                assert_eq!(at, 1, "{}", why);
+                assert!(why.contains("signature does not verify"), "{}", why);
+            }
+            other => panic!("expected a signature break, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -522,6 +736,112 @@ mod tests {
         assert_eq!(v.chained, 1);
         assert_eq!(v.entries.len(), 2);
         assert!(matches!(v.integrity, LogIntegrity::Intact));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mid_log_signer_change_breaks_the_chain() {
+        let home = tmp("rekey-splice");
+        entry("install", "weather", "a")
+            .record_under(&home)
+            .unwrap();
+        entry("pin-rotate", "weather", "b")
+            .record_under(&home)
+            .unwrap();
+        // An attacker with filesystem access but no key material:
+        // a HALF-job splice — rewrite line 1 coherently (content,
+        // digest, new key, NEW signature) without touching line 0. Each
+        // line verifies in isolation, but the signer key changes at
+        // line 1 and that is exactly the re-key signature.
+        let evil = SigningIdentity::generate();
+        let mut ls = lines(&home);
+        let e0: ReceiptEntry = serde_json::from_str(&ls[0]).unwrap();
+        let mut e1: ReceiptEntry = serde_json::from_str(&ls[1]).unwrap();
+        e1.signer = Some(evil.pubkey_hex());
+        let digest = chain_hash(&e1).unwrap();
+        e1.chain = Some(digest.clone());
+        e1.sig = Some(evil.sign(signing::receipt_payload(&digest).as_bytes()));
+        ls[1] = serde_json::to_string(&e1).unwrap();
+        rewrite_lines(&home, &ls);
+        rewrite_lines(&home, &ls);
+        std::fs::write(
+            head_path_under(&home),
+            format!("{}\n", e1.chain.as_deref().unwrap()),
+        )
+        .unwrap();
+        assert_ne!(e1.signer.as_deref(), e0.signer.as_deref());
+        // Sanity: line 1 alone WOULD verify standalone (evil signed it).
+        assert!(signing::verify(
+            e1.signer.as_deref().unwrap(),
+            signing::receipt_payload(e1.chain.as_deref().unwrap()).as_bytes(),
+            e1.sig.as_deref().unwrap()
+        ));
+        // And its prev doesn't break the walk (e0 untouched, e1.prev
+        // still points at e0's original digest).
+        let v = read_verified_under(&home);
+        match v.integrity {
+            LogIntegrity::Broken { at, why } => {
+                assert_eq!(at, 1, "{}", why);
+                assert!(why.contains("signer key changed"), "{}", why);
+            }
+            other => panic!("expected a re-key break, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unsigned_chained_lines_stay_intact_pre_sigs_shape() {
+        let home = tmp("unsigned-legacy");
+        // Hand-build a PRE-SIGNATURE log (what a 0.1.2 home holds):
+        // chained-but-unsigned lines. Note stripping signer+sig from a
+        // SIGNED line is NOT this test — the signer is chain-digest
+        // content, so that rewrite breaks the digest (covered by the
+        // edit-detection test); the legacy shape here was never signed.
+        let mut e0 = entry("install", "weather", "a");
+        e0.prev = Some(GENESIS_HASH.to_string());
+        e0.chain = Some(chain_hash(&e0).unwrap());
+        let mut e1 = entry("pin-rotate", "weather", "b");
+        e1.prev = e0.chain.clone();
+        e1.chain = Some(chain_hash(&e1).unwrap());
+        let head_digest = e1.chain.clone().unwrap();
+        let ls = vec![
+            serde_json::to_string(&e0).unwrap(),
+            serde_json::to_string(&e1).unwrap(),
+        ];
+        rewrite_lines(&home, &ls);
+        std::fs::write(head_path_under(&home), format!("{head_digest}\n")).unwrap();
+        let v = read_verified_under(&home);
+        assert_eq!(v.chained, 2);
+        assert_eq!(v.signed, 0);
+        assert!(matches!(v.integrity, LogIntegrity::Intact));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn half_signed_line_breaks_immediately() {
+        let home = tmp("half-signed");
+        entry("install", "weather", "a")
+            .record_under(&home)
+            .unwrap();
+        // Signer attached but sig stripped — parses fine and is exactly
+        // the incomplete shape a hand-crafted line would produce.
+        let ls = lines(&home)
+            .iter()
+            .map(|l| {
+                let mut e: ReceiptEntry = serde_json::from_str(l).unwrap();
+                e.sig = None;
+                serde_json::to_string(&e).unwrap()
+            })
+            .collect::<Vec<_>>();
+        rewrite_lines(&home, &ls);
+        let v = read_verified_under(&home);
+        match v.integrity {
+            LogIntegrity::Broken { at, why } => {
+                assert_eq!(at, 0, "{}", why);
+                assert!(why.contains("half-signed"), "{}", why);
+            }
+            other => panic!("expected a half-signature break, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 

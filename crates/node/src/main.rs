@@ -2442,8 +2442,10 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                 }),
                 channel: channel_receipt,
                 detail: Some(format!("drop: {}", staged.display())),
+                signer: None,
                 prev: None,
                 chain: None,
+                sig: None,
             }
             .record()?;
             Ok(())
@@ -2501,8 +2503,10 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                         pin: None,
                         channel: None,
                         detail: Some(format!("trash: {}", trash.display())),
+                        signer: None,
                         prev: None,
                         chain: None,
+                        sig: None,
                     }
                     .record()?;
                 }
@@ -2671,8 +2675,10 @@ async fn search_channel(
             },
         }),
         detail: Some(format!("search: {matched} row(s) matched {q:?}")),
+        signer: None,
         prev: None,
         chain: None,
+        sig: None,
     }
     .record()?;
     Ok(())
@@ -2784,8 +2790,10 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
                 bundle_sha256: None,
                 pin: None,
                 channel: None,
+                signer: None,
                 prev: None,
                 chain: None,
+                sig: None,
                 detail: Some(match &prior {
                     Some(old) => format!("old {old} → new {new_key}"),
                     None => format!("first pin: {new_key}"),
@@ -2935,8 +2943,10 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
                     },
                 }),
                 detail: Some(format!("{} row(s)", index.bundles.len())),
+                signer: None,
                 prev: None,
                 chain: None,
+                sig: None,
             }
             .record()?;
             Ok(())
@@ -2984,8 +2994,17 @@ async fn receipts_cmd(count: usize, all: bool) -> anyhow::Result<()> {
     // decides per-line whether to trust what follows.
     match &log.integrity {
         LogIntegrity::Intact => {
+            let sig_note = if log.signed > 0 {
+                format!(
+                    ", {} signed by the receipts key in {}",
+                    log.signed,
+                    jerith_mesh_core::pluginreceipt::RECEIPT_PUB_FILE
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "  chain intact: {} chained, hash-linked ✓ (head file in sync)",
+                "  chain intact: {} chained, hash-linked ✓ (head file in sync){sig_note}",
                 log.chained
             );
         }
