@@ -2217,7 +2217,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jerith-gcp-bridge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-house-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "jerith-plugin-template",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-ledger-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "jerith-plugin-template",
@@ -2265,7 +2265,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-mesh-bot"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-mesh-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-mesh-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2347,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-pet-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "jerith-plugin-template",
@@ -2361,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-plugin-template"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-quarantine-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "jerith-plugin-template",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "jerith-weather-plugin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "jerith-plugin-template",
