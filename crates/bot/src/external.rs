@@ -451,11 +451,8 @@ description = "Multi-day forecast."
     #[test]
     fn shipped_quarantine_manifest_parses_under_todays_rules() {
         let raw = include_str!("../../quarantine-plugin/plugin.toml");
-        let p = ExternalPlugin::parse(
-            Path::new("quarantine-plugin/plugin.toml"),
-            raw,
-        )
-        .expect("the shipped quarantine manifest must stay valid");
+        let p = ExternalPlugin::parse(Path::new("quarantine-plugin/plugin.toml"), raw)
+            .expect("the shipped quarantine manifest must stay valid");
         assert_eq!(p.id, "quarantine");
         assert_eq!(p.gate_id(), "external:quarantine");
         assert!(p.secret.is_some(), "quarantine ships signed by default");
@@ -486,11 +483,8 @@ description = "Multi-day forecast."
     #[test]
     fn shipped_weather_manifest_parses_under_todays_rules() {
         let raw = include_str!("../../weather-plugin/plugin.toml");
-        let p = ExternalPlugin::parse(
-            Path::new("weather-plugin/plugin.toml"),
-            raw,
-        )
-        .expect("the shipped weather manifest must stay valid");
+        let p = ExternalPlugin::parse(Path::new("weather-plugin/plugin.toml"), raw)
+            .expect("the shipped weather manifest must stay valid");
         assert_eq!(p.id, "weather");
         assert_eq!(p.gate_id(), "external:weather");
         let mut names: Vec<&str> = p.skills.iter().map(|s| s.name.as_str()).collect();

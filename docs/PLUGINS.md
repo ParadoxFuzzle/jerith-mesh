@@ -291,7 +291,17 @@ Events (type on the wire is snake_case):
 - `guard_violation` — `{"reason": "<public reason>"}` (never the
   blocked text)
 - `mine_won` — `{"discord_id": …, "amount_uj": …}`
+- `approval_requested` — `{"id": …, "summary": …, "action": …}` (id + a
+  coarse action summary; never model args) — the human-in-the-loop
+  bridge (FEATURES §15): a pending card rides the same signed webhook
+  as the operator-facing UI rides the owner's Telegram
+- `approval_resolved` — `{"id": …, "status": …}` — terminal state
+ (approve/deny), keyed by the same id
 
+A bot-side bonus since the weather-lane receipts wave: skill executions
+also carry a plain journal line now (`skill executed` / `skill
+execution failed`) — visibility no longer requires configuring these
+URLs just to see what a chat summoned.
 Delivery discipline: HMAC-SHA256 over `"{ts_ms}.{body}"` in
 `x-jerith-signature` (hex; `x-jerith-timestamp` rides along so
 receivers can bound the replay window), up to `max_retries` attempts

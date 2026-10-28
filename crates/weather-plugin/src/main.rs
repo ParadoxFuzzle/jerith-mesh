@@ -203,7 +203,11 @@ mod tests {
             .expect("endpoint line");
         let addr = endpoint_addr(endpoint).expect("endpoint binds");
         assert!(addr.ip().is_loopback(), "loopback by contract");
-        assert_ne!(addr.port(), 7788, "the example's port belongs to the example");
+        assert_ne!(
+            addr.port(),
+            7788,
+            "the example's port belongs to the example"
+        );
         assert_eq!(addr.port(), 7793, "the weather lane's port");
         assert!(
             plugin.get("secret").and_then(toml::Value::as_str).is_some(),
@@ -230,6 +234,9 @@ mod tests {
     fn args_place_refuses_empty_typed() {
         let err = args_place(&serde_json::json!({})).unwrap_err();
         assert!(err.contains("place is required"), "{err}");
-        assert_eq!(args_place(&serde_json::json!({"place": " Prague "})).unwrap(), "Prague");
+        assert_eq!(
+            args_place(&serde_json::json!({"place": " Prague "})).unwrap(),
+            "Prague"
+        );
     }
 }

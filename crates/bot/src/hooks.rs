@@ -13,6 +13,10 @@
 //!   reason — the public block reason, never the blocked text).
 //! - `mine_won`        — a `/mine` win landed in the tally (data:
 //!   discord_id, amount_uj).
+//! - `approval_requested` / `approval_resolved` — the human-in-the-loop
+//!   bridge (FEATURES §15, approval.rs): requested carries id + a coarse
+//!   action summary (never model args); resolved carries id + terminal
+//!   status. Operators key DM-card receivers on the pair.
 //!
 //! Delivery discipline:
 //! - HMAC-SHA256 over `"{ts_ms}.{body}"` with the configured secret in

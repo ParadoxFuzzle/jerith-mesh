@@ -206,8 +206,8 @@ pub fn code_text(code: u8) -> &'static str {
 /// honest "no such place") errors typed — the caller surfaces "no
 /// place matched 'xyz' — check spelling".
 pub fn parse_geocode(body: &str) -> Result<Place, String> {
-    let geo: GeocodeBody = serde_json::from_str(body)
-        .map_err(|e| format!("geocode body not a search result: {e}"))?;
+    let geo: GeocodeBody =
+        serde_json::from_str(body).map_err(|e| format!("geocode body not a search result: {e}"))?;
     geo.results.into_iter().next().ok_or_else(|| {
         "no place matched — check the spelling (e.g. \"New York\", not \"ny\")".to_string()
     })
@@ -216,8 +216,8 @@ pub fn parse_geocode(body: &str) -> Result<Place, String> {
 /// The forecast body's full series. Shape drift (missing `current` or
 /// `daily`) fails typed; null fields stay Option (upstream may omit).
 pub fn parse_forecast(body: &str) -> Result<ForecastBody, String> {
-    let body: ForecastBody = serde_json::from_str(body)
-        .map_err(|e| format!("forecast body not a forecast: {e}"))?;
+    let body: ForecastBody =
+        serde_json::from_str(body).map_err(|e| format!("forecast body not a forecast: {e}"))?;
     if body.current.temperature_2m.is_none() {
         return Err("forecast body has no current observations".to_string());
     }
@@ -274,14 +274,20 @@ fn f(x: &Option<f64>) -> String {
 
 /// The `weather.now` card: three lines, metric, time-stamped.
 pub fn now_card(place: &Place, tz: &str, now: &Current) -> String {
-    let head = format!("🌤️ {} — {}", card_label(place), code_text(now.weather_code.unwrap_or(255)));
+    let head = format!(
+        "🌤️ {} — {}",
+        card_label(place),
+        code_text(now.weather_code.unwrap_or(255))
+    );
     let mut lines = vec![
         head,
         format!(
             "🌡️ {} °C (feels {} °C), 💧 {}%, 💨 {} km/h",
             f(&now.temperature_2m),
             f(&now.apparent_temperature),
-            now.relative_humidity_2m.map(|v| format!("{v:.0}")).unwrap_or_else(|| "?".into()),
+            now.relative_humidity_2m
+                .map(|v| format!("{v:.0}"))
+                .unwrap_or_else(|| "?".into()),
             f(&now.wind_speed_10m)
         ),
     ];
@@ -294,11 +300,25 @@ pub fn now_card(place: &Place, tz: &str, now: &Current) -> String {
 /// The `weather.forecast` card: one line per day, high/low + pop %
 /// where the model states it.
 pub fn forecast_cards(place: &Place, tz: &str, days: &[Day]) -> String {
-    let mut lines = vec![format!("📅 {} — next {} day(s) local ({tz})", card_label(place), days.len())];
+    let mut lines = vec![format!(
+        "📅 {} — next {} day(s) local ({tz})",
+        card_label(place),
+        days.len()
+    )];
     for d in days {
-        let date = if d.date.is_empty() { "?" } else { d.date.as_str() };
-        let hi = d.temperature_2m_max.map(|v| format!("{v:.1}")).unwrap_or_else(|| "?".into());
-        let lo = d.temperature_2m_min.map(|v| format!("{v:.1}")).unwrap_or_else(|| "?".into());
+        let date = if d.date.is_empty() {
+            "?"
+        } else {
+            d.date.as_str()
+        };
+        let hi = d
+            .temperature_2m_max
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "?".into());
+        let lo = d
+            .temperature_2m_min
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "?".into());
         let pop = match d.precipitation_probability_max {
             Some(v) => format!("{v:.0}%"),
             None => "–".to_string(),
@@ -505,7 +525,10 @@ mod tests {
         assert!(fcard.contains("80%"), "{fcard}");
         assert!(fcard.contains("thunderstorm with slight hail"), "{fcard}");
         // A precip-less day is a "–", never "0%".
-        let nopop = Day { precipitation_probability_max: None, ..days[0].clone() };
+        let nopop = Day {
+            precipitation_probability_max: None,
+            ..days[0].clone()
+        };
         let fcard2 = forecast_cards(&place, "Europe/Prague", &[nopop]);
         assert!(fcard2.contains("💧 –"), "{fcard2}");
     }
@@ -565,7 +588,10 @@ mod tests {
             precipitation_probability_max: None,
         }];
         let f = forecast_result(&place, "Asia/Jakarta", &days);
-        assert_eq!(f["forecast"][0]["precipitation_probability_percent"], Value::Null);
+        assert_eq!(
+            f["forecast"][0]["precipitation_probability_percent"],
+            Value::Null
+        );
         assert!(f["card"].as_str().unwrap().contains("next 1 day(s)"));
     }
 }

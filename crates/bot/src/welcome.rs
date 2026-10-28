@@ -294,10 +294,7 @@ mod tests {
 
     #[test]
     fn gif_pick_skips_empty_and_non_gif_dirs() {
-        let dir = std::env::temp_dir().join(format!(
-            "jerith-welcome-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("jerith-welcome-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Empty pool → None.
         assert!(pick_gif(&dir, 1).is_none());
@@ -309,7 +306,11 @@ mod tests {
         std::fs::write(dir.join("a.gif"), "a").unwrap();
         std::fs::write(dir.join("b.GIF"), "b").unwrap();
         let a = pick_gif(&dir, 42).unwrap();
-        assert_eq!(pick_gif(&dir, 42), Some(a.clone()), "per-member pick is stable");
+        assert_eq!(
+            pick_gif(&dir, 42),
+            Some(a.clone()),
+            "per-member pick is stable"
+        );
         let both: std::collections::HashSet<String> = (0..50u64)
             .map(|i| {
                 pick_gif(&dir, i)
@@ -330,23 +331,13 @@ mod tests {
     #[test]
     fn unreadable_pool_falls_back_to_embed_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "jerith-welcome-test-{}-2",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("jerith-welcome-test-{}-2", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("x.gif"), "x").unwrap();
-        std::fs::set_permissions(
-            &dir,
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert!(pick_gif(&dir, 1).is_none(), "unlistable dir → None");
-        std::fs::set_permissions(
-            &dir,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
