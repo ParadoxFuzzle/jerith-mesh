@@ -237,7 +237,11 @@ async fn rpc(State(cfg): State<Arc<ServerConfig>>, headers: HeaderMap, body: Str
         tracing::warn!(plugin = %cfg.id, skill = %skill_name, msg = %msg);
         return (StatusCode::BAD_GATEWAY, error_json(&msg)).into_response();
     }
-    tracing::debug!(
+    // Every served invoke journals at INFO: the default-filter plugin
+    // ("info") carries this receipt, so an operator can see a skill was
+    // called without turning debug on (2026-10-28: DEBUG was invisible
+    // under the default INFO during the weather plugin's live-fire).
+    tracing::info!(
         plugin = %cfg.id,
         skill = %skill_name,
         ms = started.elapsed().as_millis() as u64,

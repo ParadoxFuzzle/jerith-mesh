@@ -55,7 +55,7 @@ version = "1"
 endpoint = "http://127.0.0.1:7777/rpc"   # http(s); loopback by default
 secret = "per-plugin-rotate-me"          # enables x-jerith-signature over both directions
 timeout_secs = 10                        # clamped like hooks (1–30)
-max_response_bytes = 16384               # dispatcher refuses bloated barkers
+# (response caps are dispatcher-side: 65536 bytes hard — no manifest knob)
 
 [[skill]]
 name = "now"                       # final model-visible name: "weather.now"
@@ -188,7 +188,11 @@ reactions and message chunking differ per transport).
    open goals as typed entries on ONE atomic-save state file, the
    daily briefing's `📋` line rendering the open tail over the same
    signed contract; `external:ledger` gate row, owner-DM posture;
-   no watcher — the lane moves only when asked).
+   no watcher — the lane moves only when asked). Sixth live consumer: the
+weather lane (`crates/weather-plugin/`, 2026-10-27 — `weather.now` /
+`weather.forecast`: open-meteo geocoding + current/forecast cards over
+the same signed contract; `external:weather` gate row, deliberately
+PUBLIC — a room-wide chat skill, the first non-owner_only drop).
 
 ## What would falsify this design
 

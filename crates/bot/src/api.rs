@@ -1071,6 +1071,24 @@ async fn run_tool(
 ) -> String {
     let args = parse_tool_args(raw_args);
     let outcome = registry.dispatch(cfg, name, &args).await;
+    // The one journal receipt for a skill execution. hooks events only
+    // ride when [hooks] urls exist, and the plugin's own "invoke served"
+    // line needed debug filters — before 2026-10-28 a normal chat's skill
+    // calls were invisible in the journal, so "did the model summon X?"
+    // could not be answered from the bot's own log. Success stays info;
+    // a failure (dead plugin, refusal, timeout) is warn with the cause —
+    // the same string the model reads as its {"error": …}. Arguments
+    // never ride the line (same payload-minimality rule as hooks).
+    match &outcome {
+        Ok(_) => tracing::info!(target: "bot", skill = %name, ok = true, "skill executed"),
+        Err(e) => tracing::warn!(
+            target: "bot",
+            skill = %name,
+            ok = false,
+            error = %e,
+            "skill execution failed"
+        ),
+    }
     // FEATURES §8: receivers learn the skill name and whether it worked —
     // raw arguments stay local (user text can flow through them).
     crate::hooks::global().emit(crate::hooks::Event::new(
