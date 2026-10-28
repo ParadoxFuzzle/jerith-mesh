@@ -177,6 +177,45 @@ enum Cmd {
         #[command(subcommand)]
         cmd: StackCmd,
     },
+    /// Signed plugin bundle channel (docs/PLUGIN-CHANNEL.md) — install,
+    /// verify and remove `.jbundle` drops without a source checkout.
+    Plugin {
+        #[command(subcommand)]
+        cmd: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Install a signed bundle (.jbundle) from a local path or https URL:
+    /// sha256 → publisher signature → pin → platform → node-contract →
+    /// inner binary hash, THEN extract + stage the drop. A fresh HMAC
+    /// secret is generated box-side on every install (the shipped one is
+    /// never kept); enabling is always a manual bot.toml edit.
+    Install {
+        /// Local .jbundle path (.sha256/.sig companions beside it) or an https URL.
+        source: String,
+        /// Bypass the downgrade/equal-version guard (never the verify chain).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Publisher pubkey hex (default: $JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json).
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+    /// Verify a bundle end to end without installing anything.
+    Verify {
+        /// The .jbundle file (.sha256/.sig companions beside it).
+        path: PathBuf,
+        /// Publisher pubkey hex (default: the pins file).
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+    /// Move a plugin's live drop out to plugins.d/.trash (never deleted;
+    /// installed bundles and downloads stay for the audit trail).
+    Remove {
+        /// Plugin id (the drop dir name under plugins.d/).
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -424,6 +463,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Experts { cmd } => experts_cmd(cmd).await,
         Cmd::Backup { cmd } => backup_cmd(cmd).await,
         Cmd::Stack { cmd } => stack_cmd(cmd),
+        Cmd::Plugin { cmd } => plugin_cmd(cmd).await,
     }
 }
 
@@ -1807,6 +1847,254 @@ fn run_or_print(step: &str, print_mode: bool, label: &str) -> anyhow::Result<()>
         .with_context(|| format!("spawning {program} for [{label}]"))?;
     anyhow::ensure!(status.success(), "[{label}] step failed ({status}): {step}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// plugin bundle channel (docs/PLUGIN-CHANNEL.md Phase 2) — the human
+// surface over core::pluginbundle: verify chain → (extract | stage).
+// ---------------------------------------------------------------------------
+
+/// Publisher pins file: `$JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json`
+/// mapping plugin id →.ed25519 pubkey hex. No file, no trust-on-first-use.
+fn load_pins() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let path = jerith_mesh_core::config::NodeConfig::home()
+        .join("keys")
+        .join("plugin-pins.json");
+    let raw = std::fs::read_to_string(&path).with_context(|| format!(
+        "no publisher pins file at {} — create one like {{\"weather\": \"<64-hex ed25519 pubkey>\"}} there (docs/PLUGIN-CHANNEL.md)",
+        path.display()
+    ))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("pins file {} is not valid JSON", path.display()))
+}
+
+/// Resolve the expected publisher for `id`: an explicit --pubkey, the
+/// pins file entry, or a refusal that names the presented key (the human
+/// pastes it ONLY after trusting the source).
+fn resolve_pin(id: &str, pubkey: Option<&str>, presented: &str) -> anyhow::Result<String> {
+    if let Some(p) = pubkey {
+        return Ok(p.trim().to_ascii_lowercase());
+    }
+    let pins = load_pins()?;
+    if let Some(p) = pins.get(id) {
+        return Ok(p.trim().to_ascii_lowercase());
+    }
+    anyhow::bail!(
+        "no pin for plugin {id:?} — the bundle presents publisher key {}…\n\
+         paste {{\"{id}\": \"{presented}\"}} into the pins file ONLY after trusting this source",
+        &presented[..8]
+    );
+}
+
+/// Fetch the bundle + both companions: a local path needs `.sha256`/`.sig`
+/// files beside it; an https URL downloads all three (plain http is
+/// refused; loopback plain http is a non-issue since this is a fetch of a
+/// VERIFIED artifact, not signed-request carriage) into the cache dir.
+async fn fetch_bundle(source: &str) -> anyhow::Result<(PathBuf, String, String)> {
+    use jerith_mesh_core::pluginbundle::parse_sha256_file;
+    if source.starts_with("http://") || source.starts_with("https://") {
+        anyhow::ensure!(
+            !source.starts_with("http://"),
+            "plugin install: plain http is refused — fetch over https"
+        );
+        let client = jerith_mesh_core::http::mesh_http();
+        let get = |url: String, cap: u64| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .get(&url)
+                    .timeout(Duration::from_secs(120))
+                    .send()
+                    .await
+                    .with_context(|| format!("fetching {url}"))?;
+                let resp = resp
+                    .error_for_status()
+                    .with_context(|| format!("fetching {url}"))?;
+                let len = resp.content_length().unwrap_or_default();
+                anyhow::ensure!(len <= cap, "{url}: {len} bytes — over the {cap}-byte cap");
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .with_context(|| format!("reading {url}"))?;
+                anyhow::ensure!(
+                    bytes.len() as u64 <= cap,
+                    "{url}: {} bytes — over the {cap}-byte cap",
+                    bytes.len()
+                );
+                Ok::<_, anyhow::Error>(bytes)
+            }
+        };
+        let cap = 256 * 1024 * 1024;
+        let raw = get(source.to_string(), cap).await?;
+        let sha_file = get(format!("{source}.sha256"), 4096).await?;
+        let sig_file = get(format!("{source}.sig"), 4096).await?;
+        let sha = parse_sha256_file(std::str::from_utf8(&sha_file)?)?;
+        let sig = std::str::from_utf8(&sig_file)?.trim().to_string();
+        let (id, version, _publisher) = jerith_mesh_core::pluginbundle::peek_identity(&raw)
+            .context("downloaded bundle unreadable — cannot give it a cache name")?;
+        let cache = jerith_mesh_core::config::NodeConfig::home()
+            .join("plugins")
+            .join("cache");
+        std::fs::create_dir_all(&cache)?;
+        let stem = format!(
+            "{id}-{version}-{}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let dest = cache.join(format!("{stem}.jbundle"));
+        std::fs::write(&dest, &raw)?;
+        std::fs::write(
+            format!("{}.sha256", dest.display()),
+            format!("{sha}  {stem}.jbundle\n"),
+        )?;
+        std::fs::write(format!("{}.sig", dest.display()), format!("{sig}\n"))?;
+        println!("fetched → {}", dest.display());
+        Ok((dest, sha, sig))
+    } else {
+        // Local path: companions must ride beside the bundle.
+        let path = PathBuf::from(source);
+        anyhow::ensure!(path.is_file(), "bundle path {} missing", path.display());
+        let raw_sha = std::fs::read_to_string(format!("{}.sha256", path.display()))
+            .with_context(|| format!("missing companion {}.sha256", path.display()))?;
+        let sig = std::fs::read_to_string(format!("{}.sig", path.display()))
+            .with_context(|| format!("missing companion {}.sig", path.display()))?
+            .trim()
+            .to_string();
+        Ok((path, parse_sha256_file(&raw_sha)?, sig))
+    }
+}
+
+/// One verify chain print (shared by install + verify).
+fn run_verify(
+    raw: &[u8],
+    sha: &str,
+    sig: &str,
+    pin: &str,
+) -> anyhow::Result<jerith_mesh_core::pluginbundle::VerifiedBundle> {
+    let v = jerith_mesh_core::pluginbundle::verify_bytes(
+        raw,
+        &jerith_mesh_core::pluginbundle::VerifyOptions {
+            expected_sha256: Some(sha),
+            sig_hex: sig,
+            pinned_pubkey: Some(pin),
+            platform_os: std::env::consts::OS,
+            platform_arch: std::env::consts::ARCH,
+            node_contract_version: Some(env!("CARGO_PKG_VERSION")),
+        },
+    )?;
+    let m = &v.meta;
+    println!(
+        "✓ verified: {} {} — publisher {}… · {}/{} · binary {} ({} bytes)",
+        m.id,
+        m.version,
+        publisher_thumb(&m.publisher),
+        m.os,
+        m.arch,
+        v.binary_name,
+        v.binary.len()
+    );
+    Ok(v)
+}
+
+/// First 8 hex of a publisher key + last 4 — a thumbprint to display.
+fn publisher_thumb(hex: &str) -> String {
+    let n = hex.len();
+    let head = hex.get(..8).unwrap_or(hex);
+    let tail = n.checked_sub(4).and_then(|i| hex.get(i..)).unwrap_or("");
+    format!("{head}…{tail}")
+}
+
+async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginbundle as pb;
+    use std::cmp::Ordering;
+    match cmd {
+        PluginCmd::Verify { path, pubkey } => {
+            let (path, sha, sig) = fetch_bundle(&path.display().to_string()).await?;
+            let raw = std::fs::read(&path)?;
+            let (id, _version, presented) = pb::peek_identity(&raw)
+                .context("cannot resolve a publisher pin for this bundle")?;
+            let pin = resolve_pin(&id, pubkey.as_deref(), &presented)?;
+            run_verify(&raw, &sha, &sig, &pin)?;
+            Ok(())
+        }
+        PluginCmd::Install {
+            source,
+            force,
+            pubkey,
+        } => {
+            let (bundle_path, sha, sig) = fetch_bundle(&source).await?;
+            let raw = std::fs::read(&bundle_path)?;
+            let (id, _version, presented) = pb::peek_identity(&raw)
+                .context("cannot resolve a publisher pin for this bundle")?;
+            let pin = resolve_pin(&id, pubkey.as_deref(), &presented)?;
+            let v = run_verify(&raw, &sha, &sig, &pin)?;
+            let meta = &v.meta;
+
+            // Downgrade / same-version guard: only an upgrade installs.
+            let installed = pb::latest_installed(&meta.id)?;
+            if let Some(cur) = installed {
+                let ord = pb::version_cmp(&cur, &meta.version)?;
+                anyhow::ensure!(
+                    force || ord == Ordering::Less,
+                    "plugin {}: installed {cur} is not older than {} — pass --force to \
+                     reinstall (this rotates the HMAC secret and requires BOTH units to restart)",
+                    meta.id,
+                    meta.version
+                );
+            }
+
+            let (vdir, drop_dir, _drop_manifest) = pb::install_paths(&meta.id, &meta.version);
+            let _secret = pb::extract_installed(&v, &vdir)?;
+            let staged = pb::stage_drop(&vdir, &drop_dir)?;
+            println!("installed: {}", vdir.display());
+            println!(
+                "staged drop (fresh secret generated box-side): {}",
+                staged.display()
+            );
+            println!();
+            println!(
+                "next 1: add \"external:{}\" to [plugins].enabled in {}",
+                meta.id,
+                jerith_mesh_core::config::NodeConfig::home()
+                    .join("bot.toml")
+                    .display()
+            );
+            println!(
+                "next 2: point the plugin unit at this binary:\n\n\
+                 ExecStart = {vdir}/bin/{bin} {staged}\n",
+                vdir = vdir.display(),
+                bin = v.binary_name,
+                staged = staged.display()
+            );
+            println!(
+                "next 3: restart the plugin unit AND the bot — both halves read the \
+                 manifest secret at process start"
+            );
+            Ok(())
+        }
+        PluginCmd::Remove { id } => {
+            match pb::trash_drop(&id)? {
+                Some(trash) => {
+                    println!(
+                        "drop moved to {} (not deleted — the audit trail holds; \
+                         installed bundles stay too)",
+                        trash.display()
+                    );
+                    println!(
+                        "next: remove the \"external:{id}\" row from [plugins].enabled \
+                         and stop any plugin unit"
+                    );
+                }
+                None => {
+                    println!(
+                        "no live drop for {id:?} (nothing under plugins.d/{id}) — \
+                         installed bundles were not touched"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `jerith stack …` — the optional AI companion stack + small-model

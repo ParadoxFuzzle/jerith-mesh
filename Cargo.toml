@@ -24,6 +24,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hex = "0.4"
 rand = "0.8"
 ed25519-dalek = "2"
+# Plugin bundle channel (docs/PLUGIN-CHANNEL.md): the .jbundle archive
+# is a deterministic tar.gz (sorted entries, zeroed mtimes) so the
+# sha256 a publisher signs and the sha256 a verifier computes stay
+# byte-equal across rebuilds.
+tar = "0.4"
+flate2 = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 futures-core = "0.3"
 futures-util = "0.3"

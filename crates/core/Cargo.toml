@@ -15,6 +15,9 @@ sysinfo.workspace = true
 hex.workspace = true
 sha2 = "0.10"
 rand.workspace = true
+# Plugin bundle archives — see workspace comment (deterministic tar.gz).
+tar.workspace = true
+flate2.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 ed25519-dalek.workspace = true

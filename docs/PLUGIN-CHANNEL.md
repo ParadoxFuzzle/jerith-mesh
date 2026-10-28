@@ -1,11 +1,30 @@
 # Plugin bundle channel — the install-side design
 
-Status: **design, not built** (like docs/PLUGIN-SDK.md's "not built"
-sibling sections). This doc pins the decisions so the build is a day's
-work when someone picks it up. Authored 2026-10-28, immediately after
-the release-artifact scope decision in `.github/workflows/release.yml`
-settled that plugin binaries deliberately DON'T ride releases — this
-channel is the revisit trigger's real answer.
+Status: **Phase 2 ✅ implemented** (2026-10-28) — the `.jbundle`
+engine lives in `crates/core/src/pluginbundle.rs` (build / the strict
+verify chain / extract / stage, home-injectable and fully test-pinned)
+and the human surface is `jerith plugin install|verify|remove` in
+crates/node. The keys/trust flow of Phase 3 (repo-committed
+`keys/plugin-releases.pub`, `trusted_publishers` in bot.toml, rotation
+commands) and the release.yml signing job stay **design, not built**.
+Phase 4 (signed channel index) likewise. Authored 2026-10-28,
+immediately after the release-artifact scope decision in
+`.github/workflows/release.yml` settled that plugin binaries
+deliberately DON'T ride releases — this channel is the revisit
+trigger's real answer.
+
+Phase 2 CLI reality notes (differs from the early draft, deliberately):
+
+- Pins live in `$JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json`
+  (`{"<id>": "<64-hex pub>"}`) — the Phase 3 `trusted_publishers`
+  bot.toml table becomes the migration target.
+- `--pubkey` overrides the pins file per run; an un-pinned install
+  refuses and PRINTS the presented key for the human to paste after
+  trusting the source (no trust-on-first-use).
+- The extracted manifest's structural check is an install-time
+  pre-check; the RUNTIME authority stays the bot's fail-closed
+  `plugins.d` scan at every boot (`ExternalPlugin::scan_drops`) — no
+  second parser authority ever ships.
 
 ---
 
@@ -177,12 +196,16 @@ across versions unless `--rotate` also passed).
 
 ## Rollout phases
 
-1. **Now (this doc)**: decisions + shape; no binary code changes; CLI
-   refuses `plugin` until Phase 2.
-2. **First-party bundles**: `jerith plugin` subcommands (file + https),
-   bundle build/verify with test pins (happy path / tampered tarballs /
-   wrong key / rotating key), release.yml signing job, the shipped
-   weather bundle as the first end-to-end sample.
+1. **Now (this doc)**: ~~decisions + shape; no binary code changes~~ ✅.
+2. **First-party bundles**: ✅ engine + CLI + test pins (happy path,
+   tampered tarball, wrong key, unpinned publisher, platform/contract
+   refusal, downgrade ordering, trash-removal — all in
+   `pluginbundle.rs`'s test mod; end-to-end smoke: openssl-signed
+   bundle → verify → install → downgrade guard → remove). REMAINING:
+   the `keys/plugin-releases.pub` first-party key + release.yml
+   signing job (needs the maintainer's private half in a GitHub secret
+   when CI signs), and the shipped weather bundle as the first public
+   sample.
 3. **Third-party publishers**: `trusted_publishers` config, per-id pins,
    key rotation flow, plugin removal/re-download journey documented in
    RUNBOOK under "Author a plugin".

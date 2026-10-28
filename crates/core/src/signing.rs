@@ -136,6 +136,17 @@ pub fn advertise_payload(ad: &PeerAd, stamp_ms: u64) -> String {
     )
 }
 
+/// Canonical plugin-bundle signature payload (docs/PLUGIN-CHANNEL.md):
+/// a publisher signs `prefix|plugin_id|version|tarball_sha256`, so the
+/// detached `.sig` file binds the EXACT archive bytes it accompanies —
+/// tampering anything inside (plugin.toml, README, the binary) breaks
+/// the signature, not just the `.sha256` transport check.
+pub const PLUGIN_BUNDLE_PREFIX: &str = "jerith-plbun-1";
+
+pub fn plugin_bundle_payload(plugin_id: &str, version: &str, tarball_sha256: &str) -> String {
+    format!("{PLUGIN_BUNDLE_PREFIX}|{plugin_id}|{version}|{tarball_sha256}")
+}
+
 /// Canonical ping payload.
 pub fn ping_payload(from_node_id: &str, to_node_id: &str, stamp_ms: u64) -> String {
     format!("{PING_PREFIX}|{stamp_ms}|{from_node_id}|{to_node_id}")
