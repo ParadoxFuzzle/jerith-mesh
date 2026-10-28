@@ -2166,16 +2166,16 @@ Trigger: Cloudflare's Oct 20 advisory — eight emSign/eMudhra intermediates wit
   done without ALSO restoring the old config.yml, which is the trap
   that caused this. Do it atomically.
 
-## The weather skill (echo consumer, 2026-10-27)
+## The weather skill (sixth live consumer, 2026-10-27)
 
 `crates/weather-plugin/` gives the room a REAL weather lane over the
-same signed contract — public by design (open-meteo upstream, no api
-key), gated via `[plugins] enabled` and NEVER `owner_only`:
+same signed contract — not an echo demo like `crates/plugin-template` —
+public by design (open-meteo upstream, no api key), gated via
+`[plugins] enabled` and NEVER `owner_only`:
 `weather.now` = current conditions at any place on Earth;
 `weather.forecast` = 1-7 day series. Pure parsing lives in its lib.rs
 (9 tests), wire glue in main.rs (manifest row/handler pin), and a
-bot-side manifest pin is fourth in external.rs's row.
-
+bot-side manifest pin is the fifth in external.rs's row.
 ```bash
 mkdir -p ~/.jerith-mesh/plugins.d/weather
 cp crates/weather-plugin/plugin.toml ~/.jerith-mesh/plugins.d/weather/   # rotate the secret first
