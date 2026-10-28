@@ -1654,10 +1654,18 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   `b4b9d5e0ddfcb2fe1ec03c549e3e56d47559beb84420082873ca6bcf86d6c992`.
   Any future log whose signer thumb diverges from this without a
   deliberate re-key note here is re-key-tampering, box-side. The
-  REAL operator home (`~/.jerith-mesh`) has not run a receipted lane
-  action under the 0.1.3+ binaries yet — when it does, append its
-  `plugin-receipts.pub` here too (this file rides git, which is the
-  point: the copy lives somewhere other than the box).
+  REAL operator home (`~/.jerith-mesh`) ✅ recorded (2026-10-28): its
+  first receipted lane action under the 0.1.3+ binaries was the
+  v0.1.4 channel-verify of the release pair against the committed
+  anchor (`jerith plugin channel verify /tmp/channel-verify-dist` —
+  pin `1e715b66…` from `keys/plugin-releases.pub`, generated_ms age
+  3768668 ms ≤ the 86400000 ms window, 2 rows). Its receipts key,
+  copied out of `~/.jerith-mesh/plugin-receipts.pub`:
+  `ec97668f3ecd0ee630b418d7adcf57daa5c8775ddd188aa9591674ed885cf00d`.
+  Same rule as the v0.1.3 copy: any log in that home whose signer
+  thumb diverges from this without a deliberate re-key note here is
+  re-key-tampering, box-side. (This file rides git, which is the
+  point: the copy lives somewhere other than the box.)
 - Anchor-vs-env footgun, fixed (0.1.4): the channel anchor cascade
   (`--anchor` > `$JERITH_CHANNEL_ANCHOR` > `keys/plugin-releases.pub`)
   previously treated a SET-BUT-EMPTY env value as an anchor and
