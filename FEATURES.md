@@ -2018,8 +2018,60 @@ Four pieces, exactly the drop anatomy the pet/house/quarantine proved:
   three; a finished-but-quiet day says "nothing open · 2 closed
   today"; a clean day says "nothing open"). Same signed-contract
   discipline as the pet greeting and the quarantine line:
-  `external::invoke` on `ledger.list`, no direct state-file reads —
+  `  external::invoke` on `ledger.list`, no direct state-file reads —
   the renderer is pure and pinned by tests against the exact card the
   live service emits (verified 2026-10-23: unsigned probe 403, signed
   add/done/drop/list round-trip incl. the typed unknown-id error,
   smoke rows then closed; bot restarted clean on the gate row).
+
+## 27. The weather lane (2026-10-27)
+
+`crates/weather-plugin/` + `external:weather` — the sixth live consumer
+of the plugin SDK and the first PUBLIC one. Every earlier drop rode
+`owner_only` (the owner-DM posture: most personalities don't feel safe
+served to strangers); the weather lane is room-wide by design — a chat
+skill anyone in the server can summon, gated in `[plugins] enabled`
+and deliberately never `owner_only`. It is also the purest state-free
+lane: no state file, no watch loop, no scheduler — every call goes out
+and an answer comes back.
+
+Two skills, one contract:
+
+- **The lib** (`weather-plugin/lib.rs`, pure + networkless, 9 unit
+  tests): open-meteo geocoding (list → most-populous place), the
+  current/forecast URL builders (metric, timezone-stamped), the serde
+  body parsers, the WMO 4677 code table (code → emoji + prose, e.g.
+  "slight rain"), the user-facing cards ("🌤️ Huntsville, Alabama,
+  United States — clear sky / 🌡️ 22.4 °C (feels 20.9 °C), 💧 36%,
+  💨 4.6 km/h"), and the JSON the model reads — the card never
+  replaces the fields, it rides alongside them. No API key: the
+  provider's public endpoints carry no auth.
+- **`weather.now` / `weather.forecast`** — current conditions
+  (temperature, feels-like, humidity, wind, sky condition) and a
+  per-day high/low + precipitation-probability card for 1–7 days,
+  default 3. Typed refusals carry the geographer's honesty — a
+  nonsense place answers "no place matched — check the spelling",
+  never a 500.
+- **The bin** is wire glue only: it reads its own `plugin.toml` and
+  binds exactly that address (`127.0.0.1:7793`) — manifest and service
+  cannot drift — and registers the two model-visible skills over the
+  template SDK. The signed-dispatch receipt rides the default INFO
+  filter now that the SkillServer journals per-invoke lines; bounded
+  upstream reads, timeouts at hook discipline (10 s).
+
+Live-fire receipts (2026-10-27/28):
+- Signed direct dispatch — `weather.forecast` Prague (2 days) →
+  200 + a real forecast card ("14.2 °C / 3.9 °C, 💧 60%, slight rain");
+  unsigned probes stay 403 by the SDK's own tests.
+- Chat-path fire through a forged-but-signed transport lane — the
+  model summoned `weather.now` for "weather in Paris"; the runtime
+  receipts captured the round trip end-to-end: `invoke served
+  skill=weather.now ms=1477 bytes=495` + the hooks event
+  `{"skill":"weather_now","ok":true}`.
+- Natural channel chat — a real user's "How's the weather for me?"
+  (no city named) and the follow-up correction ("I'm in Guntersville,
+  al though.") each produced the plugin's card shape for a different
+  real place, with the follow-up re-summoning the skill. The at-the-
+  time receipts were not armed then (the api.rs `skill executed` line
+  landed in the same wave as this discovery), so this is pattern
+  evidence over tool-shape replies, not a journal roundtrip.

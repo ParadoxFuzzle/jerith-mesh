@@ -51,11 +51,12 @@ declares what a compiled-in table row can do today:
 # ~/.jerith-mesh/plugins.d/weather/plugin.toml
 [plugin]
 id = "weather"
-version = "1"
 endpoint = "http://127.0.0.1:7777/rpc"   # http(s); loopback by default
 secret = "per-plugin-rotate-me"          # enables x-jerith-signature over both directions
 timeout_secs = 10                        # clamped like hooks (1–30)
-# (response caps are dispatcher-side: 65536 bytes hard — no manifest knob)
+# (response caps are dispatcher-side: 65536 bytes hard — no manifest knob;
+#  the known plugin table is id/endpoint/secret/timeout_secs — anything
+#  else in [plugin] is silently ignored, so don't ship knobs that don't exist)
 
 [[skill]]
 name = "now"                       # final model-visible name: "weather.now"

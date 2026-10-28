@@ -1,6 +1,8 @@
 # The weather skill — real open-meteo.com data (geocoding + forecast,
 # no api key) over the signed plugin contract (docs/PLUGIN-SDK.md; the
-# SDK's consumer after pet/house/quarantine/ledger). Install:
+# SDK's sixth live consumer, after pet/house/quarantine/ledger — and
+# the first PUBLIC one: gate "external:weather" under [plugins]
+# enabled, NOT owner_only). Install:
 #
 #   mkdir -p ~/.jerith-mesh/plugins.d/weather
 #   cp crates/weather-plugin/plugin.toml ~/.jerith-mesh/plugins.d/weather/
