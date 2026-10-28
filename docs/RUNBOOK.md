@@ -1555,6 +1555,35 @@ content, expected nothing". Document parsing is
 `toml::from_str::<toml::Table>`; both crates' main.rs now do that and
 pin their shipped manifests by test (2026-10-23).
 
+### Publisher trust + the signed channel (Phases 3–4, shipped 2026-10-28)
+
+Installs without a source checkout ride the signed `.jbundle` lane
+(docs/PLUGIN-CHANNEL.md — `jerith plugin install|verify|remove|build`).
+The operator's TRUST surface is two commands:
+
+```bash
+jerith plugin trust show                             # pins per plugin id, bot.toml first
+jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
+```
+
+- bot.toml `[plugins.trusted_publishers]` is the PRIMARY pin table;
+  rotation edits it through toml_edit, so operator comments and the
+  `[plugins] enabled` rows survive verbatim. The legacy
+  `keys/plugin-pins.json` file still resolves, but a bot.toml row
+  OVERRANKS it — `rotate` prints a naming note when the two disagree.
+- An un-pinned install REFUSES and prints the presented key as a
+  ready-to-paste `[plugins.trusted_publishers]` row — the human adds
+  it AFTER trusting the source (no trust-on-first-use; the
+  approval-bridge shape applied at the supply-chain layer).
+- First-party bundles (the weather sample) resolve through the
+  committed `keys/plugin-releases.pub` anchor in the repo checkout.
+- Channel discovery: `jerith plugin search [query] --channel <url|dir>`
+  (or $JERITH_CHANNEL_URL). Verify FIRST — key pinning + the 24 h
+  freshness window, the full `channel verify` gate — filter SECOND
+  (case-insensitive substring over id/version/os/arch/url, plus an
+  «installed version» marker). Every row is a claim: installing runs
+  the full bundle verify chain against the artifact regardless.
+
 ## The house card (third live consumer, 2026-10-23)
 
 `crates/house-plugin/` answers the owner's "how are you doing" over

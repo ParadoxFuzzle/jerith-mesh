@@ -20,19 +20,29 @@ gitignored — see `keys/README.md`) and the GitHub secret
 throwaway home pinned to the committed pub — CI runs the same script,
 so what ships is what was verified). The weather sample was produced
 and locally verified on 2026-10-28 (dist/, gitignored — artifacts are
-release-side, not repo-side). REMAINING unbuilt: the Phase 3
-`trusted_publishers` bot.toml table + `jerith plugin trust rotate`
-(the pins-file → bot.toml migration), `jerith plugin search` riding
-the channel index, and the actual release cut that publishes the
-sample triple.
+release-side, not repo-side).
+**Phase 3 + search ✅ implemented same day** — the operator trust
+lane lives in `jerith plugin trust show|rotate` over bot.toml's
+`[plugins.trusted_publishers]` (via toml_edit — comments and other
+tables survive rotation verbatim), pins-file-vs-table priority is
+bot.toml-first with the patches file as a LEGACY backstop, and
+`jerith plugin search` rides `channel verify`'s full gate (verify
+first, filter second; rows name artifacts, install re-verifies) —
+verify-first means an unverified or stale index is never searched.
+The only thing left unbuilt is the actual release cut that publishes
+the sample triple.
 
 Phase 2 CLI reality notes (differs from the early draft, deliberately):
 
-- Pins live in `$JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json`
-  (`{"<id>": "<64-hex pub>"}`) — the Phase 3 `trusted_publishers`
-  bot.toml table becomes the migration target.
-- `--pubkey` overrides the pins file per run; an un-pinned install
-  refuses and PRINTS the presented key for the human to paste after
+- Pins live FIRST in bot.toml `[plugins.trusted_publishers]`
+  (`"<id>" = "<64-hex pub>"` — Phase 3's primary table, listed by
+  `jerith plugin trust show`, written by `rotate`); the
+  `$JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json` file still
+  resolves but is legacy — a bot.toml row OVERRANKS a file row, and
+  `trust rotate` prints a naming note when the two disagree.
+- `--pubkey` overrides both pin sources per run; an un-pinned install
+  refuses and PRINTS the presented key as a ready-to-paste
+  `[plugins.trusted_publishers]` row for the human to add after
   trusting the source (no trust-on-first-use).
 - The extracted manifest's structural check is an install-time
   pre-check; the RUNTIME authority stays the bot's fail-closed
@@ -188,8 +198,8 @@ across versions unless `--rotate` also passed).
 
 ## Where it plugs in (code anchors for the build)
 
-- **CLI**: `crates/node/src/main.rs` `Cmd` enum — add
-  `Plugin install|verify|activate|remove|trust show`.
+- **CLI**: `crates/node/src/main.rs` `Cmd` enum —
+  `Plugin install|verify|activate|remove|trust show|trust rotate|search|channel build|channel verify`.
 - **Crypto**: `crates/core/src/signing.rs` (already has what both `node`
   and `bot` link). New: `plugin_bundle_payload(id, version,
   sha256_hex)`, one canonical string, signed with the SAME Ed25519.
@@ -214,11 +224,14 @@ across versions unless `--rotate` also passed).
    signing job + the weather sample built and verified (despite the
    doc's early draft — the sample ships on the next tag cut, not from
    this repo branch).
-3. **Third-party publishers**: `trusted_publishers` config, per-id pins,
-   key rotation flow, plugin removal/re-download journey documented in
+3. **Third-party publishers**: ✅ `trusted_publishers` config,
+   per-id pins, key rotation flow (`jerith plugin trust show|rotate` —
+   the table is bot.toml's `[plugins.trusted_publishers]`, rotation
+   goes through toml_edit so operator comments survive verbatim,
+   and a disagreeing legacy pins-file row gets named, not silently
+   outranked forever), plugin removal/re-download journey documented in
    RUNBOOK under "Author a plugin".
-4. **Signed channel index**: ✅ `pluginchannel.rs` + `jerith plugin
-   channel build|verify` + the release.yml `channel-index` gather job.
+4. **Signed channel index**: ✅ `pluginchannel.rs` +`jerith plugin channel build|verify` + the release.yml `channel-index` gather job.
    `channel.json` + `channel.json.sig` per publisher: the canonical
    payload is `jerith-chidx1|<publisher>|<generated_ms>|<sha256(bytes)>`
    — the sig binds the EXACT received bytes; the freshness window (24 h
@@ -228,8 +241,12 @@ across versions unless `--rotate` also passed).
    `keys/plugin-releases.pub` — the file's own `publisher` field must
    equal it; a self-signed index is worthless by construction). The
    index is a CLAIM SHEET: installing a row still runs the full bundle
-   verify chain against the actual artifact. `jerith plugin search` on
-   top of it remains for a later wave.
+   verify chain against the actual artifact.   `jerith plugin search` on
+   top of it shipped the same day: `--channel <url|dir>` (or
+   $JERITH_CHANNEL_URL) — verify FIRST (pinning + freshness, the full
+   channel checks), filter SECOND (case-insensitive substring over
+   id/version/os/arch/url, with an «installed version» marker from the
+   local bundle store). An unverified or stale index is never searched.
 
 ## Open questions (deliberately unresolved)
 

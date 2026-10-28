@@ -198,7 +198,8 @@ enum PluginCmd {
         /// Bypass the downgrade/equal-version guard (never the verify chain).
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Publisher pubkey hex (default: $JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json).
+        /// Publisher pubkey hex (default: [plugins.trusted_publishers]
+        /// in bot.toml, then the legacy keys/plugin-pins.json).
         #[arg(long)]
         pubkey: Option<String>,
     },
@@ -240,6 +241,55 @@ enum PluginCmd {
         /// keys/plugin-releases.hex (JERITH_BUNDLE_KEY overrides).
         #[arg(long)]
         key: Option<PathBuf>,
+    },
+    /// Search a VERIFIED signed channel index (Phase 4's human lane):
+    /// fetch + verify the pair first (key pinning + freshness — the
+    /// full channel checks), then filter rows by substring. Rows name
+    /// artifacts; installing one still runs the full bundle verify
+    /// chain — the channel shortens the find, never the trust.
+    Search {
+        /// Match substring — case-insensitive over id, version, os/arch
+        /// and url. Omitted = list every row.
+        query: Option<String>,
+        /// Channel source: an https channel.json URL (the sig rides
+        /// `….sig`) or a local directory holding the pair. Default:
+        /// $JERITH_CHANNEL_URL.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Pinned publisher anchor (64-hex). Default: --anchor >
+        /// JERITH_CHANNEL_ANCHOR > keys/plugin-releases.pub.
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Freshness window ms (0 = the 24 h default).
+        #[arg(long, default_value_t = 0)]
+        max_age_ms: u64,
+    },
+    /// Operator trust over publishers (Phase 3, docs/PLUGIN-CHANNEL.md
+    /// key model): show the per-plugin-id pins across bot.toml's
+    /// [plugins.trusted_publishers] (the primary trust root) and the
+    /// legacy pins file, and rotate an id's key with zero trust-lag.
+    Trust {
+        #[command(subcommand)]
+        cmd: TrustCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustCmd {
+    /// List the pinned publisher keys per plugin id and where each pin
+    /// lives ([plugins.trusted_publishers] in bot.toml vs the legacy
+    /// keys/plugin-pins.json).
+    Show,
+    /// Re-pin <id> to --new <64-hex pubkey> in bot.toml's
+    /// [plugins.trusted_publishers]. No trust-lag: installs signed by
+    /// the OLD key are refused the moment rotation lands; the next
+    /// install verifies against the new pin (or nothing installs).
+    Rotate {
+        /// Plugin id (the pin row's key).
+        id: String,
+        /// The new Ed25519 publisher pubkey, exactly 64 hex chars.
+        #[arg(long)]
+        new: String,
     },
 }
 
@@ -1916,35 +1966,207 @@ fn run_or_print(step: &str, print_mode: bool, label: &str) -> anyhow::Result<()>
 // ---------------------------------------------------------------------------
 
 /// Publisher pins file: `$JERITH_HOME|~/.jerith-mesh/keys/plugin-pins.json`
-/// mapping plugin id →.ed25519 pubkey hex. No file, no trust-on-first-use.
+/// mapping plugin id →.ed25519 pubkey hex. LEGACY source (Phase 3's
+/// `[plugins.trusted_publishers]` bot.toml table below is the primary
+/// one now) — an absent file resolves as just "no legacy rows"; a
+/// PRESENT but malformed file stays a loud failure (trust content is
+/// load-bearing).
 fn load_pins() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     let path = jerith_mesh_core::config::NodeConfig::home()
         .join("keys")
         .join("plugin-pins.json");
-    let raw = std::fs::read_to_string(&path).with_context(|| format!(
-        "no publisher pins file at {} — create one like {{\"weather\": \"<64-hex ed25519 pubkey>\"}} there (docs/PLUGIN-CHANNEL.md)",
-        path.display()
-    ))?;
+    if !path.is_file() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading publisher pins file {}", path.display()))?;
     serde_json::from_str(&raw)
         .with_context(|| format!("pins file {} is not valid JSON", path.display()))
 }
 
 /// Resolve the expected publisher for `id`: an explicit --pubkey, the
-/// pins file entry, or a refusal that names the presented key (the human
-/// pastes it ONLY after trusting the source).
+/// bot.toml trust row (primary), the legacy pins-file entry, or a
+/// refusal that names the presented key (the human pastes it ONLY
+/// after trusting the source).
 fn resolve_pin(id: &str, pubkey: Option<&str>, presented: &str) -> anyhow::Result<String> {
     if let Some(p) = pubkey {
         return Ok(p.trim().to_ascii_lowercase());
     }
-    let pins = load_pins()?;
-    if let Some(p) = pins.get(id) {
+    if let Some(p) = load_trusted_publishers()?.get(id) {
+        return Ok(p.clone());
+    }
+    if let Some(p) = load_pins()?.get(id) {
         return Ok(p.trim().to_ascii_lowercase());
     }
+    let shown = presented.get(..8).unwrap_or(presented);
     anyhow::bail!(
-        "no pin for plugin {id:?} — the bundle presents publisher key {}…\n\
-         paste {{\"{id}\": \"{presented}\"}} into the pins file ONLY after trusting this source",
-        &presented[..8]
+        "no pin for plugin {id:?} — the bundle presents publisher key {shown}…\n\
+         after trusting this source, paste into [plugins.trusted_publishers] in {}:\n\
+         \n\
+             \"{id}\" = \"{presented}\"\n\
+         \n\
+         (the legacy keys/plugin-pins.json file would also resolve — but bot.toml is \
+         where trust lives now)",
+        bot_toml_path().display()
     );
+}
+
+/// The operator bot.toml path — the trust table's home (docs/
+/// PLUGIN-CHANNEL.md key model). Same file `[plugins] enabled` lives
+/// in, so the pin list and the activation gate sit in one operator
+/// surface.
+fn bot_toml_path() -> PathBuf {
+    jerith_mesh_core::config::NodeConfig::home().join("bot.toml")
+}
+
+/// A trust row's key: exactly 64 hex chars.
+fn valid_pubkey_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn normalize_key(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+/// `[plugins.trusted_publishers]` in bot.toml: the per-id pubkey pins
+/// (Phase 3 of docs/PLUGIN-CHANNEL.md). Only `jerith` reads this — the
+/// bot itself never fetches bundles — but the table IS the operator's
+/// trust root, so a malformed row fails loud instead of being silently
+/// skipped (a skipped row would silently downgrade to a refusal later,
+/// and a trust table that half-works is worse than one that refuses).
+/// No file / no section = an empty map: first-party installs resolve
+/// through the committed anchor instead of a pin row.
+fn load_trusted_publishers() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let path = bot_toml_path();
+    if !path.is_file() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    parse_trusted_publishers(&text)
+        .with_context(|| format!("reading trust rows from {}", path.display()))
+}
+
+/// The trust-table parse, file-text → id → 64-hex-lowercase map.
+/// Test-separated from disk (and from the node's other bot.toml reads:
+/// the bot's own loader is a different reader — this one only exists
+/// inside `jerith`, and the bot never reads the table).
+fn parse_trusted_publishers(
+    text: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    use toml_edit::{DocumentMut, Item, Value};
+    let mut out = std::collections::BTreeMap::new();
+    let doc: DocumentMut = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("not a TOML document ({e})"))?;
+    let Some(tp) = doc.get("plugins").and_then(|p| p.get("trusted_publishers")) else {
+        return Ok(out);
+    };
+    match tp {
+        Item::Table(t) => {
+            for (k, v) in t.iter() {
+                let val = v.as_value().ok_or_else(|| {
+                    anyhow::anyhow!("trusted_publishers[{k:?}] is not a pubkey string")
+                })?;
+                insert_trust_row(&mut out, k, val)?;
+            }
+        }
+        Item::Value(Value::InlineTable(it)) => {
+            for (k, v) in it.iter() {
+                insert_trust_row(&mut out, k, v)?;
+            }
+        }
+        _ => anyhow::bail!("[plugins.trusted_publishers] is not a table of id → pubkey strings"),
+    }
+    Ok(out)
+}
+
+/// One trust row: a plain-string Ed25519 pubkey, lowercased.
+fn insert_trust_row(
+    out: &mut std::collections::BTreeMap<String, String>,
+    id: &str,
+    v: &toml_edit::Value,
+) -> anyhow::Result<()> {
+    let toml_edit::Value::String(s) = v else {
+        anyhow::bail!("trusted_publishers[{id:?}] is not a pubkey string");
+    };
+    let key = normalize_key(s.value());
+    anyhow::ensure!(
+        valid_pubkey_hex(&key),
+        "trusted_publishers[{id:?}]: {:?} is not a 64-hex Ed25519 pubkey — \
+         a trust row must be load-bearing or absent",
+        s.value()
+    );
+    out.insert(id.to_string(), key);
+    Ok(())
+}
+
+/// Rotate (or first-pin) `<id>` in bot.toml's
+/// `[plugins.trusted_publishers]` WITHOUT disturbing anything else in
+/// the file — comments, ordering and unrelated tables survive (that is
+/// why this goes through toml_edit and not a string replace).
+fn write_trusted_publishers(path: &Path, id: &str, key_hex: &str) -> anyhow::Result<PathBuf> {
+    use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
+    anyhow::ensure!(
+        valid_pubkey_hex(key_hex),
+        "{key_hex:?} is not a 64-hex Ed25519 pubkey"
+    );
+    let mut doc: DocumentMut = if path.is_file() {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        text.parse::<DocumentMut>()
+            .map_err(|e| anyhow::anyhow!("{} is not a TOML document ({e})", path.display()))?
+    } else {
+        // A fresh trust file: [plugins.trusted_publishers] with the one
+        // row, nothing else.
+        DocumentMut::new()
+    };
+    if !doc.contains_key("plugins") {
+        doc["plugins"] = Item::Table(Table::new());
+    }
+    let plugins = &mut doc["plugins"];
+    if let Some(inline) = plugins.as_inline_table_mut() {
+        // The operator wrote `[plugins]` as an inline table; the
+        // file's own style wins — the pin lives in a nested inline.
+        let sub = match inline.get_mut("trusted_publishers") {
+            Some(v) => v.as_inline_table_mut().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[plugins] trusted_publishers is not a table of id → pubkey strings"
+                )
+            })?,
+            None => {
+                inline.insert("trusted_publishers", Value::InlineTable(InlineTable::new()));
+                inline
+                    .get_mut("trusted_publishers")
+                    .and_then(|v| v.as_inline_table_mut())
+                    .expect("just inserted")
+            }
+        };
+        sub.insert(id, Value::from(key_hex));
+    } else {
+        let table = plugins.as_table_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[plugins] is neither a table nor an inline table in {}",
+                path.display()
+            )
+        })?;
+        match table
+            .entry("trusted_publishers")
+            .or_insert(Item::Table(Table::new()))
+        {
+            Item::Table(t) => {
+                t[id] = value(key_hex);
+            }
+            Item::Value(Value::InlineTable(it)) => {
+                it.insert(id, Value::from(key_hex));
+            }
+            _ => {
+                anyhow::bail!("[plugins.trusted_publishers] is not a table of id → pubkey strings")
+            }
+        }
+    }
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path.to_path_buf())
 }
 
 /// Fetch the bundle + both companions: a local path needs `.sha256`/`.sig`
@@ -2175,6 +2397,13 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        PluginCmd::Search {
+            query,
+            channel,
+            anchor,
+            max_age_ms,
+        } => search_channel(query, channel, anchor, max_age_ms).await,
+        PluginCmd::Trust { cmd } => trust_cmd(cmd).await,
         PluginCmd::Channel { cmd } => channel_cmd(cmd).await,
         PluginCmd::Remove { id } => {
             match pb::trash_drop(&id)? {
@@ -2195,6 +2424,242 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                          installed bundles were not touched"
                     );
                 }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The channel pair from an https `channel.json` URL (the sig rides
+/// `{.}.sig`; both downloads size-capped) or a local DIRECTORY holding
+/// the pair. Shared by `channel verify` and `plugin search` (the
+/// index is only ever touched AFTER verify_channel's full checks).
+async fn fetch_channel_pair(source: &str) -> anyhow::Result<(String, String)> {
+    if source.starts_with("https://") {
+        anyhow::ensure!(
+            !source.contains(char::is_whitespace),
+            "channel: source url contains whitespace"
+        );
+        let client = jerith_mesh_core::http::mesh_http();
+        let get = |url: String, cap: usize| {
+            let client = client.clone();
+            async move {
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .with_context(|| format!("fetching {url}"))?;
+                let resp = resp
+                    .error_for_status()
+                    .with_context(|| format!("fetching {url}"))?;
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .with_context(|| format!("reading {url}"))?;
+                anyhow::ensure!(
+                    bytes.len() <= cap,
+                    "{url}: {} bytes — over the {cap}-byte cap",
+                    bytes.len()
+                );
+                Ok::<_, anyhow::Error>(bytes)
+            }
+        };
+        let json = get(source.to_string(), 256 * 1024).await?;
+        let sigb = get(format!("{source}.sig"), 4096).await?;
+        return Ok((
+            String::from_utf8(json.to_vec())
+                .map_err(|e| anyhow::anyhow!("channel.json is not utf-8 ({e})"))?,
+            String::from_utf8(sigb.to_vec())
+                .map_err(|e| anyhow::anyhow!("channel.json.sig is not utf-8 ({e})"))?,
+        ));
+    }
+    let dir = PathBuf::from(source);
+    anyhow::ensure!(
+        dir.is_dir(),
+        "channel: local source must be a DIRECTORY holding the {} pair (https urls are \
+         the other form)",
+        jerith_mesh_core::pluginchannel::CHANNEL_FILE
+    );
+    jerith_mesh_core::pluginchannel::load_channel_pair(&dir)
+}
+
+/// The pinned anchor cascade for the first-party default key: CLI
+/// flag, then $JERITH_CHANNEL_ANCHOR, then the committed
+/// keys/plugin-releases.pub (a repo checkout has the anchor in-tree).
+/// Shared by `channel verify` and `plugin search`.
+fn resolve_channel_anchor(anchor: Option<String>) -> anyhow::Result<String> {
+    let found = anchor
+        .or_else(|| std::env::var("JERITH_CHANNEL_ANCHOR").ok())
+        .or_else(|| std::fs::read_to_string("keys/plugin-releases.pub").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "channel: no anchor — pass --anchor <64-hex publisher pubkey> or set \
+                 JERITH_CHANNEL_ANCHOR; verify runs only against a key the OPERATOR pinned"
+            )
+        })?;
+    Ok(found.trim().to_string())
+}
+
+/// `jerith plugin search [query] --channel <url|dir>` — the Phase 4
+/// index's human lane. Verify FIRST (pinning + freshness, the full
+/// channel checks), filter SECOND: an unverified index is never
+/// searchable, and a row is a claim, not an install (the bundle
+/// verify chain still runs on the artifact).
+async fn search_channel(
+    query: Option<String>,
+    channel: Option<String>,
+    anchor: Option<String>,
+    max_age_ms: u64,
+) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginbundle as pb;
+    use jerith_mesh_core::pluginchannel as pc;
+    let source = channel
+        .or_else(|| std::env::var("JERITH_CHANNEL_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "plugin search: no channel — pass --channel <https url | local dir> or set \
+                 JERITH_CHANNEL_URL (an UNVERIFIED index is never searched)"
+            )
+        })?;
+    let (json, sig) = fetch_channel_pair(&source).await?;
+    let anchor = resolve_channel_anchor(anchor)?;
+    let index = pc::verify_channel(&json, &sig, &anchor, max_age_ms)?;
+    println!(
+        "✓ channel verified: publisher {}… · generated {} ms ago · {} row(s)",
+        {
+            let p = &index.publisher;
+            format!("{}…{}", &p[..8], &p[p.len() - 4..])
+        },
+        crate_now_ms().saturating_sub(index.generated_ms),
+        index.bundles.len()
+    );
+    let q = query.unwrap_or_default().trim().to_lowercase();
+    let mut matched = 0usize;
+    for e in &index.bundles {
+        let hay = format!(
+            "{}\x1f{}\x1f{}/{}\x1f{}",
+            e.id, e.version, e.os, e.arch, e.url
+        )
+        .to_lowercase();
+        if !q.is_empty() && !hay.contains(&q) {
+            continue;
+        }
+        matched += 1;
+        let have = pb::latest_installed(&e.id).ok().flatten();
+        println!(
+            "  {:<10} {:<8} {:<13} {}{}",
+            e.id,
+            e.version,
+            format!("{}/{}", e.os, e.arch),
+            e.url,
+            have.map(|v| format!("  · installed {v}"))
+                .unwrap_or_default(),
+        );
+    }
+    if matched == 0 {
+        println!("  (no rows matched {q:?})");
+    }
+    println!(
+        "install any row: jerith plugin install <url>  (the full verify chain runs on the \
+         artifact regardless of the index)"
+    );
+    Ok(())
+}
+
+/// `jerith plugin trust …` — the operator's publisher trust table
+/// (Phase 3, docs/PLUGIN-CHANNEL.md key model). The bot NEVER reads
+/// these rows: trust lives in the CLI install lane, and the bot's
+/// [plugins] code is untouched.
+async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
+    match cmd {
+        TrustCmd::Show => {
+            let bot = load_trusted_publishers()?;
+            println!(
+                "bot.toml [plugins.trusted_publishers] ({}): {} row(s)",
+                bot_toml_path().display(),
+                bot.len()
+            );
+            for (id, key) in &bot {
+                println!("  {:<16} {}", id, publisher_thumb(key));
+            }
+            println!(
+                "pins file {} (legacy — a bot.toml row OVERRANKS it; a rotate migrates):",
+                jerith_mesh_core::config::NodeConfig::home()
+                    .join("keys")
+                    .join("plugin-pins.json")
+                    .display()
+            );
+            match load_pins() {
+                Ok(pins) if !pins.is_empty() => {
+                    for (id, key) in &pins {
+                        match bot.get(id) {
+                            Some(k) if k.eq_ignore_ascii_case(key) => {
+                                println!(
+                                    "  {:<16} {} (mirrored in bot.toml)",
+                                    id,
+                                    publisher_thumb(key)
+                                );
+                            }
+                            _ => println!(
+                                "  {:<16} {} (LEGACY — still resolves; rotate to migrate)",
+                                id,
+                                publisher_thumb(key)
+                            ),
+                        }
+                    }
+                }
+                Ok(_) => println!("  (empty)"),
+                Err(_) => println!("  (no file)"),
+            }
+            println!(
+                "rotate: jerith plugin trust rotate <id> --new <64-hex pubkey>  (no \
+                 trust-lag — the old key is refused from that moment)"
+            );
+            Ok(())
+        }
+        TrustCmd::Rotate { id, new } => {
+            let id = id.trim();
+            anyhow::ensure!(!id.is_empty(), "rotate: <id> required");
+            let new_key = normalize_key(&new);
+            anyhow::ensure!(
+                valid_pubkey_hex(&new_key),
+                "rotate: --new must be exactly 64 hex chars (the new Ed25519 publisher \
+                 pubkey), got {new:?}"
+            );
+            let prior = load_trusted_publishers()?.get(id).cloned();
+            let path = write_trusted_publishers(&bot_toml_path(), id, &new_key)?;
+            match prior {
+                Some(old) if old.eq_ignore_ascii_case(&new_key) => println!(
+                    "rotated plugin {id:?}: pin already {}… in {} (rewritten in place)",
+                    publisher_thumb(&old),
+                    path.display()
+                ),
+                Some(old) => println!(
+                    "rotated plugin {id:?}: {}… → {}… in {} — NO trust-lag: installs signed \
+                     by the old key are refused from this moment (a next install must \
+                     verify against the new pin)",
+                    publisher_thumb(&old),
+                    publisher_thumb(&new_key),
+                    path.display()
+                ),
+                None => println!(
+                    "pinned {id:?} (first row): {}… in {} — installs of this plugin now \
+                     verify against this key",
+                    publisher_thumb(&new_key),
+                    path.display()
+                ),
+            }
+            // A disagreeing legacy pins-file row is a stale trust
+            // source once bot.toml holds the new pin — name it.
+            if let Ok(pins) = load_pins()
+                && let Some(old) = pins.get(id)
+                && !normalize_key(old).eq_ignore_ascii_case(&new_key)
+            {
+                println!(
+                    "note: the legacy pins file still maps {id:?} → {} — bot.toml \
+                     now outranks it; remove that row to keep one source of truth",
+                    publisher_thumb(old)
+                );
             }
             Ok(())
         }
@@ -2294,61 +2759,8 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
             anchor,
             max_age_ms,
         } => {
-            let (json, sig) = if source.starts_with("https://") {
-                anyhow::ensure!(
-                    !source.contains(char::is_whitespace),
-                    "channel: source url contains whitespace"
-                );
-                let client = jerith_mesh_core::http::mesh_http();
-                let get = |url: String, cap: usize| {
-                    let client = client.clone();
-                    async move {
-                        let resp = client
-                            .get(&url)
-                            .send()
-                            .await
-                            .with_context(|| format!("fetching {url}"))?;
-                        let resp = resp
-                            .error_for_status()
-                            .with_context(|| format!("fetching {url}"))?;
-                        let bytes = resp
-                            .bytes()
-                            .await
-                            .with_context(|| format!("reading {url}"))?;
-                        anyhow::ensure!(
-                            bytes.len() <= cap,
-                            "{url}: {} bytes — over the {cap}-byte cap",
-                            bytes.len()
-                        );
-                        Ok::<_, anyhow::Error>(bytes)
-                    }
-                };
-                let json = get(source.clone(), 256 * 1024).await?;
-                let sigb = get(format!("{source}.sig"), 4096).await?;
-                (
-                    String::from_utf8(json.to_vec())
-                        .map_err(|e| anyhow::anyhow!("channel.json is not utf-8 ({e})"))?,
-                    String::from_utf8(sigb.to_vec())
-                        .map_err(|e| anyhow::anyhow!("channel.json.sig is not utf-8 ({e})"))?,
-                )
-            } else {
-                let sel = PathBuf::from(&source);
-                anyhow::ensure!(
-                    sel.is_dir(),
-                    "channel: local source must be a DIRECTORY holding the {} pair (https urls are the other form)",
-                    pc::CHANNEL_FILE
-                );
-                pc::load_channel_pair(&sel)?
-            };
-            let anchor = anchor
-                .or_else(|| std::env::var("JERITH_CHANNEL_ANCHOR").ok())
-                .or_else(|| std::fs::read_to_string("keys/plugin-releases.pub").ok())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "channel: no anchor — pass --anchor <64-hex publisher pubkey> or set \
-                     JERITH_CHANNEL_ANCHOR; verify runs only against a key the OPERATOR pinned"
-                    )
-                })?;
+            let (json, sig) = fetch_channel_pair(&source).await?;
+            let anchor = resolve_channel_anchor(anchor)?;
             let index = pc::verify_channel(&json, &sig, &anchor, max_age_ms)?;
             println!(
                 "✓ channel verified: publisher {}… · generated {} ms ago · {} row(s)",
@@ -3452,5 +3864,111 @@ mod chain_tests {
         // Limit applies.
         assert_eq!(load_chain_wallets(&conn, 1, true).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use std::path::Path;
+
+    const KEY_A: &str = concat!(
+        "aa11bb22", "cc33dd44", "ee55ff66", "00112233", "44556677", "8899aabb", "ccddeeff",
+        "00001111"
+    );
+    const KEY_B: &str = concat!(
+        "b10b0b0b", "c2c3c4c5", "d6d7d8d9", "e0e1e2e3", "f4f5f6f7", "08090a0b", "0c0d0e0f",
+        "1a2b3c4d"
+    );
+
+    /// A lived-in file: comments, an existing enabled row, one pin.
+    /// The pin is KEY_A in upper form — parse lowercases it back.
+    fn comment_file() -> String {
+        format!(
+            "# my bot.toml — keep these comments intact\n\
+             [plugins]\n\
+             enabled = [\"websearch\", \"memory\"]\n\
+             \n\
+             [plugins.trusted_publishers]\n\
+             \"weather\" = \"{}\"\n",
+            KEY_A.to_uppercase()
+        )
+    }
+
+    fn temp_file(name: &str, text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("trust-t-{}-{}", name, std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn trusted_publishers_parse_normalizes_and_refuses_junk() {
+        let pins = parse_trusted_publishers(&comment_file()).unwrap();
+        assert_eq!(pins.get("weather").unwrap(), KEY_A); // lowercased
+        assert_eq!(pins.len(), 1);
+
+        // No section = an empty map (first-party boxes have no pin row).
+        let empty = parse_trusted_publishers("[plugins]\nenabled = [\"x\"]\n").unwrap();
+        assert!(empty.is_empty());
+
+        // Not a table of rows (a string where the table belongs).
+        assert!(parse_trusted_publishers("[plugins]\ntrusted_publishers = \"x\"\n").is_err());
+        // Wrong length → loud, load-bearing row named.
+        let short: String = KEY_A.chars().take(63).collect();
+        assert!(
+            parse_trusted_publishers(&format!(
+                "[plugins.trusted_publishers]\n\"w\" = \"{short}\"\n"
+            ))
+            .is_err()
+        );
+        // Non-string row.
+        assert!(parse_trusted_publishers("[plugins.trusted_publishers]\nw = 7\n").is_err());
+    }
+
+    #[test]
+    fn rotate_rewrites_pin_and_preserves_the_rest_of_the_file() {
+        let path = temp_file("rotate", &comment_file());
+        write_trusted_publishers(&path, "weather", KEY_B).unwrap();
+        write_trusted_publishers(&path, "ledger", KEY_A).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let pins = parse_trusted_publishers(&text).unwrap();
+        assert_eq!(pins.get("weather").unwrap(), KEY_B);
+        assert_eq!(pins.get("ledger").unwrap(), KEY_A);
+        // The operator's edits outside the trust table survive verbatim.
+        assert!(text.contains("# my bot.toml — keep these comments intact"));
+        assert!(text.contains("enabled = [\"websearch\", \"memory\"]"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_creates_a_fresh_trust_file() {
+        let path = temp_file("fresh", "");
+        std::fs::remove_file(&path).unwrap();
+        write_trusted_publishers(&path, "weather", KEY_A).unwrap();
+        let pins = parse_trusted_publishers(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(pins.get("weather").unwrap(), KEY_A);
+        assert_eq!(pins.len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_survives_an_inline_plugins_table() {
+        let path = temp_file("inline", "plugins = { enabled = [\"x\"] }\n");
+        write_trusted_publishers(&path, "weather", KEY_A).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enabled = [\"x\"]"));
+        let pins = parse_trusted_publishers(&text).unwrap();
+        assert_eq!(pins.get("weather").unwrap(), KEY_A);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Path import is used by the helpers' signatures, not by these
+    // tests directly; keep the `use` from warning.
+    #[test]
+    fn path_alias_is_borrowed() {
+        fn accepts(_p: &Path) {}
+        accepts(Path::new("."));
     }
 }
