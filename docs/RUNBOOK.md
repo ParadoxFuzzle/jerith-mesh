@@ -1598,10 +1598,44 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   verdict first — `chain intact` (with how many lines are signature-
   verified) or `⚠ CHAIN BROKEN (edited / spliced / bad signature /
   mid-log key change) / LOG TRUNCATED` with the entries still shown
-  as-found (evidence, not truth). For freshness-in-enforcement,
-  `jerith plugin install <bundle> --channel <url|dir>` requires the
-  bundle to BE a row of the verified index (artifact-digest match) —
-  the install receipt then carries the freshness it passed under.
+  as-found (evidence, not truth). For
+  freshness-in-enforcement, `jerith plugin install <bundle> --channel
+  <url|dir>` requires the bundle to BE a row of the verified index
+  (artifact-digest match) — the install receipt then carries the
+  freshness it passed under.
+- Receipt gate (2026-10-28): the lane's trust-LOADING boundary —
+  `jerith plugin install` — REFUSES to run while the receipt log
+  shows a `CHAIN BROKEN` or `LOG TRUNCATED` verdict: the log is the
+  lane's own witness, and trust does not load on top of evidence
+  that the witness was tampered with. Removal paths (`plugin remove`,
+  `trust rotate`) stay UNGATED deliberately — they are the operator's
+  countermeasures, not attack surfaces (gating them would turn
+  tampering evidence into a recovery deadlock). The escape is
+  `plugin install --receipt-allow-broken`: a torn append (crash
+  between the log append and the head-rewrite) can leave the head
+  witness one receipt behind, and the receipt the install then writes
+  re-syncs the head — the override self-heals truncation. Overriding
+  a Broken verdict hides nothing: the chain break stays in the log,
+  and the reader verdict keeps reporting it.
+- Anchor copies (2026-10-28): the off-box copies the receipts lane
+  asks for. The v0.1.3 end-to-end verification home's receipts key,
+  copied out of `/tmp/v013-install/home/plugin-receipts.pub` BEFORE
+  that home was wiped — the home's log name signing key
+  `b4b9d5e0ddfcb2fe1ec03c549e3e56d47559beb84420082873ca6bcf86d6c992`.
+  Any future log whose signer thumb diverges from this without a
+  deliberate re-key note here is re-key-tampering, box-side. The
+  REAL operator home (`~/.jerith-mesh`) has not run a receipted lane
+  action under the 0.1.3+ binaries yet — when it does, append its
+  `plugin-receipts.pub` here too (this file rides git, which is the
+  point: the copy lives somewhere other than the box).
+- Anchor-vs-env footgun, fixed (0.1.4): the channel anchor cascade
+  (`--anchor` > `$JERITH_CHANNEL_ANCHOR` > `keys/plugin-releases.pub`)
+  previously treated a SET-BUT-EMPTY env value as an anchor and
+  surfaced it far downstream as a bare publisher-mismatch with a
+  blank thumb; an empty var now reports `no anchor` at resolution.
+  (Shell note: `export ANCHOR=$(…) JERITH_CHANNEL_ANCHOR=$ANCHOR` is
+  exactly the bug — every word of a simple command expands before
+  the assignments run. Split them.)
 
 ## The house card (third live consumer, 2026-10-23)
 

@@ -262,8 +262,13 @@ impl ReceiptEntry {
             .create(true)
             .append(true)
             .open(&path)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        // ONE write: line\n together. Two calls could tear between
+        // them (a line with no newline) — harmless on read (a torn
+        // tail is skipped, chaining resumes at the last good entry),
+        // but the single write_all shrinks that crash window.
+        let mut buf = line.into_bytes();
+        buf.push(b'\n');
+        file.write_all(&buf)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

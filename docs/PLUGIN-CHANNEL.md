@@ -289,7 +289,23 @@ across versions unless `--rotate` also passed).
  box (a note, a repo) and any whole-log re-key attempt would conflict
  with your copy. The remaining root capability (re-sign EVERYTHING
  including the .pub you copied) requires rewriting your copy too —
- that is the honest limit, not a gap this lane closes.
+ that is the honest limit, not a gap this lane closes. (One real
+ example of a kept copy: RUNBOOK's "Anchor copies" section archives
+ the v0.1.3 verification home's `plugin-receipts.pub` after the
+ end-to-end install test, precisely so a later re-key on that home
+ would diverge from the recorded thumb.)
+
+ The GATE (2026-10-28, closing the "what use is evidence nobody acts
+ on" question): `plugin install` now REFUSES to run while the
+ receipt log shows Broken/Truncated. Design notes: the removal paths
+ (`remove`, `trust rotate`) stay ungated — they are countermeasures,
+ and gating them would let tampered receipts hold a cleaned plugin
+ hostage; `--receipt-allow-broken` is the crash-recovery override —
+ a torn append between log-append and head-rewrite leaves the head
+ witness one receipt behind, and the receipt the install appends
+ re-syncs it, so a Truncated override self-heals; a Broken override
+ hides nothing (the break persists in the log and every later
+ verdict reports it).
 - Does the CLI auto-download from a pinned URL (the mesh bootstrap CDN
   URL?) or fetch ONLY from operator-supplied URLs? Phase 2's default
   is: operator-supplied URLs only; no automatic remote trust.

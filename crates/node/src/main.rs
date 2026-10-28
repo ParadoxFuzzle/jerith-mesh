@@ -198,6 +198,12 @@ enum PluginCmd {
         /// Bypass the downgrade/equal-version guard (never the verify chain).
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Receipt-log gate override (docs/PLUGIN-CHANNEL.md): proceed
+        /// when the receipt log shows Broken/Truncated evidence. A
+        /// crash-recovery escape — the receipt this install appends
+        /// re-syncs the head witness — never a way to hide a break.
+        #[arg(long, default_value_t = false)]
+        receipt_allow_broken: bool,
         /// Publisher pubkey hex (default: [plugins.trusted_publishers]
         /// in bot.toml, then the legacy keys/plugin-pins.json).
         #[arg(long)]
@@ -2354,7 +2360,11 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             force,
             pubkey,
             channel,
+            receipt_allow_broken,
         } => {
+            // GATE first (docs/PLUGIN-CHANNEL.md): trust loading refuses
+            // to run while the receipt log's own witness questions it.
+            receipt_gate_under(&NodeConfig::home(), receipt_allow_broken)?;
             let (bundle_path, sha, sig) = fetch_bundle(&source).await?;
             let raw = std::fs::read(&bundle_path)?;
             let (id, _version, presented) = pb::peek_identity(&raw)
@@ -2580,16 +2590,21 @@ async fn fetch_channel_pair(source: &str) -> anyhow::Result<(String, String)> {
 /// keys/plugin-releases.pub (a repo checkout has the anchor in-tree).
 /// Shared by `channel verify` and `plugin search`.
 fn resolve_channel_anchor(anchor: Option<String>) -> anyhow::Result<String> {
+    const NO_ANCHOR: &str = "channel: no anchor — pass --anchor <64-hex publisher pubkey> or set \
+         JERITH_CHANNEL_ANCHOR (non-empty); verify runs only against a key the OPERATOR pinned";
     let found = anchor
         .or_else(|| std::env::var("JERITH_CHANNEL_ANCHOR").ok())
         .or_else(|| std::fs::read_to_string("keys/plugin-releases.pub").ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "channel: no anchor — pass --anchor <64-hex publisher pubkey> or set \
-                 JERITH_CHANNEL_ANCHOR; verify runs only against a key the OPERATOR pinned"
-            )
-        })?;
-    Ok(found.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!(NO_ANCHOR))?;
+    // Set-but-empty is the same as unset: an export like
+    // `export ANCHOR=$(…) JERITH_CHANNEL_ANCHOR=$ANCHOR` expands $ANCHOR
+    // before the first assignment lands (all words of a simple command
+    // expand first), silently shipping an EMPTY anchor — which used to
+    // surface far downstream as a bare publisher-vs-anchor mismatch
+    // with a blank thumb. Fail fast, with the honest reason.
+    let found = found.trim().to_string();
+    anyhow::ensure!(!found.is_empty(), NO_ANCHOR);
+    Ok(found)
 }
 
 /// `jerith plugin search [query] --channel <url|dir>` — the Phase 4
@@ -3049,11 +3064,160 @@ async fn receipts_cmd(count: usize, all: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The receipt-log gate (docs/PLUGIN-CHANNEL.md): trust LOADING refuses
+/// to run on top of evidence that the receipt log was tampered with —
+/// the log is the lane's own witness, and a Broken/Truncated verdict
+/// means its testimony is in question. Removal paths (`plugin remove`,
+/// a `trust rotate`) stay ungated: they are the operator's countermeasures
+/// when something looks compromised, not attack surfaces, and gating
+/// them would turn tampering evidence into a recovery deadlock.
+/// `allow_override` (--receipt-allow-broken) is the crash-recovery
+/// escape: a torn append can leave the head witness one receipt behind
+/// the log, and the next receipt REWRITES the head — so overriding a
+/// Truncated verdict self-heals. Overriding a Broken verdict does not
+/// hide anything: the chain break stays in the log for every later
+/// reader to see, and the override gets recorded as its own receipt.
+fn receipt_gate_under(home: &Path, allow_override: bool) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginreceipt::{LogIntegrity, read_verified_under};
+    match read_verified_under(home).integrity {
+        LogIntegrity::Intact => Ok(()),
+        LogIntegrity::Truncated { head, last } => {
+            anyhow::ensure!(
+                allow_override,
+                "receipt log: TRUNCATED (head witness {}… but the log's tail is {}…) — \
+                 install REFUSED while its audit trail looks removed. \
+                 Investigate first; if this immediately followed a crash mid-append, \
+                 --receipt-allow-broken proceeds and the next receipt re-syncs the head",
+                &head[..8],
+                &last[..8]
+            );
+            println!(
+                "⚠ receipt log: TRUNCATED — proceeding on override; the receipt just written re-syncs the head witness"
+            );
+            Ok(())
+        }
+        LogIntegrity::Broken { at, why } => {
+            anyhow::ensure!(
+                allow_override,
+                "receipt log: CHAIN BROKEN at entry #{at} ({why}) — \
+                 install REFUSED: do not load trust on top of tampering evidence. \
+                 Investigate; --receipt-allow-broken overrides WITHOUT hiding the break"
+            );
+            println!(
+                "⚠ receipt log: CHAIN BROKEN at entry #{at} ({why}) — proceeding on override; the break stays visible"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn crate_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod receipt_lane_tests {
+    use super::*;
+
+    fn gh(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("jerith-gate-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn receipt(detail: &str) -> jerith_mesh_core::pluginreceipt::ReceiptEntry {
+        jerith_mesh_core::pluginreceipt::ReceiptEntry {
+            ts_ms: crate_now_ms(),
+            action: "test".into(),
+            plugin: Some("weather".into()),
+            version: None,
+            publisher: None,
+            bundle_sha256: None,
+            pin: None,
+            channel: None,
+            detail: Some(detail.into()),
+            signer: None,
+            prev: None,
+            chain: None,
+            sig: None,
+        }
+    }
+
+    #[test]
+    fn anchor_resolver_treats_empty_and_blank_as_no_anchor() {
+        for blank in [None, Some(String::new()), Some("   ".into())] {
+            let err = resolve_channel_anchor(blank).unwrap_err().to_string();
+            assert!(err.contains("no anchor"), "{err}");
+        }
+        let a = resolve_channel_anchor(Some("  ab\n".into())).unwrap();
+        assert_eq!(a, "ab");
+    }
+
+    #[test]
+    fn gate_allows_missing_or_empty_log() {
+        let home = gh("gate-empty");
+        receipt_gate_under(&home, false).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            jerith_mesh_core::pluginreceipt::receipts_path_under(&home),
+            "",
+        )
+        .unwrap();
+        receipt_gate_under(&home, false).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gate_refuses_truncated_and_the_override_self_heals() {
+        let home = gh("gate-trunc");
+        receipt("one").record_under(&home).unwrap();
+        receipt("two").record_under(&home).unwrap();
+        // Remove the log's tail; head stays at the true last digest.
+        let path = jerith_mesh_core::pluginreceipt::receipts_path_under(&home);
+        let ls: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(ls.len(), 2);
+        std::fs::write(&path, format!("{}\n", ls[0])).unwrap();
+        let err = receipt_gate_under(&home, false).unwrap_err().to_string();
+        assert!(err.contains("TRUNCATED"), "{err}");
+        assert!(err.contains("REFUSED"), "{err}");
+        // Override proceeds… and the receipt it would append re-syncs
+        // the head witness so the gate passes clean afterwards.
+        receipt_gate_under(&home, true).unwrap();
+        receipt("the override itself").record_under(&home).unwrap();
+        receipt_gate_under(&home, false).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gate_refuses_a_broken_chain_even_on_override_path_message() {
+        let home = gh("gate-broken");
+        receipt("one").record_under(&home).unwrap();
+        receipt("two").record_under(&home).unwrap();
+        // In-place edit of line 1 without touching its digest.
+        let path = jerith_mesh_core::pluginreceipt::receipts_path_under(&home);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let tampered = raw.replace("two", "tampered");
+        std::fs::write(&path, tampered).unwrap();
+        let err = receipt_gate_under(&home, false).unwrap_err().to_string();
+        assert!(err.contains("CHAIN BROKEN"), "{err}");
+        assert!(err.contains("entry #1"), "{err}");
+        // Override works but loudly; the log keeps the break.
+        receipt_gate_under(&home, true).unwrap();
+        let v = jerith_mesh_core::pluginreceipt::read_verified_under(&home);
+        assert!(matches!(
+            v.integrity,
+            jerith_mesh_core::pluginreceipt::LogIntegrity::Broken { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 /// `jerith stack …` — the optional AI companion stack + small-model
