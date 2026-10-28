@@ -2442,6 +2442,8 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                 }),
                 channel: channel_receipt,
                 detail: Some(format!("drop: {}", staged.display())),
+                prev: None,
+                chain: None,
             }
             .record()?;
             Ok(())
@@ -2499,6 +2501,8 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                         pin: None,
                         channel: None,
                         detail: Some(format!("trash: {}", trash.display())),
+                        prev: None,
+                        chain: None,
                     }
                     .record()?;
                 }
@@ -2667,6 +2671,8 @@ async fn search_channel(
             },
         }),
         detail: Some(format!("search: {matched} row(s) matched {q:?}")),
+        prev: None,
+        chain: None,
     }
     .record()?;
     Ok(())
@@ -2778,6 +2784,8 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
                 bundle_sha256: None,
                 pin: None,
                 channel: None,
+                prev: None,
+                chain: None,
                 detail: Some(match &prior {
                     Some(old) => format!("old {old} → new {new_key}"),
                     None => format!("first pin: {new_key}"),
@@ -2927,6 +2935,8 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
                     },
                 }),
                 detail: Some(format!("{} row(s)", index.bundles.len())),
+                prev: None,
+                chain: None,
             }
             .record()?;
             Ok(())
@@ -2936,10 +2946,21 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
 
 /// `jerith plugin receipts` — read back the audit log, newest tail last.
 async fn receipts_cmd(count: usize, all: bool) -> anyhow::Result<()> {
-    use jerith_mesh_core::pluginreceipt::{self as jr, read};
-    let entries = read();
+    use jerith_mesh_core::pluginreceipt::{self as jr, LogIntegrity, read_verified};
+    let log = read_verified();
+    let entries = &log.entries;
     let path = jr::receipts_path();
     if entries.is_empty() {
+        // An empty LOG but a NON-genesis head is not "no receipts yet"
+        // — it is a wiped log whose witness file survived.
+        if let LogIntegrity::Truncated { head, last } = &log.integrity {
+            println!(
+                "{} — no entries, but the chain head file expects {head}… and the log ends at {last}…",
+                path.display()
+            );
+            println!("⚠ receipt log was TRUNCATED (wiped) — the head witness survived");
+            return Ok(());
+        }
         println!(
             "{} — no receipts yet (installs, removals, pin rotations \
                   and channel verifications append here)",
@@ -2959,6 +2980,27 @@ async fn receipts_cmd(count: usize, all: bool) -> anyhow::Result<()> {
         if entries.len() == 1 { "y" } else { "ies" },
         entries.len() - skip
     );
+    // The integrity verdict goes right under the header — the reader
+    // decides per-line whether to trust what follows.
+    match &log.integrity {
+        LogIntegrity::Intact => {
+            println!(
+                "  chain intact: {} chained, hash-linked ✓ (head file in sync)",
+                log.chained
+            );
+        }
+        LogIntegrity::Broken { at, why } => {
+            println!("  ⚠ CHAIN BROKEN at entry #{at}: {why}");
+            println!("        entries below are as-found on disk — treat as EVIDENCE, not truth");
+        }
+        LogIntegrity::Truncated { head, last } => {
+            println!("  ⚠ LOG TRUNCATED: head file expects {head}… but the log ends at {last}…");
+            println!(
+                "        the tail was removed — entries below are as-found, treat as EVIDENCE, not truth"
+            );
+        }
+    }
+    println!();
     for e in &entries[skip..] {
         let subject = match (&e.plugin, &e.version) {
             (Some(p), Some(v)) => format!("{p} {v}"),

@@ -251,18 +251,34 @@ across versions unless `--rotate` also passed).
 ## Open questions (deliberately unresolved)
 
 - Does Phase 2 sign the audit chain? — The RECEIPT LOG now exists
-  (2026-10-28): every CLI action appends one JSON line to
-  `<home>/plugin.json` (`jerith plugin receipts` reads it) — installs
-  and removals with the bundle digest and the PIN + its SOURCE, pin
-  rotations (old → new), and channel verifications stamped with the
-  index's `generated_ms`, the age OBSERVED at check time and the
-  window enforced. Freshness is also wired into the enforcement lane:
-  `jerith plugin install <bundle> --channel <url|dir>` requires the
-  bundle to BE a row of the verified index (artifact-digest match) so
-  the install receipt carries the freshness it ran under. NOT a
-  security boundary — enforcement stays the verify chain + pin table +
-  the bot's fail-closed gate; receipts are 0600 operator files and
-  remain UNSIGNED (tamper-evident receipts stay open).
+ (2026-10-28) and is TAMPER-EVIDENT via a hash chain: every CLI action
+ appends one JSON line to `<home>/plugin.json` — installs and removals
+ with the bundle digest and the PIN + its SOURCE, pin rotations (old →
+ new), and channel verifications stamped with the index's
+ `generated_ms`, the age OBSERVED at check time and the window
+ enforced. Freshness is also wired into the enforcement lane:
+ `jerith plugin install <bundle> --channel <url|dir>` requires the
+ bundle to BE a row of the verified index (artifact-digest match) so
+ the install receipt carries the freshness it ran under.
+ 
+ The chain: each line carries `prev` (the previous chained line's
+ digest; 64 zeros for the first) and `chain` (SHA-256 over the line's
+ own canonical content), so an in-place edit fails re-verification at
+ the edited line and a spliced/reordered line fails the `prev` walk —
+ `jerith plugin receipts` prints the verdict (`chain intact` / `⚠
+ CHAIN BROKEN at #N` / `⚠ LOG TRUNCATED`) above the entries, and keeps
+ showing them as-found (hiding the entries would be its own kind of
+ tampering). Truncation — the one attack a per-line hash chain cannot
+ see — is covered by the sibling `<home>/plugin.json.head` witness
+ file: the file's tail can be deleted but the witness still names the
+ real last digest. STILL not a security boundary, and still NOT
+ VERIFIED against a key — an operator with root can rewrite log AND
+ head coherently (hash chains are secret-less); enforcement stays the
+ verify chain + pin table + the bot's fail-closed gate. The receipts
+ bind CONTENT, not identity — the open remainder is per-entry
+ Ed25519 signatures (binding a KEY, not a process), deliberately
+ left open: they add signer-key management for little extra against
+ the root-forge case the chain already documents.
 - Does the CLI auto-download from a pinned URL (the mesh bootstrap CDN
   URL?) or fetch ONLY from operator-supplied URLs? Phase 2's default
   is: operator-supplied URLs only; no automatic remote trust.

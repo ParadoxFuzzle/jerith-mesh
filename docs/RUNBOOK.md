@@ -1583,12 +1583,16 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   (case-insensitive substring over id/version/os/arch/url, plus an
   «installed version» marker). Every row is a claim: installing runs
   the full bundle verify chain against the artifact regardless.
-- Audit trail: every CLI lane action appends a JSON line to
-  `<home>/plugin.json` (0600) — installs and removals with the bundle
-  digest and the PIN + its SOURCE (`jerith plugin trust rotate`'s old
-  → new), and channel verifications stamped with the index's
-  `generated_ms`, the age OBSERVED and the window enforced. Read it
-  with `jerith plugin receipts [--all] [--count N]`. For
+- Audit trail: every CLI lane action appends a hash-chained JSON line
+  to `<home>/plugin.json` (0600, tamper-evident) — installs and removals
+  with the bundle digest and the PIN + its SOURCE (`jerith plugin trust
+  rotate`'s old → new), and channel verifications stamped with the
+  index's `generated_ms`, the age OBSERVED and the window enforced.
+  Each line carries `prev` + a `chain` digest; the sibling
+  `plugin.json.head` witness catches tail deletion. `jerith plugin
+  receipts [--all] [--count N]` prints the integrity verdict first —
+  `chain intact` or `⚠ CHAIN BROKEN / LOG TRUNCATED` with the entries
+  still shown as-found (evidence, not truth). For
   freshness-in-enforcement, `jerith plugin install <bundle> --channel
   <url|dir>` requires the bundle to BE a row of the verified index
   (artifact-digest match) — the install receipt then carries the
