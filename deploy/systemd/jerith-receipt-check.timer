@@ -1,0 +1,13 @@
+# Beats jerith-receipt-check.service hourly. Persistent=true so a
+# suspended-machine gap does not silently skip checks — the verdict
+# runs on the next wake-up.
+[Unit]
+Description=hourly jerith receipt-log integrity check
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=jerith-receipt-check.service
+
+[Install]
+WantedBy=timers.target

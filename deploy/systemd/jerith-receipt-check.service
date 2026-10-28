@@ -1,0 +1,25 @@
+# jerith-mesh plugin-lane health check — the scripted half of the
+# receipt gate (docs/PLUGIN-CHANNEL.md, RUNBOOK "Scripted check").
+# Runs `jerith plugin receipts --verdict`: one verdict line over
+# <home>/plugin.json; exit 0 only when the chain stands, so a
+# CHAIN BROKEN / LOG TRUNCATED verdict FAILS the unit — the red light
+# lives at `systemctl --user list-timers` and
+# `journalctl --user -u jerith-receipt-check`, printing the same words
+# the human printout uses. Install:
+#   cp deploy/systemd/jerith-receipt-check.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-receipt-check.timer
+# One-off ad hoc: systemctl --user start jerith-receipt-check.service
+[Unit]
+Description=jerith-mesh receipt-log integrity check (fails on CHAIN BROKEN / LOG TRUNCATED)
+
+[Service]
+Type=oneshot
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith plugin receipts --verdict
+# Read-only discipline: the check only READS plugin.json / .head and
+# the receipts pubkey — it never appends. The self-healing receipt
+# that re-syncs a torn head must come from a real lane action, not
+# from the monitor (an append here would mask the truncation it
+# exists to see).
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true

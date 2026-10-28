@@ -1630,6 +1630,23 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   The restart-side override is explicit and loud:
   `JERITH_BOT_ALLOW_BROKEN_RECEIPTS=1` proceeds WITHOUT hiding the
   break `jerith plugin receipts` keeps reporting.
+- Scripted check (2026-10-28): the verdict is for machines too —
+  `deploy/systemd/jerith-receipt-check.{service,timer}` run
+  `jerith plugin receipts --verdict` hourly as a user-level oneshot:
+  install (repo root) with
+  `cp deploy/systemd/jerith-receipt-check.{service,timer}
+  ~/.config/systemd/user/ && systemctl --user daemon-reload &&
+  systemctl --user enable --now jerith-receipt-check.timer`, and a
+  one-off ad hoc run is `systemctl --user start jerith-receipt-check.service`.
+  An intact chain leaves nothing but the one `chain intact` line in
+  the journal; a `CHAIN BROKEN`/`LOG TRUNCATED` verdict exits 1 and
+  FAILS the unit, so `systemctl --user list-timers` and
+  `journalctl --user -u jerith-receipt-check` surface it with the
+  same words the human printout uses. The unit is deliberately
+  read-only (`ProtectHome=read-only`): the check OBSERVES the
+  witness, it never appends — the self-healing receipt that re-syncs
+  a torn head must come from a real lane action, not the monitor
+  (a monitor append would mask the truncation it exists to see).
 - Anchor copies (2026-10-28): the off-box copies the receipts lane
   asks for. The v0.1.3 end-to-end verification home's receipts key,
   copied out of `/tmp/v013-install/home/plugin-receipts.pub` BEFORE
