@@ -306,6 +306,14 @@ across versions unless `--rotate` also passed).
  re-syncs it, so a Truncated override self-heals; a Broken override
  hides nothing (the break persists in the log and every later
  verdict reports it).
+
+ The bot-side mirror (same day): the bot's config load runs the
+ same gate at STARTUP — a Broken/Truncated verdict refuses the
+ restart with external plugin drops loaded (the drops are the
+ runtime half of the same trust boundary). Override:
+ `JERITH_BOT_ALLOW_BROKEN_RECEIPTS=1`, loud banner, break kept
+ visible. Trust loading now fails closed in BOTH halves: the CLI
+ that stages trust and the bot that serves it.
 - Does the CLI auto-download from a pinned URL (the mesh bootstrap CDN
   URL?) or fetch ONLY from operator-supplied URLs? Phase 2's default
   is: operator-supplied URLs only; no automatic remote trust.

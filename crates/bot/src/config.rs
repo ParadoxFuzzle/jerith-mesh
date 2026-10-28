@@ -457,6 +457,25 @@ impl BotConfig {
         crate::plugins::SkillRegistry::check_external_collisions(&external_plugins)
             .map_err(|e| anyhow::anyhow!("{} (scanning {})", e, plugins_dir_path().display()))?;
 
+        // Receipt gate (2026-10-28, docs/PLUGIN-CHANNEL.md): the receipt
+        // log is the plugin lane's own witness, so RESTART refuses to
+        // load external plugin drops while its verdict shows evidence
+        // of tampering (Broken/Truncated) — the plug-side mirror of the
+        // install gate. Removal/countermeasure paths stay ungated, and
+        // the crash-recovery escape is explicit: a torn append can
+        // leave the head witness one receipt behind, and the recovery
+        // is the same self-heal as the CLI override — the next receipt
+        // re-syncs the head. JERITH_BOT_ALLOW_BROKEN_RECEIPTS=1 takes
+        // that escape here with a LOUD banner and hides nothing (the
+        // reader verdict keeps reporting the break; the refusal
+        // message says as much).
+        receipt_gate_for_bot(
+            &jerith_mesh_core::config::NodeConfig::home(),
+            std::env::var("JERITH_BOT_ALLOW_BROKEN_RECEIPTS")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false),
+        )?;
+
         let system_prompt = std::env::var(PERSONA_ENV)
             .ok()
             .map(|s| s.trim().to_string())
@@ -848,6 +867,46 @@ pub fn persona_file_path() -> PathBuf {
     PathBuf::from(home).join(".jerith-mesh").join("persona.md")
 }
 
+/// The bot-side mirror of the CLI install gate: restart refuses to
+/// load external plugin drops while the receipt log shows Broken or
+/// Truncated evidence (`allow_override` = JERITH_BOT_ALLOW_BROKEN_
+/// RECEIPTS=1; overridable crash recovery, never a silently-passed
+/// break — the warning prints and the log keeps the break).
+pub fn receipt_gate_for_bot(home: &std::path::Path, allow_override: bool) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginreceipt::{LogIntegrity, read_verified_under};
+    match read_verified_under(home).integrity {
+        LogIntegrity::Intact => Ok(()),
+        LogIntegrity::Truncated { head, last } => {
+            anyhow::ensure!(
+                allow_override,
+                "receipt log: TRUNCATED (head witness {}… but the log's tail is {}…) — bot REFUSED \
+                 to restart with external plugin drops loaded. Investigate the receipt log; \
+                 the CLI `plugin install --receipt-allow-broken` (or a successful receipting \
+                 action) re-syncs the head witness; restart again after recovery",
+                &head[..8],
+                &last[..8]
+            );
+            eprintln!(
+                "⚠ receipt log: TRUNCATED — starting on override (JERITH_BOT_ALLOW_BROKEN_RECEIPTS=1); the break stays visible in `jerith plugin receipts`"
+            );
+            Ok(())
+        }
+        LogIntegrity::Broken { at, why } => {
+            anyhow::ensure!(
+                allow_override,
+                "receipt log: CHAIN BROKEN at entry #{at} ({why}) — bot REFUSED to restart with \
+                 external plugin drops loaded: do not serve plugins on a tampered-evidence \
+                 audit trail. Investigate; the same override env (JERITH_BOT_ALLOW_BROKEN_\
+                 RECEIPTS=1) proceeds WITHOUT hiding the break",
+            );
+            eprintln!(
+                "⚠ receipt log: CHAIN BROKEN at entry #{at} ({why}) — starting on override; the break stays visible in `jerith plugin receipts`"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// `~/.jerith-mesh/plugins.d/` — external plugin manifest drops
 /// (Phase 3a, docs/PLUGIN-SDK.md). Missing dir = no external plugins
 /// (opt-in by directory existence); everything inside is validated
@@ -1012,6 +1071,90 @@ struct OwnerTable {
 fn read_file_config(path: &PathBuf) -> Option<FileConfig> {
     let text = std::fs::read_to_string(path).ok()?;
     toml::from_str(&text).ok()
+}
+
+#[cfg(test)]
+mod receipt_gate_tests {
+    use super::*;
+    use jerith_mesh_core::pluginreceipt;
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bot-rct-gate-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn receipt(detail: &str) -> pluginreceipt::ReceiptEntry {
+        pluginreceipt::ReceiptEntry {
+            ts_ms: 1730000000000,
+            action: "test".into(),
+            plugin: Some("weather".into()),
+            version: None,
+            publisher: None,
+            bundle_sha256: None,
+            pin: None,
+            channel: None,
+            detail: Some(detail.into()),
+            signer: None,
+            prev: None,
+            chain: None,
+            sig: None,
+        }
+    }
+
+    #[test]
+    fn bot_gate_allows_missing_or_empty_log() {
+        let home = tmp_home("missing");
+        receipt_gate_for_bot(&home, false).unwrap();
+        std::fs::write(pluginreceipt::receipts_path_under(&home), "").unwrap();
+        receipt_gate_for_bot(&home, false).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn bot_gate_refuses_truncated_and_reports_the_witness() {
+        let home = tmp_home("trunc");
+        receipt("one").record_under(&home).unwrap();
+        receipt("two").record_under(&home).unwrap();
+        let path = pluginreceipt::receipts_path_under(&home);
+        let ls: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        std::fs::write(&path, format!("{}\n", ls[0])).unwrap();
+        let err = receipt_gate_for_bot(&home, false).unwrap_err().to_string();
+        assert!(err.contains("TRUNCATED"), "{err}");
+        assert!(err.contains("bot REFUSED"), "{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn bot_gate_refuses_a_broken_chain_and_stays_loud_on_override() {
+        let home = tmp_home("broken");
+        receipt("one").record_under(&home).unwrap();
+        receipt("two").record_under(&home).unwrap();
+        // In-place edit of line 1 without touching its digest.
+        let path = pluginreceipt::receipts_path_under(&home);
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("two", "biz"),
+        )
+        .unwrap();
+        let err = receipt_gate_for_bot(&home, false).unwrap_err().to_string();
+        assert!(err.contains("CHAIN BROKEN"), "{err}");
+        assert!(err.contains("entry #1"), "{err}");
+        // Override proceeds, and the log keeps the break for the reader.
+        receipt_gate_for_bot(&home, true).unwrap();
+        let v = pluginreceipt::read_verified_under(&home);
+        assert!(matches!(
+            v.integrity,
+            pluginreceipt::LogIntegrity::Broken { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 #[cfg(test)]

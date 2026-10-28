@@ -1615,8 +1615,18 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   between the log append and the head-rewrite) can leave the head
   witness one receipt behind, and the receipt the install then writes
   re-syncs the head — the override self-heals truncation. Overriding
-  a Broken verdict hides nothing: the chain break stays in the log,
+  a  Broken verdict hides nothing: the chain break stays in the log,
   and the reader verdict keeps reporting it.
+- Bot-side mirror (2026-10-28): the gate cuts both ways —
+  the bot's STARTUP now runs the same gate against the receipt log:
+  while a Broken/Truncated verdict stands, config load REFUSES and
+  the bot does not restart with external plugin drops loaded (chat
+  never comes up, so the drops can't serve tools from a tampered
+  audit trail). Same recovery: fix the log (the CLI install override
+  or any receipting action re-syncs a truncation), then restart.
+  The restart-side override is explicit and loud:
+  `JERITH_BOT_ALLOW_BROKEN_RECEIPTS=1` proceeds WITHOUT hiding the
+  break `jerith plugin receipts` keeps reporting.
 - Anchor copies (2026-10-28): the off-box copies the receipts lane
   asks for. The v0.1.3 end-to-end verification home's receipts key,
   copied out of `/tmp/v013-install/home/plugin-receipts.pub` BEFORE
