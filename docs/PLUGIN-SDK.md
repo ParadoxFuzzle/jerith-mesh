@@ -195,6 +195,12 @@ weather lane (`crates/weather-plugin/`, 2026-10-27 — `weather.now` /
 the same signed contract; `external:weather` gate row, deliberately
 PUBLIC — a room-wide chat skill, the first non-owner_only drop).
 
+## Distribution (separate design, not built)
+
+Getting an external plugin onto an operator's box without a source
+checkout — signed `.jbundle` artifacts, publisher keys, the fail-closed
+install chain — is its own doc: [PLUGIN-CHANNEL.md](PLUGIN-CHANNEL.md).
+
 ## What would falsify this design
 
 - If a real external skill needs streaming (model-driven, long-running

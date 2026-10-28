@@ -331,6 +331,9 @@ cargo test -p jerith-mesh-core skill_         # node-side skill routes
 - `FEATURES.md §8` — the feature ledger this doc details
 - [docs/PLUGIN-SDK.md](PLUGIN-SDK.md) — the *design* (not built) for
   taking plugins out of process and adding Telegram/WhatsApp transports
+- [docs/PLUGIN-CHANNEL.md](PLUGIN-CHANNEL.md) — the *design* (not
+  built) for signed, verified plugin bundle installs (`jerith plugin
+  install`, publisher keys, threat model)
 - `docs/RUNBOOK.md` — operator side: `[websearch]` key setup, guard
   config, `[monitor]`, lore vault wiring
 - `crates/bot/src/plugins.rs` — the single-table architecture
