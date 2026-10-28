@@ -1197,6 +1197,18 @@ exceptions, via `.cargo/audit.toml`. Current state after this pass:
   path — most importantly RUSTSEC-2026-0346 (medium), where `Debug`
   impls can print TLS session secrets into logs. The workspace compiles
   and the full suite is green on 0.23.46.
+- **Fixed (2026-10-28):** `tokio 1.53.2 → 1.54.1` (plain `cargo update
+  -p tokio` — the workspace pin is `"1"`, so this is a lockfile-only
+  change). Clears RUSTSEC-2026-0386: `AsyncFd::new` and friends
+  accepted any `AsRawFd`, letting safe code register a closed/dup'd fd
+  and deregister a reused descriptor number on drop — a use-after-free
+  route through the I/O driver. 1.54.0 was tried first and is YANKED
+  upstream (found live, `cargo update` refused nothing but compiling on
+  a yanked version poisons future builds — 1.53.4 does not exist on the
+  index either); 1.54.1 is the landing version. Nothing in the tree
+  constructs `AsyncFd` directly (verified: `cargo tree` consumers use
+  it only inside quinn/socket2 internals), so the exposure was
+  theoretical, but the gate is the gate.
 - **Accepted for now (7 advisories, all one subgraph):** `rustls
   0.22.4` + `rustls-webpki 0.102.8`, pulled *only* by `serenity 0.12.5`
   → `tokio-tungstenite 0.21` (the bot's Discord websocket). The fixes
@@ -1244,6 +1256,17 @@ and with it nine advisories, accepted the day they tripped the CI gate:
   bot's rings hold pods (`[u8; 16]`, `[f32; 2]`, no Drop), so the
   precondition is unreachable in our code. Fix blocked: songbird pins
   the 0.4 API.
+- **crypto-bigint 0.5.5 (RUSTSEC-2026-0387, 2026-10-23):** timing
+  variability (secret-dependent branches) in subtraction/division/
+  Montgomery multiplication and non-CT equality — a secret-leak advisory
+  against p256/k256/p384 ECDSA math. Pulled *only* via
+  songbird → davey → openmls/p256 → elliptic-curve 0.13 (verified
+  `cargo tree -i crypto-bigint`: the whole subgraph hangs under davey);
+  the fix line (≥ 0.7.6) is semver-unreachable from elliptic-curve
+  0.13's `crypto-bigint 0.5` demand, so it sits behind the same
+  upstream songbird release as the libcrux chain. Never executed: the
+  voice config never enables MLS/DAVE, so no veto/inversion arithmetic
+  from this crate runs. Same revisit trigger: next songbird release.
 
 Both facts were checked against the resolved tree, not assumed. The
 `.cargo/audit.toml` voice-lane block holds the entries with the same
