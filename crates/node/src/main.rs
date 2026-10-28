@@ -202,6 +202,14 @@ enum PluginCmd {
         /// in bot.toml, then the legacy keys/plugin-pins.json).
         #[arg(long)]
         pubkey: Option<String>,
+        /// FRESHNESS-PINNED install: the bundle must be a row of the
+        /// VERIFIED channel pair at this source (an https channel.json
+        /// URL or a local dir holding the pair). The full verify chain
+        /// still runs; the row match (by artifact sha256) additionally
+        /// binds the artifact to the index — and the receipt log
+        /// records the freshness the row was checked under.
+        #[arg(long)]
+        channel: Option<String>,
     },
     /// Verify a bundle end to end without installing anything.
     Verify {
@@ -271,6 +279,18 @@ enum PluginCmd {
     Trust {
         #[command(subcommand)]
         cmd: TrustCmd,
+    },
+    /// Show the plugin-lane receipt log (<home>/plugin.json): installs,
+    /// removals, pin rotations and channel verifications, each with the
+    /// pin (and its SOURCE) that authorized it and the channel
+    /// freshness observed at check time. Append-only, 0600.
+    Receipts {
+        /// Tail length (newest entries last).
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        /// Print the whole log instead of the tail.
+        #[arg(long, default_value_t = false)]
+        all: bool,
     },
 }
 
@@ -1987,16 +2007,21 @@ fn load_pins() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
 /// Resolve the expected publisher for `id`: an explicit --pubkey, the
 /// bot.toml trust row (primary), the legacy pins-file entry, or a
 /// refusal that names the presented key (the human pastes it ONLY
-/// after trusting the source).
-fn resolve_pin(id: &str, pubkey: Option<&str>, presented: &str) -> anyhow::Result<String> {
+/// after trusting the source). Returns the pin AND where it came from
+/// — the source label rides the receipt log (audit trail).
+fn resolve_pin(
+    id: &str,
+    pubkey: Option<&str>,
+    presented: &str,
+) -> anyhow::Result<(String, &'static str)> {
     if let Some(p) = pubkey {
-        return Ok(p.trim().to_ascii_lowercase());
+        return Ok((p.trim().to_ascii_lowercase(), "flag"));
     }
     if let Some(p) = load_trusted_publishers()?.get(id) {
-        return Ok(p.clone());
+        return Ok((p.clone(), "bot.toml"));
     }
     if let Some(p) = load_pins()?.get(id) {
-        return Ok(p.trim().to_ascii_lowercase());
+        return Ok((p.trim().to_ascii_lowercase(), "pins-file"));
     }
     let shown = presented.get(..8).unwrap_or(presented);
     anyhow::bail!(
@@ -2246,7 +2271,6 @@ async fn fetch_bundle(source: &str) -> anyhow::Result<(PathBuf, String, String)>
         Ok((path, parse_sha256_file(&raw_sha)?, sig))
     }
 }
-
 /// One verify chain print (shared by install + verify).
 fn run_verify(
     raw: &[u8],
@@ -2309,6 +2333,8 @@ fn publisher_thumb(hex: &str) -> String {
 
 async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
     use jerith_mesh_core::pluginbundle as pb;
+    use jerith_mesh_core::pluginchannel as pc;
+    use jerith_mesh_core::pluginreceipt as jr;
     use std::cmp::Ordering;
     match cmd {
         PluginCmd::Verify { path, pubkey } => {
@@ -2316,22 +2342,52 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             let raw = std::fs::read(&path)?;
             let (id, _version, presented) = pb::peek_identity(&raw)
                 .context("cannot resolve a publisher pin for this bundle")?;
-            let pin = resolve_pin(&id, pubkey.as_deref(), &presented)?;
+            let (pin, _pin_source) = resolve_pin(&id, pubkey.as_deref(), &presented)?;
             run_verify(&raw, &sha, &sig, &pin)?;
+            // NOT receipted: verify's contract is "without touching disk"
+            // (the picking-apart tool), and its failures already name
+            // everything an install receipt would say.
             Ok(())
         }
         PluginCmd::Install {
             source,
             force,
             pubkey,
+            channel,
         } => {
             let (bundle_path, sha, sig) = fetch_bundle(&source).await?;
             let raw = std::fs::read(&bundle_path)?;
             let (id, _version, presented) = pb::peek_identity(&raw)
                 .context("cannot resolve a publisher pin for this bundle")?;
-            let pin = resolve_pin(&id, pubkey.as_deref(), &presented)?;
+            let (pin, pin_source) = resolve_pin(&id, pubkey.as_deref(), &presented)?;
             let v = run_verify(&raw, &sha, &sig, &pin)?;
             let meta = &v.meta;
+
+            // FRESHNESS-PINNED installs: --channel fetches + verifies a
+            // channel pair and requires the bundle to BE a row of the
+            // verified index (artifact-digest match). The receipt then
+            // carries the freshness the row was checked under.
+            let mut channel_receipt: Option<jr::ChannelReceipt> = None;
+            if let Some(chsrc) = &channel {
+                let (json, csig) = fetch_channel_pair(chsrc).await?;
+                let anchor = resolve_channel_anchor(None)?;
+                let index = pc::verify_channel(&json, &csig, &anchor, 0)?;
+                anyhow::ensure!(
+                    index
+                        .bundles
+                        .iter()
+                        .any(|e| e.sha256.eq_ignore_ascii_case(&sha)),
+                    "--channel: the bundle ({sha}…) is NOT a row of the verified index — \
+                     install it plainly, or fetch the artifact the index names"
+                );
+                let now = crate_now_ms();
+                channel_receipt = Some(jr::ChannelReceipt {
+                    source: chsrc.trim().to_string(),
+                    generated_ms: index.generated_ms,
+                    observed_age_ms: now.saturating_sub(index.generated_ms),
+                    max_age_ms: pc::DEFAULT_MAX_AGE_MS,
+                });
+            }
 
             // Downgrade / same-version guard: only an upgrade installs.
             let installed = pb::latest_installed(&meta.id)?;
@@ -2373,6 +2429,21 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                 "next 3: restart the plugin unit AND the bot — both halves read the \
                  manifest secret at process start"
             );
+            jr::ReceiptEntry {
+                ts_ms: crate_now_ms(),
+                action: "install".into(),
+                plugin: Some(meta.id.clone()),
+                version: Some(meta.version.clone()),
+                publisher: Some(meta.publisher.clone()),
+                bundle_sha256: Some(v.tarball_sha256.clone()),
+                pin: Some(jr::PinReceipt {
+                    source: pin_source.into(),
+                    pin: pin.clone(),
+                }),
+                channel: channel_receipt,
+                detail: Some(format!("drop: {}", staged.display())),
+            }
+            .record()?;
             Ok(())
         }
         PluginCmd::Build { source, out, key } => {
@@ -2405,6 +2476,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
         } => search_channel(query, channel, anchor, max_age_ms).await,
         PluginCmd::Trust { cmd } => trust_cmd(cmd).await,
         PluginCmd::Channel { cmd } => channel_cmd(cmd).await,
+        PluginCmd::Receipts { count, all } => receipts_cmd(count, all).await,
         PluginCmd::Remove { id } => {
             match pb::trash_drop(&id)? {
                 Some(trash) => {
@@ -2417,6 +2489,18 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                         "next: remove the \"external:{id}\" row from [plugins].enabled \
                          and stop any plugin unit"
                     );
+                    jr::ReceiptEntry {
+                        ts_ms: crate_now_ms(),
+                        action: "remove".into(),
+                        plugin: Some(id.clone()),
+                        version: None,
+                        publisher: None,
+                        bundle_sha256: None,
+                        pin: None,
+                        channel: None,
+                        detail: Some(format!("trash: {}", trash.display())),
+                    }
+                    .record()?;
                 }
                 None => {
                     println!(
@@ -2534,6 +2618,7 @@ async fn search_channel(
         index.bundles.len()
     );
     let q = query.unwrap_or_default().trim().to_lowercase();
+    use jerith_mesh_core::pluginreceipt as jr;
     let mut matched = 0usize;
     for e in &index.bundles {
         let hay = format!(
@@ -2563,6 +2648,27 @@ async fn search_channel(
         "install any row: jerith plugin install <url>  (the full verify chain runs on the \
          artifact regardless of the index)"
     );
+    jr::ReceiptEntry {
+        ts_ms: crate_now_ms(),
+        action: "channel-verify".into(),
+        plugin: None,
+        version: None,
+        publisher: Some(index.publisher.clone()),
+        bundle_sha256: None,
+        pin: None,
+        channel: Some(jr::ChannelReceipt {
+            source: source.trim().to_string(),
+            generated_ms: index.generated_ms,
+            observed_age_ms: crate_now_ms().saturating_sub(index.generated_ms),
+            max_age_ms: if max_age_ms == 0 {
+                pc::DEFAULT_MAX_AGE_MS
+            } else {
+                max_age_ms
+            },
+        }),
+        detail: Some(format!("search: {matched} row(s) matched {q:?}")),
+    }
+    .record()?;
     Ok(())
 }
 
@@ -2571,6 +2677,7 @@ async fn search_channel(
 /// these rows: trust lives in the CLI install lane, and the bot's
 /// [plugins] code is untouched.
 async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginreceipt as jr;
     match cmd {
         TrustCmd::Show => {
             let bot = load_trusted_publishers()?;
@@ -2629,16 +2736,16 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
             let prior = load_trusted_publishers()?.get(id).cloned();
             let path = write_trusted_publishers(&bot_toml_path(), id, &new_key)?;
             match prior {
-                Some(old) if old.eq_ignore_ascii_case(&new_key) => println!(
+                Some(ref old) if old.eq_ignore_ascii_case(&new_key) => println!(
                     "rotated plugin {id:?}: pin already {}… in {} (rewritten in place)",
-                    publisher_thumb(&old),
+                    publisher_thumb(old),
                     path.display()
                 ),
-                Some(old) => println!(
+                Some(ref old) => println!(
                     "rotated plugin {id:?}: {}… → {}… in {} — NO trust-lag: installs signed \
                      by the old key are refused from this moment (a next install must \
                      verify against the new pin)",
-                    publisher_thumb(&old),
+                    publisher_thumb(old),
                     publisher_thumb(&new_key),
                     path.display()
                 ),
@@ -2661,6 +2768,22 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
                     publisher_thumb(old)
                 );
             }
+            // The rotation IS the audit event: what changed, for which id.
+            jr::ReceiptEntry {
+                ts_ms: crate_now_ms(),
+                action: "pin-rotate".into(),
+                plugin: Some(id.to_string()),
+                version: None,
+                publisher: Some(new_key.clone()),
+                bundle_sha256: None,
+                pin: None,
+                channel: None,
+                detail: Some(match &prior {
+                    Some(old) => format!("old {old} → new {new_key}"),
+                    None => format!("first pin: {new_key}"),
+                }),
+            }
+            .record()?;
             Ok(())
         }
     }
@@ -2673,6 +2796,7 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
 async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
     use jerith_mesh_core::pluginbundle as pb;
     use jerith_mesh_core::pluginchannel as pc;
+    use jerith_mesh_core::pluginreceipt as jr;
     match cmd {
         ChannelCmd::Build { dir, url_base, key } => {
             let dir = dir.unwrap_or_else(|| PathBuf::from("dist"));
@@ -2781,9 +2905,87 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
                 "install any row: jerith plugin install <url>  (the full verify \
                  chain runs against the artifact regardless of the index)"
             );
+            jr::ReceiptEntry {
+                ts_ms: crate_now_ms(),
+                action: "channel-verify".into(),
+                plugin: None,
+                version: None,
+                publisher: Some(index.publisher.clone()),
+                bundle_sha256: None,
+                pin: Some(jr::PinReceipt {
+                    source: "anchor".into(),
+                    pin: anchor.clone(),
+                }),
+                channel: Some(jr::ChannelReceipt {
+                    source: source.trim().to_string(),
+                    generated_ms: index.generated_ms,
+                    observed_age_ms: crate_now_ms().saturating_sub(index.generated_ms),
+                    max_age_ms: if max_age_ms == 0 {
+                        pc::DEFAULT_MAX_AGE_MS
+                    } else {
+                        max_age_ms
+                    },
+                }),
+                detail: Some(format!("{} row(s)", index.bundles.len())),
+            }
+            .record()?;
             Ok(())
         }
     }
+}
+
+/// `jerith plugin receipts` — read back the audit log, newest tail last.
+async fn receipts_cmd(count: usize, all: bool) -> anyhow::Result<()> {
+    use jerith_mesh_core::pluginreceipt::{self as jr, read};
+    let entries = read();
+    let path = jr::receipts_path();
+    if entries.is_empty() {
+        println!(
+            "{} — no receipts yet (installs, removals, pin rotations \
+                  and channel verifications append here)",
+            path.display()
+        );
+        return Ok(());
+    }
+    let skip = if all {
+        0
+    } else {
+        entries.len().saturating_sub(count)
+    };
+    println!(
+        "{} — {} entr{} (showing {})",
+        path.display(),
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        entries.len() - skip
+    );
+    for e in &entries[skip..] {
+        let subject = match (&e.plugin, &e.version) {
+            (Some(p), Some(v)) => format!("{p} {v}"),
+            (Some(p), None) => p.clone(),
+            _ => "-".into(),
+        };
+        println!(
+            "{:<13} {:<15} {:<24} {}",
+            e.ts_ms,
+            e.action,
+            subject.trim_end(),
+            e.detail.as_deref().unwrap_or("-")
+        );
+        if let Some(pin) = &e.pin {
+            println!("               pin {}…  ({})", &pin.pin[..8], pin.source);
+        }
+        if let Some(c) = &e.channel {
+            println!(
+                "               channel {} — generated_ms {} (age {} ms ≤ {} ms window)",
+                c.source, c.generated_ms, c.observed_age_ms, c.max_age_ms
+            );
+        }
+        if let Some(pub_key) = &e.publisher {
+            println!("               publisher {}…", &pub_key[..8]);
+        }
+    }
+    Ok(())
 }
 
 fn crate_now_ms() -> u64 {

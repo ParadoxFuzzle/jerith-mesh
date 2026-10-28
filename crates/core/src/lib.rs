@@ -27,6 +27,7 @@ pub mod ping;
 pub mod pipeline;
 pub mod pluginbundle;
 pub mod pluginchannel;
+pub mod pluginreceipt;
 pub mod quic;
 pub mod ratelimit;
 pub mod replication;

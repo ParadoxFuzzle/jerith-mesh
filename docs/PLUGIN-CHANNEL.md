@@ -250,8 +250,19 @@ across versions unless `--rotate` also passed).
 
 ## Open questions (deliberately unresolved)
 
-- Does Phase 2 sign the audit chain? (A `plugin.json` CLI receipt log
-  seems reasonable and needs no crypto now.)
+- Does Phase 2 sign the audit chain? — The RECEIPT LOG now exists
+  (2026-10-28): every CLI action appends one JSON line to
+  `<home>/plugin.json` (`jerith plugin receipts` reads it) — installs
+  and removals with the bundle digest and the PIN + its SOURCE, pin
+  rotations (old → new), and channel verifications stamped with the
+  index's `generated_ms`, the age OBSERVED at check time and the
+  window enforced. Freshness is also wired into the enforcement lane:
+  `jerith plugin install <bundle> --channel <url|dir>` requires the
+  bundle to BE a row of the verified index (artifact-digest match) so
+  the install receipt carries the freshness it ran under. NOT a
+  security boundary — enforcement stays the verify chain + pin table +
+  the bot's fail-closed gate; receipts are 0600 operator files and
+  remain UNSIGNED (tamper-evident receipts stay open).
 - Does the CLI auto-download from a pinned URL (the mesh bootstrap CDN
   URL?) or fetch ONLY from operator-supplied URLs? Phase 2's default
   is: operator-supplied URLs only; no automatic remote trust.
