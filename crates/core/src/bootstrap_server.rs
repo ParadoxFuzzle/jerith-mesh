@@ -419,7 +419,6 @@ fn score_of(e: &Entry) -> i32 {
     e.score
 }
 
-#[allow(dead_code)]
 fn entry_default_fields(ad: PeerAd) -> Entry {
     Entry {
         ad,

@@ -110,11 +110,13 @@ jobs:
   dependency-audit:
     # Advisory gate: a NEW RUSTSEC advisory anywhere in any crate's
     # dependency graph fails the build (releases can't land on it). The
-    # six accepted serenity-websocket advisories are the ONLY exceptions,
-    # via .cargo/audit.toml — each points to its rationale in
-    # docs/RUNBOOK.md → "Dependency security posture". Delete that file's
-    # entries (and rerun this gate clean) when the serenity/poise
-    # migration lands.
+    # accepted advisories documented in .cargo/audit.toml +
+    # docs/RUNBOOK.md → "Dependency security posture" are the ONLY
+    # exceptions — two subgraphs, two revisit triggers: the serenity
+    # websocket stack (serenity 0.13/PR #3599) and the songbird/davey
+    # voice lane (next songbird release). Both are dormant-by-design and
+    # each carries a same-day rationale. When either migration lands,
+    # delete its entries and rerun this gate clean.
     name: cargo audit (dependency advisories gate)
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -1273,7 +1273,7 @@ Both facts were checked against the resolved tree, not assumed. The
 revisit trigger (next songbird release): delete it then.
 
 Verified upstream facts (2026-10-15): **serenity 0.13 does not exist
-yet** — 0.12.5 (2025-12-20) is the newest release and it pins
+yet** —   0.12.5 (2025-12-20) is the newest release and it pins
 `tokio-tungstenite 0.21` (hence rustls 0.22 + webpki 0.102.8).
 tokio-tungstenite itself moved on (0.27+ by mid-2025), but serenity's
 semver demand pins the old line, so a solo bump is impossible.
@@ -1297,8 +1297,10 @@ Three paths, in preference order:
    breaks (framework builder, context/gateway plumbing, `EditMessage`
    builder changes), then `cargo tree -i rustls` MUST report only the
    0.23 line and `cargo audit` must come back clean — that is the exit
-   criterion, after which the six `ignore` entries in
-   `.cargo/audit.toml` are deleted (their comments say exactly that).
+   criterion, after which the websocket-stack `ignore` entries in
+   `.cargo/audit.toml` are deleted (their comments say exactly that;
+   the voice-lane block rides a separate revisit trigger — the next
+   songbird release — and keeps its own accounting until then).
 2. **Stopgap: flip serenity to `native_tls_backend`** (only if the
    risk calculus changes — not the current default). Serenity 0.12.5
    exposes `default_native_tls` / `native_tls_backend`, which moves
@@ -1333,10 +1335,12 @@ path and the primary answer remains serenity 0.13.
 
 Interim guardrail (done this pass): `cargo audit` now gates CI
 (`.github/workflows/ci.yml`, `dependency-audit` job) against every
-advisory EXCEPT the six documented here — `.cargo/audit.toml` ignores
-exactly those IDs, each with a pointer to this runbook section. A NEW
+advisory EXCEPT the ones documented here — `.cargo/audit.toml`
+ignores exactly those IDs, each with a pointer to this runbook section
+(the set has two subgraphs: the serenity websocket stack, and the
+songbird/davey voice lane accepted on their own days below). A NEW
 advisory anywhere in any crate's dependency graph breaks the build;
-the accepted six cannot silently grow. Maintenance rule: whenever a new
+the accepted set cannot silently grow. Maintenance rule: whenever a new
 advisory is accepted-with-reason, it gets a runbook paragraph and an
 audit.toml entry in the same commit — never one without the other.
 

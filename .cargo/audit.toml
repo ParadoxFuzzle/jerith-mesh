@@ -2,14 +2,15 @@
 # `dependency-audit` gate — a NEW advisory anywhere in any crate's
 # dependency graph fails the build).
 #
-# The entries below are the ONLY accepted advisories. Each corresponds to
-# a documented rationale in docs/RUNBOOK.md → "Dependency security
-# posture"; they are all one subgraph — serenity 0.12.5's pinned
-# tokio-tungstenite 0.21 websocket stack (rustls 0.22.4 + webpki
-# 0.102.8) — and their fixes live in the 0.23/0.103 lines, i.e. serenity
-# 0.13 territory. The maintenance rule: a new accepted advisory gets a
-# runbook paragraph AND an entry here in the same commit; when the
-# serenity/poise migration lands, delete every entry in this list.
+# The entries below are the ONLY accepted advisories. Each corresponds
+# to a documented rationale in docs/RUNBOOK.md → "Dependency security
+# posture"; they fall into two subgraphs, each with its own revisit
+# trigger: (a) serenity 0.12.5's pinned tokio-tungstenite 0.21 websocket stack (rustls 0.22.4 + webpki 0.102.8) — revisit behind
+# serenity 0.13 / PR #3599; (b) the songbird/davey voice-lane block
+# below — revisit behind the next songbird release. The maintenance
+# rule: a new accepted advisory gets a runbook paragraph AND an entry
+# here in the same commit; when the migrations land, delete the
+# corresponding entries in this list.
 #
 # Voice-lane block (2026-10-21): songbird 0.6.1's subtree. The eight
 # libcrux-* entries sit in davey (Discord DAVE E2EE/MLS), which songbird
