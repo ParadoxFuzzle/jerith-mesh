@@ -519,6 +519,8 @@ fn router_with_limiters(
         .route("/v1/report-measure", post(report_measure))
         .route("/v1/leave", post(leave))
         .route("/v1/models/counts", get(model_counts))
+        .route("/v1/vitals", get(vitals))
+        .route("/vitals", get(vitals_page))
         .with_state((state, ttl_ms))
         .layer(axum::middleware::from_fn_with_state(
             BootstrapLimiters { anon, identity },
@@ -1321,6 +1323,174 @@ async fn model_counts(State((registry, ttl_ms)): State<Shared>) -> Response {
     (StatusCode::OK, Json(out)).into_response()
 }
 
+/// GET /v1/vitals — the READ-ONLY public narrative: what the mesh looks
+/// like right now, as AGGREGATES ONLY (no addresses, no node ids, no
+/// payload figures that could identify a single operator). Everything is
+/// already tracked in-memory for /health and /v1/peers; this route is
+/// the storytelling view of the same state, and like them it lives
+/// behind the same limiter guard (pays the anonymous IP bucket).
+/// Additive-only fields: existing consumers (the /vitals page, tests)
+/// ignore unknown keys, so this shape may grow, never shrink semantics.
+async fn vitals(State((registry, ttl_ms)): State<Shared>) -> Response {
+    let live = sweep_live_scored(&registry, ttl_ms).await;
+    let live_count = live.len();
+    let halted = live
+        .iter()
+        .filter(|e| score_of(e) <= HALT_SCORE_THRESHOLD)
+        .count();
+    let flagged = live.iter().filter(|e| score_of(e) < 0).count();
+    let models: std::collections::BTreeMap<&str, usize> =
+        live.iter()
+            .fold(std::collections::BTreeMap::new(), |mut m, e| {
+                *m.entry(e.ad.model_id.as_str()).or_default() += 1;
+                m
+            });
+    let model_rows: Vec<serde_json::Value> = models
+        .into_iter()
+        .map(|(model, count)| serde_json::json!({"model_id": model, "count": count}))
+        .collect();
+    let (measures_agg, tok_served, tok_cons) = {
+        let m = registry.measures.read().await;
+        let MeasureTally { subjects, .. } = &*m;
+        let subjects_now = subjects.len();
+        let rows: Vec<serde_json::Value> = subjects
+            .keys()
+            .filter_map(|subject| {
+                let v = m.quorum_view(subject)?;
+                Some(serde_json::json!({
+                    "reports": v.reports,
+                    "distinct_reporters": v.distinct_reporters,
+                    "measured_median": v.measured_median,
+                    "spread_percent": v.spread_percent,
+                    "consistent": v.consistent,
+                }))
+            })
+            .collect();
+        let quorumed = rows.iter().filter(|r| r["consistent"].is_boolean()).count();
+        let consistent = rows
+            .iter()
+            .filter(|r| r["consistent"] == serde_json::json!(true))
+            .count();
+        (
+            serde_json::json!({
+                "subjects_live": subjects_now,
+                "quorumed_subjects": quorumed,
+                "consistent_subjects": consistent,
+                "recent_rows": rows,
+            }),
+            m.uploads_accepted,
+            m.uploads_duped,
+        )
+    };
+    let young = registry
+        .young_fraud_reports
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let fraud_reports_outstanding: u64 = live.iter().map(|e| e.fraud_reports.len() as u64).sum();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "generated_ms": now_ms(),
+            "mesh": {
+                "live_nodes": live_count,
+                "flagged_nodes": flagged,
+                "halted_nodes": halted,
+                "models": model_rows,
+            },
+            "economy": {
+                // §2 tally bookkeeping: accepted observations vs deduped
+                // replays (the accept side of the anti-replay discipline).
+                "measure_uploads_accepted": tok_served,
+                "measure_uploads_deduped": tok_cons,
+            },
+            "quorum": measures_agg,
+            "trust": {
+                // §10: fraud evidence currently held (live, recovery-
+                // applied entries only), plus the zero-weight-report tally.
+                "fraud_reports_outstanding": fraud_reports_outstanding,
+                "young_fraud_reports_total": young,
+            },
+            "security": serde_json::to_value(crate::metrics::security_snapshot())
+                .expect("security counters serialize"),
+        })),
+    )
+        .into_response()
+}
+
+/// GET /vitals — the self-contained storytelling page (no external
+/// assets; fetches /v1/vitals same-origin). Same security-header
+/// discipline as the node's status page (web.rs): no-store, nosniff,
+/// no-referrer, and a CSP pinning the inline blocks by sha256 digest
+/// (recomputed from VITALS_PAGE at first request, so page edits re-pin
+/// instead of roting into a mismatch).
+async fn vitals_page() -> Response {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let csp = CSP.get_or_init(|| crate::web::build_csp(VITALS_PAGE));
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, csp),
+        ],
+        VITALS_PAGE,
+    )
+        .into_response()
+}
+
+const VITALS_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jerith mesh — live vitals</title>
+<style>
+:root { color-scheme: dark; }
+body {
+  background: #0d1117; color: #c9d1d9; font: 15px/1.5 -apple-system, "Segoe UI", sans-serif;
+  margin: 0; padding: 2rem; }
+h1 { font-size: 1.3rem; margin: 0 0 .2rem; }
+.sub { color: #8b949e; margin-bottom: 1.5rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; max-width: 60rem; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; }
+.card h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; color: #8b949e; margin: 0 0 .5rem; }
+.big { font-size: 2.2rem; font-weight: 600; color: #58a6ff; }
+.tag { font-size: .8rem; color: #8b949e; }
+.bad { color: #f85149; } .warn { color: #d29922; }
+ul.models { margin: .3rem 0 0; padding-left: 1.1rem; }
+.grow { flexGrow: 1 }
+</style>
+</head>
+<body>
+<h1>jerith mesh — live vitals</h1>
+<p class="sub">Public aggregates from the bootstrap registry. No addresses or operator identities leave the server — what the mesh looks like, nothing about who runs it. <a href="/v1/vitals" style="color:#58a6ff">raw JSON</a>.</p>
+<div class="cards" id="cards"></div>
+<script>
+"use strict";
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function card(title, body){
+  return '<div class="card"><h2>'+esc(title)+'</h2>'+body+'</div>';
+}
+fetch('/v1/vitals').then(r=>r.json()).then(v=>{
+  const m=v.mesh||{}, q=v.quorum||{}, t=v.trust||{}, s=v.security||{}, e=v.economy||{};
+  const models=(m.models||[]).map(x=>'<li>'+esc(x.model_id)+' — '+x.count+'</li>').join('')||'<li class="tag">none right now</li>';
+  const cons=(q.recent_rows||[]).filter(r=>r.consistent===true).length;
+  const incon=(q.recent_rows||[]).filter(r=>r.consistent===false).length;
+  let html='';
+  html+=card('Live nodes','<div class="big">'+(m.live_nodes??'–')+'</div><div class="tag">ads refreshed within the registry TTL</div>');
+  html+=card('Model census', '<ul class="models">'+models+'</ul>');
+  html+=card('Reputation', '<div class="big '+(m.flagged_nodes? 'warn':'')+'">'+(m.flagged_nodes??'–')+'</div><div class="tag">currently flagged · <b class="'+(m.halted_nodes?'bad':'')+'">'+(m.halted_nodes??0)+'</b> halted (traffic-withheld)</div>');
+  html+=card('Contribution quorum', '<div class="big">'+(q.quorumed_subjects??'–')+'</div><div class="tag">quorumed subjects · '+cons+' consistent · '+incon+' inconsistent · '+(q.subjects_live??0)+' tracked</div>');
+  html+=card('Trust pressure', '<div class="big '+(t.fraud_reports_outstanding? 'warn':'')+'">'+(t.fraud_reports_outstanding??'–')+'</div><div class="tag">fraud reports held live · '+(t.young_fraud_reports_total??0)+' zero-weight (sybil-shape) reports seen ever</div>');
+  html+=card('Admission security', '<div class="big">'+(s.rate_limited_429_total??'–')+'</div><div class="tag">429s served · '+(s.oversize_reject_total??0)+' oversize rejects'+'</div>');
+  html+=card('Measure feed', '<div class="big">'+(e.measure_uploads_accepted??'–')+'</div><div class="tag">accepted measurement uploads · '+(e.measure_uploads_deduped??0)+' deduped replays</div>');
+  document.getElementById('cards').innerHTML=html;
+}).catch(()=>{document.getElementById('cards').innerHTML='<div class="card bad">vitals unavailable — the bootstrap may be restarting.</div>'});
+</script>
+</body>
+</html>
+"#;
+
 /// Serve the bootstrap node until the process exits.
 pub async fn serve(options: BootstrapOptions) -> anyhow::Result<()> {
     let registry = Arc::new(Registry {
@@ -1520,6 +1690,195 @@ mod tests {
         assert_eq!(glm.count, 3);
         assert_eq!(glm.quants.get("int4"), Some(&2));
         assert_eq!(glm.quants.get("fp8"), Some(&1));
+    }
+
+    /// Pin-by-test for `/v1/vitals`: seeded registry (two live models, a
+    /// flagged + a halted entry, one quorumed measure subject, one
+    /// single-report subject, young-fraud counter) → shapes AND the
+    /// privacy guarantee: no address, no `rpc_address`, no `node_id` of
+    /// the seeded ads ever leaves in the response body. This test IS the
+    /// documentation of what the public vitals may and may not tell.
+    #[tokio::test]
+    async fn vitals_aggregates_and_leak_nothing() {
+        let now = crate::bootstrap::now_ms();
+        let registry = Arc::new(Registry::default());
+        registry
+            .young_fraud_reports
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        let port = "9731";
+        let ad_of = |id: &str, model: &str, quant: &str| PeerAd {
+            node_id: id.into(),
+            address: format!("127.0.0.1:{port}"),
+            model_id: model.into(),
+            quant: quant.into(),
+            contribution_percent: 30,
+            rpc_address: String::new(),
+            last_seen_ms: now,
+            role: NodeRole::Hybrid,
+            resources: None,
+            hosted_experts: None,
+            hosted_expert_count: None,
+            discovery_servers: Vec::new(),
+            gossip_reputations: None,
+        };
+        let entry = |id: &str, model: &str, quant: &str, score: i32, fraudent: bool| {
+            let mut fraud_reports = std::collections::HashMap::new();
+            if fraudent {
+                fraud_reports.insert(
+                    "reporter1".to_string(),
+                    (FraudKind::Leeching, now.saturating_sub(1000)),
+                );
+            }
+            Entry {
+                ad: ad_of(id, model, quant),
+                last_refresh_ms: now,
+                first_seen_ms: now,
+                dead_votes: 0,
+                score,
+                fraud_reports,
+            }
+        };
+        registry.entries.write().await.extend([
+            ("a".into(), entry("aaaa1111", "glm-5.3", "int4", 0, false)),
+            ("b".into(), entry("bbbb2222", "glm-5.3", "fp8", 0, false)),
+            ("c".into(), entry("cccc3333", "qwen3:8b", "int4", 0, false)),
+            ("f".into(), entry("ffff4444", "qwen3:8b", "int4", -5, true)),
+            ("h".into(), entry("ffff5555", "glm-5.3", "int4", -50, false)),
+        ]);
+        // One quorumed+consistent subject (same figures), one unquorumed.
+        registry.measures.write().await.record(
+            "bbbb2222",
+            MeasureRecord {
+                reporter: "aaaa1111".into(),
+                block_stamp_ms: now,
+                window_secs: 60,
+                measured_percent: 40,
+            },
+        );
+        registry.measures.write().await.record(
+            "bbbb2222",
+            MeasureRecord {
+                reporter: "cccc3333".into(),
+                block_stamp_ms: now,
+                window_secs: 60,
+                measured_percent: 40,
+            },
+        );
+        registry.measures.write().await.record(
+            "aaaa1111",
+            MeasureRecord {
+                reporter: "cccc3333".into(),
+                block_stamp_ms: now,
+                window_secs: 60,
+                measured_percent: 90,
+            },
+        );
+        let app = router(Arc::clone(&registry), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = crate::http::mesh_http();
+        let body = client
+            .get(format!("{base}/v1/vitals"))
+            .send()
+            .await
+            .unwrap();
+        assert!(body.status().is_success(), "vitals must read public");
+        let text = body.text().await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&text).expect("vitals must be a valid JSON document");
+        // Mesh aggregates from the seeded ads.
+        assert_eq!(v["mesh"]["live_nodes"], 5);
+        assert_eq!(v["mesh"]["flagged_nodes"], 2); // -5 and -50
+        assert_eq!(v["mesh"]["halted_nodes"], 1); // only the -50
+        let models: Vec<&serde_json::Value> =
+            v["mesh"]["models"].as_array().unwrap().iter().collect();
+        assert_eq!(models.len(), 2);
+        assert!(
+            models
+                .iter()
+                .any(|m| m["model_id"] == "glm-5.3" && m["count"] == 3)
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m["model_id"] == "qwen3:8b" && m["count"] == 2)
+        );
+        // Quorum aggregates: two tracked subjects, one with a quorum AND
+        // consistency (identical measured from 2 reporters), one unquorumed.
+        assert_eq!(v["quorum"]["subjects_live"], 2);
+        assert_eq!(v["quorum"]["quorumed_subjects"], 1);
+        assert_eq!(v["quorum"]["consistent_subjects"], 1);
+        let rows = v["quorum"]["recent_rows"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r["consistent"] == serde_json::json!(true))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r["consistent"] == serde_json::json!(null))
+        );
+        // Trust + sybil counters ride through.
+        assert_eq!(v["trust"]["fraud_reports_outstanding"], 1);
+        assert_eq!(v["trust"]["young_fraud_reports_total"], 7);
+        assert_eq!(v["economy"]["measure_uploads_accepted"], 3);
+        assert_eq!(v["economy"]["measure_uploads_deduped"], 0);
+        assert!(v["security"].is_object(), "security counters ride along");
+        // THE privacy pin: no ad address, no node id, no rpc hints.
+        assert!(!text.contains("127.0.0.1"), "no addresses in vitals");
+        assert!(!text.contains("aaaa1111"), "no node ids in vitals");
+        assert!(
+            !text.contains("rpc_address"),
+            "no wire-address fields in vitals"
+        );
+    }
+
+    /// The /vitals page: self-contained HTML with the SAME security
+    /// header discipline as the node status page (no-store, nosniff,
+    /// no-referrer, CSP pinning inline digests — no 'unsafe-inline' when
+    /// the markers hold), fetching /v1/vitals same-origin.
+    #[tokio::test]
+    async fn vitals_page_serves_pinned_html() {
+        let app = router(Arc::new(Registry::default()), DEFAULT_ADVERTISE_TTL_MS);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::http::mesh_http();
+        let r = client
+            .get(format!("http://{addr}/vitals"))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        assert!(
+            r.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(
+            r.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(r.headers().get("referrer-policy").unwrap(), "no-referrer");
+        let csp = r
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("sha256-"),
+            "inline blocks pinned by digest: {csp}"
+        );
+        assert!(csp.contains("default-src 'none'"));
+        assert!(!csp.contains("unsafe-inline"), "markers hold — no fallback");
+        let body = r.text().await.unwrap();
+        assert!(body.contains("live vitals"));
+        assert!(body.contains("/v1/vitals"), "the page fetches its own data");
     }
 
     #[tokio::test]

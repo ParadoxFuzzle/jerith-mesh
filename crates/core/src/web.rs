@@ -31,7 +31,7 @@ pub fn router(state: std::sync::Arc<MeshState>) -> Router {
 
 /// The inline block of PAGE between `<tag>` and `</tag>` (tag without
 /// attributes; must exist or the CSP builder falls back).
-fn inline_block(page: &str, tag: &str) -> Option<String> {
+pub(crate) fn inline_block(page: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = page.find(&open)? + open.len();
@@ -68,15 +68,17 @@ fn b64(data: &[u8]) -> String {
 }
 
 /// `"sha256-<digest>"` for one inline block.
-fn hash_source(block: &str) -> String {
+pub(crate) fn hash_source(block: &str) -> String {
     let digest = Sha256::digest(block.as_bytes());
     format!("sha256-{}", b64(&digest))
 }
 
-/// The full CSP built from PAGE's own inline blocks. Falls back to
+/// The full CSP built from a page's own inline blocks. Falls back to
 /// `'unsafe-inline'` per source if the markers ever move (defense must
-/// survive edits that reshape the HTML).
-fn build_csp(page: &str) -> String {
+/// survive edits that reshape the HTML). Generic over the page so the
+/// bootstrap's vitals page (bootstrap_server) reuses it — one CSP
+/// discipline, one place.
+pub(crate) fn build_csp(page: &str) -> String {
     let script = match inline_block(page, "script") {
         Some(s) => hash_source(&s),
         None => "'unsafe-inline'".to_string(),

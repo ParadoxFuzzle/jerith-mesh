@@ -32,6 +32,35 @@ server set (`data/discovery-servers.json`) still pins a remote server
 as last-good after the swap, clear the file once; the node re-pins
 from the config-ordered rotation within one tick.
 
+## Mesh vitals page (bootstrap, public, 2026-10-28)
+
+The bootstrap serves two public reads beyond peer discovery: `GET
+/v1/vitals` (aggregate JSON) and `GET /vitals` (the self-contained HTML
+page that fetches it same-origin — the "who is the mesh and how is it
+behaving" story). Both sit behind the same two-lane limiter guard as
+the rest of the bootstrap router and carry the node status page's
+security-header discipline (no-store/nosniff/no-referrer + CSP pinning
+the inline script/style digests; the digest pins recompute at first
+request, so page edits re-pin rather than rote-mismatch).
+
+What vitals tells the world — deliberately, aggregate-only: live-node
+count + per-model census, flagged/halted entry counts (§10 score
+aggregates, never per-node score rows), the §2 contribution-quorum view
+(quorumed vs consistent measure subjects, accepted/deduped upload
+counts), fraud-evidence pressure (live-reported + zero-weight
+young-report total), and the limiter/oversize security counters. What
+it must NEVER tell: ad addresses, node ids, per-node scores, rpc
+endpoints — pinned by test (`vitals_aggregates_and_leak_nothing`, which
+also documents the allowed shapes). Additive-only contract: fields may
+be appended, never re-TypEd/removed; the vitals template + external
+consumers ignore unknown keys.
+
+Update-day checklist (with a rebuild): `cargo build --release --bin
+jerith` → `systemctl --user restart jerith-bootstrap` → `curl
+http://127.0.0.1:8999/v1/vitals` (live check) + `curl
+http://127.0.0.1:8999/vitals | head` (page serves). The public URL is
+the tunnel origin: `https://p2p.jerithai.com/vitals`.
+
 ## JerithChain node (co-hosted, integrated into the mesh install)
 
 The chain node is part of the mesh stack, not a sidecar — the mesh shares
