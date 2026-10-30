@@ -969,7 +969,15 @@ async fn backup_cmd(cmd: BackupCmd) -> anyhow::Result<()> {
                     println!("  - {s}");
                 }
             }
-            println!("next: jerith run (config.toml restored with this node's identity)");
+            if unit_active("jerith-node") {
+                println!(
+                    "note: the jerith-node service is ACTIVE and reading these files — \
+                     restart it to pick the restore up: \
+                     systemctl --user restart jerith-node"
+                );
+            } else {
+                println!("next: jerith run (config.toml restored with this node's identity)");
+            }
         }
     }
     Ok(())
@@ -2070,18 +2078,61 @@ fn bot_toml_gates(id: &str) -> anyhow::Result<bool> {
     parse_enabled_gate(&text, id)
 }
 
-/// Is the conventional plugin unit (`jerith-<id>-plugin`) actually
-/// active right now? `systemctl --user is-active` answers 0 only for
-/// active — unknown units, inactive ones and a missing systemctl (mac
-/// boxes) all read "not running", so the remove hint says so instead of
-/// commanding a stop that was already done.
-fn plugin_unit_active(id: &str) -> bool {
-    let unit = format!("jerith-{id}-plugin");
+/// Is a systemd --user unit active right now? `systemctl --user
+/// is-active` answers 0 only for active — unknown units, inactive ones
+/// and a missing systemctl (mac boxes) all read "not running".
+fn unit_active(name: &str) -> bool {
     std::process::Command::new("systemctl")
-        .args(["--user", "is-active", unit.as_str()])
+        .args(["--user", "is-active", name])
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// Is the conventional plugin unit (`jerith-<id>-plugin`) actually
+/// active right now? Probed before remove/install hints so they say
+/// "SKIPPED" or "start" — never command a stop/restart that is
+/// already moot.
+fn plugin_unit_active(id: &str) -> bool {
+    unit_active(&format!("jerith-{id}-plugin"))
+}
+
+/// The full unit text systemd would run for the conventional plugin
+/// unit (base unit + drop-ins). Empty string = unprobeable (no unit,
+/// no systemctl): every consumer falls back to the original advice.
+fn plugin_unit_execstart_text(id: &str) -> String {
+    let unit = format!("jerith-{id}-plugin");
+    std::process::Command::new("systemctl")
+        .args(["--user", "cat", unit.as_str()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Does a systemd unit text point ExecStart at BOTH the binary and
+/// the manifest path? install's next-2 skips its unit edit when the
+/// unit already names the very paths this install just produced
+/// (same-version reinstall reuses the version dir; the drop path
+/// never moves — an upgrade produces a new version dir and keeps
+/// the advice).
+fn unit_execstart_points_at(text: &str, binary: &str, manifest: &str) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    unit_execstart_matches(text, binary, manifest, &home)
+}
+
+/// The pure half (home passed in, test-friendly): does a served unit
+/// text point ExecStart at BOTH paths, after expanding `%h` — the
+/// live-unit shape (checked against the real jerith-weather-plugin
+/// unit) — to the install's absolute home?
+fn unit_execstart_matches(text: &str, binary: &str, manifest: &str, home: &str) -> bool {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter(|l| l.trim_start().starts_with("ExecStart"))
+        .filter(|l| !l.contains("ExecStartPre") && !l.contains("ExecStartPost"))
+        .any(|l| {
+            let expanded = l.replace("%h", home);
+            expanded.contains(binary) && expanded.contains(manifest)
+        })
 }
 
 fn parse_enabled_gate(text: &str, id: &str) -> anyhow::Result<bool> {
@@ -2519,17 +2570,65 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                         .display()
                 );
             }
-            println!(
-                "next 2: point the plugin unit at this binary:\n\n\
-                 ExecStart = {vdir}/bin/{bin} {staged}\n",
-                vdir = vdir.display(),
-                bin = v.binary_name,
-                staged = staged.display()
-            );
-            println!(
-                "next 3: restart the plugin unit AND the bot — both halves read the \
-                 manifest secret at process start"
-            );
+            // next 2 judged against the unit systemd would actually
+            // run: when its ExecStart already names exactly this
+            // binary+manifest (same-version reinstall), the edit is
+            // finished work and says so. Unprobeable (no unit,
+            // no systemctl) or a different binary path (an upgrade)
+            // keeps the edit advice.
+            let binary_path = format!("{}/bin/{}", vdir.display(), v.binary_name);
+            let manifest_path = staged.display().to_string();
+            if unit_execstart_points_at(
+                &plugin_unit_execstart_text(&meta.id),
+                &binary_path,
+                &manifest_path,
+            ) {
+                println!(
+                    "next 2: SKIPPED — the jerith-{id}-plugin unit's ExecStart already \
+                     points at this exact binary+manifest",
+                    id = meta.id,
+                );
+            } else {
+                println!(
+                    "next 2: point the plugin unit at this binary:\n\n\
+                     ExecStart = {vdir}/bin/{bin} {staged}\n",
+                    vdir = vdir.display(),
+                    bin = v.binary_name,
+                    staged = staged.display()
+                );
+            }
+            // next 3 judged against actual unit state: a dead unit
+            // needs a start, not a restart, and a jerith-bot that
+            // isn't running has no secret to refresh.
+            let unit_running = plugin_unit_active(&meta.id);
+            let bot_running = unit_active("jerith-bot");
+            match (unit_running, bot_running) {
+                (true, true) => println!(
+                    "next 3: restart the plugin unit AND jerith-bot (systemctl --user restart \
+                     jerith-{}-plugin) — both halves read the manifest secret at process \
+                     start, and this install re-generated it",
+                    meta.id
+                ),
+                (true, false) => println!(
+                    "next 3: restart the plugin unit (systemctl --user restart \
+                     jerith-{}-plugin) — it reads the re-staged secret at start; jerith-bot \
+                     isn't running, nothing to refresh there",
+                    meta.id
+                ),
+                (false, true) => println!(
+                    "next 3: START the plugin unit (systemctl --user start \
+                     jerith-{}-plugin — a restart would refuse, it isn't running), then \
+                     restart jerith-bot — both halves read the manifest secret at process \
+                     start",
+                    meta.id
+                ),
+                (false, false) => println!(
+                    "next 3: START the plugin unit (systemctl --user start \
+                     jerith-{}-plugin) — nothing to restart: neither the unit nor jerith-bot \
+                     is active",
+                    meta.id
+                ),
+            }
             jr::ReceiptEntry {
                 ts_ms: crate_now_ms(),
                 action: "install".into(),
@@ -3182,19 +3281,35 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
                 crate_now_ms().saturating_sub(index.generated_ms),
                 index.bundles.len()
             );
+            // Same per-row honesty as search: the row's OWN version
+            // being on disk decides the tag and the footer.
+            let mut installable = 0usize;
             for e in &index.bundles {
+                let installed = pb::installed_versions_under(&NodeConfig::home(), &e.id);
+                let (tail, installable_row) = search_row_state(&e.version, &installed);
+                if installable_row {
+                    installable += 1;
+                }
                 println!(
-                    "  {:<10} {:<8} {:<13} {}",
+                    "  {:<10} {:<8} {:<13} {}{}",
                     e.id,
                     e.version,
                     format!("{}/{}", e.os, e.arch),
-                    e.url
+                    e.url,
+                    tail
                 );
             }
-            println!(
-                "install any row: jerith plugin install <url>  (the full verify \
-                 chain runs against the artifact regardless of the index)"
-            );
+            if installable == 0 {
+                println!(
+                    "nothing to install — every row's exact version is already on disk \
+                     (reinstalling means passing that row's url to 'jerith plugin install')"
+                );
+            } else {
+                println!(
+                    "install any row whose version is not on disk: jerith plugin install <url> \
+                     (the full verify chain runs against the artifact regardless of the index)"
+                );
+            }
             jr::ReceiptEntry {
                 ts_ms: crate_now_ms(),
                 action: "channel-verify".into(),
@@ -3656,19 +3771,51 @@ fn stack_cmd(cmd: StackCmd) -> anyhow::Result<()> {
                 shell_run(step, t.name())?;
             }
             println!("✓ {} installed", t.name());
+            // The "point the node at it" hints probe the config: when
+            // it already names exactly what the step would set (e.g.
+            // the operator pre-configured or is reinstalling the
+            // tool), the set command is already-done noise.
+            let cfg = NodeConfig::load().ok().flatten().unwrap_or_default();
             match t {
-                StackTool::Ollama => println!(
-                    "  point the node at it: jerith config set \n  runtime_url=http://127.0.0.1:11434"
-                ),
-                StackTool::LiteLLM => println!(
-                    "  point the node at it: jerith config set runtime_url=http://127.0.0.1:4000"
-                ),
+                StackTool::Ollama => {
+                    if cfg.runtime_url == "http://127.0.0.1:11434" {
+                        println!(
+                            "  point the node at it: SKIPPED — runtime_url already \
+                             http://127.0.0.1:11434"
+                        );
+                    } else {
+                        println!(
+                            "  point the node at it: jerith config set \n  runtime_url=http://127.0.0.1:11434"
+                        );
+                    }
+                }
+                StackTool::LiteLLM => {
+                    if cfg.runtime_url == "http://127.0.0.1:4000" {
+                        println!(
+                            "  point the node at it: SKIPPED — runtime_url already \
+                             http://127.0.0.1:4000"
+                        );
+                    } else {
+                        println!(
+                            "  point the node at it: jerith config set runtime_url=http://127.0.0.1:4000"
+                        );
+                    }
+                }
                 StackTool::LangChain | StackTool::LangGraph | StackTool::LangSmith => println!(
                     "  see integrations/langchain/ in the repo — the examples use this node's \n  gateway as an OpenAI-compatible endpoint (LangSmith: set LANGSMITH_TRACING=true \n  and note the LANGSMITH_API_KEY env vars; never commit them)"
                 ),
-                StackTool::Postgres => println!(
-                    "  then: jerith config set memory_backend=postgres \\\n                     memory_dsn=postgres://postgres@127.0.0.1:5432/jerith\\?sslmode=disable"
-                ),
+                StackTool::Postgres => {
+                    let already_pg = cfg.memory_backend == MemoryBackend::PostgresPgvector
+                        && cfg.memory_dsn.as_deref()
+                            == Some("postgres://postgres@127.0.0.1:5432/jerith?sslmode=disable");
+                    if already_pg {
+                        println!("  then: SKIPPED — memory already runs on postgres with this DSN");
+                    } else {
+                        println!(
+                            "  then: jerith config set memory_backend=postgres \\\n                     memory_dsn=postgres://postgres@127.0.0.1:5432/jerith\\?sslmode=disable"
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -4755,6 +4902,41 @@ mod trust_tests {
     fn path_alias_is_borrowed() {
         fn accepts(_p: &Path) {}
         accepts(Path::new("."));
+    }
+
+    #[test]
+    fn unit_execstart_probe_respects_comments_and_pre_post() {
+        const BIN: &str = "/home/u/.jerith-mesh/plugins/pet/0.1.0/bin/pet";
+        const MAN: &str = "/home/u/.jerith-mesh/plugins.d/pet/plugin.toml";
+        // The real shape: unit rows with a plain ExecStart.
+        let yes =
+            format!("[Unit]\nDescription=x\n\n[Service]\nExecStart={BIN} {MAN}\nRestart=always\n");
+        assert!(unit_execstart_points_at(&yes, BIN, MAN));
+        // The spaced form the install hint itself prints.
+        let spaced = format!("ExecStart = {BIN} {MAN}\n");
+        assert!(unit_execstart_points_at(&spaced, BIN, MAN));
+        // A commented-out ExecStart is not a configuration.
+        assert!(!unit_execstart_points_at(
+            &format!("#ExecStart={BIN} {MAN}\n"),
+            BIN,
+            MAN
+        ));
+        // ExecStartPre naming the same paths does not satisfy the gate.
+        assert!(!unit_execstart_points_at(
+            &format!("ExecStartPre=ln -s {BIN} {MAN}\n"),
+            BIN,
+            MAN
+        )); // A different version dir (an upgrade) → no match, advice stays.
+        assert!(!unit_execstart_points_at(
+            &format!("ExecStart=/home/u/.jerith-mesh/plugins/pet/0.0.9/bin/pet {MAN}\n"),
+            BIN,
+            MAN
+        ));
+        // The live-unit shape: `%h` specifiers must not defeat the
+        // probe (that would turn a done edit back into advice).
+        let specified = "ExecStart=%h/.jerith-mesh/plugins/pet/0.1.0/bin/pet \
+              %h/.jerith-mesh/plugins.d/pet/plugin.toml\n";
+        assert!(unit_execstart_matches(specified, BIN, MAN, "/home/u"));
     }
 
     // Already-done honesty for the search/trust next-step hints:
