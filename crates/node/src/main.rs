@@ -2097,6 +2097,18 @@ fn plugin_unit_active(id: &str) -> bool {
     unit_active(&format!("jerith-{id}-plugin"))
 }
 
+/// Is a systemd --user unit ENABLED (installed into the boot set)?
+/// Same probed-hint rule as activity: `is-enabled` answers 0 only for
+/// enabled — missing/unknown units and absent systemctl read disabled,
+/// so a remove hint may say "nothing to stop" honestly.
+fn unit_enabled(name: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", name])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// The full unit text systemd would run for the conventional plugin
 /// unit (base unit + drop-ins). Empty string = unprobeable (no unit,
 /// no systemctl): every consumer falls back to the original advice.
@@ -2565,9 +2577,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                 println!(
                     "next 1: add \"external:{}\" to [plugins].enabled in {}",
                     meta.id,
-                    jerith_mesh_core::config::NodeConfig::home()
-                        .join("bot.toml")
-                        .display()
+                    bot_toml_path().display()
                 );
             }
             // next 2 judged against the unit systemd would actually
@@ -2740,15 +2750,32 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                              in [plugins].enabled"
                         );
                     }
+                    // enable-state matters too: a disabled-substitute
+                    // stop of an ENABLED unit resurrects the plugin
+                    // after the next reboot — precisely the surprise a
+                    // removed plugin should not deliver.
+                    let unit = format!("jerith-{id}-plugin");
                     if plugin_unit_active(&id) {
+                        if unit_enabled(&unit) {
+                            println!(
+                                "next 2: disable AND stop the unit (it is ENABLED — a plain \
+                                 stop would come back after reboot): systemctl --user \
+                                 disable --now {unit}"
+                            );
+                        } else {
+                            println!(
+                                "next 2: stop the running unit (systemctl --user stop {unit})"
+                            );
+                        }
+                    } else if unit_enabled(&unit) {
                         println!(
-                            "next 2: stop the running unit (systemctl --user stop \
-                             jerith-{id}-plugin)"
+                            "next 2: disable the unit (not running, but ENABLED — it would \
+                             come back after reboot): systemctl --user disable {unit}"
                         );
                     } else {
                         println!(
-                            "next 2: SKIPPED — no jerith-{id}-plugin unit is \
-                             active (nothing to stop)"
+                            "next 2: SKIPPED — no jerith-{id}-plugin unit is active or \
+                             enabled (nothing to stop)"
                         );
                     }
                     jr::ReceiptEntry {
@@ -2893,20 +2920,55 @@ async fn fetch_channel_pair(source: &str) -> anyhow::Result<(String, String)> {
 /// keys/plugin-releases.pub (a repo checkout has the anchor in-tree).
 /// Shared by `channel verify` and `plugin search`.
 fn resolve_channel_anchor(anchor: Option<String>) -> anyhow::Result<String> {
-    const NO_ANCHOR: &str = "channel: no anchor — pass --anchor <64-hex publisher pubkey> or set \
-         JERITH_CHANNEL_ANCHOR (non-empty); verify runs only against a key the OPERATOR pinned";
-    let found = anchor
-        .or_else(|| std::env::var("JERITH_CHANNEL_ANCHOR").ok())
-        .or_else(|| std::fs::read_to_string("keys/plugin-releases.pub").ok())
+    let (raw, _origin) = find_channel_anchor(anchor)?;
+    // Empty sources never resolve (the export footgun below): an anchor
+    // that trims to nothing falls through to the NEXT source, and an
+    // empty-everything box fails loud with the full NO_ANCHOR list —
+    // never with a blank thumb far downstream.
+    Ok(raw.trim().to_string())
+}
+
+/// Where the operator's channel anchor comes from, in precedence
+/// order: explicit `--anchor` arg, `JERITH_CHANNEL_ANCHOR`, the repo
+/// checkout's `keys/plugin-releases.pub`, and the home copy an
+/// operator may keep at `<home>/keys/plugin-releases.pub` (jerith
+/// runs from the home under systemd; a CWD-relative repo path is
+/// invisible there). A source that exists but trims to NOTHING does
+/// not count — it falls through to the next one (the set-but-empty
+/// export footgun: `export A=$(…) JERITH_CHANNEL_ANCHOR=$A` used to
+/// ship a blank anchor that surfaced far downstream as a mismatch
+/// with a blank thumb). Returns (raw key bytes, human origin) —
+/// trust show renders the same table complete.
+fn find_channel_anchor(explicit: Option<String>) -> anyhow::Result<(String, &'static str)> {
+    const NO_ANCHOR: &str = "channel: no anchor — pass --anchor <64-hex publisher pubkey>, \
+         set JERITH_CHANNEL_ANCHOR (non-empty), or keep keys/plugin-releases.pub in the \
+         checkout or at <home>/keys/; verify runs only against a key the OPERATOR pinned";
+    let found = explicit
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| (a, "the --anchor argument"))
+        .or_else(|| {
+            std::env::var("JERITH_CHANNEL_ANCHOR")
+                .ok()
+                .filter(|a| !a.trim().is_empty())
+                .map(|a| (a, "the JERITH_CHANNEL_ANCHOR env var"))
+        })
+        .or_else(|| {
+            std::fs::read_to_string("keys/plugin-releases.pub")
+                .ok()
+                .filter(|a| !a.trim().is_empty())
+                .map(|a| (a, "keys/plugin-releases.pub (this checkout)"))
+        })
+        .or_else(|| {
+            std::fs::read_to_string(
+                jerith_mesh_core::config::NodeConfig::home()
+                    .join("keys")
+                    .join("plugin-releases.pub"),
+            )
+            .ok()
+            .filter(|a| !a.trim().is_empty())
+            .map(|a| (a, "the home keys/plugin-releases.pub"))
+        })
         .ok_or_else(|| anyhow::anyhow!(NO_ANCHOR))?;
-    // Set-but-empty is the same as unset: an export like
-    // `export ANCHOR=$(…) JERITH_CHANNEL_ANCHOR=$ANCHOR` expands $ANCHOR
-    // before the first assignment lands (all words of a simple command
-    // expand first), silently shipping an EMPTY anchor — which used to
-    // surface far downstream as a bare publisher-vs-anchor mismatch
-    // with a blank thumb. Fail fast, with the honest reason.
-    let found = found.trim().to_string();
-    anyhow::ensure!(!found.is_empty(), NO_ANCHOR);
     Ok(found)
 }
 
@@ -3031,6 +3093,24 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
             );
             for (id, key) in &bot {
                 println!("  {:<16} {}", id, publisher_thumb(key));
+            }
+            // The THIRD trust root, made visible: the anchor every
+            // channel verify/install resolves to right now (arg, env,
+            // checkout copy, or home copy — same probe the lanes
+            // themselves run). A trust table that hides one of its
+            // roots invites the where-does-verification-read hunt.
+            match find_channel_anchor(None) {
+                Ok((key, origin)) if key.trim().is_empty() => {
+                    println!("channel anchor: NONE — the source ({origin}) exists but holds no key")
+                }
+                Ok((key, origin)) => println!(
+                    "channel anchor: {} (from {origin})",
+                    publisher_thumb(key.trim())
+                ),
+                Err(_) => println!(
+                    "channel anchor: NONE — a channel verify/install then needs --anchor, \
+                     JERITH_CHANNEL_ANCHOR, or a keys/plugin-releases.pub copy"
+                ),
             }
             // Same already-done honesty as the other next-step hints:
             // when every pins row is mirrored into bot.toml, "a rotate
