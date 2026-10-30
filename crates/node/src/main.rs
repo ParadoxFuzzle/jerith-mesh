@@ -4471,10 +4471,10 @@ mod trust_tests {
         // external: prefix is drop-only, so a bare id never matches.
         assert!(!parse_enabled_gate(&doc, "websearch").unwrap());
         assert!(!parse_enabled_gate(&doc, "memory").unwrap());
-        let doc2 = format!("[plugins]\nenabled = [\" external:weather \", \"websearch\"]\n");
+        let doc2 = "[plugins]\nenabled = [\" external:weather \", \"websearch\"]\n".to_string();
         assert!(!parse_enabled_gate(&doc2, "weather").unwrap());
         let doc3 = "[plugins]\nenabled = [\"external:weatherx\"]\n";
-        assert!(!parse_enabled_gate(&doc3, "weather").unwrap());
+        assert!(!parse_enabled_gate(doc3, "weather").unwrap());
         assert!(!parse_enabled_gate("", "weather").unwrap());
         assert!(
             !parse_enabled_gate("[plugins]\nowner_only = [\"external:pet\"]\n", "pet").unwrap(),
