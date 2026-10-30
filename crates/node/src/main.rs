@@ -2552,6 +2552,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             Ok(())
         }
         PluginCmd::Build { source, out, key } => {
+            use jerith_mesh_core::pluginchannel as pc;
             let identity = load_signing_seed(key.as_deref())?;
             let report = pb::build(&source, &out, &identity)?;
             println!(
@@ -2567,10 +2568,38 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                 report.sha_path.display(),
                 report.sig_path.display()
             );
-            println!(
-                "next: attach all three to the release (or host them), then \
-                 'jerith plugin channel build' to list them in the signed index"
-            );
+            // Honest channel half of the hint: when a signed channel
+            // pair already sits beside the built bundle and verifies
+            // against this publisher listing THIS exact sha,
+            // re-running 'channel build' restamps finished work. Probe
+            // ONLY alongside the bundle (the natural dist staging)
+            // and fail toward the original advice: unverifiable pair,
+            // different publisher, or missing files all mean the
+            // step may still be needed. u64::MAX max-age because a
+            // listing's age is not the point — row identity is.
+            let dist = report.bundle_path.parent().unwrap_or(Path::new("."));
+            let already_listed = (|| -> Option<bool> {
+                let (json, sig) = pc::load_channel_pair(dist).ok()?;
+                let index =
+                    pc::verify_channel(&json, &sig, &identity.pubkey_hex(), u64::MAX).ok()?;
+                Some(channel_lists_row(
+                    &index.bundles,
+                    &report.meta.id,
+                    &report.meta.version,
+                    &report.tarball_sha256,
+                ))
+            })();
+            let channel_half = match already_listed {
+                Some(true) => format!(
+                    "; channel: SKIPPED — the signed pair in {} already lists this \
+                     exact sha, so 'jerith plugin channel build' only when the row set changes",
+                    dist.display()
+                ),
+                _ => ", then 'jerith plugin channel build' to list them in the signed \
+                     index"
+                    .to_string(),
+            };
+            println!("next: attach all three to the release (or host them){channel_half}");
             Ok(())
         }
         PluginCmd::Search {
@@ -2650,6 +2679,43 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Does the channel row list contain this id+version+sha (the exact
+/// artifact, not merely the id)? Case-insensitive on the sha digest.
+fn channel_lists_row(
+    bundles: &[jerith_mesh_core::pluginchannel::ChannelEntry],
+    id: &str,
+    version: &str,
+    sha256: &str,
+) -> bool {
+    bundles
+        .iter()
+        .any(|r| r.id == id && r.version == version && r.sha256.eq_ignore_ascii_case(sha256))
+}
+
+/// Do two channel row sets carry the same rows (order-insensitive —
+/// the deterministic builder sorts, but a comparison that leans on
+/// order would swing on hand-maintained files)?
+fn channel_rows_match(
+    fresh: &[jerith_mesh_core::pluginchannel::ChannelEntry],
+    live: &[jerith_mesh_core::pluginchannel::ChannelEntry],
+) -> bool {
+    if fresh.len() != live.len() {
+        return false;
+    }
+    // ChannelEntry has no Ord; sort by the builder's own key set.
+    let mut a: Vec<&jerith_mesh_core::pluginchannel::ChannelEntry> = fresh.iter().collect();
+    let mut b: Vec<&jerith_mesh_core::pluginchannel::ChannelEntry> = live.iter().collect();
+    a.sort_by(|x, y| {
+        (&x.id, &x.version, &x.os, &x.arch, &x.sha256)
+            .cmp(&(&y.id, &y.version, &y.os, &y.arch, &y.sha256))
+    });
+    b.sort_by(|x, y| {
+        (&x.id, &x.version, &x.os, &x.arch, &x.sha256)
+            .cmp(&(&y.id, &y.version, &y.os, &y.arch, &y.sha256))
+    });
+    a == b
 }
 
 /// One search row's honest outcome, from the row's version and the
@@ -3065,10 +3131,41 @@ async fn channel_cmd(cmd: ChannelCmd) -> anyhow::Result<()> {
             std::fs::write(&sig_path, sig.trim())?;
             println!("channel: {} row(s)", row_count);
             println!("wrote {} + {}", json_path.display(), sig_path.display());
-            println!(
-                "next: upload BOTH files beside the bundles; operators verify via \
-                 'jerith plugin channel verify <url> --anchor <pub hex>'"
-            );
+            // Honest upload half: when the live channel at url_base
+            // already verifies against this publisher AND its rows
+            // are exactly the fresh ones, the upload restamps finished
+            // work (only generated_ms changes). Any other outcome —
+            // offline, 404, different publisher, differing rows —
+            // falls toward the original advice — a probe must never
+            // turn a real publish need into a skip.
+            let live_url = format!("{url_base}/{}", pc::CHANNEL_FILE);
+            let fresh_index: pc::ChannelIndex = serde_json::from_str(&json)
+                .map_err(|e| anyhow::anyhow!("channel: fresh index failed to parse ({e})"))?;
+            let live_probe = fetch_channel_pair(&live_url)
+                .await
+                .ok()
+                .and_then(|(lj, ls)| {
+                    pc::verify_channel(&lj, &ls, &identity.pubkey_hex(), u64::MAX).ok()
+                });
+            match live_probe {
+                Some(live) if channel_rows_match(&fresh_index.bundles, &live.bundles) => {
+                    println!(
+                        "upload: SKIPPED — {live_url} already serves exactly these rows; \
+                         this rebuild only stamped a fresh generated-at"
+                    );
+                }
+                Some(live) => println!(
+                    "next: upload BOTH files beside the bundles — the live pair differs \
+                     ({} live row(s) vs {} fresh); operators verify via \
+                     'jerith plugin channel verify <url> --anchor <pub hex>'",
+                    live.bundles.len(),
+                    fresh_index.bundles.len()
+                ),
+                None => println!(
+                    "next: upload BOTH files beside the bundles; operators verify via \
+                     'jerith plugin channel verify <url> --anchor <pub hex>'"
+                ),
+            }
             Ok(())
         }
         ChannelCmd::Verify {
@@ -4693,6 +4790,55 @@ mod trust_tests {
         let (tail, installable) = have(&["0.2.0"], "0.1.3");
         assert!(installable);
         assert!(tail.contains("0.2.0 installed"), "{tail}");
+    }
+
+    fn entry(id: &str, version: &str, sha: &str) -> jerith_mesh_core::pluginchannel::ChannelEntry {
+        jerith_mesh_core::pluginchannel::ChannelEntry {
+            id: id.into(),
+            version: version.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            url: format!("https://x/{id}-{version}-{sha}"),
+            sha256: sha.into(),
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn channel_lists_row_names_the_exact_artifact() {
+        let rows = vec![
+            entry("weather", "0.1.4", "aa11"),
+            entry("pet", "0.0.9", "bb22"),
+        ];
+        assert!(channel_lists_row(&rows, "weather", "0.1.4", "aa11"));
+        // Digest case must not block the match.
+        assert!(channel_lists_row(&rows, "weather", "0.1.4", "AA11"));
+        // Right id+version but a different sha is NOT the same row.
+        assert!(!channel_lists_row(&rows, "weather", "0.1.4", "cc33"));
+        // Same id, different version — the old row doesn't satisfy the new.
+        assert!(!channel_lists_row(&rows, "weather", "0.1.5", "aa11"));
+        assert!(!channel_lists_row(&rows, "ledger", "1.0.0", "aa11"));
+    }
+
+    #[test]
+    fn channel_rows_match_ignores_order() {
+        let a = vec![
+            entry("weather", "0.1.4", "aa11"),
+            entry("pet", "0.0.9", "bb22"),
+        ];
+        let b = vec![
+            entry("pet", "0.0.9", "bb22"),
+            entry("weather", "0.1.4", "aa11"),
+        ];
+        assert!(channel_rows_match(&a, &b));
+        // Identical apart from one swapped version → differs.
+        let c = vec![
+            entry("pet", "0.0.9", "bb22"),
+            entry("weather", "0.1.5", "aa11"),
+        ];
+        assert!(!channel_rows_match(&a, &c));
+        // Row-count mismatch → differs even if one side is a subset.
+        assert!(!channel_rows_match(&a, &[entry("pet", "0.0.9", "bb22")]));
     }
 
     #[test]
