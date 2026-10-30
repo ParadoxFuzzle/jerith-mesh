@@ -216,6 +216,14 @@ enum PluginCmd {
         /// records the freshness the row was checked under.
         #[arg(long)]
         channel: Option<String>,
+        /// Freshness window ms for --channel installs (0 = the 24 h
+        /// default) — the same knob `plugin search` and `plugin channel
+        /// verify` take. An operator without the signing seed cannot
+        /// "maintain" an aging first-party index; widening the window
+        /// here is the honest out — the receipt records the window the
+        /// row was actually checked under.
+        #[arg(long, default_value_t = 0)]
+        max_age_ms: u64,
     },
     /// Verify a bundle end to end without installing anything.
     Verify {
@@ -2365,6 +2373,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             force,
             pubkey,
             channel,
+            max_age_ms,
             receipt_allow_broken,
         } => {
             // GATE first (docs/PLUGIN-CHANNEL.md): trust loading refuses
@@ -2386,7 +2395,12 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             if let Some(chsrc) = &channel {
                 let (json, csig) = fetch_channel_pair(chsrc).await?;
                 let anchor = resolve_channel_anchor(None)?;
-                let index = pc::verify_channel(&json, &csig, &anchor, 0)?;
+                let index = pc::verify_channel(&json, &csig, &anchor, max_age_ms)?;
+                let enforced = if max_age_ms == 0 {
+                    pc::DEFAULT_MAX_AGE_MS
+                } else {
+                    max_age_ms
+                };
                 anyhow::ensure!(
                     index
                         .bundles
@@ -2400,7 +2414,7 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                     source: chsrc.trim().to_string(),
                     generated_ms: index.generated_ms,
                     observed_age_ms: now.saturating_sub(index.generated_ms),
-                    max_age_ms: pc::DEFAULT_MAX_AGE_MS,
+                    max_age_ms: enforced,
                 });
             }
 

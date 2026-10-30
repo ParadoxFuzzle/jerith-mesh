@@ -1601,11 +1601,15 @@ jerith plugin trust rotate weather --new <64-hex>    # re-pin — zero trust-lag
   as-found (evidence, not truth). Scripted checks use
   `jerith plugin receipts --verdict` — one verdict line, exit 0 only
   when the chain stands (so a systemd check or shell can gate on it
-  without parsing entries). For
-  freshness-in-enforcement, `jerith plugin install <bundle> --channel
-  <url|dir>` requires the bundle to BE a row of the verified index
-  (artifact-digest match) — the install receipt then carries the
-  freshness it passed under.
+  without parsing entries). For   freshness-in-enforcement, `jerith plugin install <bundle> --channel
+   <url|dir>` requires the bundle to BE a row of the verified index
+   (artifact-digest match) — the install receipt then carries the
+   freshness it passed under. The window is the same operator knob the
+   other channel surfaces take (`--max-age-ms`, 0 = the 24 h default):
+   an operator cannot "maintain" a stale first-party index (only the
+   release signing seed rebuilds it), so installing from an aged pair
+   means widening the window explicitly — the receipt records the
+   window actually enforced, aged-but-verified never silently fresh.
 - Receipt gate (2026-10-28): the lane's trust-LOADING boundary —
   `jerith plugin install` — REFUSES to run while the receipt log
   shows a `CHAIN BROKEN` or `LOG TRUNCATED` verdict: the log is the
