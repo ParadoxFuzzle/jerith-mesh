@@ -2070,6 +2070,20 @@ fn bot_toml_gates(id: &str) -> anyhow::Result<bool> {
     parse_enabled_gate(&text, id)
 }
 
+/// Is the conventional plugin unit (`jerith-<id>-plugin`) actually
+/// active right now? `systemctl --user is-active` answers 0 only for
+/// active — unknown units, inactive ones and a missing systemctl (mac
+/// boxes) all read "not running", so the remove hint says so instead of
+/// commanding a stop that was already done.
+fn plugin_unit_active(id: &str) -> bool {
+    let unit = format!("jerith-{id}-plugin");
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", unit.as_str()])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 fn parse_enabled_gate(text: &str, id: &str) -> anyhow::Result<bool> {
     use toml_edit::DocumentMut;
     let gate = format!("external:{id}");
@@ -2119,6 +2133,26 @@ fn load_trusted_publishers() -> anyhow::Result<std::collections::BTreeMap<String
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     parse_trusted_publishers(&text)
         .with_context(|| format!("reading trust rows from {}", path.display()))
+}
+
+fn trust_pins_file_header(
+    bot: &std::collections::BTreeMap<String, String>,
+    pins: &std::collections::BTreeMap<String, String>,
+) -> &'static str {
+    if pins.is_empty() {
+        // Empty/absent file: no legacy rows exist to migrate at all —
+        // advertising rotation-migration here is already-done noise.
+        "empty — no legacy rows to migrate; rotate pins land only in \
+         bot.toml"
+    } else if pins
+        .iter()
+        .all(|(id, key)| bot.get(id).is_some_and(|k| k.eq_ignore_ascii_case(key)))
+    {
+        "legacy file — every row mirrored in bot.toml, nothing left for a \
+         rotate to migrate"
+    } else {
+        "legacy — a bot.toml row OVERRANKS it; a rotate migrates"
+    }
 }
 
 /// The trust-table parse, file-text → id → 64-hex-lowercase map.
@@ -2560,10 +2594,35 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                          installed bundles stay too)",
                         trash.display()
                     );
-                    println!(
-                        "next: remove the \"external:{id}\" row from [plugins].enabled \
-                         and stop any plugin unit"
-                    );
+                    // Same honesty rule as install's next steps: don't
+                    // command edits that are already done. The gate row
+                    // membership reads [plugins].enabled with the bot's
+                    // exact semantics; the unit probe asks systemd whether
+                    // the conventional plugin unit is ACTUALLY running.
+                    let gated = bot_toml_gates(&id).unwrap_or(false);
+                    if gated {
+                        println!(
+                            "next 1: remove the \"external:{id}\" row from \
+                             [plugins].enabled in {}",
+                            bot_toml_path().display()
+                        );
+                    } else {
+                        println!(
+                            "next 1: SKIPPED — no \"external:{id}\" row left \
+                             in [plugins].enabled"
+                        );
+                    }
+                    if plugin_unit_active(&id) {
+                        println!(
+                            "next 2: stop the running unit (systemctl --user stop \
+                             jerith-{id}-plugin)"
+                        );
+                    } else {
+                        println!(
+                            "next 2: SKIPPED — no jerith-{id}-plugin unit is \
+                             active (nothing to stop)"
+                        );
+                    }
                     jr::ReceiptEntry {
                         ts_ms: crate_now_ms(),
                         action: "remove".into(),
@@ -2591,6 +2650,24 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// One search row's honest outcome, from the row's version and the
+/// versions of that id already on disk: the printed tag plus whether
+/// the row is actually installable (its exact version missing — not
+/// merely "this id has something installed"). Test-separated from the
+/// async search loop.
+fn search_row_state(row_version: &str, installed: &[String]) -> (String, bool) {
+    // `installed` is sort-ascending (the bundle helper sorts), so the
+    // last entry is the latest.
+    let latest = installed.last();
+    let row_installed = installed.iter().any(|v| v == row_version);
+    let tail = match latest {
+        Some(l) if row_installed => format!("  · installed {l}"),
+        Some(l) => format!("  · {l} installed, this row ({row_version}) is not"),
+        None => String::new(),
+    };
+    (tail, !row_installed)
 }
 
 /// The channel pair from an https `channel.json` URL (the sig rides
@@ -2704,6 +2781,10 @@ async fn search_channel(
     let q = query.unwrap_or_default().trim().to_lowercase();
     use jerith_mesh_core::pluginreceipt as jr;
     let mut matched = 0usize;
+    // Rows whose exact version is already on disk: the honest basis
+    // for the footer's "install any row" advice — an already-full slate
+    // shouldn't command an install that is a no-op.
+    let mut installable = 0usize;
     for e in &index.bundles {
         let hay = format!(
             "{}\x1f{}\x1f{}/{}\x1f{}",
@@ -2714,24 +2795,33 @@ async fn search_channel(
             continue;
         }
         matched += 1;
-        let have = pb::latest_installed(&e.id).ok().flatten();
+        let installed = pb::installed_versions_under(&NodeConfig::home(), &e.id);
+        let (tail, installable_row) = search_row_state(&e.version, &installed);
+        if installable_row {
+            installable += 1;
+        }
         println!(
             "  {:<10} {:<8} {:<13} {}{}",
             e.id,
             e.version,
             format!("{}/{}", e.os, e.arch),
             e.url,
-            have.map(|v| format!("  · installed {v}"))
-                .unwrap_or_default(),
+            tail,
         );
     }
     if matched == 0 {
         println!("  (no rows matched {q:?})");
+    } else if installable == 0 {
+        println!(
+            "nothing to install — every matched row's exact version is already on disk \
+             (reinstalling means passing that row's url to 'jerith plugin install')"
+        );
+    } else {
+        println!(
+            "install any unmatched row: jerith plugin install <url>  (the full verify chain \
+             runs on the artifact regardless of the index)"
+        );
     }
-    println!(
-        "install any row: jerith plugin install <url>  (the full verify chain runs on the \
-         artifact regardless of the index)"
-    );
     jr::ReceiptEntry {
         ts_ms: crate_now_ms(),
         action: "channel-verify".into(),
@@ -2777,12 +2867,23 @@ async fn trust_cmd(cmd: TrustCmd) -> anyhow::Result<()> {
             for (id, key) in &bot {
                 println!("  {:<16} {}", id, publisher_thumb(key));
             }
+            // Same already-done honesty as the other next-step hints:
+            // when every pins row is mirrored into bot.toml, "a rotate
+            // migrates" is advice for work already done — say so instead.
+            let pin_header = match load_pins() {
+                Ok(pins) => trust_pins_file_header(&bot, &pins),
+                Err(_) => {
+                    "empty — no legacy rows to migrate; rotate pins land \
+                         only in bot.toml"
+                }
+            };
             println!(
-                "pins file {} (legacy — a bot.toml row OVERRANKS it; a rotate migrates):",
+                "pins file {} ({}):",
                 jerith_mesh_core::config::NodeConfig::home()
                     .join("keys")
                     .join("plugin-pins.json")
-                    .display()
+                    .display(),
+                pin_header
             );
             match load_pins() {
                 Ok(pins) if !pins.is_empty() => {
@@ -4557,5 +4658,73 @@ mod trust_tests {
     fn path_alias_is_borrowed() {
         fn accepts(_p: &Path) {}
         accepts(Path::new("."));
+    }
+
+    // Already-done honesty for the search/trust next-step hints:
+    // helpers feed PRINTFS, so their verdicts are pinned the way the
+    // CLI prints them.
+    #[test]
+    fn search_row_state_honors_the_rows_own_version() {
+        let have = |ins: &[&str], row: &str| {
+            let sorted: Vec<String> = ins.iter().map(|s| s.to_string()).collect();
+            // installed_versions_under sorts; the helper leans on it.
+            let mut s = sorted;
+            s.sort();
+            search_row_state(row, &s)
+        };
+        // Exact version on disk → satisfied row, NOT installable.
+        let (tail, installable) = have(&["0.1.3", "0.1.4"], "0.1.4");
+        assert!(!installable);
+        assert!(tail.contains("installed 0.1.4"), "{tail}");
+        // Upgrade row (latest on disk is OLDER) — must not read as
+        // satisfied; the tag names both sides honestly.
+        let (tail, installable) = have(&["0.1.3"], "0.1.4");
+        assert!(installable);
+        assert!(
+            tail.contains("0.1.3 installed") && tail.contains("this row (0.1.4) is not"),
+            "{tail}"
+        );
+        // Nothing installed at all → silent tag, installable.
+        let (tail, installable) = have(&[], "0.1.4");
+        assert!(installable);
+        assert!(tail.is_empty(), "{tail}");
+        // Downgrade-style row: newer already installed, row version
+        // missing — still installable, tag doesn't claim it's installed.
+        let (tail, installable) = have(&["0.2.0"], "0.1.3");
+        assert!(installable);
+        assert!(tail.contains("0.2.0 installed"), "{tail}");
+    }
+
+    #[test]
+    fn pins_header_says_rotate_migration_is_done_when_all_mirrored() {
+        let mut bot = std::collections::BTreeMap::new();
+        bot.insert("weather".into(), KEY_A.to_string());
+        let mut pins = std::collections::BTreeMap::new();
+        // Same key in a different case still counts as mirrored.
+        pins.insert("weather".into(), KEY_A.to_uppercase());
+        assert_eq!(
+            trust_pins_file_header(&bot, &pins),
+            "legacy file — every row mirrored in bot.toml, nothing left for a \
+             rotate to migrate"
+        );
+        // One unmirrored row → the migrate advice stays.
+        pins.insert("ledger".into(), KEY_B.to_string());
+        assert_eq!(
+            trust_pins_file_header(&bot, &pins),
+            "legacy — a bot.toml row OVERRANKS it; a rotate migrates"
+        );
+        // Empty/absent pins file → the nothing-to-migrate wording, and
+        // a dropped bot.toml row (pin gone) is NOT mirrored.
+        assert_eq!(
+            trust_pins_file_header(&bot, &std::collections::BTreeMap::new()),
+            "empty — no legacy rows to migrate; rotate pins land only in \
+             bot.toml"
+        );
+        let mut stale = std::collections::BTreeMap::new();
+        stale.insert("weather".into(), KEY_A.to_string());
+        assert_eq!(
+            trust_pins_file_header(&std::collections::BTreeMap::new(), &stale),
+            "legacy — a bot.toml row OVERRANKS it; a rotate migrates"
+        );
     }
 }
