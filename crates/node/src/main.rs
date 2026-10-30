@@ -1937,7 +1937,19 @@ fn setup_flow(a: SetupArgs) -> anyhow::Result<()> {
     }
 
     println!("\nDone. Config: {}", NodeConfig::config_path().display());
-    println!("\nNext: ./jerith run   (or set up wallets with `jerith config`)");
+    // Same running-service probe as the restore hint: a rerun of
+    // setup on a box whose node service is active must not read as
+    // `./jerith run` advice — that would start a second daemon into
+    // the live home instead of reloading the service it is under.
+    if unit_active("jerith-node") {
+        println!(
+            "\nNext: ./jerith run would start a SECOND node — the jerith-node service is \
+             ACTIVE; reload the new identity instead: systemctl --user restart jerith-node \
+             (wallets: `jerith config`)"
+        );
+    } else {
+        println!("\nNext: ./jerith run   (or set up wallets with `jerith config`)");
+    }
 
     Ok(())
 }
@@ -4672,7 +4684,17 @@ async fn model_cmd(new_model: Option<String>) -> anyhow::Result<()> {
             );
             cfg.set_model(mid);
             cfg.save()?;
-            println!("Saved. Restart `jerith run` to join the new model's mesh.");
+            // Same running-service probe as the restore hint: `jerith
+            // run` beside an ACTIVE jerith-node service is not a
+            // restart, it is a second daemon into a live home.
+            if unit_active("jerith-node") {
+                println!(
+                    "Saved. Restart the running node service to join the new model's mesh: \
+                     systemctl --user restart jerith-node"
+                );
+            } else {
+                println!("Saved. Restart `jerith run` to join the new model's mesh.");
+            }
         }
     }
     Ok(())
