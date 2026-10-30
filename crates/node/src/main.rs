@@ -2055,6 +2055,36 @@ fn resolve_pin(
     );
 }
 
+/// Does `[plugins].enabled` in bot.toml already gate `external:<id>`?
+/// The install "next 1" step is wrong advice when the row exists (an
+/// upgrade reinstall doesn't need it) — the two cases deserve different
+/// guidance. `Err`-silent: after staging, a next-step check must never
+/// fail the install (bot.toml was already parsed for the pin above).
+fn bot_toml_gates(id: &str) -> anyhow::Result<bool> {
+    let path = bot_toml_path();
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    parse_enabled_gate(&text, id)
+}
+
+fn parse_enabled_gate(text: &str, id: &str) -> anyhow::Result<bool> {
+    use toml_edit::DocumentMut;
+    let gate = format!("external:{id}");
+    let doc: DocumentMut = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("not a TOML document ({e})"))?;
+    let Some(enabled) = doc.get("plugins").and_then(|p| p.get("enabled")) else {
+        return Ok(false);
+    };
+    Ok(enabled
+        .as_array()
+        .map(|a| a.iter().any(|v| v.as_str() == Some(gate.as_str())))
+        .unwrap_or(false))
+}
+
 /// The operator bot.toml path — the trust table's home (docs/
 /// PLUGIN-CHANNEL.md key model). Same file `[plugins] enabled` lives
 /// in, so the pin list and the activation gate sit in one operator
@@ -2440,13 +2470,21 @@ async fn plugin_cmd(cmd: PluginCmd) -> anyhow::Result<()> {
                 staged.display()
             );
             println!();
-            println!(
-                "next 1: add \"external:{}\" to [plugins].enabled in {}",
-                meta.id,
-                jerith_mesh_core::config::NodeConfig::home()
-                    .join("bot.toml")
-                    .display()
-            );
+            let gated = bot_toml_gates(&meta.id).unwrap_or(false);
+            if gated {
+                println!(
+                    "next 1: SKIPPED — \"external:{}\" is already in [plugins].enabled in bot.toml",
+                    meta.id
+                );
+            } else {
+                println!(
+                    "next 1: add \"external:{}\" to [plugins].enabled in {}",
+                    meta.id,
+                    jerith_mesh_core::config::NodeConfig::home()
+                        .join("bot.toml")
+                        .display()
+                );
+            }
             println!(
                 "next 2: point the plugin unit at this binary:\n\n\
                  ExecStart = {vdir}/bin/{bin} {staged}\n",
@@ -4419,6 +4457,29 @@ mod trust_tests {
              \"weather\" = \"{}\"\n",
             KEY_A.to_uppercase()
         )
+    }
+
+    /// `[plugins].enabled` membership — the BOT's exact semantics
+    /// (serde rows, no trimming): a space-padded row is an operator
+    /// typo the bot itself would fail loud on, so the install guidance
+    /// must not pretend it satisfies the gate.
+    #[test]
+    fn enabled_gate_membership() {
+        let doc = comment_file();
+        assert!(!parse_enabled_gate(&doc, "weather").unwrap());
+        // In-tree plugins ride the enabled list as bare ids — the
+        // external: prefix is drop-only, so a bare id never matches.
+        assert!(!parse_enabled_gate(&doc, "websearch").unwrap());
+        assert!(!parse_enabled_gate(&doc, "memory").unwrap());
+        let doc2 = format!("[plugins]\nenabled = [\" external:weather \", \"websearch\"]\n");
+        assert!(!parse_enabled_gate(&doc2, "weather").unwrap());
+        let doc3 = "[plugins]\nenabled = [\"external:weatherx\"]\n";
+        assert!(!parse_enabled_gate(&doc3, "weather").unwrap());
+        assert!(!parse_enabled_gate("", "weather").unwrap());
+        assert!(
+            !parse_enabled_gate("[plugins]\nowner_only = [\"external:pet\"]\n", "pet").unwrap(),
+            "owner_only rows never satisfy the enabled gate"
+        );
     }
 
     fn temp_file(name: &str, text: &str) -> std::path::PathBuf {

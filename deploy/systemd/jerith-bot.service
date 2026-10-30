@@ -26,7 +26,7 @@ RestartSec=5
 # Optional overrides (defaults: gateway http://127.0.0.1:8900, chain http://127.0.0.1:8322):
 #Environment=JERITH_GATEWAY_URL=http://127.0.0.1:8900
 #Environment=JERITH_CHAIN_URL=http://127.0.0.1:8322
-#Environment=JERITH_TOKEN=/tmp/jn/keys/api.token
+#Environment=JERITH_TOKEN=replace-me  # chain api token; DEFAULT is ~/.jerith-mesh/keys/api.token (JERITH_TOKEN_FILE overrides)
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true

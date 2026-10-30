@@ -107,10 +107,30 @@ impl SigningIdentity {
 
     /// Fresh random keypair.
     pub fn generate() -> Self {
-        let secret: [u8; 32] = rand::random();
-        Self {
-            signing: SigningKey::from_bytes(&secret),
+        // SNI-safe regeneration: quinn dials with the node_id as SNI and
+        // rustls rejects a BARE ALL-NUMERIC label as "not a valid DNS
+        // name" — an all-digit 16-hex fingerprint (≈1/2200 of identities)
+        // would be permanently un-dialable, so regenerate it at birth
+        // (the loop is expected to run exactly once; see sni_safe).
+        loop {
+            let secret: [u8; 32] = rand::random();
+            let candidate = Self {
+                signing: SigningKey::from_bytes(&secret),
+            };
+            if Self::sni_safe(&candidate.node_id()) {
+                return candidate;
+            }
         }
+    }
+
+    /// Is this node_id dialable as QUIC SNI? `call` hands the node_id
+    /// straight to quinn → rustls, which refuses a bare all-numeric label
+    /// (probed 2026-10-30: "1234567890123456" → REJECT InvalidDnsNameError,
+    /// "1e715b6671b3c2de" → ACCEPT). Existing keys are touchable-free:
+    /// this gates NEW generation, and `call` surfaces a typed error for
+    /// remote ids that predate the rule.
+    pub fn sni_safe(node_id: &str) -> bool {
+        rustls::pki_types::ServerName::try_from(node_id.to_string()).is_ok()
     }
 
     pub fn secret_bytes(&self) -> [u8; 32] {
@@ -470,6 +490,24 @@ mod tests {
         let id = SigningIdentity::generate();
         assert_eq!(id.node_id(), id.pubkey_hex()[..16]);
         assert_eq!(id.pubkey_hex().len(), 64);
+    }
+
+    /// The probed rustls rule, pinned where the identity lives: a bare
+    /// all-numeric label is NOT a valid SNI target, so `generate()` must
+    /// never ship one (its regeneration loop now guarantees that).
+    #[test]
+    fn sni_safety_rules_and_generated_ids() {
+        assert!(!SigningIdentity::sni_safe("1234567890123456"));
+        assert!(SigningIdentity::sni_safe("0f0e0d0c0b0a0908"));
+        assert!(SigningIdentity::sni_safe("1e715b6671b3c2de"));
+        for _ in 0..200 {
+            let id = SigningIdentity::generate();
+            assert!(
+                SigningIdentity::sni_safe(&id.node_id()),
+                "generated identity {} is not SNI-safe",
+                id.node_id()
+            );
+        }
     }
 
     #[test]

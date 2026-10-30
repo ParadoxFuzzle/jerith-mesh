@@ -3105,6 +3105,15 @@ pub async fn call(
     _identity: &SigningIdentity,
     timeout: Duration,
 ) -> anyhow::Result<NodeRpcReply> {
+    // Typed early rejection for the SNI-unsafe edge (signing.rs::sni_safe):
+    // an all-digit node_id is refused by rustls at connect — say so before
+    // quinn produces the cryptic "connect failed: invalid dns name".
+    anyhow::ensure!(
+        SigningIdentity::sni_safe(server_node_id),
+        "node_id {server_node_id} cannot ride SNI (bare all-numeric label — rustls \
+         rejects it): that peer's identity predates generation-time regeneration \
+         and cannot be dialed from this wire"
+    );
     let connecting = endpoint
         .connect(addr, server_node_id)
         .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;

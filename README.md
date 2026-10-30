@@ -107,6 +107,7 @@ scripts/dev-e2e.sh
 | Tensor transport: on-disk expert weights served over QUIC (on-demand LRU hot set, real SwiGLU forward, honest refusal for unhosted experts, peers advertise what they hold) | ✅ Phase 2 |
 | Expert replication + sharding: measured demand (`expert_stats`) drives hot-expert replica fetches (chunked, checksum-validated weight transfer) and a rendezvous ring gives cold experts exactly one owner | ✅ Phase 2 |
 | Discord bot + plugin/skill SDK (OpenClaw-style registry, bot.toml `[plugins]` gating; first-class `memory.*`/`lore.*` + web tools; six external-process drops live: template example, pet, house, quarantine, ledger, weather — the last one PUBLIC) | ✅ Phase 3 core |
+| Signed plugin channel: `.jbundle` install chain, per-box receipt audit log, fail-closed receipt gates (CLI install + bot restart), hourly systemd verdict check | ✅ 0.1.4 |
 
 ### Setup flow
 
