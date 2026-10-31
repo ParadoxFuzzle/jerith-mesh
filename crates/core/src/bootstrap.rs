@@ -69,6 +69,19 @@ pub struct PeerAd {
     /// `advertise_payload` — rolling upgrades stay wire-compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_reputations: Option<Vec<crate::signing::ReputationStamp>>,
+    /// Model ids this node VOLUNTARILY shares with the mesh (`[sharing]
+    /// models`), sorted. Empty/absent = shares nothing — the default, and
+    /// the safe reading for every pre-sharing ad. A model appears here
+    /// only after the operator switched it ON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_models: Vec<String>,
+    /// Union of the shared models' detected capabilities ("text",
+    /// "vision", "video", "embedding", "image_gen"), canonical order.
+    /// Derived from `shared_models` at advertise time; absent when nothing
+    /// is shared. Lets a node without vision/video/embedding see who has
+    /// it instead of answering blind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_capabilities: Vec<String>,
 }
 
 /// Cap on stamps carried per ad — bounded like every gossip payload.
@@ -118,6 +131,12 @@ impl PeerAd {
             Some(list) => list.iter().any(|e| e == expert_id),
             None => false,
         }
+    }
+
+    /// Does this peer publish `capability` (e.g. "vision")? Only models
+    /// the peer's operator explicitly shared contribute labels.
+    pub fn shares_capability(&self, capability: &str) -> bool {
+        self.shared_capabilities.iter().any(|c| c == capability)
     }
 
     /// Build the advertisement fields from a node's hosted expert ids
@@ -743,6 +762,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         }
     }
@@ -804,6 +825,42 @@ mod tests {
         // And a peer with no hosting fields serializes without them.
         let out = serde_json::to_value(ad("n", "m", "int4")).unwrap();
         assert!(out.get("hosted_experts").is_none());
+    }
+
+    /// Voluntary sharing rides the same ad without breaking old peers: an
+    /// ad with no sharing fields parses as "shares nothing" (the safe
+    /// direction) and a non-sharing ad serializes without the fields.
+    #[test]
+    fn shared_model_fields_are_wire_compatible_and_opt_in() {
+        let out = serde_json::to_value(ad("n", "m", "int4")).unwrap();
+        assert!(
+            out.get("shared_models").is_none(),
+            "nothing shared, nothing sent"
+        );
+        assert!(out.get("shared_capabilities").is_none());
+
+        let legacy: PeerAd = serde_json::from_str(
+            r#"{"node_id":"a","address":"127.0.0.1:1","model_id":"m","quant":"int4","contribution_percent":25,"last_seen_ms":1,"role":"hybrid","rpc_address":""}"#,
+        )
+        .expect("legacy ad parses");
+        assert!(legacy.shared_models.is_empty());
+        assert!(legacy.shared_capabilities.is_empty());
+        assert!(!legacy.shares_capability("vision"), "absence is opt-out");
+
+        let mut sharing = ad("eye", "m", "int4");
+        let offer = crate::modelshare::SharingConfig {
+            models: vec!["minicpm-v4.6:1b".into(), "nomic-embed-text".into()],
+        }
+        .offer();
+        sharing.shared_models = offer.models;
+        sharing.shared_capabilities = offer.capabilities;
+        assert!(sharing.shares_capability("vision"));
+        assert!(sharing.shares_capability("video"));
+        assert!(sharing.shares_capability("embedding"));
+        assert!(!sharing.shares_capability("image_gen"));
+        let round: PeerAd =
+            serde_json::from_str(&serde_json::to_string(&sharing).unwrap()).unwrap();
+        assert_eq!(round.shared_capabilities, sharing.shared_capabilities);
     }
 
     #[test]

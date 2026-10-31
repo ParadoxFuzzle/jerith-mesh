@@ -1,19 +1,24 @@
-//! Minimal web UI: single-file status page served at the gateway port.
+//! Node dashboard: single-file status + settings page at the gateway port.
 //!
-//! Phase 0 scope: live status cards (model, contribution %, peers, meters).
-//! Phase 2/3 scope: the dashboard adds earnings (mining + chain view),
-//! expert hit-rate (LRU cache + measured activations) and per-model
-//! latency views — all fed from the node's own /status and /v1/metrics,
-//! same-origin only.
+//! Live views (all fed same-origin from the node's own endpoints):
+//! `/status` (node/mesh/chain/guard/experts), `/v1/metrics` (latency,
+//! trends, per-peer + per-model drills), `/v1/skills/memory/stats`
+//! (memory store) and `/v1/models` (runtime catalog). The settings panel
+//! reads `GET /v1/config` and writes `POST /v1/config`; only the
+//! hot-reloadable knobs ride that surface (identity/ports/model/DSN stay
+//! CLI-only — see `dashconfig.rs`).
 //!
 //! Hardening: the page is served with a strict security-header set —
 //! `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
 //! `Referrer-Policy: no-referrer`, and a CSP that pins the inline
 //! `<script>`/`<style>` blocks by their sha256 digests (no
 //! `'unsafe-inline'`), locks `frame-ancestors` to 'none' (clickjacking),
-//! and drops `base-uri`/`form-action`/`object-src` to nothing. The
-//! digests are computed from `PAGE` itself at first request, so page
-//! edits re-pin automatically instead of roting into a mismatch.
+//! and drops `base-uri`/`form-action`/`object-src` to nothing. Hash
+//! sources MUST be single-quoted (`script-src 'sha256-…'`) — unquoted
+//! ones are invalid CSP and are silently ignored, which blocks the whole
+//! inline script (live 2026-10-31: every card stuck at "—"). The digests
+//! are computed from `PAGE` itself at first request, so page edits re-pin
+//! automatically instead of rotting into a mismatch.
 
 use axum::Router;
 use axum::extract::State;
@@ -67,7 +72,8 @@ fn b64(data: &[u8]) -> String {
     out
 }
 
-/// `"sha256-<digest>"` for one inline block.
+/// `sha256-<digest>` for one inline block (unquoted; `build_csp` adds the
+/// single quotes the CSP grammar requires around a hash-source).
 pub(crate) fn hash_source(block: &str) -> String {
     let digest = Sha256::digest(block.as_bytes());
     format!("sha256-{}", b64(&digest))
@@ -80,11 +86,13 @@ pub(crate) fn hash_source(block: &str) -> String {
 /// discipline, one place.
 pub(crate) fn build_csp(page: &str) -> String {
     let script = match inline_block(page, "script") {
-        Some(s) => hash_source(&s),
+        // QUOTES ARE LOAD-BEARING: an unquoted `sha256-…` source is
+        // invalid, browsers ignore it, and the inline script never runs.
+        Some(s) => format!("'{}'", hash_source(&s)),
         None => "'unsafe-inline'".to_string(),
     };
     let style = match inline_block(page, "style") {
-        Some(s) => hash_source(&s),
+        Some(s) => format!("'{}'", hash_source(&s)),
         None => "'unsafe-inline'".to_string(),
     };
     format!(
@@ -117,119 +125,255 @@ async fn index(State(_gw): State<std::sync::Arc<MeshState>>) -> impl IntoRespons
     )
 }
 
-const PAGE: &str = r#"<!doctype html>
+const PAGE: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>jerith-mesh node</title>
 <style>
   :root { color-scheme: dark; }
-  body { font-family: ui-monospace, monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 2rem; }
-  h1 { color: #58a6ff; font-weight: 500; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; max-width: 900px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; }
-  .card h2 { margin: 0 0 .5rem; font-size: .8rem; text-transform: uppercase; color: #8b949e; letter-spacing: .08em; }
-  .card p { margin: 0; font-size: 1.6rem; }
-  .fine { color: #8b949e; font-size: .8rem; margin-top: 6px; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 1.6rem 2rem 3rem; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .75rem 1rem; margin-bottom: 1.2rem; }
+  h1 { color: #58a6ff; font-weight: 600; font-size: 1.45rem; margin: 0; letter-spacing: .01em; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+  .badge { border: 1px solid #30363d; border-radius: 999px; padding: .15rem .55rem; font-size: .72rem; color: #8b949e; background: #161b22; }
+  .badge.ok { color: #3fb950; border-color: #238636; }
+  .badge.err { color: #f85149; border-color: #da3633; }
+  .muted { color: #8b949e; font-size: .78rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1rem; max-width: 1180px; }
+  .section { grid-column: 1 / -1; margin: 1.1rem 0 -.35rem; font-size: .72rem; text-transform: uppercase; letter-spacing: .12em; color: #8b949e; font-weight: 500; border-bottom: 1px solid #21262d; padding-bottom: .4rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem 1.05rem; min-width: 0; }
+  .card h2 { margin: 0 0 .55rem; font-size: .74rem; text-transform: uppercase; color: #8b949e; letter-spacing: .08em; font-weight: 500; }
+  .card p { margin: 0; font-size: 1.45rem; line-height: 1.2; overflow-wrap: anywhere; }
+  .p-sm { font-size: .82rem !important; line-height: 1.45 !important; }
+  .fine { color: #8b949e; font-size: .76rem; margin-top: 6px; line-height: 1.45; overflow-wrap: anywhere; }
   .card details { margin-top: .6rem; }
-  .card summary { cursor: pointer; color: #8b949e; font-size: .8rem; }
+  .card summary { cursor: pointer; color: #8b949e; font-size: .76rem; }
   .card summary:hover, .card details[open] summary { color: #58a6ff; }
-  .card table { width: 100%; border-collapse: collapse; font-size: .78rem; margin-top: .45rem; }
+  .card table { width: 100%; border-collapse: collapse; font-size: .74rem; margin-top: .45rem; overflow-x: auto; }
   .card th { text-align: left; color: #8b949e; font-weight: 500; padding: 2px 8px 3px 0; border-bottom: 1px solid #30363d; }
   .card td { padding: 3px 8px 3px 0; border-bottom: 1px dotted #21262d; white-space: nowrap; }
-  footer { margin-top: 2rem; color: #8b949e; font-size: .8rem; }
+  .wide { grid-column: 1 / -1; }
+  .setgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .7rem 1.1rem; }
+  .setrow { display: flex; flex-direction: column; gap: .25rem; font-size: .78rem; color: #c9d1d9; }
+  .setrow small { color: #8b949e; font-size: .7rem; line-height: 1.35; }
+  .setrow input, .setrow select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: .38rem .5rem; font: inherit; font-size: .78rem; width: 100%; }
+  .setrow input:focus, .setrow select:focus { outline: none; border-color: #58a6ff; }
+  .sharelist { display: flex; flex-direction: column; gap: .1rem; margin-top: .7rem; }
+  .shrow { display: flex; align-items: center; gap: .6rem; font-size: .78rem; padding: .3rem .1rem; border-bottom: 1px dotted #21262d; cursor: pointer; }
+  .shrow:hover { color: #58a6ff; }
+  .shrow input { accent-color: #2ea043; }
+  .shid { overflow-wrap: anywhere; }
+  .chips { display: flex; flex-wrap: wrap; gap: .25rem; margin-left: auto; }
+  .chip { border: 1px solid #30363d; border-radius: 999px; padding: .05rem .45rem; font-size: .68rem; color: #8b949e; }
+  .chip.vision { color: #58a6ff; border-color: #1f6feb; }
+  .chip.video { color: #d2a8ff; border-color: #8957e5; }
+  .chip.embedding { color: #3fb950; border-color: #238636; }
+  .chip.image_gen { color: #f0883e; border-color: #bd561d; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: .9rem; }
+  .btn { background: #238636; border: 1px solid #2ea043; color: #fff; border-radius: 6px; padding: .4rem .9rem; font: inherit; font-size: .78rem; cursor: pointer; }
+  .btn:hover { background: #2ea043; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.ghost { background: transparent; border-color: #30363d; color: #c9d1d9; }
+  .btn.ghost:hover { border-color: #58a6ff; color: #58a6ff; }
+  footer { margin-top: 2rem; color: #8b949e; font-size: .78rem; line-height: 1.6; }
+  .lnk { color: #58a6ff; text-decoration: none; }
+  .lnk:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
-<h1>🦜 jerith-mesh node</h1>
+<header>
+  <h1>🦜 jerith-mesh</h1>
+  <div class="meta">
+    <span id="nodebadge" class="badge">node —</span>
+    <span id="conn" class="badge">connecting…</span>
+    <span id="stamp" class="muted">—</span>
+  </div>
+</header>
 <div class="grid">
-  <div class="card"><h2>Model</h2><p id="model">—</p><div class="fine">quantization shown under the name</div></div>
-  <div class="card"><h2>Contribution</h2><p id="contrib">—%</p><div class="fine">minimum 25% required</div></div>
-  <div class="card"><h2>Peers alive</h2><p id="peers">—</p><div class="fine">same-model nodes only</div></div>
-  <div class="card"><h2>Role</h2><p id="role">—</p><div class="fine">contributor / requester / hybrid</div></div>
-  <div class="card"><h2>Tokens served</h2><p id="tokens">—</p><div class="fine">for the mesh, this window</div></div>
-  <div class="card"><h2>Expert activations</h2><p id="acts">—</p><div class="fine">loads served to peers</div></div>
+
+  <h2 class="section">Node</h2>
+  <div class="card"><h2>Model</h2><p id="model">—</p><div class="fine" id="modelfine">quantization · role</div></div>
+  <div class="card"><h2>Contribution</h2><p id="contrib">—%</p><div class="fine" id="contribfine">minimum 25% required</div></div>
+  <div class="card"><h2>Uptime</h2><p id="uptime">—</p><div class="fine" id="uptimefine">this process</div></div>
+  <div class="card"><h2>Runtime</h2><p id="runtime" class="p-sm">—</p><div class="fine" id="runtimefine">local OpenAI-compatible server</div></div>
+
+  <h2 class="section">Mesh</h2>
+  <div class="card"><h2>Peers alive</h2><p id="peers">—</p><div class="fine" id="peersfine">same-model nodes only</div></div>
+  <div class="card"><h2>Tokens served</h2><p id="tokens">—</p><div class="fine" id="tokensfine">for the mesh, this process</div></div>
+  <div class="card"><h2>Trend (5-min buckets)</h2><p id="trend">—</p><div class="fine" id="trendfine">per-bucket load, oldest → newest</div></div>
+  <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
+  <div class="card"><h2>Mesh peers served</h2><p id="peerlist" class="p-sm">—</p><div class="fine" id="peerfine">per-peer latency breakdown</div></div>
+  <div class="card"><h2>Per-model latency</h2><p id="mcount">—</p><div class="fine" id="mcountfine">models in this metering window</div><details><summary>drill-down: per-model rows</summary><table id="mtable"></table><div class="fine" id="mtablefine">fastest mean first · req, ok%, mean/max ms, mesh %, tokens</div></details></div>
+
+  <h2 class="section">Memory &amp; models</h2>
+  <div class="card"><h2>Memory entries</h2><p id="memcount">—</p><div class="fine" id="memfine">node-private store</div></div>
+  <div class="card"><h2>Runtime models</h2><p id="models">—</p><div class="fine" id="modelsfine">catalog served by the runtime</div></div>
+  <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
+  <div class="card"><h2>Expert activations</h2><p id="acts">—</p><div class="fine" id="actsfine">loads served to peers</div></div>
+
+  <h2 class="section">Earnings &amp; trust</h2>
+  <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div><details><summary>drill-down: earnings lines</summary><table id="wtable"></table><div class="fine" id="wtablefine">window, mining, wallet, chain</div></details></div>
+  <div class="card"><h2>Stake gate</h2><p id="stake">—</p><div class="fine" id="stakefine">escrow · slash events</div></div>
   <div class="card"><h2>Phase 4 verification</h2><p id="ccommit">—</p><div class="fine" id="ccommitfine">commitment checks</div></div>
   <div class="card"><h2>Jerith Guard</h2><p id="guard">—</p><div class="fine" id="guardfine">outbound screens</div></div>
   <div class="card"><h2>Sybil fence</h2><p id="sybil">—</p><div class="fine" id="sybilfine">zero-weight slash attempts (§10)</div></div>
-  <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div><details><summary>drill-down: earnings lines</summary><table id="wtable"></table><div class="fine" id="wtablefine">window, mining, wallet, chain</div></details></div>
-  <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
-  <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
-  <div class="card"><h2>Trend (5-min buckets)</h2><p id="trend">—</p><div class="fine" id="trendfine">per-bucket load, oldest → newest</div></div>
-  <div class="card"><h2>Mesh peers served</h2><p id="peerlist" style="font-size:.9rem">—</p><div class="fine" id="peerfine">per-peer latency breakdown</div></div>
-  <div class="card"><h2>Pipeline routes</h2><p id="pipeline">—</p><div class="fine" id="pipelinefine">multi-hop walks</div></div>
-  <div class="card"><h2>Per-model latency</h2><p id="mcount">—</p><div class="fine" id="mcountfine">models in this metering window</div><details><summary>drill-down: per-model rows</summary><table id="mtable"></table><div class="fine" id="mtablefine">fastest mean first · req, ok%, mean/max ms, mesh %, tokens</div></details></div>
+
+  <h2 class="section">Model sharing</h2>
+  <div class="card wide">
+    <h2>Share local models with the mesh</h2>
+    <div class="fine" id="sharestatus">loading…</div>
+    <div class="sharelist" id="sharelist"></div>
+    <div class="actions">
+      <button class="btn" id="sharesave" type="button">Save sharing</button>
+      <button class="btn ghost" id="sharerefresh" type="button">Refresh</button>
+    </div>
+    <div class="fine" id="sharereadout">opt-in: every model is opted out until you tick it and save</div>
+  </div>
+  <div class="card wide">
+    <h2>Mesh capability providers</h2>
+    <p id="meshcaps" class="p-sm">—</p>
+    <div class="fine" id="meshcapfine">alive peers publishing shared models · vision, video, embedding, text, image_gen</div>
+  </div>
+
+  <h2 class="section">Settings</h2>
+  <div class="card wide">
+    <h2>Node settings</h2>
+    <div class="fine" id="setstatus">loading…</div>
+    <div class="setgrid" id="settings"></div>
+    <div class="actions">
+      <button class="btn" id="save" type="button">Save settings</button>
+      <button class="btn ghost" id="reload" type="button">Reload</button>
+    </div>
+    <div class="fine" id="readout"></div>
+  </div>
+
 </div>
 <footer>
   jerith-mesh · a P2P compute mesh for MoE models ·
-  <a href="/status" style="color:#58a6ff">raw JSON</a> ·
-  <a href="/health" style="color:#58a6ff">health</a> ·
-  <a href="/v1/models" style="color:#58a6ff">OpenAI API</a>
+  <a class="lnk" href="/status">raw JSON</a> ·
+  <a class="lnk" href="/v1/metrics">metrics JSON</a> ·
+  <a class="lnk" href="/health">health</a> ·
+  <a class="lnk" href="/v1/models">OpenAI API</a>
 </footer>
 <script>
+const $ = (id) => document.getElementById(id);
+const set = (id, value) => { const el = $(id); if (el) el.textContent = value; };
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString());
+function uptime(sec) {
+  if (sec == null) return '—';
+  const s = Math.max(0, Math.floor(sec));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
+        m = Math.floor((s % 3600) / 60);
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  return m + 'm ' + (s % 60) + 's';
+}
+
 async function refresh() {
   try {
-    const [r, mr] = await Promise.all([
+    const [r, mr, memr, mdl] = await Promise.all([
       fetch('/status'),
       fetch('/v1/metrics').catch(() => null),
+      fetch('/v1/skills/memory/stats').catch(() => null),
+      fetch('/v1/models').catch(() => null),
     ]);
+    if (!r.ok) throw new Error('status ' + r.status);
     const j = await r.json();
     const mj = mr && mr.ok ? await mr.json() : null;
-    document.getElementById('model').textContent = j.model || 'not set';
-    document.getElementById('contrib').textContent = (j.contribution_percent ?? '—') + '%';
-    document.getElementById('peers').textContent = j.peers_alive ?? '—';
-    document.getElementById('role').textContent = j.role || '—';
-    document.getElementById('tokens').textContent = j.meters?.tokens_served ?? '—';
-    document.getElementById('acts').textContent = j.meters?.expert_activations ?? '—';
-    // Phase 4 verification widget.
+    const mem = memr && memr.ok ? await memr.json() : null;
+    const catalog = mdl && mdl.ok ? await mdl.json() : null;
+
+    $('conn').className = 'badge ok';
+    $('conn').textContent = 'live';
+    set('stamp', 'updated ' + new Date().toLocaleTimeString());
+    set('nodebadge', 'node ' + (j.node_id || '?').slice(0, 16));
+
+    set('model', j.model || 'not set');
+    set('modelfine', (j.quant || '—') + ' · ' + (j.role || '—'));
+    set('contrib', (j.contribution_percent ?? '—') + '%');
+    set('contribfine', `measured share this tick · role ${j.role || '—'}`);
+    set('uptime', uptime(j.meters?.uptime_seconds));
+    set('uptimefine', `${fmt(j.meters?.tokens_served)} tokens served · ${fmt(j.meters?.expert_activations)} expert loads`);
+    set('runtime', j.runtime_url || '—');
+    set('runtimefine', `max tokens ${j.runtime_num_predict ?? 'uncapped'} · ${j.peers_alive ?? 0} peer(s) alive`);
+
+    set('peers', j.peers_alive ?? '—');
+    set('peersfine', `${j.peer_count ?? 0} known · same-model only`);
+    set('tokens', fmt(j.meters?.tokens_served));
+    set('tokensfine', `${fmt(j.meters?.tokens_consumed)} consumed · ${fmt(j.meters?.bytes_relayed)} bytes relayed`);
+    set('acts', fmt(j.meters?.expert_activations));
+    set('actsfine', `token bytes consumed ${fmt(j.meters?.tokens_consumed)}`);
+
+    set('memcount', mem ? fmt(mem.count) : (j.memory_store ? '0' : 'off'));
+    const dims = (mem && Array.isArray(mem.dims) && mem.dims.length)
+      ? ' · dims ' + mem.dims.map((d) => d[0] + '×' + fmt(d[1])).join(', ')
+      : '';
+    set('memfine', (j.memory_store || 'no memory store') + dims);
+    if (mdl === null || !catalog) {
+      set('models', '—');
+      set('modelsfine', 'runtime catalog unavailable');
+    } else {
+      const n = (catalog.data || []).length;
+      set('models', fmt(n));
+      set('modelsfine', `base ${j.model || '—'} · ${j.runtime_url || ''}`);
+    }
+
+    set('stake', j.stake?.gate_clear ? 'clear' : 'locked');
+    set('stakefine', `${fmt(j.stake?.staked_uj)} / ${fmt(j.stake?.required_uj)} µJER · slash events ${j.stake?.slash_events ?? 0} · refusals ${j.stake?.gate_refusals ?? 0}`);
+
     const v = j.verify ?? {};
-    document.getElementById('ccommit').textContent = v.commitment_checks ?? '—';
-    document.getElementById('ccommitfine').textContent =
-      `commitment checks · failures ${v.commitment_failures ?? 0}` +
-      ` · replays ${v.replay_matches ?? 0}/${v.replays_dispatched ?? 0}` +
-      ` · fraud reports ${v.fraud_reports_flushed ?? 0}`;
-    // Jerith Guard widget (null = disabled in config).
+    set('ccommit', fmt(v.commitment_checks));
+    set('ccommitfine',
+      `failures ${v.commitment_failures ?? 0} · replays ${v.replay_matches ?? 0}/${v.replays_dispatched ?? 0}` +
+      ` · fraud reports ${v.fraud_reports_flushed ?? 0}`);
+
     const g = j.guard;
-    document.getElementById('guard').textContent = g ? (g.screens ?? '—') : 'off';
-    document.getElementById('guardfine').textContent = g
-      ? `outbound screens · blocked ${g.requests_blocked ?? 0} · redacted ${g.values_redacted ?? 0} · logged ${g.detections_logged ?? 0}`
-      : 'guard disabled in config.toml ([guard] enabled = false)';
-    // Phase 2 modernity: expert hit-rate (LRU cache hit ratio + measured
-    // demand from /status.experts; "off" when no expert store lives here).
+    set('guard', g ? fmt(g.screens) : 'off');
+    set('guardfine', g
+      ? `blocked ${g.requests_blocked ?? 0} · redacted ${g.values_redacted ?? 0} · logged ${g.detections_logged ?? 0}`
+      : 'guard disabled in config.toml ([guard] enabled = false)');
+
+    const bs = j.bootstrap;
+    if (bs && bs.reachable) {
+      set('sybil', bs.young_fraud_reports ?? 0);
+      set('sybilfine', `zero-weight slash attempts · bootstrap ${bs.url ?? '—'}`);
+    } else if (bs) {
+      set('sybil', '—');
+      set('sybilfine', `bootstrap probe failed (${bs.error ?? 'status ' + (bs.status ?? '—')})`);
+    } else {
+      set('sybil', 'off');
+      set('sybilfine', 'no bootstrap URL configured');
+    }
+
     const ex = j.experts;
     if (ex && (ex.hits ?? 0) + (ex.misses ?? 0) > 0) {
       const hr = Math.round(100 * ex.hits / (ex.hits + ex.misses));
-      document.getElementById('hit').textContent = hr + '%';
-      document.getElementById('hitfine').textContent =
-        `cache hits/misses ${ex.hits}/${ex.misses} · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts · hot ${Array.isArray(ex.hot) ? ex.hot.length : '?'} / cold ${ex.cold ?? '?'} · prefetch ${ex.prefetches ?? 0}`;
+      set('hit', hr + '%');
+      set('hitfine', `hits/misses ${ex.hits}/${ex.misses} · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts · hot ${Array.isArray(ex.hot) ? ex.hot.length : '?'} / cold ${ex.cold ?? '?'} · prefetch ${ex.prefetches ?? 0}`);
     } else if (ex) {
-      document.getElementById('hit').textContent = '—';
-      document.getElementById('hitfine').textContent =
-        `no loads yet · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts`;
+      set('hit', '—');
+      set('hitfine', `no loads yet · ${ex.activations_total ?? 0} activations on ${ex.activations_distinct ?? 0} experts`);
     } else {
-      document.getElementById('hit').textContent = 'off';
-      document.getElementById('hitfine').textContent = 'no expert store on this node';
+      set('hit', 'off');
+      set('hitfine', 'no expert store on this node');
     }
-    // Phase 2/3 dashboard view: latency from /v1/metrics (busiest model
-    // headline; per-model detail rides the fine line pattern).
+
     const models = Object.entries((mj && mj.models) || {});
     if (models.length) {
       const busiest = models.reduce((a, b) => ((b[1].requests ?? 0) >= (a[1].requests ?? 0) ? b : a));
       const st = busiest[1];
-      document.getElementById('latency').textContent =
-        st.latency_ms_mean != null && st.requests ? st.latency_ms_mean + ' ms' : '—';
-      document.getElementById('latencyfine').textContent =
-        `${busiest[0]} · p-max ${st.latency_ms_max ?? '—'} ms · ok ${st.ok_percent ?? '—'}% · mesh ${st.mesh_served ?? 0}/${st.requests ?? 0}`;
+      set('latency', st.latency_ms_mean != null && st.requests ? st.latency_ms_mean + ' ms' : '—');
+      set('latencyfine', `${busiest[0]} · max ${st.latency_ms_max ?? '—'} ms · ok ${st.ok_percent ?? '—'}% · mesh ${st.mesh_served ?? 0}/${st.requests ?? 0}`);
     } else {
-      document.getElementById('latency').textContent = '—';
-      document.getElementById('latencyfine').textContent =
-        'no completions in the window yet';
+      set('latency', '—');
+      set('latencyfine', 'no completions in the window yet');
     }
-    // Drill-down: per-model rows, fastest mean first. Model names ride
-    // the (unauthenticated, loopback) API surface as request-supplied
-    // strings, so every cell goes through the text escaper.
-    const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
-      ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+
     const mrows = Object.entries((mj && mj.models) || {}).map(([name, s]) => ({
       name,
       req: s.requests ?? 0,
@@ -239,11 +383,10 @@ async function refresh() {
       mesh: s.requests ? Math.round(100 * (s.mesh_served ?? 0) / s.requests) : 0,
       tok: s.total_tokens ?? 0,
     }));
-    document.getElementById('mcount').textContent = mrows.length || '—';
-    document.getElementById('mcountfine').textContent =
-      (mrows.length
-        ? `requests ${mj.requests_total ?? '—'} · window open ${mj.window_started_ms ? new Date(mj.window_started_ms).toLocaleString() : '—'}`
-        : 'no completions in the window yet');
+    set('mcount', mrows.length || '—');
+    set('mcountfine', mrows.length
+      ? `requests ${fmt(mj.requests_total)} · window open ${mj.window_started_ms ? new Date(mj.window_started_ms).toLocaleString() : '—'}`
+      : 'no completions in the window yet');
     if (mrows.length) {
       mrows.sort((a, b) => (a.mean ?? Infinity) - (b.mean ?? Infinity));
       document.getElementById('mtable').innerHTML =
@@ -251,15 +394,12 @@ async function refresh() {
         mrows.map((r) =>
           `<tr><td>${esc(r.name)}</td><td>${r.req}</td><td>${r.okp ?? '—'}</td><td>${r.mean ?? '—'}</td><td>${r.max}</td><td>${r.mesh}%</td><td>${r.tok}</td></tr>`
         ).join('');
-      document.getElementById('mtablefine').textContent =
-        'fastest mean first · mesh % = completions served by peers';
+      set('mtablefine', 'fastest mean first · mesh % = completions served by peers');
     } else {
       document.getElementById('mtable').textContent = '';
-      document.getElementById('mtablefine').textContent = 'no per-model rows yet';
+      set('mtablefine', 'no per-model rows yet');
     }
-    // Ops observability: 5-minute trend buckets (bounded ring on the
-    // node) rendered as a text sparkline, plus the per-peer latency
-    // breakdown of who actually served the mesh chat for us.
+
     if (mj && Array.isArray(mj.history) && mj.history.length) {
       const hist = mj.history;
       const counts = hist.map((b) => b.requests ?? 0);
@@ -269,84 +409,49 @@ async function refresh() {
         counts.map((c, i) => {
           const h = Math.round(30 * c / top) + 1;
           return '<rect x="' + i * 1.55 + '" y="' + (32 - h) + '" width="1.4" height="' + h +
-            " fill='#58a6ff'></rect>";
+            ' fill="#58a6ff"></rect>';
         }).join('') + '</svg>';
-      const lastH = hist.slice(-12); // last hour
+      const lastH = hist.slice(-12);
       const req = lastH.reduce((s, b) => s + (b.requests ?? 0), 0);
       const lat = lastH.reduce((s, b) => s + (b.latency_ms_total ?? 0), 0);
       const mesh = lastH.reduce((s, b) => s + (b.mesh_served ?? 0), 0);
-      document.getElementById('trendfine').textContent =
-        `last hour: ${req} requests · mean ${req ? Math.round(lat / req) : '—'} ms` +
-        ` · mesh-served ${mesh}/${req} · buckets ${hist.length}, 5 min each`;
+      set('trendfine', `last hour: ${req} requests · mean ${req ? Math.round(lat / req) : '—'} ms · mesh-served ${mesh}/${req} · buckets ${hist.length}, 5 min each`);
     } else {
-      document.getElementById('trend').textContent = '—';
-      document.getElementById('trendfine').textContent = 'no completions recorded yet';
+      set('trend', '—');
+      set('trendfine', 'no completions recorded yet');
     }
+
     if (mj && Array.isArray(mj.peers) && mj.peers.length) {
       const short = (id) => (id || '?').slice(0, 10);
-      document.getElementById('peerlist').textContent =
-        mj.peers.map((p) =>
-          `${short(p.peer)} ${p.requests}× ${p.requests ? p.latency_ms_mean ?? '—' : '—'}ms ${p.ok_percent ?? 0}%`
-        ).join(' · ');
-      document.getElementById('peerfine').textContent =
-        `${mj.peers.length} peer${mj.peers.length === 1 ? '' : 's'} this window · id, count, mean ms, ok%`;
+      set('peerlist', mj.peers.map((p) =>
+        `${short(p.peer)} ${p.requests}× ${p.requests ? p.latency_ms_mean ?? '—' : '—'}ms ${p.ok_percent ?? 0}%`
+      ).join(' · '));
+      set('peerfine', `${mj.peers.length} peer${mj.peers.length === 1 ? '' : 's'} this window · id, count, mean ms, ok%`);
     } else {
-      document.getElementById('peerlist').textContent = '—';
-      document.getElementById('peerfine').textContent =
-        'no mesh-peer completions yet (local runtime only)';
+      set('peerlist', '—');
+      set('peerfine', 'no mesh-peer completions yet (local runtime only)');
     }
-    // M3 pipeline routes: counters exist and are tested; the live
-    // producer rides the routing transport (pending the Colibri-side
-    // layer split), so until then the card reads "no route data yet".
+
     const pj = mj ? mj.pipeline || null : null;
-    document.getElementById('pipeline').textContent = pj ? (pj.routes_total ?? 0) : '—';
-    document.getElementById('pipelinefine').textContent = pj
-      ? `routes walked · over-budget hops ${pj.over_budget_hops ?? 0} · last walk ${pj.last_route_ms ?? 0} ms`
-      : 'no route data yet';
-    // §10 anti-sybil fence: OUR bootstrap's live zero-weight tally
-    // (/status.bootstrap mirror). "—" = probe failed; "off" = none.
-    const bs = j.bootstrap;
-    if (bs && bs.reachable) {
-      document.getElementById('sybil').textContent = bs.young_fraud_reports ?? 0;
-      document.getElementById('sybilfine').textContent =
-        `zero-weight slash attempts · bootstrap ${bs.url ?? '—'}`;
-    } else if (bs) {
-      document.getElementById('sybil').textContent = '—';
-      document.getElementById('sybilfine').textContent =
-        `bootstrap probe failed (${bs.error ?? 'status ' + (bs.status ?? '—')}) · zero-weight slashes unseen`;
-    } else {
-      document.getElementById('sybil').textContent = 'off';
-      document.getElementById('sybilfine').textContent = 'no bootstrap URL configured';
-    }
-    // Earnings view: chain-truthful JER balance when the wallet card is
-    // live (Phase 4); the local mines-won count stays the honest fallback
-    // whenever the chain RPC is down or this node isn't a JerithChain one.
+    // (pipeline counters have no producer yet; the card stays honest)
     const ch = j.chain;
-    const chainInfo =
-      (ch && ch.reachable
-        ? ` · chain height ${ch.height ?? '—'} · circulating ${(ch.circulating_jer ?? '—')} JER`
-        : ' · chain view unreachable');
+    const chainInfo = ch && ch.reachable
+      ? ` · chain height ${ch.height ?? '—'} · circulating ${ch.circulating_jer ?? '—'} JER`
+      : ' · chain view unreachable';
     const w = j.wallet;
     if (w && w.reachable) {
       const bal = Number(w.balance_uj ?? 0) / 1e6;
-      document.getElementById('earn').textContent = bal.toFixed(6) + ' JER';
-      document.getElementById('earnfine').textContent =
-        (w.exists
-          ? `chain wallet ${w.identity}`
-          : `chain wallet ${w.identity} · no wallet yet (first mined JER creates it)`) +
+      set('earn', bal.toFixed(6) + ' JER');
+      set('earnfine',
+        (w.exists ? `chain wallet ${w.identity}` : `chain wallet ${w.identity} · no wallet yet (first mined JER creates it)`) +
         (w.available_jer != null ? ` · spendable ${Number(w.available_jer).toFixed(6)}` : '') +
-        ` · mined-this-node ${j.meters?.mines_won ?? 0}/${j.meters?.mines_attempted ?? 0}` +
-        chainInfo;
+        ` · mined ${j.meters?.mines_won ?? 0}/${j.meters?.mines_attempted ?? 0}` + chainInfo);
     } else {
-      document.getElementById('earn').textContent = String(j.meters?.mines_won ?? 0);
-      document.getElementById('earnfine').textContent =
+      set('earn', String(j.meters?.mines_won ?? 0));
+      set('earnfine',
         `mining attempts ${j.meters?.mines_attempted ?? 0}` +
-        (w && !w.reachable ? ` · wallet probe failed: ${w.error ?? '—'}` : ' · wallet card off (not JerithChain)') +
-        chainInfo;
+        (w && !w.reachable ? ` · wallet probe failed: ${w.error ?? '—'}` : ' · wallet card off (not JerithChain)') + chainInfo);
     }
-    // Drill-down: earnings lines inside the wallet card — the metering
-    // window, the local mining tallies, and (when reachable) the
-    // chain-truthful wallet identity/balance/spendable and chain state.
     const mkrow = (k, v) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`;
     document.getElementById('wtable').innerHTML =
       (mj ? mkrow('window open', new Date(mj.window_started_ms || Date.now()).toLocaleString()) : '') +
@@ -358,17 +463,161 @@ async function refresh() {
       (w && w.reachable && w.available_jer != null ? mkrow('spendable (JER)', Number(w.available_jer).toFixed(6)) : '') +
       (ch && ch.reachable ? mkrow('chain height', ch.height ?? '—') : '') +
       (ch && ch.reachable ? mkrow('circulating (JER)', ch.circulating_jer ?? '—') : '');
-    document.getElementById('wtablefine').textContent =
+    set('wtablefine',
       (w && w.reachable ? 'wallet live' : 'wallet offline — local tallies only') +
-      (ch && ch.reachable ? ' · chain live' : ' · chain unreachable');
-  } catch (e) { /* node stopped */ }
+      (ch && ch.reachable ? ' · chain live' : ' · chain unreachable') +
+      (pj ? ' · pipeline routes ' + (pj.routes_total ?? 0) : ''));
+  } catch (e) {
+    $('conn').className = 'badge err';
+    $('conn').textContent = 'unreachable';
+    set('stamp', String(e));
+  }
 }
+
+async function loadSettings() {
+  try {
+    const r = await fetch('/v1/config');
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('status ' + r.status));
+    const box = $('settings');
+    box.textContent = '';
+    (j.settings || []).forEach((s) => {
+      const row = document.createElement('label');
+      row.className = 'setrow';
+      const name = document.createElement('span');
+      name.textContent = s.label;
+      let input;
+      if (s.kind === 'select') {
+        input = document.createElement('select');
+        (s.options || []).forEach((o) => {
+          const opt = document.createElement('option');
+          opt.value = o;
+          opt.textContent = o;
+          input.append(opt);
+        });
+      } else {
+        input = document.createElement('input');
+        input.type = s.kind === 'number' ? 'number' : 'text';
+        if (s.min != null) input.min = String(s.min);
+        if (s.kind === 'number') input.step = '1';
+      }
+      input.value = s.value ?? '';
+      input.dataset.key = s.key;
+      const help = document.createElement('small');
+      help.textContent = s.help || '';
+      row.append(name, input, help);
+      box.append(row);
+    });
+    set('readout', (j.readonly || []).map((x) => `${x.label}: ${x.value}`).join('  ·  ') + ' · ' + (j.note || ''));
+    set('setstatus', 'editing the hot-reloadable knobs · save writes config.toml');
+  } catch (e) {
+    set('setstatus', 'settings unavailable: ' + e);
+  }
+}
+
+async function loadSharing() {
+  try {
+    const r = await fetch('/v1/sharing');
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('status ' + r.status));
+    const box = $('sharelist');
+    box.textContent = '';
+    const models = j.models || [];
+    models.forEach((m) => {
+      const row = document.createElement('label');
+      row.className = 'shrow';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!m.shared;
+      cb.dataset.model = m.id;
+      const id = document.createElement('span');
+      id.className = 'shid';
+      id.textContent = m.id + (m.base ? ' (base)' : '') + (m.available === false ? ' (not served)' : '');
+      const chips = document.createElement('span');
+      chips.className = 'chips';
+      (m.capabilities || []).forEach((c) => {
+        const chip = document.createElement('span');
+        chip.className = 'chip ' + String(c).replace(/[^a-z_]/g, '');
+        chip.textContent = c;
+        chips.append(chip);
+      });
+      row.append(cb, id, chips);
+      box.append(row);
+    });
+    const shared = j.sharing || {};
+    set('sharestatus', models.length
+      ? `${models.length} runtime model(s) · ${(shared.models || []).length} shared · runtime ${j.runtime_reachable ? 'reachable' : 'unreachable'}`
+      : 'no runtime models listed' + (j.runtime_error ? ' — ' + j.runtime_error : ''));
+    set('sharereadout', 'opt-in: every model is opted out until you tick it and save'
+      + ((shared.capabilities || []).length ? ' · advertising: ' + shared.capabilities.join(', ') : ' · advertising nothing'));
+    const mc = (j.mesh && j.mesh.providers) || {};
+    const parts = Object.entries(mc).map(([k, v]) =>
+      k + ': ' + (Array.isArray(v) && v.length ? v.map((x) => String(x).slice(0, 10)).join(', ') : '—'));
+    set('meshcaps', parts.length ? parts.join(' · ') : '—');
+    set('meshcapfine', `${((j.mesh && j.mesh.peers) || []).length} peer(s) known · providers are opt-in peers, not assumptions`);
+  } catch (e) {
+    set('sharestatus', 'sharing unavailable: ' + e);
+  }
+}
+
+$('sharesave').addEventListener('click', async () => {
+  const models = [];
+  document.querySelectorAll('#sharelist input[data-model]').forEach((el) => {
+    if (el.checked) models.push(el.dataset.model);
+  });
+  set('sharestatus', 'saving…');
+  $('sharesave').disabled = true;
+  try {
+    const r = await fetch('/v1/sharing', {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'x-jerith-config': '1'},
+      body: JSON.stringify({models}),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('status ' + r.status));
+    set('sharestatus', 'saved — sharing ' + ((j.shared || []).length ? j.shared.join(', ') : 'nothing')
+      + ' · ' + j.note);
+    setTimeout(loadSharing, 900);
+  } catch (e) {
+    set('sharestatus', 'share save failed: ' + e);
+  } finally {
+    $('sharesave').disabled = false;
+  }
+});
+$('sharerefresh').addEventListener('click', loadSharing);
+
+$('save').addEventListener('click', async () => {
+  const changes = {};
+  document.querySelectorAll('#settings [data-key]').forEach((el) => { changes[el.dataset.key] = el.value; });
+  set('setstatus', 'saving…');
+  $('save').disabled = true;
+  try {
+    const r = await fetch('/v1/config', {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'x-jerith-config': '1'},
+      body: JSON.stringify({changes}),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('status ' + r.status));
+    set('setstatus', `saved ${j.applied.join(', ')} · ${j.note}`);
+    setTimeout(loadSettings, 1200);
+  } catch (e) {
+    set('setstatus', 'save failed: ' + e);
+  } finally {
+    $('save').disabled = false;
+  }
+});
+$('reload').addEventListener('click', loadSettings);
+
 refresh();
+loadSettings();
+loadSharing();
 setInterval(refresh, 3000);
+setInterval(loadSharing, 15000);
 </script>
 </body>
 </html>
-"#;
+"##;
 
 #[cfg(test)]
 mod tests {
@@ -415,6 +664,26 @@ mod tests {
         assert!(csp.contains("connect-src 'self'"));
     }
 
+    /// The 2026-10-31 outage: unquoted hash sources are invalid CSP, so
+    /// browsers ignored them and blocked the page's whole inline script
+    /// (every card stuck at "—"). Quotes are the fix; pin them.
+    #[test]
+    fn csp_hash_sources_are_quoted() {
+        let csp = build_csp(PAGE);
+        assert!(
+            csp.contains("script-src 'sha256-"),
+            "quoted script hash: {csp}"
+        );
+        assert!(
+            csp.contains("style-src 'sha256-"),
+            "quoted style hash: {csp}"
+        );
+        assert!(
+            !csp.contains("script-src sha256-") && !csp.contains("style-src sha256-"),
+            "unquoted hash sources are ignored by browsers: {csp}"
+        );
+    }
+
     #[tokio::test]
     async fn page_serves_with_security_headers() {
         let server = spawn();
@@ -439,7 +708,7 @@ mod tests {
         let csp = t.get("content-security-policy").expect("CSP required");
         let csp = csp.to_str().unwrap();
         assert!(
-            csp.contains("frame-ancestors 'none'") && csp.contains("sha256-"),
+            csp.contains("frame-ancestors 'none'") && csp.contains("'sha256-"),
             "CSP must hash-pin the inline blocks and bar framing: {csp}"
         );
         // No cookies are ever set: the UI is unauthenticated (loopback
@@ -464,5 +733,28 @@ mod tests {
         assert!(PAGE.contains("const esc = (s) =>"), "cell escaper present");
         assert!(PAGE.contains("esc(r.name)"), "per-model cells escaped");
         assert!(PAGE.contains("esc(k)"), "earnings label cells escaped");
+    }
+
+    /// The settings panel ships in this page and talks to the guarded
+    /// same-origin endpoint (the header forces a CORS preflight, which a
+    /// cross-site caller cannot pass).
+    #[test]
+    fn settings_panel_ships_with_the_guarded_endpoint() {
+        assert!(PAGE.contains(r#"id="settings""#));
+        assert!(PAGE.contains("fetch('/v1/config')"));
+        assert!(PAGE.contains("'x-jerith-config': '1'"));
+        assert!(PAGE.contains("Save settings"));
+        // Model sharing: per-model opt-in toggles over detected
+        // capabilities, saved through the same guarded header.
+        assert!(PAGE.contains(r#"id="sharelist""#), "sharing list ships");
+        assert!(PAGE.contains("fetch('/v1/sharing')"), "sharing panel wired");
+        assert!(PAGE.contains("Save sharing"));
+        assert!(PAGE.contains(r#"id="meshcaps""#), "provider view ships");
+        // No inline style attributes: CSP pins the <style> block only, so
+        // `style="…"` attributes would be blocked (and silently degrade).
+        assert!(
+            !PAGE.contains("style=\""),
+            "inline style attributes are CSP-blocked"
+        );
     }
 }

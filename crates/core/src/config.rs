@@ -263,7 +263,7 @@ impl Default for SpecialistConfig {
     }
 }
 
-/// Web access skills (OpenClaw migration): Brave Search API + URL fetch.
+/// Web access skills: Brave Search API + URL fetch.
 /// See websearch.rs. Everything is node-local — search key resolution,
 /// SSRF guards and page fetching never touch mesh peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,7 +271,7 @@ pub struct WebSearchConfig {
     /// Master switch for both /v1/skills/web/* endpoints.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider id — only "brave" ships today (OpenClaw parity).
+    /// Search provider id — only "brave" ships today (parity).
     #[serde(default = "default_search_provider")]
     pub provider: String,
     /// Brave API key inline (wins over every other source). Usually left
@@ -279,7 +279,7 @@ pub struct WebSearchConfig {
     #[serde(default)]
     pub api_key: Option<String>,
     /// Path to a file holding only the Brave API key (brave-key format:
-    /// the OpenClaw secrets provider's singleValue file).
+    /// the legacy secrets provider's singleValue file).
     #[serde(default)]
     pub api_key_path: Option<String>,
     /// Brave-compatible API base URL (trusted proxies); empty → the real
@@ -335,10 +335,10 @@ impl Default for WebSearchConfig {
 }
 
 impl WebSearchConfig {
-    /// Resolve the Brave API key the same way OpenClaw's brave plugin was
+    /// Resolve the Brave API key the same way the previous stack's brave plugin was
     /// configured (config inline → env → configured path), then the
     /// jerith-side copies: the node home brave-key file, and finally — read
-    /// only — the OpenClaw keyring file this integration migrated from.
+    /// only — the legacy keyring file this integration migrated from.
     pub fn resolved_api_key(&self) -> Option<String> {
         let read_file = |p: &Path| -> Option<String> {
             match std::fs::read_to_string(p) {
@@ -560,6 +560,13 @@ pub struct NodeConfig {
     /// mesh behaves exactly as before until this is set.
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Voluntary model sharing (`[sharing]` in config.toml): the exact
+    /// runtime model ids this operator opted to serve to the mesh. EMPTY
+    /// by default — every model is opted OUT until switched ON (dashboard
+    /// or `jerith config set sharing.models`). See `modelshare.rs` for the
+    /// capability labels each shared id advertises.
+    #[serde(default)]
+    pub sharing: crate::modelshare::SharingConfig,
 }
 
 impl NodeConfig {
@@ -1010,6 +1017,7 @@ impl Default for NodeConfig {
             peers: PeerPolicyConfig::default(),
             discovery: crate::discovery::DiscoveryConfig::default(),
             privacy: PrivacyConfig::default(),
+            sharing: crate::modelshare::SharingConfig::default(),
         }
     }
 }
@@ -1248,6 +1256,9 @@ impl NodeConfig {
         // [discovery]: a dead bootstrap is survivable; a MALFORMED URL in
         // the rotation is a per-tick error loop — fail the node at boot.
         self.discovery.validate()?;
+        // [sharing]: blank/whitespace ids would advertise an unusable
+        // model; an unbounded list would bloat every ad.
+        self.sharing.validate()?;
         Ok(())
     }
 }

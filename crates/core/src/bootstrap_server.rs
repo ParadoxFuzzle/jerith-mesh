@@ -1580,6 +1580,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         (id, a)
@@ -1719,6 +1721,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         let entry = |id: &str, model: &str, quant: &str, score: i32, fraudent: bool| {
@@ -2020,6 +2024,8 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                shared_models: Vec::new(),
+                shared_capabilities: Vec::new(),
                 gossip_reputations: None,
             };
             let r = client
@@ -2879,6 +2885,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         let r = client
@@ -2910,6 +2918,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         registry.entries.write().await.insert(
@@ -3107,6 +3117,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         // Re-sign with the accused's identity (same key, same node_id).
@@ -3322,6 +3334,8 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                shared_models: Vec::new(),
+                shared_capabilities: Vec::new(),
                 gossip_reputations: None,
             },
             last_refresh_ms: 0,
@@ -3563,6 +3577,8 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                shared_models: Vec::new(),
+                shared_capabilities: Vec::new(),
                 gossip_reputations: None,
             },
             last_refresh_ms: 0,
@@ -3591,6 +3607,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         // Two stamps: a fixed one for shape determinism, a fresh one for

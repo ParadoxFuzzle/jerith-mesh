@@ -554,6 +554,8 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                shared_models: Vec::new(),
+                shared_capabilities: Vec::new(),
                 gossip_reputations: None,
             },
             PeerAd {
@@ -569,6 +571,8 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                shared_models: Vec::new(),
+                shared_capabilities: Vec::new(),
                 gossip_reputations: None,
             },
         ];

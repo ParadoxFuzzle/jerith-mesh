@@ -227,6 +227,11 @@ impl Gateway {
             .route("/v1/skills/vision/describe", post(skill_vision_describe))
             .route("/v1/skills/vision/analyze", post(skill_vision_analyze))
             .route("/v1/metrics", get(metrics_handler))
+            .route("/v1/config", get(get_config).post(post_config))
+            // Voluntary model sharing: list every runtime model with its
+            // detected capabilities + toggle state, and replace the shared
+            // set (guarded like /v1/config).
+            .route("/v1/sharing", get(get_sharing).post(post_sharing))
             .with_state(state)
             .layer(axum::middleware::from_fn_with_state(
                 limiter,
@@ -544,8 +549,7 @@ fn bad_request(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
 }
 
-/// skill: web.search — Brave Search API (web mode), OpenClaw brave-plugin
-/// port. Optional body fields: count, country, search_lang, ui_lang,
+/// skill: web.search — Brave Search API (web mode) — optional body fields: count, country, search_lang, ui_lang,
 /// freshness (day|week|month|year).
 async fn skill_web_search(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(web) = gw.web.clone() else {
@@ -600,7 +604,7 @@ async fn skill_web_search(State(gw): State<Arc<Gateway>>, Json(body): Json<Value
 }
 
 /// skill: web.fetch — download a URL and return readable page text
-/// (OpenClaw web_fetch port). Optional body field: max_chars.
+/// (Jerith Mesh web_fetch skill). Optional body field: max_chars.
 async fn skill_web_fetch(State(gw): State<Arc<Gateway>>, Json(body): Json<Value>) -> Response {
     let Some(web) = gw.web.clone() else {
         return web_disabled_response();
@@ -922,11 +926,14 @@ fn peers_roster(reg: &crate::bootstrap::PeerRegistry, own_id: &str) -> serde_jso
                 "quant": ad.quant,
                 "role": ad.role,
                 "contribution_percent": ad.contribution_percent,
-                "state": state,
-                "last_rtt_ms": health.and_then(|h| h.last_rtt_ms),
+                "state": state,                    "last_rtt_ms": health.and_then(|h| h.last_rtt_ms),
                 "smoothed_rtt_ms": health.and_then(|h| h.smoothed_rtt_ms),
                 "consecutive_failures": health.map(|h| h.consecutive_failures).unwrap_or(0),
                 "hosted_experts": ad.hosted_experts.clone().unwrap_or_default(),
+                // Voluntary model sharing: only the ids this peer's
+                // operator switched ON, plus their detected capabilities.
+                "shared_models": ad.shared_models.clone(),
+                "shared_capabilities": ad.shared_capabilities.clone(),
             })
         })
         .collect();
@@ -939,6 +946,18 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
     let reg = gw.state.registry.lock().await;
     let meters = gw.state.meters.lock().await;
     let roster = peers_roster(&reg, &cfg.node_id);
+    let mesh_caps = mesh_capability_providers(&roster);
+    // Voluntary model sharing: exactly what this node currently offers
+    // (empty by default) and which peers publish each capability.
+    let sharing_value = {
+        let offer = cfg.sharing.offer();
+        json!({
+            "models": offer.models,
+            "capabilities": offer.capabilities,
+            "opt_in": true,
+            "note": "off by default — a model is offered only after an explicit opt-in",
+        })
+    };
     let peer_count = roster.as_array().map(|a| a.len()).unwrap_or(0);
     let peers_alive = roster
         .as_array()
@@ -1253,6 +1272,10 @@ async fn status(State(gw): State<Arc<Gateway>>) -> axum::response::Response {
         // Local memory (FEATURES §6): the backend actually live-served.
         "memory_store": memory_store_value,
         "peer_count": peer_count,
+        // Capability landscape: which alive peers publish vision/video/
+        // embedding, so a node without them can see whom to ask.
+        "mesh_capabilities": mesh_caps,
+        "sharing": sharing_value,
         "peers_alive": peers_alive,
         "peers": roster,
         "meters": {
@@ -2761,6 +2784,291 @@ fn sanitize_choices(body: &mut Value) {
     }
 }
 
+/// Dashboard settings: the editable (hot-reloadable) knobs, plus the
+/// read-only facts the page should show instead of editing.
+async fn get_config(State(gw): State<Arc<Gateway>>) -> Response {
+    let cfg = gw.state.config.read().await;
+    Json(json!({
+        "settings": crate::dashconfig::settings_json(&cfg),
+        "readonly": crate::dashconfig::readonly_json(&cfg),
+        "note": "hot-reloadable values apply within one ping tick; identity, ports, model and the memory DSN are CLI-only",
+    }))
+    .into_response()
+}
+
+/// Apply a dashboard settings patch. The custom header is the CSRF fence:
+/// a cross-site caller cannot attach it without a CORS preflight, and this
+/// loopback server approves none. Validation mirrors `jerith config set`
+/// and is all-or-nothing — nothing is written on a refusal.
+async fn post_config(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if headers.get("x-jerith-config").and_then(|v| v.to_str().ok()) != Some("1") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "missing x-jerith-config header"})),
+        )
+            .into_response();
+    }
+    let Some(changes) = body.get("changes").and_then(Value::as_object) else {
+        return bad_request("body must be {\"changes\": {key: value}}");
+    };
+    let mut cfg = gw.state.config.read().await.clone();
+    let applied = match crate::dashconfig::apply(&mut cfg, changes) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&e.to_string()),
+    };
+    if let Err(e) = cfg.save() {
+        tracing::warn!(error = %e, "dashboard settings save failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("cannot save config: {e}")})),
+        )
+            .into_response();
+    }
+    // Reflect immediately; the ping tick re-reads the same file. Fields
+    // that need a restart (identity, ports, model) are not in the patch.
+    *gw.state.config.write().await = cfg;
+    Json(json!({
+        "ok": true,
+        "applied": applied,
+        "note": "saved to config.toml; hot-reloadable values apply within one ping tick",
+    }))
+    .into_response()
+}
+
+/// Which alive peers publish each shared capability (canonical order). This
+/// is the "who has vision/video/embedding?" view — providers are opt-in
+/// nodes, never assumed from a model tag alone.
+fn mesh_capability_providers(roster: &Value) -> Value {
+    let rows: Vec<&Value> = roster
+        .as_array()
+        .map(|a| a.iter().filter(|r| r["state"] != "deprecated").collect())
+        .unwrap_or_default();
+    let mut out = serde_json::Map::new();
+    for cap in crate::modelshare::Capability::all() {
+        let ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| {
+                r["shared_capabilities"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|c| c.as_str() == Some(cap.as_str())))
+            })
+            .filter_map(|r| r["node_id"].as_str())
+            .collect();
+        out.insert(cap.as_str().to_string(), json!(ids));
+    }
+    Value::Object(out)
+}
+
+/// The runtime's model ids (`GET {runtime}/v1/models`). Bounded by a short
+/// timeout: the dashboard must stay responsive when the runtime is down.
+async fn runtime_model_ids(gw: &Gateway) -> Result<Vec<String>, String> {
+    let url = format!("{}/v1/models", gw.runtime_url.trim_end_matches('/'));
+    let mut req = crate::http::mesh_http()
+        .get(&url)
+        .timeout(Duration::from_secs(3));
+    if let Some(k) = &gw.runtime_api_key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("runtime unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("runtime returned {}", resp.status()));
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("runtime listing is not JSON: {e}"))?;
+    Ok(body
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    r.get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Sharing panel data: every model the runtime serves, what it can do, and
+/// whether this operator has opted it in; plus what the mesh publishes.
+/// Read-only and same-origin like `/status` — it carries no secret.
+async fn get_sharing(State(gw): State<Arc<Gateway>>) -> Response {
+    let cfg = gw.state.config.read().await.clone();
+    let offer = cfg.sharing.offer();
+    let (runtime_ids, runtime_error) = match runtime_model_ids(&gw).await {
+        Ok(ids) => (ids, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let mut cards: Vec<Value> = runtime_ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "capabilities": crate::modelshare::labels(id),
+                "shared": cfg.sharing.shares(id),
+                "available": true,
+                "base": gw.base_model.as_deref() == Some(id.as_str()),
+            })
+        })
+        .collect();
+    // A shared id the runtime no longer serves stays visible and flagged:
+    // the operator must be able to see (and undo) a stale opt-in.
+    for id in &offer.models {
+        if !runtime_ids.iter().any(|r| r == id) {
+            cards.push(json!({
+                "id": id,
+                "capabilities": crate::modelshare::labels(id),
+                "shared": true,
+                "available": false,
+                "base": false,
+            }));
+        }
+    }
+    let peers = {
+        let reg = gw.state.registry.lock().await;
+        let mut rows: Vec<Value> = reg
+            .all_ads()
+            .iter()
+            .filter(|ad| ad.node_id != cfg.node_id)
+            .map(|ad| {
+                let state = reg
+                    .health_of(&ad.node_id)
+                    .map(|h| h.state)
+                    .unwrap_or(crate::bootstrap::PeerState::Unknown);
+                json!({
+                    "node_id": ad.node_id,
+                    "state": match state {
+                        crate::bootstrap::PeerState::Alive => "alive",
+                        crate::bootstrap::PeerState::Deprecated => "deprecated",
+                        crate::bootstrap::PeerState::Unknown => "unknown",
+                    },
+                    "models": ad.shared_models,
+                    "capabilities": ad.shared_capabilities,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| a["node_id"].as_str().cmp(&b["node_id"].as_str()));
+        rows
+    };
+    let providers = {
+        let mut out = serde_json::Map::new();
+        for cap in crate::modelshare::Capability::all() {
+            let ids: Vec<&str> = peers
+                .iter()
+                .filter(|p| p["state"] != "deprecated")
+                .filter(|p| {
+                    p["capabilities"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|c| c.as_str() == Some(cap.as_str())))
+                })
+                .filter_map(|p| p["node_id"].as_str())
+                .collect();
+            out.insert(cap.as_str().to_string(), json!(ids));
+        }
+        Value::Object(out)
+    };
+    Json(json!({
+        "models": cards,
+        "sharing": {
+            "models": offer.models,
+            "capabilities": offer.capabilities,
+        },
+        "runtime_reachable": runtime_error.is_none(),
+        "runtime_error": runtime_error,
+        "mesh": { "peers": peers, "providers": providers },
+        "note": "opt-in: nothing is shared until a model is switched ON and saved",
+    }))
+    .into_response()
+}
+
+/// Replace the shared-model set. Same CSRF fence as `/v1/config` (a custom
+/// header forces a preflight this loopback server never approves), and the
+/// same all-or-nothing rule: ids are validated against the live runtime
+/// FIRST, so a typo can never advertise a model this node cannot serve.
+async fn post_sharing(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if headers.get("x-jerith-config").and_then(|v| v.to_str().ok()) != Some("1") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "missing x-jerith-config header"})),
+        )
+            .into_response();
+    }
+    let Some(list) = body.get("models").and_then(Value::as_array) else {
+        return bad_request("body must be {\"models\": [model ids]}");
+    };
+    let mut ids = Vec::with_capacity(list.len());
+    for v in list {
+        match v.as_str() {
+            Some(s) => ids.push(s.to_string()),
+            None => return bad_request("models must be an array of model id strings"),
+        }
+    }
+    let ids = match crate::modelshare::validate_models(&ids) {
+        Ok(v) => v,
+        Err(e) => return bad_request(&e.to_string()),
+    };
+    let runtime_ids = match runtime_model_ids(&gw).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!("cannot verify model ids — {e}; sharing unchanged"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let unknown: Vec<&String> = ids
+        .iter()
+        .filter(|id| !runtime_ids.iter().any(|r| r == *id))
+        .collect();
+    if !unknown.is_empty() {
+        return bad_request(&format!(
+            "runtime does not serve these model ids: {unknown:?} — sharing unchanged"
+        ));
+    }
+    let mut cfg = gw.state.config.read().await.clone();
+    cfg.sharing = crate::modelshare::SharingConfig { models: ids };
+    if let Err(e) = cfg.sharing.validate() {
+        return bad_request(&e.to_string());
+    }
+    if let Err(e) = cfg.save() {
+        tracing::warn!(error = %e, "dashboard sharing save failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("cannot save config: {e}")})),
+        )
+            .into_response();
+    }
+    let offer = cfg.sharing.offer();
+    // Reflect immediately; the ping tick picks the same file up anyway.
+    *gw.state.config.write().await = cfg;
+    Json(json!({
+        "ok": true,
+        "shared": offer.models,
+        "capabilities": offer.capabilities,
+        "note": "saved to config.toml; the next ping tick advertises the new offer",
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2868,6 +3176,8 @@ mod tests {
             hosted_experts: Some(vec!["exp.a".into()]),
             hosted_expert_count: Some(1),
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: None,
         };
         let gate = crate::models::ModelId {
@@ -2951,6 +3261,94 @@ mod tests {
                 "{url} must NOT count as loopback"
             );
         }
+    }
+
+    /// Capability providers are the ALIVE peers publishing a capability:
+    /// a deprecated peer's offer must not read as available.
+    #[test]
+    fn mesh_capability_providers_name_only_alive_sharing_peers() {
+        let roster = json!([
+            {"node_id": "aa-eye", "state": "alive",
+             "shared_models": ["minicpm-v4.6:1b"],
+             "shared_capabilities": ["text", "vision", "video"]},
+            {"node_id": "bb-embed", "state": "alive",
+             "shared_models": ["nomic-embed-text"],
+             "shared_capabilities": ["embedding"]},
+            {"node_id": "cc-gone", "state": "deprecated",
+             "shared_models": ["moondream:latest"],
+             "shared_capabilities": ["text", "vision"]},
+            {"node_id": "dd-quiet", "state": "alive",
+             "shared_models": [], "shared_capabilities": []}
+        ]);
+        let v = mesh_capability_providers(&roster);
+        assert_eq!(v["vision"], json!(["aa-eye"]), "deprecated peer excluded");
+        assert_eq!(v["video"], json!(["aa-eye"]));
+        assert_eq!(v["embedding"], json!(["bb-embed"]));
+        assert_eq!(v["text"], json!(["aa-eye"]));
+        assert_eq!(v["image_gen"], json!([]));
+    }
+
+    /// The panel lists the shared set even when the runtime is down (a
+    /// stale opt-in must stay visible and editable), and marks it
+    /// unavailable rather than pretending the model is served.
+    #[tokio::test]
+    async fn sharing_panel_is_honest_when_the_runtime_is_unreachable() {
+        let cfg = crate::config::NodeConfig {
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            sharing: crate::modelshare::SharingConfig {
+                models: vec!["moondream:latest".into()],
+            },
+            ..crate::config::NodeConfig::default()
+        };
+        let mut cfg = cfg;
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state: state.clone(),
+            runtime_url: "http://127.0.0.1:1".to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: None,
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("test server");
+        let res = server.get("/v1/sharing").await;
+        assert_eq!(res.status_code(), StatusCode::OK);
+        let j: Value = res.json();
+        assert_eq!(j["runtime_reachable"], false, "no stub runtime: {j}");
+        assert_eq!(
+            j["sharing"]["capabilities"],
+            json!(["text", "vision"]),
+            "labels come from the id itself: {j}"
+        );
+        let row = &j["models"][0];
+        assert_eq!(row["id"], "moondream:latest");
+        assert_eq!(row["shared"], true);
+        assert_eq!(row["available"], false, "stale opt-in flagged: {j}");
+        assert_eq!(j["mesh"]["peers"], json!([]));
+
+        // The write surface is guarded like /v1/config: no custom header →
+        // refused before any runtime probe or config write.
+        let res = server
+            .post("/v1/sharing")
+            .json(&json!({"models": []}))
+            .await;
+        assert_eq!(res.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.config.read().await.sharing.models,
+            vec!["moondream:latest".to_string()],
+            "a refused patch must not half-apply"
+        );
     }
 
     fn spawn_plain(runtime_url: &'static str, fallback: bool) -> TestServer {
@@ -3370,6 +3768,36 @@ mod tests {
             spec_lane: std::sync::Arc::new(SpecLane::default()),
         };
         TestServer::new(gw.router().into_make_service()).expect("test server")
+    }
+
+    /// The dashboard's settings API: GET is read-only and always safe;
+    /// POST is guarded by a custom header (cross-site callers cannot send
+    /// it without a CORS preflight this server never approves) and applies
+    /// an all-or-nothing, CLI-validated patch. Refusals happen BEFORE any
+    /// write, so the test never touches the real config.toml.
+    #[tokio::test]
+    async fn dashboard_config_api_reads_and_guards_writes() {
+        let server = spawn_with_memory();
+        let body: Value = server.get("/v1/config").await.json();
+        assert!(
+            body["settings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["key"] == "contribution_percent"),
+            "editable settings listed: {body}"
+        );
+        assert!(
+            body["readonly"].as_array().is_some_and(|a| !a.is_empty()),
+            "read-only facts listed"
+        );
+
+        // No guard header → refused before validation/save.
+        let res = server
+            .post("/v1/config")
+            .json(&json!({"changes": {"contribution_percent": "40"}}))
+            .await;
+        assert_eq!(res.status_code(), StatusCode::FORBIDDEN);
     }
 
     /// Test server with the default-configured Jerith Guard armed;

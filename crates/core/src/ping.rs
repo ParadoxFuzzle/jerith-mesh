@@ -616,6 +616,36 @@ impl MeshFallbackChat {
         }
     }
 
+    /// Does any alive, privacy-allowed, dialable peer publish
+    /// `capability`? The gateway asks this before borrowing vision/video
+    /// work, so the answer is "there is somebody to ask", never a guess
+    /// from the local config.
+    pub async fn peer_advertises_capability(
+        &self,
+        state: &Arc<MeshState>,
+        capability: &str,
+    ) -> bool {
+        let cfg = state.config.read().await;
+        let allow = cfg.privacy.hop_allowlist();
+        let reg = state.registry.lock().await;
+        let found = reg.all_ads().iter().any(|ad| {
+            ad.shares_capability(capability)
+                && allow
+                    .as_ref()
+                    .map(|a| a.contains(&ad.node_id.as_str()))
+                    .unwrap_or(true)
+                && !ad.rpc_address.is_empty()
+                && !state.peer_block.blocked(&ad.node_id)
+                && reg
+                    .health_of(&ad.node_id)
+                    .map(|h| h.state != PeerState::Deprecated)
+                    .unwrap_or(false)
+        });
+        drop(reg);
+        drop(cfg);
+        found
+    }
+
     /// Build inputs for the router from live registry state: connectable
     /// peers (rtt, alive, advertised resources, VERIFIED reputation (§10
     /// / Phase 5)) + their advertised QUIC rpc addresses.
@@ -1000,10 +1030,26 @@ impl MeshFallbackChat {
         messages: &[serde_json::Value],
         local_try: impl FnOnce() -> anyhow::Result<String>,
     ) -> anyhow::Result<(String, Option<String>)> {
+        self.chat_with_fallback_capability(state, messages, None, local_try)
+            .await
+    }
+
+    /// Capability-aware fallback: `prefer` names a shared capability
+    /// ("vision", "video"). Peers that publish it are asked FIRST; the
+    /// rest of the walk keeps its RTT order (stable sort), so a peer that
+    /// cannot see still serves when nobody who can is reachable. This is
+    /// how a node with no local vision lane borrows one from the mesh.
+    pub async fn chat_with_fallback_capability(
+        &self,
+        state: &Arc<MeshState>,
+        messages: &[serde_json::Value],
+        prefer: Option<&str>,
+        local_try: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<(String, Option<String>)> {
         req_id_tracker();
         let req_id = format!("chat-{}", crate::bootstrap::now_ms());
         let tier = state.config.read().await.privacy.clone();
-        let (peers, addrs) = {
+        let (mut peers, addrs) = {
             let (peers, addrs) = self.mesh_view(state, None).await;
             match tier.hop_allowlist() {
                 Some(allow) => {
@@ -1023,6 +1069,18 @@ impl MeshFallbackChat {
                 None => (peers, addrs),
             }
         };
+        // Capability preference: peers that publish the capability the
+        // caller cannot serve itself go first. Stable sort — the RTT order
+        // inside each group is untouched, so a capable peer that is down
+        // still degrades to the ordinary walk instead of a refusal.
+        if let Some(cap) = prefer {
+            let ads = { state.registry.lock().await.all_ads() };
+            let shares = |id: &str| {
+                ads.iter()
+                    .any(|ad| ad.node_id == id && ad.shares_capability(cap))
+            };
+            peers.sort_by_key(|(id, ..)| if shares(id) { 0 } else { 1 });
+        }
         self.refresh_pins(state).await;
         // trusted_peers with nobody trusted (or local_only outright): the
         // local runtime still runs, and a local failure must say WHY no
@@ -1774,6 +1832,10 @@ async fn run_loop(
             // over QUIC — 127.0.0.1 ads made every remote dial a self-dial.
             let cfg = state.config.read().await;
             let advertise_host = cfg.advertised_host();
+            // Voluntary model sharing: exactly the operator's opted-in ids
+            // plus the capabilities each id demonstrably carries. An empty
+            // list advertises nothing (the default).
+            let offer = cfg.sharing.offer();
             // Phase 2 tensor transport: publish the experts actually held
             // (None when no store is attached — placement then keeps the
             // historical "assume hosted" behavior for this node).
@@ -1800,6 +1862,11 @@ async fn run_loop(
                     let d = state.discovery.lock().await;
                     d.ad_servers(None)
                 },
+                // Voluntary model sharing (opt-in per model): the operator
+                // switched these ids ON in the dashboard; each id's labels
+                // come from the id itself (modelshare::detect).
+                shared_models: offer.models.clone(),
+                shared_capabilities: offer.capabilities.clone(),
                 // §10 reputation gossip: bootstrap-verified score stamps
                 // (verified against OUR pins) ride inside the ad so peers
                 // can learn configured-bootstrap scores without trusting
@@ -2681,6 +2748,8 @@ mod tests {
             hosted_experts: None,
             hosted_expert_count: None,
             discovery_servers: Vec::new(),
+            shared_models: Vec::new(),
+            shared_capabilities: Vec::new(),
             gossip_reputations: Some(vec![stamp_of(
                 &origin,
                 &origin.pubkey_hex(),
@@ -2771,6 +2840,8 @@ mod tests {
                     hosted_experts: None,
                     hosted_expert_count: None,
                     discovery_servers: Vec::new(),
+                    shared_models: Vec::new(),
+                    shared_capabilities: Vec::new(),
                     gossip_reputations: None,
                 });
                 reg.record_ping_ok(id, 5);
@@ -3443,6 +3514,8 @@ mod tests {
                 hosted_experts: None,
                 hosted_expert_count: None,
                 discovery_servers: Vec::new(),
+                shared_models: Vec::new(),
+                shared_capabilities: Vec::new(),
                 gossip_reputations: None,
             });
             targets.push((node_id, url));
