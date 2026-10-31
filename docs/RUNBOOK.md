@@ -2489,8 +2489,64 @@ and `can_write: false` mean signed-out. The startup journal says the same
 (`read mode="anonymous_feed"`). Adding
 `~/.jerith-mesh/reddit/credentials.toml` (`0600`; `client_id`,
 `client_secret`, `user_agent`, plus `refresh_token` or
-`username`+`password`) and restarting the unit upgrades every path in
-place — no code change, no manifest edit.
+`username`+`password`) and restarting the unit upgrades every pathin place — no code change, no manifest edit.
+
+### Getting credentials (the part only the account owner can do)
+
+Register a **script** app at <https://www.reddit.com/prefs/apps> →
+"create another app":
+
+- name — anything (`jerith-mesh`); type — **script** (web app/installed app
+  do not give you a refresh token the drop can use)
+- about url / description — blank is fine
+- **redirect uri — `http://localhost:8899/callback`** (exactly; the drop's
+  helper listens there)
+
+After creating it, the app card shows two values: the **client id** (the
+short string directly under the app name) and the **secret**. Then:
+
+```bash
+scripts/reddit-auth.py authorize \
+  --client-id <id> --client-secret <secret> \
+  --user-agent 'linux:jerith-mesh:0.1.4 (by /u/YourBotName)'
+# prints the authorize URL, catches the redirect, mints a PERMANENT
+# refresh token, checks /api/v1/me, then writes credentials.toml 0600
+systemctl --user restart jerith-reddit-plugin
+# then, from an owner DM or the signed RPC snippet above: reddit.about
+# -> connected: true, can_write: true
+```
+
+`--paste` copies the code by hand instead of catching the redirect;
+`--dry-run` validates without writing; `--print-url-only` just shows the
+URL. `scripts/reddit-auth.py check` re-validates what is on disk (token
+exchange + `/api/v1/me`) and never rewrites the file — it is the honest
+answer to "is the lane actually connected?" without invoking the drop.
+
+Scopes requested: `identity,read,submit,edit,vote,history,mysubreddits` —
+that is every skill's need and nothing more. The refresh token is stored
+in the credentials file; the **account password is never written** by the
+`authorize` path. `password` exists for accounts without 2FA (the classic
+bot flow) and does write the password, so prefer `authorize`.
+
+**Known 2026 registration failure modes** (if `prefs/apps` misbehaves,
+the problem is Reddit's, not the drop's):
+
+- submitting "create app" returns `an error occurred (status: 500)` —
+  app creation is intermittently broken for some accounts; retry later,
+  try incognito/a different browser, and confirm the account has a
+  verified email.
+- a redirect loop into a policy page, or a CAPTCHA loop, instead of the
+  form — same class of breakage; the workarounds above apply, and there is
+  no API path around it (app registration is web-only by design).
+- "invalid_client" from `scripts/reddit-auth.py check` means the
+  client_id/client_secret pair is wrong — the secret is the field labelled
+  `secret`, not the app name or the redirect.
+- `invalid_grant` on `authorize` usually means the code was reused or more
+  than ~10 minutes passed: codes are single-use, so re-run from the URL.
+
+Until one of those paths succeeds, the lane keeps reading through the
+public feeds (the mode table above) — signed-out is a degraded state, not
+a broken one.
 
 **The signed-out budget is the whole design.** Measured on the main node:
 about **one feed request per 30 s**, alternating between an empty `429`
