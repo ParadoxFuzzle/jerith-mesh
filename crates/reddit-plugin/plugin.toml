@@ -1,0 +1,83 @@
+# The reddit lane — the drop that lets Jerith read and (with a
+# confirmed preview) write on Reddit: browse a sub, search, open a
+# thread, submit a post, comment, edit its own text, vote, and keep a
+# watch list the bot's monitor sweeps so it can be on the lookout.
+#
+# Install:
+#
+#   mkdir -p ~/.jerith-mesh/plugins.d/reddit ~/.jerith-mesh/reddit
+#   cp crates/reddit-plugin/plugin.toml ~/.jerith-mesh/plugins.d/reddit/
+#   # rotate the secret below first (openssl rand -hex 16)
+#   # credentials: ~/.jerith-mesh/reddit/credentials.toml, chmod 600
+#   #   client_id / client_secret / user_agent (required)
+#   #   + refresh_token (preferred) or username + password
+#   cargo build --release -p jerith-reddit-plugin
+#   cp deploy/systemd/jerith-reddit-plugin.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-reddit-plugin
+#   # then add "external:reddit" to [plugins] owner_only in bot.toml
+#   # (never `enabled`: posting as the account is an owner-DM lane) and
+#   # restart jerith-bot.
+#
+# ONE endpoint line binds BOTH sides, same rule every drop keeps: the
+# binary reads `[plugin] endpoint` and binds that address, so manifest
+# and service cannot drift. Loopback by default; non-loopback must be
+# https (the drop parser enforces this, fail-closed at bot start).
+#
+# Write safety: submit/comment/edit NEVER touch Reddit on the first
+# call. They return a preview plus `proposal_id` + `confirm_token`;
+# only a second call carrying both (within 10 minutes) posts anything.
+# Votes are direct — one call, reversible, and the same rule Reddit's
+# own bot policy states: a bot may vote on what it reads, it may not
+# run coordinated voting rings. Watch state lives in
+# `$JERITH_REDDIT_WATCH` (default `~/.jerith-mesh/reddit/watch.json`).
+
+[plugin]
+id = "reddit"
+endpoint = "http://127.0.0.1:7794/rpc"
+secret = "per-plugin-rotate-me"          # delete for unsigned dev mode
+timeout_secs = 15                         # clamped 1-30 (hook discipline)
+
+[[skill]]
+name = "browse"
+description = "Read a subreddit listing: the newest, hottest, top or rising posts in r/<subreddit>. Returns per post its fullname (t3_…), title, author, score, comment count, permalink and a card. Pass subreddit \"all\" or \"popular\" for the site-wide feeds. Read-only; costs nothing but a rate-limit slot."
+parameters = { type = "object", properties = { subreddit = { type = "string", description = "Subreddit name, r/-prefix optional" }, sort = { type = "string", description = "hot (default), new, top, rising or controversial" }, window = { type = "string", description = "For top/controversial: hour, day (default), week, month, year, all" }, limit = { type = "integer", description = "1-50, default 10" }, after = { type = "string", description = "Paging cursor from a previous call" } }, required = ["subreddit"] }
+
+[[skill]]
+name = "search"
+description = "Search Reddit posts. Inside one subreddit when `subreddit` is given, site-wide otherwise. Returns the same per-post shape as browse. Read-only."
+parameters = { type = "object", properties = { query = { type = "string", description = "Search terms" }, subreddit = { type = "string", description = "Optional: restrict to this subreddit" }, sort = { type = "string", description = "relevance (default), new, top, comments" }, window = { type = "string", description = "For top: hour, day, week, month, year, all" }, limit = { type = "integer", description = "1-50, default 10" } }, required = ["query"] }
+
+[[skill]]
+name = "thread"
+description = "Open one Reddit post: its title, body, score, and the top-level comments (author, score, text). `id` takes a fullname (t3_…), a bare post id, or a reddit.com permalink/URL. Read-only — use it before replying so a comment answers the actual thread."
+parameters = { type = "object", properties = { id = { type = "string", description = "t3_ fullname, post id, or permalink" }, limit = { type = "integer", description = "Comments to read, 1-50, default 15" } }, required = ["id"] }
+
+[[skill]]
+name = "submit"
+description = "Submit a NEW post (self/text or link) as the bot's account. TWO-STEP BY DESIGN: call it once with no confirm token and it returns a preview of exactly what would be posted plus `proposal_id` and `confirm_token` — show that preview to the owner and only call again with both values after an explicit yes. Never invent the confirmation yourself."
+parameters = { type = "object", properties = { subreddit = { type = "string", description = "Subreddit to post in" }, title = { type = "string", description = "Post title, 3-300 characters" }, kind = { type = "string", description = "self (default) or link" }, text = { type = "string", description = "Body for a self post (markdown)" }, url = { type = "string", description = "http(s) URL for a link post" }, proposal_id = { type = "integer", description = "From the preview call — second step only" }, confirm_token = { type = "string", description = "From the preview call — second step only" } }, required = ["subreddit", "title"] }
+
+[[skill]]
+name = "comment"
+description = "Reply to a post or comment (thing_id = t3_… for a post, t1_… for a comment; a bare id is read as a post). Same two-step rail as submit: first call previews and returns `proposal_id` + `confirm_token`, the second call with both actually posts. Show the preview and get a yes first."
+parameters = { type = "object", properties = { thing_id = { type = "string", description = "t3_ post or t1_ comment fullname" }, text = { type = "string", description = "Comment body (markdown)" }, proposal_id = { type = "integer", description = "From the preview call" }, confirm_token = { type = "string", description = "From the preview call" } }, required = ["thing_id", "text"] }
+
+[[skill]]
+name = "edit"
+description = "Edit text the bot's account previously posted (post body or comment). Only its own content can be edited — Reddit refuses anything else. Same two-step rail: preview + confirm token, then the confirmed call. Include the full replacement text (edits replace, not append)."
+parameters = { type = "object", properties = { thing_id = { type = "string", description = "t1_ comment or t3_ post fullname" }, text = { type = "string", description = "Full replacement body (markdown)" }, proposal_id = { type = "integer", description = "From the preview call" }, confirm_token = { type = "string", description = "From the preview call" } }, required = ["thing_id", "text"] }
+
+[[skill]]
+name = "vote"
+description = "Upvote (dir up), downvote (dir down) or clear a vote (dir none) on one post or comment. Reversible and single-call. Do not use this to run voting rings or to trade votes — Reddit's bot policy forbids coordinated voting; one considered vote on something the bot actually read is the whole permitted use."
+parameters = { type = "object", properties = { thing_id = { type = "string", description = "t3_ post or t1_ comment fullname (bare id reads as a post)" }, dir = { type = "string", description = "up, down, or none" } }, required = ["thing_id", "dir"] }
+
+[[skill]]
+name = "watch"
+description = "The lookout list. action add/remove/list manages watched subreddits and match terms (terms are case-insensitive substrings of title+body; no terms = every new post in the sub). action check polls the watched subs' newest posts since the last check, marks them delivered, and returns only new matches — the bot's monitor calls this on a timer, so a check with no matches is normal and quiet. action recent (hours 1-168, default 24) re-reads the already-delivered digest without advancing anything — the daily briefing uses it, so asking for the digest never swallows what the next check should still report."
+parameters = { type = "object", properties = { action = { type = "string", description = "add, remove, list, check, or recent" }, subreddit = { type = "string", description = "For add/remove" }, terms = { type = "string", description = "Comma-separated match terms to add (add only)" }, term = { type = "string", description = "One term to remove (remove only)" }, limit = { type = "integer", description = "check: max matches to return, default 10, max 25" }, hours = { type = "integer", description = "recent: how far back, 1-168, default 24" } }, required = ["action"] }
+
+[[skill]]
+name = "about"
+description = "Account + auth health: which Reddit user the credentials belong to, link/comment karma, which auth flow is configured (refresh token / password / app-only), the API base, and the last call's rate-limit headroom. Use it to answer 'is the reddit lane actually connected?' instead of guessing."
+parameters = { type = "object" }

@@ -366,8 +366,23 @@ async fn main() -> anyhow::Result<()> {
                     if cfg.monitor.enabled {
                         let http_handle = ctx.http.clone();
                         let monitor_cfg = cfg.monitor.clone();
+                        // The reddit lookout calls the drop over the
+                        // signed contract from inside this same tick, so
+                        // the loop needs the parsed drops and the gates.
+                        let owner = cfg.owner_discord_id;
+                        let drops = cfg.external_plugins.clone();
+                        let enabled_plugins = cfg.plugins.enabled.clone();
+                        let owner_only_plugins = cfg.plugins.owner_only.clone();
                         tokio::spawn(async move {
-                            monitor::run_loop(http_handle, cfg.owner_discord_id, monitor_cfg).await;
+                            monitor::run_loop(
+                                http_handle,
+                                owner,
+                                monitor_cfg,
+                                drops,
+                                enabled_plugins,
+                                owner_only_plugins,
+                            )
+                            .await;
                         });
                     }
                 }

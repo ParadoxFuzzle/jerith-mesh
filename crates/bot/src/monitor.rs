@@ -1,4 +1,4 @@
-//! Monitor scaffold — the OpenClaw ops-monitor family (disk-space-alerts,
+//! Monitor scaffold — the Jerith Mesh ops-monitor family (disk-space-alerts,
 //! ssl-cert-monitor, temperature-monitor, log-rotation-health,
 //! docker-update-checker, backup-verification) collapsed into one module.
 //!
@@ -11,15 +11,16 @@
 //!
 //! Privileged boundary: this module **reports only** — it never restarts
 //! services, never runs repairs, never executes system changes. The
-//! OpenClaw watchdog's auto-restart behavior was deliberately NOT ported
+//! the legacy watchdog's auto-restart behavior was deliberately NOT ported
 //! here; owner.rs's default-deny gate exists precisely so system-level
 //! actions stay owner-commanded, and the monitor keeps to the reporting
-//! half of that OpenClaw pattern.
+//! half of that legacy pattern.
 
 use std::path::{Path, PathBuf};
 
 use poise::serenity_prelude as serenityall;
 use serde::Serialize;
+use serde_json::{Value, json};
 
 /// Health of one check.
 #[derive(Debug, Clone, Serialize)]
@@ -339,7 +340,7 @@ fn check_temps(limits: &MonitorLimits) -> CheckResult {
     }
 }
 
-/// Log files over the size cap (rotation health,OpenClaw check).
+/// Log files over the size cap (rotation health check).
 fn check_logs(limits: &MonitorLimits) -> CheckResult {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let mut biggest: Option<(u64, String)> = None;
@@ -391,7 +392,7 @@ fn check_logs(limits: &MonitorLimits) -> CheckResult {
 }
 
 /// Backup freshness: each configured dir must have a file touched within
-/// 26h (the OpenClaw nightly cadence + slack).
+/// 26h (the legacy nightly cadence + slack).
 fn check_backups(limits: &MonitorLimits) -> CheckResult {
     if limits.backup_dirs.is_empty() {
         return CheckResult {
@@ -583,6 +584,83 @@ fn newest_file_age_ms(dir: &Path, now_ms: u64) -> u64 {
     now_ms.saturating_sub(newest)
 }
 
+// ---------------------------------------------------------------------------
+// The reddit lookout (crates/reddit-plugin, `external:reddit`)
+// ---------------------------------------------------------------------------
+
+/// Is the reddit drop gated in at all? Writes live in `owner_only`, but a
+/// reads-first install can list it under `enabled` — either way the watch
+/// list is the operator's, so either gate counts.
+fn reddit_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
+    let gate = "external:reddit";
+    enabled.iter().any(|g| g == gate) || owner_only.iter().any(|g| g == gate)
+}
+
+/// The lookout line from a `reddit.watch` check card. `None` when the
+/// check found nothing — a quiet pass is the monitor's whole contract, so
+/// a watch list with no news never adds a DM.
+///
+/// The plugin has already advanced its own cursor by the time this runs,
+/// which is what makes the line safe to repeat every tick: each match is
+/// announced exactly once, and an unanswered DM is not re-sent.
+pub fn render_reddit_line(v: &Value) -> Option<String> {
+    let count = v["new_count"].as_u64()?;
+    if count == 0 {
+        return None;
+    }
+    let mut line = format!("👀 **reddit** — {count} new match(es)");
+    for m in v["matches"].as_array().into_iter().flatten().take(5) {
+        let sub = m["subreddit"].as_str().unwrap_or("?");
+        let title = m["title"].as_str().unwrap_or("(no title)");
+        let title = if title.chars().count() > 90 {
+            format!("{}…", title.chars().take(89).collect::<String>())
+        } else {
+            title.to_string()
+        };
+        line.push_str(&format!("\n• r/{sub} — {title}"));
+        if let Some(url) = m["permalink"].as_str()
+            && !url.is_empty()
+        {
+            line.push_str(&format!(" <{url}>"));
+        }
+    }
+    if let Some(errs) = v["errors"].as_array().filter(|e| !e.is_empty()) {
+        line.push_str(&format!(
+            "\n_{} watched sub(s) could not be read._",
+            errs.len()
+        ));
+    }
+    Some(line)
+}
+
+/// Ask the reddit drop for the posts that matched the operator's watch
+/// list since the last tick. Same discipline as every other plugin call
+/// here: the signed dispatch contract, an absent/downed drop is silence,
+/// and nothing in this module ever writes to Reddit.
+async fn reddit_section(
+    plugins: &[crate::external::ExternalPlugin],
+    enabled: &[String],
+    owner_only: &[String],
+) -> Option<String> {
+    if !reddit_opted_in(enabled, owner_only) {
+        return None;
+    }
+    let plugin = plugins.iter().find(|p| p.id == "reddit")?;
+    match crate::external::invoke(
+        plugin,
+        "reddit.watch",
+        &json!({"action": "check", "limit": 10}),
+    )
+    .await
+    {
+        Ok(card) => render_reddit_line(&card),
+        Err(e) => {
+            tracing::debug!(error = %e, "reddit lookout skipped — the drop wasn't answering");
+            None
+        }
+    }
+}
+
 /// Monitor loop (spawned once from main.rs with the bot's HTTP client):
 /// run the checks; when anything is warn/fail, DM the owner once through
 /// serenity's HTTP handle — checks that pass stay quiet. An absent owner
@@ -592,13 +670,18 @@ pub async fn run_loop(
     http: std::sync::Arc<serenityall::http::Http>,
     owner_id: Option<u64>,
     cfg: crate::config::MonitorConfig,
+    // The parsed drops + the two gate lists: the reddit lookout needs the
+    // drop to call and the operator's opt-in to know whether to call it.
+    plugins: Vec<crate::external::ExternalPlugin>,
+    enabled_plugins: Vec<String>,
+    owner_only_plugins: Vec<String>,
 ) {
     tracing::info!(
         owner_dm = owner_id
             .map(|o| o.to_string())
             .unwrap_or_else(|| "none (fails quiet)".into()),
         interval_minutes = cfg.interval_minutes,
-        "monitor scaffold started (OpenClaw ops-monitor port)"
+        "monitor scaffold started (Jerith Mesh ops-monitor)"
     );
     let limits = MonitorLimits {
         backup_dirs: cfg.backup_dirs,
@@ -606,7 +689,17 @@ pub async fn run_loop(
     };
     loop {
         let results = run_checks(&limits);
-        if let Some(report) = render_report(&results) {
+        // The lookout rides the same tick as the system checks: one DM,
+        // not a second notification loop with its own cadence to reason
+        // about. A check that finds nothing leaves `report` alone.
+        let lookout = reddit_section(&plugins, &enabled_plugins, &owner_only_plugins).await;
+        let report = match (render_report(&results), lookout) {
+            (None, None) => None,
+            (Some(r), None) => Some(r),
+            (None, Some(l)) => Some(format!("🩺 **jerith-mesh monitor**\n{l}")),
+            (Some(r), Some(l)) => Some(format!("{r}\n{l}")),
+        };
+        if let Some(report) = report {
             match owner_id {
                 Some(owner) => {
                     use serenityall::builder::CreateMessage;
@@ -793,5 +886,55 @@ mod tests {
         let r2 = check_backups(&limits2);
         assert_eq!(r2.level, Level::Fail);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- the reddit lookout --------------------------------------------
+
+    /// A quiet watch never writes a line (that is what keeps the monitor
+    /// from becoming a second notification loop), and a match line carries
+    /// the sub, the title and the permalink — nothing else.
+    #[test]
+    fn reddit_lookout_is_silent_until_something_matches() {
+        assert_eq!(
+            render_reddit_line(&json!({"new_count": 0, "matches": []})),
+            None
+        );
+        assert_eq!(render_reddit_line(&json!({"note": "no subs"})), None);
+        let line = render_reddit_line(&json!({
+            "new_count": 2,
+            "matches": [
+                {"subreddit": "rust", "title": "Async runtimes",
+                 "permalink": "https://www.reddit.com/r/rust/comments/a/x/"},
+                {"subreddit": "all", "title": "x", "permalink": ""}
+            ]
+        }))
+        .expect("a line for two matches");
+        assert!(line.contains("2 new match"), "{line}");
+        assert!(
+            line.contains("r/rust") && line.contains("Async runtimes"),
+            "{line}"
+        );
+        assert!(line.contains("comments/a/x"), "{line}");
+        // A long title is clipped, not swallowed.
+        let long = render_reddit_line(&json!({
+            "new_count": 1,
+            "matches": [{"subreddit": "rust", "title": "t".repeat(400), "permalink": ""}]
+        }))
+        .expect("line");
+        assert!(long.chars().count() < 300, "{long}");
+    }
+
+    /// The lookout only runs for an install that gated the drop in —
+    /// either under `enabled` (reads-first) or `owner_only` (the shipped
+    /// posture), never by the drop merely existing in plugins.d.
+    #[test]
+    fn reddit_lookout_respects_the_plugin_gate() {
+        assert!(reddit_opted_in(&["external:reddit".to_string()], &[]));
+        assert!(reddit_opted_in(&[], &["external:reddit".to_string()]));
+        assert!(!reddit_opted_in(
+            &["external:weather".to_string()],
+            &["external:pet".to_string()]
+        ));
+        assert!(!reddit_opted_in(&[], &[]));
     }
 }

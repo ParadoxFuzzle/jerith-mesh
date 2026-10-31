@@ -220,6 +220,14 @@ async fn build_report(cfg: &crate::config::BotConfig, day: &str) -> String {
         s.push_str(&line);
     }
 
+    // The reddit lookout's digest — what the watch terms caught in the
+    // last day, folded into the one note. Reads the drop's digest
+    // (`watch recent`), never its cursor, so the 08:00 note cannot
+    // swallow what the 08:30 monitor tick should still announce.
+    if let Some(line) = reddit_section(cfg).await {
+        s.push_str(&line);
+    }
+
     // Mesh (peer truth; a cheap HTTPS GET that degrades with a name).
     s.push_str(&match crate::api::gateway_status(cfg).await {
         Ok(st) => {
@@ -617,6 +625,65 @@ async fn ledger_section(cfg: &crate::config::BotConfig) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// The reddit lookout digest (§ crates/reddit-plugin, external:reddit)
+// ---------------------------------------------------------------------------
+
+fn reddit_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
+    let gate = "external:reddit";
+    enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
+}
+
+/// The morning digest line from a `reddit.watch recent` card. `None` when
+/// nothing was caught — a quiet night adds no line, the same rule the
+/// monitor keeps. The titles are clipped so one line stays one line.
+fn render_reddit_line(v: &Value) -> Option<String> {
+    let count = v["count"].as_u64()?;
+    if count == 0 {
+        return None;
+    }
+    let hours = v["hours"].as_u64().unwrap_or(24);
+    let mut line = format!("👀 reddit lookout: {count} caught in the last {hours}h");
+    let caught: Vec<String> = v["matches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter_map(|m| {
+            let sub = m["subreddit"].as_str().unwrap_or("?");
+            let title = m["title"].as_str().unwrap_or("(no title)");
+            Some(format!("r/{sub} `{}`", clip_line(title, 60)))
+        })
+        .collect();
+    if !caught.is_empty() {
+        line.push_str(&format!(" — {}", caught.join(" · ")));
+    }
+    Some(line)
+}
+
+/// Compose the digest section — same signed contract, same opt-in rule as
+/// the ledger/pet/quarantine lines above, and silent when the watch list
+/// is empty (the drop answers `count: 0` honestly, we just print nothing).
+async fn reddit_section(cfg: &crate::config::BotConfig) -> Option<String> {
+    if !reddit_opted_in(&cfg.plugins.enabled, &cfg.plugins.owner_only) {
+        return None;
+    }
+    let plugin = cfg.external_plugins.iter().find(|p| p.id == "reddit")?;
+    match crate::external::invoke(
+        plugin,
+        "reddit.watch",
+        &serde_json::json!({"action": "recent", "hours": 24}),
+    )
+    .await
+    {
+        Ok(card) => render_reddit_line(&card).map(|l| format!("{l}\n")),
+        Err(e) => {
+            tracing::debug!(error = %e, "reddit digest skipped — the drop wasn't answering");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Persisted fire state + schedule loop
 // ---------------------------------------------------------------------------
 
@@ -735,6 +802,48 @@ pub async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reddit digest is silent on a clean night, names the sub and a
+    /// clipped title when it isn't, and never grows past one line's worth
+    /// of text.
+    #[test]
+    fn reddit_digest_line_is_quiet_until_something_was_caught() {
+        assert_eq!(
+            render_reddit_line(&serde_json::json!({"count": 0, "hours": 24})),
+            None
+        );
+        assert_eq!(render_reddit_line(&serde_json::json!({"oops": 1})), None);
+        let line = render_reddit_line(&serde_json::json!({
+            "count": 2,
+            "hours": 24,
+            "matches": [
+                {"subreddit": "selfhosted", "title": "Jerith mesh on a NUC", "score": 12},
+                {"subreddit": "rust", "title": "t".repeat(300), "score": 1}
+            ]
+        }))
+        .expect("a digest line for two matches");
+        assert!(
+            line.starts_with("👀 reddit lookout: 2 caught in the last 24h"),
+            "{line}"
+        );
+        assert!(
+            line.contains("r/selfhosted") && line.contains("Jerith mesh on a NUC"),
+            "{line}"
+        );
+        assert!(line.chars().count() < 400, "clipped: {line}");
+    }
+
+    /// The digest only appears for an install that gated the drop in —
+    /// the drop merely living in plugins.d says nothing.
+    #[test]
+    fn reddit_digest_respects_the_plugin_gate() {
+        assert!(reddit_opted_in(&["external:reddit".to_string()], &[]));
+        assert!(reddit_opted_in(&[], &["external:reddit".to_string()]));
+        assert!(!reddit_opted_in(
+            &["external:weather".to_string()],
+            &["external:pet".to_string()]
+        ));
+    }
 
     /// Freshness arithmetic: today and yesterday are fresh, older
     /// stamps are not, garbage is not (garbage never reads as fresh).

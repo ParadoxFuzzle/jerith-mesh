@@ -1,0 +1,26 @@
+[package]
+name = "jerith-reddit-plugin"
+version.workspace = true
+edition.workspace = true
+description = "The mesh reddit skill: browse/search/thread reads plus submit/comment/edit/vote over the plugin SDK's signed /rpc contract — reads free, writes behind a propose-and-confirm token (docs/PLUGIN-SDK.md)."
+
+[[bin]]
+name = "jerith-reddit"
+path = "src/main.rs"
+
+[dependencies]
+jerith-plugin-template = { path = "../plugin-template" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# Upstream is oauth.reddit.com (public HTTPS); same rustls discipline as
+# the weather drop — the workspace provider pin stays untouched.
+# `form` is not a reqwest feature (0.12 ships the form encoder in the
+# default API) — the URL-encoded body comes from the default surface.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = { workspace = true }
+base64 = { workspace = true }

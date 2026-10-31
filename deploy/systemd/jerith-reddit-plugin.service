@@ -1,0 +1,30 @@
+# jerith-mesh reddit plugin — user-level service (crates/reddit-plugin,
+# served over the signed /rpc contract on :7794, oauth.reddit.com upstream).
+# Install:
+#   cp deploy/systemd/jerith-reddit-plugin.service ~/.config/systemd/user/
+#   mkdir -p ~/.jerith-mesh/plugins.d/reddit ~/.jerith-mesh/reddit
+#   cp crates/reddit-plugin/plugin.toml ~/.jerith-mesh/plugins.d/reddit/
+#   # rotate the manifest secret first (openssl rand -hex 16)
+#   # then write ~/.jerith-mesh/reddit/credentials.toml (chmod 600):
+#   #   client_id / client_secret / user_agent (required)
+#   #   refresh_token (preferred) or username + password
+#   systemctl --user daemon-reload && systemctl --user enable --now jerith-reddit-plugin
+#   # then add "external:reddit" to [plugins] owner_only in bot.toml + restart jerith-bot
+[Unit]
+Description=jerith-mesh reddit plugin (browse/search/thread + gated submit/comment/edit/vote, :7794)
+After=network-online.target
+
+[Service]
+Type=simple
+# Env vars override the credentials file — either works; the file is the
+# default because it keeps secrets out of the unit.
+EnvironmentFile=-%h/.jerith-mesh/reddit/reddit.env
+ExecStart=%h/Documents/Projects/jerith-mesh/target/release/jerith-reddit %h/.jerith-mesh/plugins.d/reddit/plugin.toml
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
