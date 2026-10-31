@@ -1,19 +1,77 @@
 //! Live Postgres lookup of the `jerith_people` registry (per chat turn).
 //!
-//! Connection contract mirrors OpenClaw's `scripts/shared/pg_pool.py`:
+//! Connection contract mirrors the previous stack's `scripts/shared/pg_pool.py`:
 //! `root@127.0.0.1:5432/jerith_people`, the password resolved from
 //! `~/.pgpass` (read in-process, never echoed or logged). bot.toml's
 //! optional `[postgres]` table overrides every field. The lookup degrades
 //! to "no speaker context" when the database is unreachable — a chat must
 //! never fail because the people database is down.
 
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
+use serde_json::json;
+
+use crate::plugins::SkillSpec;
 
 /// Rough per-message context budget for the speaker block (chars).
 const SPEAKER_BLOCK_MAX: usize = 2000;
+
+// ---------------------------------------------------------------------------
+// people.lookup — the registry lookup the bot was missing
+// ---------------------------------------------------------------------------
+//
+// The per-turn speaker block only describes the person TALKING, and the
+// persona's known-users export is capped, so a question about *another*
+// member ("what name colour does X use?") had no honest answer path — the
+// bot reported "I don't have a tool to look them up". This skill is that
+// tool: read-only, bounded, and deliberately narrow about what it returns.
+//
+// The registry holds operator notes, not a public profile: only
+// preference-shaped facts (name colour, pronouns, nickname, …) are
+// shareable. Medical notes, real names and contact details never leave the
+// database through this skill — see `is_shareable_fact`.
+
+/// Fact-key fragments that describe a *preference* — safe to show a chat.
+const PREFERENCE_TOKENS: &[&str] = &[
+    "color",
+    "colour",
+    "pronoun",
+    "timezone",
+    "language",
+    "nickname",
+    "emoji",
+    "preference",
+    "favorite",
+    "favourite",
+    "style",
+    "tone",
+    "call_me",
+    "calls_me",
+    "display",
+    // Self-selected roles are a preference the picker itself records.
+    "role",
+];
+
+/// Fact-key fragments that are NEVER shareable, even when the key also
+/// matches a preference token (`real_name`, `pain_meds`, `address`, …).
+const SENSITIVE_TOKENS: &[&str] = &[
+    "med",
+    "real_name",
+    "address",
+    "password",
+    "token",
+    "secret",
+    "phone",
+    "email",
+];
+
+/// Per-match preference lines; the total response stays small enough for a
+/// chat turn even when a partial name matches several people.
+const LOOKUP_MAX_FACTS: usize = 8;
+const LOOKUP_MAX_MATCHES: i64 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PgConfig {
@@ -51,7 +109,7 @@ fn default_timeout_secs() -> u64 {
 }
 
 impl Default for PgConfig {
-    /// The OpenClaw-stack connection contract (pg_pool.py defaults):
+    /// The local connection contract (pg_pool.py defaults):
     /// root@127.0.0.1:5432/jerith_people, auth via ~/.pgpass.
     fn default() -> Self {
         Self {
@@ -192,6 +250,189 @@ pub async fn lookup(cfg: &PgConfig, discord_id: &str) -> Result<Option<String>> 
     Ok(Some(format_speaker_block(&v)))
 }
 
+/// Is this profile key safe to show in a chat lookup?
+///
+/// Allowlist-by-meaning: the key must look like a preference AND must not
+/// look like a sensitive note. Anything unrecognized stays private (a
+/// missing preference is a fine answer; a leaked medical note is not).
+pub fn is_shareable_fact(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    if SENSITIVE_TOKENS.iter().any(|t| k.contains(t)) {
+        return false;
+    }
+    PREFERENCE_TOKENS.iter().any(|t| k.contains(t))
+}
+
+/// The model-facing `people.lookup` skill (read-only registry search).
+pub fn skills() -> Vec<SkillSpec> {
+    vec![SkillSpec {
+        name: "people.lookup",
+        plugin: "people",
+        description: "Look up a Discord member in the jerith_people registry by id, username or display name (partial names allowed). Returns username, display name, trust and preference facts such as name colour, pronouns or nickname. Read-only. Private notes, medical facts, real names and contacts are never returned; an empty result means the registry has no preference recorded.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Discord id, username or display name"
+                }
+            },
+            "required": ["query"]
+        }),
+        run: lookup_runner,
+    }]
+}
+
+fn lookup_runner<'a>(
+    cfg: &'a crate::config::BotConfig,
+    args: &'a serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let query = args
+            .get("query")
+            .and_then(|q| q.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        anyhow::ensure!(!query.is_empty(), "people.lookup: 'query' is required");
+        anyhow::ensure!(
+            query.chars().count() <= 100,
+            "people.lookup: query is too long"
+        );
+        let pg = cfg.postgres.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("people.lookup: no [postgres] lane configured — registry lookup is off")
+        })?;
+        let matches = lookup_any(pg, query).await?;
+        Ok(json!({
+            "matches": matches,
+            "found": matches.len(),
+            "note": if matches.is_empty() {
+                "no jerith_people row matches this query, and no preference is recorded — do not invent one"
+            } else {
+                "preference facts only; the registry's private notes are not shared"
+            },
+        }))
+    })
+}
+
+/// Read-only registry search: exact id / username / display name first,
+/// then a partial username/display match. One statement, bounded rows.
+async fn lookup_any(cfg: &PgConfig, query: &str) -> Result<Vec<serde_json::Value>> {
+    anyhow::ensure!(cfg.enabled, "people.lookup: postgres lookup disabled");
+    let conn = cfg
+        .conn_string()
+        .ok_or_else(|| anyhow::anyhow!("people.lookup: no connection info"))?;
+    let rows = tokio::time::timeout(
+        Duration::from_secs(cfg.timeout_secs),
+        fetch_people(&conn, query),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("people.lookup timed out"))??;
+    Ok(rows)
+}
+
+async fn fetch_people(conn: &str, query: &str) -> Result<Vec<serde_json::Value>> {
+    use tokio_postgres::NoTls;
+
+    let (client, connection) =
+        tokio::time::timeout(Duration::from_secs(2), tokio_postgres::connect(conn, NoTls))
+            .await
+            .map_err(|_| anyhow::anyhow!("postgres connect timeout"))?
+            .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?;
+    let driver = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!(error = %e, "people-lookup connection closed with error");
+        }
+    });
+
+    let sql = "SELECT p.discord_id, coalesce(p.username,'') AS username, coalesce(NULLIF(p.display_name,''), coalesce(p.username,'')) AS display_name, coalesce(p.trust,'') AS trust, coalesce(p.timezone,'') AS timezone, coalesce((SELECT jsonb_agg(jsonb_build_object('k', up.profile_key, 'v', up.profile_value) ORDER BY up.profile_key) FROM user_profiles up WHERE up.user_id = p.discord_id), '[]'::jsonb)::text AS facts FROM people p WHERE p.discord_id = $1 OR lower(coalesce(p.username,'')) = lower($1) OR lower(coalesce(p.display_name,'')) = lower($1) OR coalesce(p.username,'') ILIKE '%' || $1 || '%' OR coalesce(p.display_name,'') ILIKE '%' || $1 || '%' ORDER BY (p.discord_id = $1) DESC, p.username LIMIT $2";
+    let rows = client
+        .query(sql, &[&query, &LOOKUP_MAX_MATCHES])
+        .await
+        .map_err(|e| anyhow::anyhow!("people lookup failed: {e}"))?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let facts_text: String = row.try_get("facts").unwrap_or_else(|_| "[]".into());
+        let facts: Vec<serde_json::Value> = serde_json::from_str(&facts_text).unwrap_or_default();
+        let preferences: Vec<serde_json::Value> = facts
+            .into_iter()
+            .filter(|f| {
+                f.get("k")
+                    .and_then(|k| k.as_str())
+                    .map(is_shareable_fact)
+                    .unwrap_or(false)
+            })
+            .filter(|f| f.get("v").and_then(|v| v.as_str()).is_some())
+            .take(LOOKUP_MAX_FACTS)
+            .collect();
+        out.push(json!({
+            "discord_id": row.try_get::<_, String>("discord_id").unwrap_or_default(),
+            "username": row.try_get::<_, String>("username").unwrap_or_default(),
+            "display_name": row.try_get::<_, String>("display_name").unwrap_or_default(),
+            "trust": row.try_get::<_, String>("trust").unwrap_or_default(),
+            "timezone": row.try_get::<_, String>("timezone").unwrap_or_default(),
+            "preferences": preferences,
+        }));
+    }
+
+    drop(client);
+    driver.abort();
+    Ok(out)
+}
+
+/// Persist a preference row (`user_profiles`) for one member. Narrow,
+/// single-statement upsert on the registry's own table — the same shape the
+/// legacy picker wrote to the people file, now visible to `people.lookup`
+/// and the known-users export.
+async fn upsert_profile(
+    cfg: &PgConfig,
+    discord_id: &str,
+    key: &'static str,
+    value: &str,
+) -> Result<()> {
+    anyhow::ensure!(cfg.enabled, "registry persistence disabled");
+    let conn = cfg
+        .conn_string()
+        .ok_or_else(|| anyhow::anyhow!("no connection info"))?;
+    tokio::time::timeout(Duration::from_secs(cfg.timeout_secs), async move {
+        use tokio_postgres::NoTls;
+        let (client, connection) =
+            tokio::time::timeout(Duration::from_secs(2), tokio_postgres::connect(&conn, NoTls))
+                .await
+                .map_err(|_| anyhow::anyhow!("postgres connect timeout"))?
+                .map_err(|e| anyhow::anyhow!("postgres connect failed: {e}"))?;
+        let driver = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!(error = %e, "registry connection closed with error");
+            }
+        });
+        // The registry's unique (user_id, profile_key) makes this an upsert;
+        // no created_at/confidence guessing — those columns carry defaults.
+        let sql = "INSERT INTO user_profiles (user_id, profile_key, profile_value, confidence, source, updated_at) VALUES ($1, $2, $3, 1.0, 'jerith-bot', now()) ON CONFLICT (user_id, profile_key) DO UPDATE SET profile_value = EXCLUDED.profile_value, updated_at = now(), source = EXCLUDED.source";
+        client
+            .execute(sql, &[&discord_id, &key, &value])
+            .await
+            .map_err(|e| anyhow::anyhow!("profile write failed: {e}"))?;
+        drop(client);
+        driver.abort();
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("profile persistence timed out"))??;
+    Ok(())
+}
+
+/// The name colour the member just picked (`name_color`).
+pub async fn remember_name_color(cfg: &PgConfig, discord_id: &str, value: &str) -> Result<()> {
+    upsert_profile(cfg, discord_id, "name_color", value).await
+}
+
+/// The self-service roles the member picked (`discord_roles`, comma
+/// separated names) — written by roles.rs after each add/remove.
+pub async fn remember_roles(cfg: &PgConfig, discord_id: &str, value: &str) -> Result<()> {
+    upsert_profile(cfg, discord_id, "discord_roles", value).await
+}
+
 /// Pure block formatting (tests cover without a database).
 pub fn format_speaker_block(v: &serde_json::Value) -> String {
     let s = |opt: Option<&serde_json::Value>| -> String {
@@ -324,6 +565,43 @@ mod tests {
             block.contains("discord_id: 285471197825859584"),
             "speaker block must carry the owner's discord id"
         );
+    }
+
+    /// The lookup returns preference-shaped facts and refuses everything
+    /// personal, even when a key contains both signals.
+    #[test]
+    fn lookup_shares_preferences_but_never_private_notes() {
+        for safe in [
+            "color_hex_preference",
+            "name_color",
+            "pronouns",
+            "timezone",
+            "nickname",
+        ] {
+            assert!(is_shareable_fact(safe), "{safe} should be shareable");
+        }
+        for private in [
+            "real_name",
+            "pain_meds",
+            "address",
+            "phone",
+            "email",
+            "favorite_med",
+            "sexuality_note",
+            "core_belief",
+        ] {
+            assert!(!is_shareable_fact(private), "{private} must stay private");
+        }
+    }
+
+    #[test]
+    fn lookup_skill_declares_read_only_narrow_contract() {
+        let s = skills();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].name, "people.lookup");
+        assert_eq!(s[0].plugin, "people");
+        assert!(s[0].description.contains("never returned"));
+        assert_eq!(s[0].parameters["required"], json!(["query"]));
     }
 
     #[test]

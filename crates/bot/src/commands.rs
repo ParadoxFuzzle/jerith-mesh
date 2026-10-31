@@ -427,7 +427,7 @@ pub async fn myjercraft(ctx: Ctx<'_>) -> Result<(), Error> {
 
 /// Briefing of the watched threads (decisions + mesh digest).
 ///
-/// The full what-did-i-miss port of OpenClaw's skill: sweeps each
+/// The full what-did-i-miss port of the previous stack's skill: sweeps each
 /// configured archiver channel's latest messages over Discord REST,
 /// extracts the decision/tech-note lines and adds a 3-line mesh reasoning
 /// digest. Read-only — no memory writes, no web round-trips.
@@ -919,18 +919,20 @@ pub const HELP_TEXT: &str = "\
 `/recall <query>` — search the node's private memory
 `/factcheck <draft> [canon]` — fact-check a draft against the node's canon register (local-only lane; omit canon to auto-load the Colony X register)
 `/template [name] [subject] [style]` — writing-template pack: no args lists the four templates inline; with args fills one as structured JSON (local-only lane)
-`/briefing [hours]` — what happened across the watched threads (decisions + mesh digest, OpenClaw what-did-i-miss port)
+`/briefing [hours]` — what happened across the watched threads (decisions + mesh digest, Jerith Mesh what-did-i-miss)
 `/status` — node + mesh status snapshot
 `/peers` — list live peers in the mesh
 `/mine` — try to mine JER on the local JerithChain node
 `/leaderboard` — JER mining leaderboard (top winners)
 `/myjercraft` — show your own JER balance on the chain
+`/namecolor [colour]` — your own name colour role (presets or #hex; no args lists the palette; nobody can repaint someone else)
+`/role [name] [remove]` — give yourself a role the server opened up (no args lists them; only your own; a missing non-colour role pings the owner for approval)
 `/timeout <guild_id> <member_id> [minutes] [clear]` — guild moderation, **owner-DM only**
 `/help` — this message
 
 System-level actions are **owner-DM only**: commands outside this list are
 refused for everyone except direct messages from the bot owner's account
-(OpenClaw trust model, default-deny for unclassified commands).";
+(Jerith Mesh trust model, default-deny for unclassified commands).";
 
 /// Reply attribution: every reply names WHAT answered. The gateway's
 /// `x-jerith-served-by` classifies the lane — "local:{model}" stayed

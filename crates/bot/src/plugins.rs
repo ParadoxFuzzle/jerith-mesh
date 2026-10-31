@@ -1,4 +1,4 @@
-//! Plugin / skill SDK (OpenClaw-style modular plugin architecture port).
+//! Plugin / skill SDK (Jerith Mesh modular plugin architecture).
 //!
 //! The bot's model-facing capabilities are organized as **plugins** owning
 //! dot-named **skills** (`web_search`, `memory.embed`, …). A skill is an
@@ -52,7 +52,12 @@ pub const PREPACKAGED_PLUGINS: [&str; 8] = [
 ///   refused at load. The registry refuses dispatch of their skills from a
 ///   registry not constructed in owner-privileged mode (the refusal
 ///   contract).
-pub const OWNER_ONLY_PLUGINS: [&str; 3] = ["gcp", "coordinator", "workflows"];
+pub const OWNER_ONLY_PLUGINS: [&str; 4] = ["gcp", "coordinator", "workflows", "pgquery"];
+
+/// The in-tree owner-only families: never listable in `[plugins] enabled`
+/// or `owner_only`, always joined into an owner-privileged registry by
+/// the chat path. (`gcp` is the external drop; it rides `owner_only`.)
+pub const OWNER_ONLY_IN_TREE: [&str; 3] = ["coordinator", "workflows", "pgquery"];
 
 /// Boxed executor future for one model-requested skill call.
 type BoxedSkillFut<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send + 'a>>;
@@ -65,7 +70,7 @@ type SkillRunner =
 /// One callable skill inside a plugin.
 #[derive(Debug, Clone)]
 pub struct SkillSpec {
-    /// OpenClaw-style dot-or-bare name the model sees (`web_search`,
+    /// The dot-or-bare name the model sees (`web_search`,
     /// `memory.embed`, `lore.search`).
     pub name: &'static str,
     /// Owning plugin id (`websearch`, `memory`, `lore`).
@@ -263,6 +268,13 @@ fn standard_skills() -> Vec<SkillSpec> {
     // Rust-native macro-tools (FEATURES §17.2): one model verb wrapping a
     // compiled sub-pipeline (scrape → strip → chunk → embed → summarize).
     v.extend(crate::pipeline::skills());
+    // Read-only Postgres lookups (`pg.query`, owner-DM only).
+    v.extend(crate::pgquery::skills());
+    // Registry lookup for ANY member (`people.lookup`, chat-safe subset) —
+    // the tool the bot was missing when asked about another user's name
+    // colour (2026-10-31), where only the speaker block + a capped persona
+    // export existed.
+    v.extend(crate::people::skills());
     v
 }
 
@@ -825,7 +837,7 @@ impl SkillRegistry {
     /// generated from the SAME source the payload's `tools` array comes
     /// from ([`Self::tool_defs`]), so prompt and declarations can never
     /// disagree (2026-10-23 report: "the bot doesn't realize it has web
-    /// search": the workspace persona advertised the OpenClaw-era shell
+    /// search": the workspace persona advertised the legacy shell
     /// tools, so the only truthful picture of the real surface was the
     /// bare tools array, which many runtimes read loosely). Call it ONLY
     /// when the chat actually attaches the tools array — advertising a
@@ -948,6 +960,9 @@ mod tests {
             guard: Default::default(),
             system_prompt: None,
             postgres: None,
+            pgquery: Default::default(),
+            namecolor: Default::default(),
+            roles: Default::default(),
             web: Default::default(),
             plugins: Default::default(),
             owner_discord_id: None,
@@ -1372,6 +1387,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("external:gcp"), "routed: {err}");
+    }
+
+    /// `pg.query` is owner-DM only: absent from a plain registry, present
+    /// once an owner-privileged session joins the in-tree owner families.
+    #[test]
+    fn pg_query_joins_only_owner_privileged_registries() {
+        let name = "pg.query".to_string();
+        let plain = SkillRegistry::standard(Vec::<String>::new());
+        assert!(!plain.enabled_skill_names().contains(&name));
+        assert!(
+            plain
+                .tool_defs()
+                .iter()
+                .all(|d| d["function"]["name"] != "pg_query")
+        );
+        let in_tree: Vec<String> = OWNER_ONLY_IN_TREE.iter().map(|s| s.to_string()).collect();
+        let owner = SkillRegistry::standard(Vec::<String>::new())
+            .join(&in_tree)
+            .owner_privileged();
+        assert!(owner.enabled_skill_names().contains(&name));
     }
 
     #[test]

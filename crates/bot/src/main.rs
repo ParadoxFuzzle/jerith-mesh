@@ -27,10 +27,13 @@ mod hooks;
 mod mailbox;
 mod mongo;
 mod monitor;
+mod namecolor;
 mod owner;
 mod people;
+mod pgquery;
 mod pipeline;
 mod plugins;
+mod roles;
 mod router;
 mod sandbox;
 mod squeeze;
@@ -49,7 +52,7 @@ type Error = anyhow::Error;
 /// Owner gate as the framework's `command_check` (poise gives no inferred
 /// types here, so it's a named fn). See owner.rs: user-level commands run
 /// for everyone; anything else — including unclassified future commands —
-/// runs only in a DM from the bot owner (default-deny, OpenClaw trust
+/// runs only in a DM from the bot owner (default-deny, Jerith Mesh trust
 /// model ported).
 fn owner_gate_check(
     ctx: poise::Context<'_, Data, Error>,
@@ -142,9 +145,9 @@ async fn main() -> anyhow::Result<()> {
     // orphan repair) and — if `[approvals]` has a Telegram pair — the
     // inline-keyboard poller come up.
     approval::init(std::sync::Arc::new(cfg.clone()));
-    // Persona: composed from the OpenClaw-style workspace canon docs
+    // Persona: composed from the workspace canon docs
     // (~/.jerith-mesh/workspace/IDENTITY|SOUL|USER|USER_MODEL|AGENTS|MEMORY.md,
-    // staged on first boot from the migrated OpenClaw workspace) when
+    // staged on first boot from the migrated workspace) when
     // neither `JERITH_PERSONA` nor bot.toml's `system_prompt` is set. The
     // flat `~/.jerith-mesh/persona.md` remains the fallback when the
     // workspace holds no canon docs.
@@ -153,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         if !staged.is_empty() {
             tracing::info!(
                 staged = staged.join(", "),
-                "workspace canon docs staged from the OpenClaw workspace"
+                "workspace canon docs staged from the legacy workspace"
             );
         }
         match composed {
@@ -188,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
     // Known users: the jerith_people PostgreSQL database, exported live by
     // the site cron (people + profile facts + trust levels + identity
     // links). Appended to whatever persona the bot ended up with — this is
-    // the "reading its database" step the OpenClaw gateway did implicitly.
+    // the "reading its database" step the legacy gateway did implicitly.
     {
         let path = config::known_users_file_path();
         if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -255,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let intents = serenityall::GatewayIntents::non_privileged();
-    //Guild-member lane (welcome.rs, OpenClaw guild-watcher port): widen
+    //Guild-member lane (welcome.rs, Jerith Mesh guild watcher): widen
     // with the privileged GUILD_MEMBERS intent so joins are seen. No
     // dev-portal change needed: the app already carries the member intents
     // — the watcher connected with intents.members on this same token.
@@ -291,6 +294,12 @@ async fn main() -> anyhow::Result<()> {
                 commands::leaderboard(),
                 commands::myjercraft(),
                 commands::gif(),
+                // Cosmetic name-colour roles, converted from the legacy
+                // OpenClaw picker: own colour only, always.
+                namecolor::namecolor(),
+                // Self-service general roles (roles.rs): own roles only;
+                // a missing non-colour role becomes an owner ping.
+                roles::role(),
                 // Guild-admin lever — deliberately unclassified in
                 // owner.rs's USER_COMMANDS: the default-deny gate makes
                 // it owner-DM only (system-level action).
@@ -325,7 +334,7 @@ async fn main() -> anyhow::Result<()> {
                 // Voice lane captions surface (voice.rs): the http handle
                 // for the optional `[voice] captions_channel_id` posts.
                 voice::set_captions_http(ctx.http.clone());
-                // Discord thread archiver (OpenClaw skill port): an
+                // Discord thread archiver (Jerith Mesh skill): an
                 // operator-configured background ingest — no commands, no
                 // system-level change; subscribed in bot.toml [archiver].
                 // Spawns after the gateway is registered so memory embeds
@@ -357,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                         "voice enabled but not runnable (ids/key/model missing) — lane stays off"
                     );
                 }
-                // Monitor scaffold (OpenClaw ops-monitor port): periodic
+                // Monitor scaffold (Jerith Mesh ops-monitor): periodic
                 // checks with a single owner DM when something fails.
                 // Reports only — no restarts/no repairs (owner.rs holds
                 // the system-level boundary).

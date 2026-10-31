@@ -439,7 +439,7 @@ pub async fn chat_with_usage_live(
     live: Option<&LiveTap>,
     owner_privileged: bool,
 ) -> Result<(String, Option<String>, u64)> {
-    // Context squeeze (OpenClaw context-squeeze port): compact the history
+    // Context squeeze (Jerith Mesh context-squeeze): compact the history
     // before it rides the request when it blows the configured budget.
     // Pure pass first (drop-oldest-turns, head-trim) — the summary stage
     // needs the caller's state handle and runs separately (squeeze.rs docs).
@@ -509,7 +509,7 @@ pub async fn chat_with_usage_live(
     }
 
     // Live identity: resolve the tagged speaker against the jerith_people
-    // registry (direct Postgres — same contract as the OpenClaw stack:
+    // registry (direct Postgres — same contract as the previous stack:
     // root@127.0.0.1:5432, password via ~/.pgpass). The freshest row is
     // attached as a second system message; an unreachable database or an
     // unknown speaker just means the chat proceeds without it.
@@ -543,7 +543,7 @@ pub async fn chat_with_usage_live(
         model = lane;
     }
 
-    // Web access (OpenClaw stack migration): the chat request declares the
+    // Web access (previous stack migration): the chat request declares the
     // enabled plugins' skills as OpenAI tools, so a tool-capable runtime can
     // web_search / memory.embed / lore.search mid-answer (the plugin SDK's
     // registry decides what's summonable; see plugins.rs). Unsupported
@@ -558,7 +558,18 @@ pub async fn chat_with_usage_live(
     // registry they always built.
     let mut reg = crate::plugins::SkillRegistry::standard(cfg.plugins.enabled.clone());
     if owner_privileged {
-        reg = reg.join(&cfg.plugins.owner_only).owner_privileged();
+        // In-tree owner-only families (coordinator, workflows, pgquery)
+        // never ride config — the documented owner-DM contract is that
+        // they join automatically, so join them here alongside the
+        // operator-listed external drops (`external:gcp`).
+        let in_tree: Vec<String> = crate::plugins::OWNER_ONLY_IN_TREE
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        reg = reg
+            .join(&cfg.plugins.owner_only)
+            .join(&in_tree)
+            .owner_privileged();
     }
     let registry = std::sync::Arc::new(
         reg.with_external(cfg.external_plugins.clone())
@@ -734,7 +745,7 @@ pub async fn chat_with_usage_live(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        // Slop tolerance (OpenClaw-era runtimes): some OpenAI-compatible
+        // Slop tolerance (legacy runtimes): some OpenAI-compatible
         // stacks — qwen3:8b via LiteLLM/Ollama on this vps — answer the
         // tool intent as plain JSON content instead of native tool_calls.
         // Detect `{"function_name": …, "arguments": …}` there and subject

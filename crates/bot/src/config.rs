@@ -57,16 +57,28 @@ pub struct BotConfig {
     /// could mangle the owner's own security rules quoted inside it.
     pub system_prompt: Option<String>,
     /// Optional `[postgres]` table — live jerith_people lookup per chat turn
-    /// (OpenClaw-stack defaults; password resolved from ~/.pgpass). Degrades
+    /// (loopback defaults; password resolved from ~/.pgpass). Degrades
     /// silently to no context when the DB is unreachable.
     pub postgres: Option<crate::people::PgConfig>,
-    /// Web access via the gateway's web skills (OpenClaw migration): when
+    /// Optional `[pgquery]` table — the read-only `pg.query` skill
+    /// (owner-DM sessions only; see pgquery.rs). Absent = defaults:
+    /// loopback Postgres as `root` via `~/.pgpass`, the local
+    /// databases + the node's pgvector store allowlisted.
+    pub pgquery: crate::pgquery::PgQueryConfig,
+    /// Colour-role picker (`[namecolor]`): the legacy OpenClaw picker
+    /// converted into this bot's chat/commands (namecolor.rs). On by
+    /// default — it only assigns cosmetic colour roles.
+    pub namecolor: crate::namecolor::NameColorConfig,
+    /// Self-service roles (`[roles]`): a member picks their own roles, a
+    /// missing non-colour role becomes an owner ping (roles.rs).
+    pub roles: crate::roles::RolesConfig,
+    /// Web access via the gateway's web skills (migration): when
     /// enabled, chat requests declare `web_search` + `web_fetch` tools and
     /// executed tool calls are fed back into the conversation (OpenAI
     /// tool-calling protocol). Off → the bot never touches the web.
     pub web: WebToolsConfig,
-    /// Plugin / skill gating (`[plugins]` in bot.toml, OpenClaw-style
-    /// modular plugin architecture; see plugins.rs). The `enabled` list
+    /// Plugin / skill gating (`[plugins]` in bot.toml, modular
+    /// plugin architecture; see plugins.rs). The `enabled` list
     /// names the pre-packaged plugins that are switched on; everything the
     /// model can summon derives from it (web loop tools, memory.*, lore).
     pub plugins: PluginsConfig,
@@ -76,23 +88,23 @@ pub struct BotConfig {
     pub external_plugins: Vec<crate::external::ExternalPlugin>,
     /// The bot owner's Discord id (default-deny gate for system-level
     /// commands; see owner.rs). Resolved from `$JERITH_BOT_OWNER_ID`, then
-    /// bot.toml `[owner] discord_id`, then the OpenClaw config's
+    /// bot.toml `[owner] discord_id`, then the legacy config's
     /// `commands.ownerAllowFrom` (read-only borrow, like the token).
     pub owner_discord_id: Option<u64>,
     /// Discord thread-archiver (operator-configured background ingestion;
     /// off unless `[archiver] enabled = true` and channels are listed).
     pub archiver: ArchiverConfig,
-    /// Context squeeze (OpenClaw context-squeeze/juice-compact port):
+    /// Context squeeze (Jerith Mesh context-squeeze/juice-compact):
     /// per-user history compaction before chats.
     pub squeeze: SqueezeConfig,
-    /// Ops monitor (OpenClaw ops-monitor family port): periodic checks
+    /// Ops monitor (Jerith Mesh ops-monitor family): periodic checks
     /// with a single owner DM when something fails. Reports only.
     pub monitor: MonitorConfig,
     /// Daily owner self-briefing: one owner DM per day stitching journal,
     /// monitor, mail, voice and approvals (`[briefing]`, see briefing.rs).
     pub briefing: BriefingConfig,
-    /// Welcome-DM lane (`[welcome]` in bot.toml): the OpenClaw
-    /// guild-watcher port — three embeds + local GIF pool + DM to every
+    /// Welcome-DM lane (`[welcome]` in bot.toml): the legacy
+    /// guild-watcher — three embeds + local GIF pool + DM to every
     /// human joining a scoped guild (welcome.rs). Off by default.
     pub welcome: crate::welcome::WelcomeConfig,
     /// Webhook / event hooks for plugin authors (FEATURES §8): fire-
@@ -490,6 +502,9 @@ impl BotConfig {
             guard: file.guard.unwrap_or_default(),
             system_prompt,
             postgres: file.postgres,
+            pgquery: file.pgquery.unwrap_or_default(),
+            namecolor: file.namecolor.unwrap_or_default(),
+            roles: file.roles.unwrap_or_default(),
             web: file.web.unwrap_or_default(),
             plugins: {
                 let cfg = file.plugins.unwrap_or_default();
@@ -572,7 +587,7 @@ impl BotConfig {
         })
     }
 
-    /// Owner id resolution (env → file → OpenClaw borrow). A missing owner
+    /// Owner id resolution (env → file → Jerith Mesh borrow). A missing owner
     /// is allowed but leaves the default-deny gate closed for everyone:
     /// system-level commands stay refused until an owner is configured.
     fn resolve_owner(file: &FileConfig) -> Option<u64> {
@@ -616,6 +631,9 @@ impl BotConfig {
             guard: jerith_mesh_core::guard::GuardConfig::default(),
             system_prompt: None,
             postgres: None,
+            pgquery: crate::pgquery::PgQueryConfig::default(),
+            namecolor: crate::namecolor::NameColorConfig::default(),
+            roles: crate::roles::RolesConfig::default(),
             web: WebToolsConfig::default(),
             plugins: PluginsConfig::default(),
             owner_discord_id: None,
@@ -644,8 +662,8 @@ impl BotConfig {
     }
 }
 
-/// Context-squeeze settings (`[squeeze]` in bot.toml) — OpenClaw
-/// context-squeeze port. On by default with a gentle budget; `enabled =
+/// Context-squeeze settings (`[squeeze]` in bot.toml) — the legacy
+/// context-squeeze. On by default with a gentle budget; `enabled =
 /// false` restores the plain 8-turn ring semantics verbatim.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SqueezeConfig {
@@ -691,7 +709,7 @@ impl Default for SqueezeConfig {
 }
 
 /// Discord thread-archiver configuration (`[archiver]` in bot.toml) — port
-/// of the OpenClaw thread-archiver skill's options. Disabled unless
+/// of the Jerith Mesh thread-archiver skill's options. Disabled unless
 /// explicitly enabled AND at least one channel id is listed.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ArchiverConfig {
@@ -701,7 +719,7 @@ pub struct ArchiverConfig {
     /// ordinary Discord channels to the REST API.
     #[serde(default)]
     pub channel_ids: Vec<u64>,
-    /// Sweep cadence in minutes (OpenClaw cron equivalent).
+    /// Sweep cadence in minutes (legacy cron equivalent).
     #[serde(default = "default_archiver_interval")]
     pub interval_minutes: u64,
     /// Page size per channel fetch (Discord max 100).
@@ -758,8 +776,8 @@ impl Default for ArchiverConfig {
     }
 }
 
-/// Ops-monitor settings (`[monitor]` in bot.toml) — OpenClaw
-/// ops-monitor family port. On by default (disk/temp/log checks are
+/// Ops-monitor settings (`[monitor]` in bot.toml) — the legacy
+/// ops-monitor family. On by default (disk/temp/log checks are
 /// free); the backup-freshness check only runs for listed dirs.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MonitorConfig {
@@ -919,7 +937,7 @@ pub fn plugins_dir_path() -> PathBuf {
 /// `~/.jerith-mesh/known-users.md` — live export of the `jerith_people`
 /// PostgreSQL database (site cron, every 5 min). Appended to the persona
 /// so the bot reads its people registry — the individual-user recognition
-/// source the OpenClaw gateway used to provide.
+/// source the legacy gateway used to provide.
 pub fn known_users_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
@@ -955,20 +973,28 @@ struct FileConfig {
     system_prompt: Option<String>,
     /// Optional `[postgres]` table — live jerith_people lookup per chat turn.
     postgres: Option<crate::people::PgConfig>,
+    /// Optional `[pgquery]` table — read-only Postgres lookups (pgquery.rs).
+    pgquery: Option<crate::pgquery::PgQueryConfig>,
+    /// Optional `[namecolor]` table — the colour-role picker converted to
+    /// this bot (namecolor.rs). Absent = enabled with the legacy palette.
+    namecolor: Option<crate::namecolor::NameColorConfig>,
+    /// Optional `[roles]` table — self-service roles (roles.rs). Absent =
+    /// enabled for every safe, non-colour role.
+    roles: Option<crate::roles::RolesConfig>,
     /// Optional `[guard]` section — same shape as the node's config.toml.
     guard: Option<jerith_mesh_core::guard::GuardConfig>,
     /// Optional `[web]` section — tool-loop toggle for the gateway's
     /// web skills (Brave search + fetch).
     web: Option<WebToolsConfig>,
     /// Optional `[owner]` table — the bot owner's Discord id, gating
-    /// system-level commands (see owner.rs; borrowed from the OpenClaw
+    /// system-level commands (see owner.rs; borrowed from the legacy
     /// config when missing, same as the token).
     owner: Option<OwnerTable>,
     /// Optional `[archiver]` table — Discord thread-archiver config
-    /// (OpenClaw skill port, see archiver.rs).
+    /// (Jerith Mesh skill, see archiver.rs).
     archiver: Option<ArchiverConfig>,
     /// Optional `[squeeze]` table — context-squeeze compaction settings
-    /// (OpenClaw context-squeeze port, see squeeze.rs).
+    /// (Jerith Mesh context-squeeze, see squeeze.rs).
     squeeze: Option<SqueezeConfig>,
     /// Optional `[monitor]` table — ops-monitor settings (checks +
     /// owner-DM reports; see monitor.rs).
@@ -976,8 +1002,8 @@ struct FileConfig {
     /// Optional `[briefing]` table — the daily owner self-briefing (see
     /// briefing.rs).
     briefing: Option<BriefingConfig>,
-    /// Optional `[welcome]` table — the welcome-DM lane (OpenClaw
-    /// guild-watcher port, see welcome.rs).
+    /// Optional `[welcome]` table — the welcome-DM lane (the legacy
+    /// guild-watcher, see welcome.rs).
     welcome: Option<crate::welcome::WelcomeConfig>,
     /// Optional `[hooks]` table — webhook event hooks for plugin authors
     /// (FEATURES §8, see hooks.rs). Empty = disabled.

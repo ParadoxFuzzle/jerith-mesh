@@ -33,7 +33,7 @@ use std::time::Duration;
 /// Cap on one dispatcher response (a bloated barker can't eat memory).
 pub const MAX_RESPONSE_BYTES: usize = 65536;
 
-/// Model-visible skill names are the OpenClaw-style dot-or-bare tokens:
+/// Model-visible skill names are the dot-or-bare skill tokens:
 /// ASCII letter/digit start, then letters/digits/`._-` (no whitespace —
 /// the name lands in tool declarations and the dispatch whitelist).
 fn valid_skill_name(name: &str) -> bool {

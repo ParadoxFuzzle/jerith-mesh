@@ -38,7 +38,7 @@ pub async fn handle(
     {
         return Ok(());
     }
-    // Welcome-DM lane (welcome.rs, the OpenClaw guild-watcher port): DM
+    // Welcome-DM lane (welcome.rs, the Jerith Mesh guild watcher): DM
     // one of three embeds + a local GIF to a scoped-server join. Cheap
     // filter first, spawn inside — the dispatch loop never waits.
     if let serenityall::FullEvent::GuildMemberAddition { new_member, .. } = event {
@@ -184,6 +184,44 @@ pub async fn handle(
         }
     };
     let Some(prompt) = prompt else { return Ok(()) };
+
+    // Name-colour lane (namecolor.rs): the legacy picker converted to chat.
+    // A recognised colour request is executed HERE — the model has no
+    // Discord role tools, so routing it to the model produced the "I can't
+    // assign roles" refusal (2026-10-31) while the old picker bot sat idle.
+    if let (Some(guild_id), Some(ask)) =
+        (msg.guild_id, crate::namecolor::parse_chat_request(&prompt))
+    {
+        let cfg = ctx.user_data().await.cfg.clone();
+        let reply = crate::namecolor::handle_chat_request(
+            &ctx.serenity_context.http,
+            guild_id,
+            msg.author.id,
+            ask,
+            &cfg,
+        )
+        .await;
+        let _ = msg.channel_id.say(ctx.serenity_context, reply).await;
+        return Ok(());
+    }
+
+    // Self-service roles (roles.rs): same shape for general roles — the
+    // speaker's own roles only. A role that doesn't exist becomes an owner
+    // ping (creating non-colour roles needs approval); colour roles are
+    // redirected to the lane above, where creation needs none.
+    if let (Some(guild_id), Some(ask)) = (msg.guild_id, crate::roles::parse_chat_request(&prompt)) {
+        let cfg = ctx.user_data().await.cfg.clone();
+        let reply = crate::roles::handle_chat_request(
+            &ctx.serenity_context.http,
+            guild_id,
+            msg.author.id,
+            ask,
+            &cfg,
+        )
+        .await;
+        let _ = msg.channel_id.say(ctx.serenity_context, reply).await;
+        return Ok(());
+    }
 
     let user = msg.author.id.get();
     let data = ctx.user_data().await;
@@ -363,7 +401,7 @@ pub fn strip_bot_mentions(content: &str, bot_user_id: u64) -> String {
 
 /// Tag the caller's identity onto their message so the model sees WHO is
 /// talking (the persona already encodes the owner's Discord id, giving it
-/// the same individual-user awareness the OpenClaw gateway had). Kept in
+/// the same individual-user awareness the legacy gateway had). Kept in
 /// history, so each stored turn carries its speaker across the conversation.
 pub fn speaker_tag(user: &serenityall::User) -> String {
     let display = user

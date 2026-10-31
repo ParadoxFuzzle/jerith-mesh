@@ -1,4 +1,4 @@
-//! Owner allowlist + command classification — port of OpenClaw's trust
+//! Owner allowlist + command classification — port of the previous stack's trust
 //! model (`commands.ownerAllowFrom` + the security-audit default-deny
 //! stance), tuned for the mesh bot:
 //!
@@ -6,7 +6,7 @@
 //!    explicitly classified as user-level in [`USER_COMMANDS`]. Anything
 //!    not listed there (a command added later, without a classification)
 //!    is refused *for everyone* until it is classified — the same rule
-//!    OpenClaw's security audit applies when commands ship without an
+//!    the previous stack's security audit applies when commands ship without an
 //!    owner allowlist ("commands will be rejected for everyone").
 //! 2. **System-level actions are owner-DM only.** A command that escapes
 //!    the user-level list can only run when the invocation is a DM and
@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-/// Where the OpenClaw stack stored its owner allowlist (read-only borrow;
+/// Where the previous stack stored its owner allowlist (read-only borrow;
 /// the mesh bot never writes to ~/.openclaw).
 pub const OPENCLAW_CONFIG_PATH: &str = ".openclaw/openclaw.json";
 
@@ -35,8 +35,13 @@ pub const OPENCLAW_CONFIG_PATH: &str = ".openclaw/openclaw.json";
 /// `help`) or confined to the caller's own data (own chat, own memory
 /// notes, own JER wallet via `mine`; chain mining is a per-user wallet
 /// feature, not node/host control).
-pub const USER_COMMANDS: [&str; 15] = [
+pub const USER_COMMANDS: [&str; 17] = [
     "ask",
+    // Cosmetic colour roles (namecolor.rs): the caller's own colour only.
+    "namecolor",
+    // Self-service general roles (roles.rs): the caller's own roles only;
+    // a missing non-colour role becomes an owner ping, never a creation.
+    "role",
     "read",
     "reset",
     "remember",
@@ -73,7 +78,7 @@ pub enum Gate {
     Deny(String),
 }
 
-/// OpenClaw-rule decision for one command invocation. `dm` = invoked in a
+/// owner-rule decision for one command invocation. `dm` = invoked in a
 /// direct message, `author_id` = invoking Discord user, `owner_id` =
 /// resolved bot owner (None → no classified owner exists → default-deny).
 pub fn gate_command(dm: bool, author_id: u64, owner_id: Option<u64>, command: &str) -> Gate {
@@ -84,13 +89,13 @@ pub fn gate_command(dm: bool, author_id: u64, owner_id: Option<u64>, command: &s
         Some(id) if dm && author_id == id => Gate::Allow,
         _ => Gate::Deny(format!(
             "🛡️ `{command}` is a system-level action — owner-DM only \
-             (OpenClaw trust model ported to jerith-mesh). Direct-message me \
+             (Jerith Mesh trust model). Direct-message me \
              from the bot owner's account to use it."
         )),
     }
 }
 
-/// Borrow the owner's Discord id from the OpenClaw config
+/// Borrow the owner's Discord id from the legacy config
 /// (`commands.ownerAllowFrom: ["discord:<id>", …]` / bare ids accepted).
 /// Read-only, same borrow pattern as the bot token migration.
 pub fn borrow_owner_from_openclaw(path: &Path) -> Option<u64> {
@@ -122,9 +127,11 @@ mod tests {
 
     #[test]
     fn classification_counts_the_registered_set() {
-        // All 15 user-level commands classify; the rest of the
-        // registered set (mail, gif, timeout, voiceleave) is
-        // deliberately unclassified → owner-DM-only.
+        // All user-level commands classify; the rest of the registered
+        // set (mail, gif, timeout, voiceleave) is deliberately
+        // unclassified → owner-DM-only. `/namecolor` and `/role` are
+        // user-level: cosmetic/opt-in roles on yourself, with no path to
+        // anyone else's.
         for (i, cmd) in USER_COMMANDS.iter().enumerate() {
             assert!(command_is_user_level(cmd), "{cmd} must classify");
             let _ = i;
