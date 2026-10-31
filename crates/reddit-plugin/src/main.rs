@@ -675,8 +675,11 @@ fn watch_card(matches: &[Post], now: f64) -> String {
 }
 
 async fn do_check(r: Arc<Reddit>, limit: usize) -> std::result::Result<Value, String> {
-    let base = r.creds()?.base();
     let w = load_watch(&r.watch_file);
+    // The fresh-install path: nothing watched yet is a QUIET tick, not an
+    // auth failure. Checking the list before demanding credentials is what
+    // keeps the monitor's first sweep silent on a box that has the drop
+    // installed but not yet configured.
     if w.subs.is_empty() {
         return Ok(json!({
             "new_count": 0,
@@ -685,6 +688,7 @@ async fn do_check(r: Arc<Reddit>, limit: usize) -> std::result::Result<Value, St
             "note": "no subreddits on the watch list yet — add one with action=add",
         }));
     }
+    let base = r.creds()?.base();
     let mut posts: Vec<Post> = Vec::new();
     let mut checked: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();

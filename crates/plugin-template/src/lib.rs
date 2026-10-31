@@ -224,7 +224,11 @@ async fn rpc(State(cfg): State<Arc<ServerConfig>>, headers: HeaderMap, body: Str
         Ok(v) => v,
         Err(e) => {
             // The model reads `{"error": …}` and may retry differently —
-            // the skill's honest failure, not a transport failure.
+            // the skill's honest failure, not a transport failure. It still
+            // gets a receipt: a refusing skill used to be invisible in the
+            // journal (found live 2026-10-31, a lookup whose handler error
+            // logged nothing while the bot's caller saw only silence).
+            tracing::warn!(plugin = %cfg.id, skill = %skill_name, error = %e, "invoke refused");
             return (StatusCode::OK, axum::response::Json(json!({ "error": e }))).into_response();
         }
     };

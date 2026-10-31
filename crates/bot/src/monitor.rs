@@ -655,7 +655,10 @@ async fn reddit_section(
     {
         Ok(card) => render_reddit_line(&card),
         Err(e) => {
-            tracing::debug!(error = %e, "reddit lookout skipped — the drop wasn't answering");
+            // WARN, not debug: an unarmed lookout looks exactly like a quiet
+            // one, and the whole point of this lane is that it speaks. One
+            // line per tick is the price of not lying by silence.
+            tracing::warn!(error = %e, "reddit lookout skipped — the drop wasn't answering");
             None
         }
     }
@@ -683,16 +686,38 @@ pub async fn run_loop(
         interval_minutes = cfg.interval_minutes,
         "monitor scaffold started (Jerith Mesh ops-monitor)"
     );
+    // Whether the reddit lookout is actually armed is two facts, not one:
+    // the operator gated the drop in AND the manifest parsed at load. They
+    // fail differently (config vs plugins.d), so the boot line names both
+    // instead of leaving an unarmed lookout indistinguishable from a quiet
+    // one.
+    let lookout_gated = reddit_opted_in(&enabled_plugins, &owner_only_plugins);
+    let lookout_drop = plugins.iter().any(|p| p.id == "reddit");
+    tracing::info!(
+        reddit_lookout = lookout_gated && lookout_drop,
+        gated = lookout_gated,
+        drop_parsed = lookout_drop,
+        "monitor lookout state"
+    );
+    if lookout_gated && !lookout_drop {
+        tracing::warn!(
+            "external:reddit is gated in but no reddit drop parsed — check ~/.jerith-mesh/plugins.d/reddit/plugin.toml"
+        );
+    }
     let limits = MonitorLimits {
         backup_dirs: cfg.backup_dirs,
         ..MonitorLimits::default()
     };
     loop {
-        let results = run_checks(&limits);
-        // The lookout rides the same tick as the system checks: one DM,
-        // not a second notification loop with its own cadence to reason
-        // about. A check that finds nothing leaves `report` alone.
+        // The lookout runs BEFORE the system checks on purpose: `df`,
+        // `openssl s_client` and hwmon reads can block for seconds to
+        // minutes, and an alert must not queue behind them. It is also
+        // the only async call here, so putting it first keeps the tick's
+        // blocking half honest.
         let lookout = reddit_section(&plugins, &enabled_plugins, &owner_only_plugins).await;
+        let results = run_checks(&limits);
+        // One DM, not a second notification loop with its own cadence to
+        // reason about. A check that finds nothing leaves `report` alone.
         let report = match (render_report(&results), lookout) {
             (None, None) => None,
             (Some(r), None) => Some(r),

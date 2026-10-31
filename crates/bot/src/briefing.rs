@@ -677,7 +677,9 @@ async fn reddit_section(cfg: &crate::config::BotConfig) -> Option<String> {
     {
         Ok(card) => render_reddit_line(&card).map(|l| format!("{l}\n")),
         Err(e) => {
-            tracing::debug!(error = %e, "reddit digest skipped — the drop wasn't answering");
+            // Warn: a missing digest is indistinguishable from a quiet
+            // night, and this line is the only place that difference shows.
+            tracing::warn!(error = %e, "reddit digest skipped — the drop wasn't answering");
             None
         }
     }
