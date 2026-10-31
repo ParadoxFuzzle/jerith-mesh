@@ -683,10 +683,10 @@ fn render_reddit_line(v: &Value) -> Option<String> {
         .into_iter()
         .flatten()
         .take(3)
-        .filter_map(|m| {
+        .map(|m| {
             let sub = m["subreddit"].as_str().unwrap_or("?");
             let title = m["title"].as_str().unwrap_or("(no title)");
-            Some(format!("r/{sub} `{}`", clip_line(title, 60)))
+            format!("r/{sub} `{}`", clip_line(title, 60))
         })
         .collect();
     if !caught.is_empty() {

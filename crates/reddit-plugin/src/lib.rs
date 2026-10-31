@@ -1402,7 +1402,7 @@ impl Watch {
             .iter()
             .filter(|c| c.caught_at_ms >= cutoff_ms)
             .collect();
-        out.sort_by(|a, b| b.caught_at_ms.cmp(&a.caught_at_ms));
+        out.sort_by_key(|c| std::cmp::Reverse(c.caught_at_ms));
         out
     }
 
@@ -2055,9 +2055,9 @@ mod tests {
             ..Post::default()
         };
         let mut w = Watch::default();
-        assert_eq!(w.record(&[p.clone()], now), 1);
+        assert_eq!(w.record(std::slice::from_ref(&p), now), 1);
         assert_eq!(
-            w.record(&[p.clone()], now + 1),
+            w.record(std::slice::from_ref(&p), now + 1),
             0,
             "same id can't double-count"
         );
