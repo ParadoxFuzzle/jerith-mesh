@@ -1,4 +1,4 @@
-//! The weather skill's pure half (OpenClaw `weather` skill family,
+//! The weather skill's pure half (Jerith Mesh `weather` skill family,
 //! re-homed over the plugin SDK with real upstream data).
 //!
 //! Everything here is clockless, networkless parsing over the public

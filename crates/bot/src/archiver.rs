@@ -1,5 +1,5 @@
-//! Discord thread archiver — port of the OpenClaw `thread-archiver`
-//! plugin-skill, with the extraction half the OpenClaw agent harness used
+//! Discord thread archiver — port of the previous stack's `thread-archiver`
+//! plugin-skill, with the extraction half the legacy agent harness used
 //! to provide now implemented deterministically.
 //!
 //! What it does (operator-configured, not command-triggered):
@@ -11,7 +11,7 @@
 //!      `author: line`, other bots' lines skipped.
 //!   3. Publish the summary three ways: the memory embed via the
 //!      gateway's `POST /v1/skills/memory/embed` (the jerith-native
-//!      addition: `/recall` becomes thread-aware, which OpenClaw could
+//!      addition: `/recall` becomes thread-aware, which the previous stack could
 //!      never offer — its archive only lived as a webhook post); the
 //!      optional upstream-parity POST to `notes_webhook` (204, same body
 //!      shape as the Python skill); and a local markdown archive file in
@@ -39,7 +39,7 @@ use crate::config::{ArchiverConfig, BotConfig};
 /// Discord REST base (v10 — the bare minimum these bot uses).
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
-/// Default decision/note markers, mirroring the lines the OpenClaw agent
+/// Default decision/note markers, mirroring the lines the legacy agent
 /// used to surface as "Decisions & notes" in its archive digests.
 pub const DEFAULT_MARKERS: [&str; 9] = [
     "decision",
@@ -85,8 +85,8 @@ pub fn effective_markers(arch: &ArchiverConfig, guild_id: Option<u64>) -> Vec<St
     default_markers()
 }
 
-/// Markdown header the OpenClaw `_summarize` produced; kept byte-for-byte
-/// so an operator tracking the OpenClaw wiki sees the same shape.
+/// Markdown header the legacy `_summarize` produced; kept byte-for-byte
+/// so an operator tracking the legacy wiki sees the same shape.
 pub fn render_summary(source_ref: &str, archived_at: &str, notes: &[&str]) -> String {
     let mut out = format!(
         "## Thread Archive - {source_ref}\n*Archived {archived_at}*\n\n### Decisions & notes\n\n"
@@ -177,7 +177,7 @@ pub fn newest_message_id(messages: &[Value]) -> Option<u64> {
         .max()
 }
 
-/// UTC timestamp in the OpenClaw format (`%Y-%m-%d %H:%M:%S`), no chrono
+/// UTC timestamp in the legacy format (`%Y-%m-%d %H:%M:%S`), no chrono
 /// in the workspace: Howard Hinnant's civil-from-days, unit-tested below.
 pub fn utc_timestamp_string(unix_ms: u64) -> String {
     let secs = unix_ms / 1000;
@@ -202,7 +202,7 @@ pub fn utc_timestamp_string(unix_ms: u64) -> String {
     )
 }
 
-/// Ledger — the OpenClaw skill's `ledger.json` shape minus URL entries
+/// Ledger — the Jerith Mesh skill's `ledger.json` shape minus URL entries
 /// (channels are configured in bot.toml here), plus the pointer the
 /// sweep resumes from (`last_message_id`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -454,7 +454,7 @@ async fn sweep_one(
         return Ok(());
     }
 
-    // 2. webhook parity with the OpenClaw skill (optional).
+    // 2. webhook parity with the legacy skill (optional).
     if let Some(webhook) = arch.notes_webhook.as_deref().filter(|w| !w.is_empty())
         && let Err(e) = post_webhook(client, webhook, &summary).await
     {
@@ -493,7 +493,7 @@ async fn post_webhook(client: &reqwest::Client, webhook: &str, body: &str) -> Re
     Ok(())
 }
 
-/// Where the archiver mirrors OpenClaw's STATE_DIR — under the node's
+/// Where the archiver mirrors the previous stack's STATE_DIR — under the node's
 /// data dir (`~/.jerith-mesh/data/thread-archiver/`).
 pub fn archiver_dir() -> PathBuf {
     crate::config::data_dir().join("thread-archiver")
@@ -505,7 +505,7 @@ pub async fn run_loop(cfg: BotConfig) {
     tracing::info!(
         channels = cfg.archiver.channel_ids.len(),
         interval_minutes = interval,
-        "thread archiver loop started (OpenClaw skill port)"
+        "thread archiver loop started (Jerith Mesh skill)"
     );
     if cfg.archiver.channel_ids.is_empty() {
         tracing::warn!(
@@ -683,7 +683,7 @@ mod tests {
         );
         ledger.save(&dir).unwrap();
         let loaded = Ledger::load(&dir);
-        assert_eq!(loaded.version, 1); // OpenClaw skill's ledger version
+        assert_eq!(loaded.version, 1); // Jerith Mesh skill's ledger version
         assert_eq!(loaded.entries["42"].last_message_id, Some(999_000));
         let _ = std::fs::remove_dir_all(&dir);
     }

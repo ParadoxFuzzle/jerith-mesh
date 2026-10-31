@@ -2,7 +2,7 @@
 # Discord transports hand over are read INSIDE a disposable container —
 # see crates/bot/src/sandbox.rs for the runtime safety flags).
 #
-# Base: the migrated OpenClaw stack sandbox (python3 present, already on
+# Base: the migrated sandbox base (python3 present, already on
 # the host). We add only the text-extraction tools the extractor script
 # uses: poppler-utils (pdftotext for .pdf). No network packages beyond
 # that; the extractor itself is stdlib-only and rides the bot binary.

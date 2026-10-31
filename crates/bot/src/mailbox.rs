@@ -5,7 +5,7 @@
 //! the mail server is restarting; arrival timestamp = filename stamp written
 //! by the mailhook (`YYYYMMDD-HHMMSS-<rand>.eml`). This is privileged data —
 //! the command is deliberately NOT in owner.rs `USER_COMMANDS`, so the
-//! default-deny gate makes it owner-DM only (OpenClaw trust model).
+//! default-deny gate makes it owner-DM only (Jerith Mesh trust model).
 
 use std::path::{Path, PathBuf};
 

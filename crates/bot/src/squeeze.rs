@@ -1,4 +1,4 @@
-//! Context squeeze — OpenClaw's context-squeeze/juice-compact pattern,
+//! Context squeeze — the previous stack's context-squeeze/juice-compact pattern,
 //! ported to the mesh bot.
 //!
 //! The bot keeps a per-user chat history ring (`state.rs`, 8 turns / 16
@@ -7,7 +7,7 @@
 //! drops the oldest turns wholesale, and a fresh model call re-reads
 //! whatever remains at full length.
 //!
-//! This module does what OpenClaw's compaction plugin did, in three
+//! This module does what the previous stack's compaction plugin did, in three
 //! escalating stages (cheapest first):
 //!
 //! 1. **hard-trim** each oversized message to `per_msg_max` chars
@@ -107,7 +107,7 @@ fn total_chars(history: &[Value]) -> usize {
 /// Stage 3 (async, called from the chat call sites): when the history is
 /// still over budget after the passive pass, collapse the oldest
 /// `summarize_count` messages into one mesh-written digest and store the
-/// replacement back (state.replace_history) — the OpenClaw compaction
+/// replacement back (state.replace_history) — the Jerith Mesh compaction
 /// semantics: the raw turns are gone, the summary lives on.
 ///
 /// Paced by `min_interval_secs` per user (a mesh round-trip per squeeze is

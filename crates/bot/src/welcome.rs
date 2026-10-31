@@ -1,5 +1,5 @@
-//! Welcome-DM lane (`[welcome]` in bot.toml) — the OpenClaw
-//! guild-watcher port (workspace/silly_welcome_bot.py →
+//! Welcome-DM lane (`[welcome]` in bot.toml) — the legacy
+//! guild-watcher pattern (workspace/silly_welcome_bot.py →
 //! ~/.openclaw/plugin-skills/guild-admin/guild_watcher.py), with byte-
 //! identical welcome embeds and the migrated GIF pool:
 //!
@@ -14,7 +14,7 @@
 //!   guard)
 //!
 //! Dormant unless `[welcome] enabled = true` (config.rs), like every
-//! other OpenClaw skill port ([archiver], [monitor]). Departs from the
+//! other Jerith Mesh skill ([archiver], [monitor]). Departs from the
 //! watcher by replacing its heartbeat-file/cron-watchdog machinery with
 //! this bot's systemd supervision (Restart=always) — the watcher was a
 //! whole service unit approximating what jerith-bot already is.

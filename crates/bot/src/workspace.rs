@@ -1,17 +1,17 @@
-//! Bot workspace — the OpenClaw workspace pattern, ported.
+//! Bot workspace — the Jerith Mesh workspace pattern.
 //!
-//! OpenClaw's agent read its personality/canon from a `workspace/`
+//! The previous stack's agent read its personality/canon from a `workspace/`
 //! directory of editable markdown docs (SOUL.md, IDENTITY.md, USER.md,
 //! USER_MODEL.md, AGENTS.md…). This bot ships the same layout under
 //! `~/.jerith-mesh/workspace/`:
 //!
 //! - **`bootstrap()`** stages canon docs it doesn't yet have from the
-//!   migrated OpenClaw workspace (`~/.openclaw/workspace/` — a read-only
+//!   migrated workspace (`~/.openclaw/workspace/` — a read-only
 //!   borrow, like the token/key borrows) and writes a README. Stages
 //!   missing files only: user edits are never overwritten, and `~/.openclaw`
 //!   is never written to.
 //! - **`compose_persona()`** builds the bot's system prompt from the
-//!   workspace canon in OpenClaw's own doc order (IDENTITY → SOUL →
+//!   workspace canon in the previous stack's own doc order (IDENTITY → SOUL →
 //!   soul/* → USER → USER_MODEL → AGENTS → MEMORY), replacing the older
 //!   flat `persona.md` read (which stays the fallback when no canon
 //!   exists).
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 /// The canon docs the mesh bot consumes, in compose order. A doc missing
 /// from the workspace is simply skipped.
 ///
-/// The `soul/*.md` entries are the persona sub-docs that the OpenClaw
+/// The `soul/*.md` entries are the persona sub-docs that the legacy
 /// gateway composed implicitly and the 2026-10 migration left behind
 /// (IDENTITY.md/SOUL.md still name `soul/model-identity.md` in their
 /// text). They sit right after SOUL.md — they extend it. The other soul
@@ -56,7 +56,7 @@ pub fn workspace_dir() -> PathBuf {
     Path::new(&home).join(".jerith-mesh").join("workspace")
 }
 
-/// The OpenClaw workspace to borrow from (read-only).
+/// The legacy workspace to borrow from (read-only).
 pub fn openclaw_workspace_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     Path::new(&home).join(".openclaw").join("workspace")
@@ -65,7 +65,7 @@ pub fn openclaw_workspace_dir() -> PathBuf {
 /// README content — explains what lives here and how edits apply.
 const README_MD: &str = r#"# jerith-bot workspace
 
-Personality + canon docs for the mesh bot (OpenClaw workspace pattern).
+Personality + canon docs for the mesh bot (Jerith Mesh workspace pattern).
 
 | Doc | What it holds |
 |---|---|
@@ -79,7 +79,7 @@ Personality + canon docs for the mesh bot (OpenClaw workspace pattern).
 | `soul/response-approach.md` | anti-autopilot response approach + pre-send self-check |
 | `soul/self-improving.md` | how corrections land on the mesh (registry-based) |
 
-Missing canon docs are staged from the migrated OpenClaw workspace on
+Missing canon docs are staged from the migrated workspace on
 startup; existing files are never overwritten. **Edit these files
 directly** — changes apply on the next bot restart (the persona is
 composed at startup, in this doc order). The post-cap combined prompt
@@ -90,7 +90,7 @@ holds no canon docs at all.
 "#;
 
 /// Stage canon docs when missing + the README. Returns which files were
-/// newly written. Never overwrites existing files, never touches OpenClaw.
+/// newly written. Never overwrites existing files, never touches the legacy workspace.
 pub fn bootstrap(workspace: &Path, openclaw_ws: &Path) -> Vec<String> {
     let mut staged = Vec::new();
     let _ = std::fs::create_dir_all(workspace);

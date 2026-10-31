@@ -312,7 +312,7 @@ impl BotStateInner {
     /// Context squeeze: atomically replace a user's stored history with a
     /// compacted version (squeeze.rs output). The next `history()` call
     /// serves the compacted ring; the raw turns are gone (dropped-by-design
-    /// — the summary digest lives in the replacement), matching OpenClaw's
+    /// — the summary digest lives in the replacement), matching the previous stack's
     /// compaction semantics. Cooldown bookkeeping is untouched.
     pub fn replace_history(&self, user: u64, squeezed: Vec<Value>) {
         let mut users = self.users.lock().expect("user map lock");
