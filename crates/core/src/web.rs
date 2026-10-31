@@ -131,6 +131,12 @@ const PAGE: &str = r#"<!doctype html>
   .card h2 { margin: 0 0 .5rem; font-size: .8rem; text-transform: uppercase; color: #8b949e; letter-spacing: .08em; }
   .card p { margin: 0; font-size: 1.6rem; }
   .fine { color: #8b949e; font-size: .8rem; margin-top: 6px; }
+  .card details { margin-top: .6rem; }
+  .card summary { cursor: pointer; color: #8b949e; font-size: .8rem; }
+  .card summary:hover, .card details[open] summary { color: #58a6ff; }
+  .card table { width: 100%; border-collapse: collapse; font-size: .78rem; margin-top: .45rem; }
+  .card th { text-align: left; color: #8b949e; font-weight: 500; padding: 2px 8px 3px 0; border-bottom: 1px solid #30363d; }
+  .card td { padding: 3px 8px 3px 0; border-bottom: 1px dotted #21262d; white-space: nowrap; }
   footer { margin-top: 2rem; color: #8b949e; font-size: .8rem; }
 </style>
 </head>
@@ -146,12 +152,13 @@ const PAGE: &str = r#"<!doctype html>
   <div class="card"><h2>Phase 4 verification</h2><p id="ccommit">—</p><div class="fine" id="ccommitfine">commitment checks</div></div>
   <div class="card"><h2>Jerith Guard</h2><p id="guard">—</p><div class="fine" id="guardfine">outbound screens</div></div>
   <div class="card"><h2>Sybil fence</h2><p id="sybil">—</p><div class="fine" id="sybilfine">zero-weight slash attempts (§10)</div></div>
-  <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div></div>
+  <div class="card"><h2>Wallet (JER)</h2><p id="earn">—</p><div class="fine" id="earnfine">chain balance · mining wins</div><details><summary>drill-down: earnings lines</summary><table id="wtable"></table><div class="fine" id="wtablefine">window, mining, wallet, chain</div></details></div>
   <div class="card"><h2>Expert hit-rate</h2><p id="hit">—</p><div class="fine" id="hitfine">LRU cache + demand</div></div>
   <div class="card"><h2>Latency</h2><p id="latency">—</p><div class="fine" id="latencyfine">busiest model, this window</div></div>
   <div class="card"><h2>Trend (5-min buckets)</h2><p id="trend">—</p><div class="fine" id="trendfine">per-bucket load, oldest → newest</div></div>
   <div class="card"><h2>Mesh peers served</h2><p id="peerlist" style="font-size:.9rem">—</p><div class="fine" id="peerfine">per-peer latency breakdown</div></div>
   <div class="card"><h2>Pipeline routes</h2><p id="pipeline">—</p><div class="fine" id="pipelinefine">multi-hop walks</div></div>
+  <div class="card"><h2>Per-model latency</h2><p id="mcount">—</p><div class="fine" id="mcountfine">models in this metering window</div><details><summary>drill-down: per-model rows</summary><table id="mtable"></table><div class="fine" id="mtablefine">fastest mean first · req, ok%, mean/max ms, mesh %, tokens</div></details></div>
 </div>
 <footer>
   jerith-mesh · a P2P compute mesh for MoE models ·
@@ -217,6 +224,38 @@ async function refresh() {
       document.getElementById('latency').textContent = '—';
       document.getElementById('latencyfine').textContent =
         'no completions in the window yet';
+    }
+    // Drill-down: per-model rows, fastest mean first. Model names ride
+    // the (unauthenticated, loopback) API surface as request-supplied
+    // strings, so every cell goes through the text escaper.
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+      ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+    const mrows = Object.entries((mj && mj.models) || {}).map(([name, s]) => ({
+      name,
+      req: s.requests ?? 0,
+      okp: s.requests ? Math.round(100 * (s.ok ?? 0) / s.requests) : null,
+      mean: s.requests ? Math.round((s.latency_ms_total ?? 0) / s.requests) : null,
+      max: s.latency_ms_max ?? 0,
+      mesh: s.requests ? Math.round(100 * (s.mesh_served ?? 0) / s.requests) : 0,
+      tok: s.total_tokens ?? 0,
+    }));
+    document.getElementById('mcount').textContent = mrows.length || '—';
+    document.getElementById('mcountfine').textContent =
+      (mrows.length
+        ? `requests ${mj.requests_total ?? '—'} · window open ${mj.window_started_ms ? new Date(mj.window_started_ms).toLocaleString() : '—'}`
+        : 'no completions in the window yet');
+    if (mrows.length) {
+      mrows.sort((a, b) => (a.mean ?? Infinity) - (b.mean ?? Infinity));
+      document.getElementById('mtable').innerHTML =
+        '<tr><th>model</th><th>req</th><th>ok%</th><th>mean</th><th>max</th><th>mesh</th><th>tok</th></tr>' +
+        mrows.map((r) =>
+          `<tr><td>${esc(r.name)}</td><td>${r.req}</td><td>${r.okp ?? '—'}</td><td>${r.mean ?? '—'}</td><td>${r.max}</td><td>${r.mesh}%</td><td>${r.tok}</td></tr>`
+        ).join('');
+      document.getElementById('mtablefine').textContent =
+        'fastest mean first · mesh % = completions served by peers';
+    } else {
+      document.getElementById('mtable').textContent = '';
+      document.getElementById('mtablefine').textContent = 'no per-model rows yet';
     }
     // Ops observability: 5-minute trend buckets (bounded ring on the
     // node) rendered as a text sparkline, plus the per-peer latency
@@ -305,6 +344,23 @@ async function refresh() {
         (w && !w.reachable ? ` · wallet probe failed: ${w.error ?? '—'}` : ' · wallet card off (not JerithChain)') +
         chainInfo;
     }
+    // Drill-down: earnings lines inside the wallet card — the metering
+    // window, the local mining tallies, and (when reachable) the
+    // chain-truthful wallet identity/balance/spendable and chain state.
+    const mkrow = (k, v) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`;
+    document.getElementById('wtable').innerHTML =
+      (mj ? mkrow('window open', new Date(mj.window_started_ms || Date.now()).toLocaleString()) : '') +
+      mkrow('tokens served', j.meters?.tokens_served ?? '—') +
+      mkrow('expert activations', j.meters?.expert_activations ?? '—') +
+      mkrow('mining wins / attempts', `${j.meters?.mines_won ?? 0} / ${j.meters?.mines_attempted ?? 0}`) +
+      (w && w.exists ? mkrow('wallet identity', w.identity) : '') +
+      (w && w.reachable ? mkrow('balance (JER)', (Number(w.balance_uj ?? 0) / 1e6).toFixed(6)) : '') +
+      (w && w.reachable && w.available_jer != null ? mkrow('spendable (JER)', Number(w.available_jer).toFixed(6)) : '') +
+      (ch && ch.reachable ? mkrow('chain height', ch.height ?? '—') : '') +
+      (ch && ch.reachable ? mkrow('circulating (JER)', ch.circulating_jer ?? '—') : '');
+    document.getElementById('wtablefine').textContent =
+      (w && w.reachable ? 'wallet live' : 'wallet offline — local tallies only') +
+      (ch && ch.reachable ? ' · chain live' : ' · chain unreachable');
   } catch (e) { /* node stopped */ }
 }
 refresh();
@@ -393,5 +449,20 @@ mod tests {
             None,
             "the page must not introduce cookie state"
         );
+    }
+
+    #[test]
+    fn drilldowns_ship_with_escaped_cells() {
+        // Both drill-down tables are in the page.
+        assert!(
+            PAGE.contains(r#"id="mtable""#),
+            "per-model drill-down table"
+        );
+        assert!(PAGE.contains(r#"id="wtable""#), "earnings drill-down table");
+        // Model/action names ride the unauthenticated API surface as
+        // free strings: the page must escape them before innerHTML.
+        assert!(PAGE.contains("const esc = (s) =>"), "cell escaper present");
+        assert!(PAGE.contains("esc(r.name)"), "per-model cells escaped");
+        assert!(PAGE.contains("esc(k)"), "earnings label cells escaped");
     }
 }
