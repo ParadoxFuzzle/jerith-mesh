@@ -267,12 +267,28 @@ fn note_sse_chunk(acc: &mut RoundAcc, line: &str) {
 /// parse exactly the buffered way. Transport breaks MID-stream with real
 /// content already folded degrade to a cut-marked partial instead of
 /// failing the chat; an empty side of the same failure still errors.
+/// The gateway stamps every chat completion with an
+/// `x-jerith-served-by` header classifying the lane that answered —
+/// "local:{model}" = the node's own hosted model (text stayed on-box),
+/// "runtime:{id}" = a runtime-tier id (LiteLLM tiers can proxy
+/// upstream), "mesh:{peer}" = a mesh peer computed it. Parsed here so
+/// each reply carries attribution the reader can check, instead of
+/// discovering the route after the fact.
+fn served_header_label(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("x-jerith-served-by")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 async fn fetch_streamed_round(
     url: &str,
     payload: &Value,
     timeout: std::time::Duration,
     live: Option<&LiveTap>,
-) -> Result<(reqwest::StatusCode, Value)> {
+) -> Result<(reqwest::StatusCode, Value, Option<String>)> {
     use futures_util::StreamExt;
 
     let mut payload = payload.clone();
@@ -286,6 +302,7 @@ async fn fetch_streamed_round(
         .send()
         .await
         .with_context(|| format!("gateway unreachable at {url}"))?;
+    let served = served_header_label(&resp);
     let status = resp.status();
 
     let is_sse = resp
@@ -298,7 +315,7 @@ async fn fetch_streamed_round(
         // Plain JSON: parse exactly like the buffered path (errors and
         // non-streaming stacks included) and let the shared loop decide.
         let body: Value = resp.json().await.context("gateway returned non-JSON")?;
-        return Ok((status, body));
+        return Ok((status, body, served));
     }
 
     let mut acc = RoundAcc::default();
@@ -366,7 +383,7 @@ async fn fetch_streamed_round(
             }
         }
     }
-    Ok((status, acc.into_pseudo_body()))
+    Ok((status, acc.into_pseudo_body(), served))
 }
 
 /// POST /v1/chat/completions on the gateway. Returns the assistant text plus
@@ -679,7 +696,12 @@ pub async fn chat_with_usage_live(
         if tools_enabled {
             payload["tools"] = Value::Array(registry.tool_defs());
         }
-        let (status, body) = if cfg.chat_stream {
+        // Provider attribution rides the gateway's stamps on every chat
+        // return path: x-jerith-served-by classifies the lane —
+        // "local:{model}" stayed on-box, "runtime:{id}" is a LiteLLM
+        // tier id (may proxy upstream), "mesh:{peer}" left the node.
+        // The final answer round's label is the reply's receipt.
+        let (status, body, round_served) = if cfg.chat_stream {
             fetch_streamed_round(&url, &payload, chat_timeout, round_live).await?
         } else {
             let resp = client()
@@ -690,8 +712,9 @@ pub async fn chat_with_usage_live(
                 .await
                 .with_context(|| format!("gateway unreachable at {url}"))?;
             let status = resp.status();
+            let served = served_header_label(&resp);
             let body: Value = resp.json().await.context("gateway returned non-JSON")?;
-            (status, body)
+            (status, body, served)
         };
         if !status.is_success() {
             // First-round failure with tools on: one toolless retry in case
@@ -736,10 +759,15 @@ pub async fn chat_with_usage_live(
                 .pointer("/choices/0/message/content")
                 .and_then(value_to_string)
                 .unwrap_or_default();
-            let served_by = body
-                .get("mesh_fallback")
-                .and_then(value_to_string)
-                .filter(|s| !s.is_empty());
+            // Provenance: the stamped header wins (it names the actual
+            // lane — local / runtime tier / mesh peer); the body's
+            // mesh_fallback stays the fallback for gateways that don't
+            // stamp (bare peer id, the old behavior — tests included).
+            let served_by = round_served.clone().or_else(|| {
+                body.get("mesh_fallback")
+                    .and_then(value_to_string)
+                    .filter(|s| !s.is_empty())
+            });
             tokens_used += body
                 .pointer("/usage/total_tokens")
                 .and_then(Value::as_u64)

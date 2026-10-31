@@ -1079,6 +1079,34 @@ async fn memory_cmd(cmd: MemoryCmd) -> anyhow::Result<()> {
     let store = MemoryHandle::open_for_config(&cfg).await?;
     match cmd {
         MemoryCmd::Add { text } => {
+            // Secrets rule (operator, 2026-10-30): API keys, vault secrets,
+            // and credential-shaped strings never land in memory — the CLI
+            // write lane runs the same Guard screen as the HTTP embed
+            // skill. Blocked categories refuse the write; redact-category
+            // hits store the REDACTED text.
+            let mut text = text;
+            if let Ok(guard) = jerith_mesh_core::guard::Guard::build(&cfg.guard) {
+                let probe = serde_json::json!({"role": "user", "content": text});
+                match guard.screen_messages(std::slice::from_ref(&probe)) {
+                    Ok(Some(patched)) => {
+                        let redacted = patched
+                            .first()
+                            .and_then(|m| m.get("content").and_then(serde_json::Value::as_str))
+                            .unwrap_or(&text);
+                        if redacted != text.as_str() {
+                            eprintln!(
+                                "secret/PII-shaped content detected — storing the REDACTED text"
+                            );
+                            text = redacted.to_string();
+                        }
+                    }
+                    Ok(None) => {} // clean
+                    Err(verdict) => anyhow::bail!(
+                        "memory add refused — {} (secrets never go into memory)",
+                        verdict.block_reason()
+                    ),
+                }
+            }
             let (id, provider) = store.embed_and_store(&text).await?;
             println!("stored #{id} (provider: {provider:?})");
         }

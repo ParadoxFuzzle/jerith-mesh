@@ -272,6 +272,12 @@ async fn main() -> anyhow::Result<()> {
                 commands::recall(),
                 commands::briefing(),
                 commands::lore(),
+                // User-level in owner.rs: the gateway's writing/factcheck
+                // skill (local-only lane, canon register auto-loaded).
+                commands::factcheck(),
+                // User-level in owner.rs: writing-template pack (menu
+                // inline; fills go through the local-only template lane).
+                commands::template(),
                 commands::status(),
                 commands::peers(),
                 // User-level in owner.rs: reads only attachments the

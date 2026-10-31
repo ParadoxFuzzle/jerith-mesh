@@ -35,7 +35,7 @@ pub const OPENCLAW_CONFIG_PATH: &str = ".openclaw/openclaw.json";
 /// `help`) or confined to the caller's own data (own chat, own memory
 /// notes, own JER wallet via `mine`; chain mining is a per-user wallet
 /// feature, not node/host control).
-pub const USER_COMMANDS: [&str; 13] = [
+pub const USER_COMMANDS: [&str; 15] = [
     "ask",
     "read",
     "reset",
@@ -43,6 +43,8 @@ pub const USER_COMMANDS: [&str; 13] = [
     "recall",
     "briefing",
     "lore",
+    "factcheck",
+    "template",
     "status",
     "peers",
     "mine",
@@ -120,7 +122,7 @@ mod tests {
 
     #[test]
     fn classification_counts_the_registered_set() {
-        // All 13 user-level commands classify; the rest of the
+        // All 15 user-level commands classify; the rest of the
         // registered set (mail, gif, timeout, voiceleave) is
         // deliberately unclassified → owner-DM-only.
         for (i, cmd) in USER_COMMANDS.iter().enumerate() {

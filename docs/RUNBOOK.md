@@ -2417,3 +2417,52 @@ intent unioned in main.rs). The OpenClaw-era Python unit
 (`guild-admin-watcher.service`) is stopped + disabled 2026-10-27
 (reversible with `systemctl --user start`); both lanes firing at once
 would double-DM — keep only one up.
+
+---
+
+## Reliability-first lane: served_by labels, local-only pin, memory secrets (2026-10-30)
+
+**Propose-and-confirm stays law.** Stake changes, plugin installs/pin
+rotations, and config rewrites are operator moves — the bot and any
+agent assistant must propose and wait, never auto-execute. (Standing
+rule; repeated here because two new affordances arrived the same day.)
+
+**Which provider answered?** Every chat-completion reply now carries
+`x-jerith-served-by: local:<model>` (the node's hosted id — on-box),
+`runtime:<model>` (a runtime-tier id — LiteLLM tiers may proxy
+off-box), or `mesh:<peer>` (a mesh peer answered — off-box, labeled
+honestly). `/health` grew a `served_by` block (`last` + `stayed_local`).
+`GET /v1/models` annotates each row with `provider` local/runtime plus
+a `local_model` echo. Private work checks one header instead of
+discovering the route after publication.
+
+**True local-only path.** `[privacy] level = "local_only"` now also
+pins CHAT to the node's own hosted model: the tool/vision/deep/primary
+tiers (runtime ids that historically routed qwen3:8b-shaped requests
+up to laguna-m/Poolside/Nvidia) are DISABLED at the router, and
+outbound peer dispatch was already refused at this level. Explicit
+caller-model pins still pass (a caller asking by name means it).
+Switch: edit config, one ping tick binds it (hot-reload plan marks
+privacy hot).
+
+**Never store secrets in memory.** `POST /v1/skills/memory/embed` and
+`jerith memory add` both run the Jerith Guard screen on the input:
+API-key/password-shaped text in a BLOCK category refuses the write
+(422 / CLI bail); REDACT-category hits store the redacted text, never
+the raw value. This is a hard rule, not a heuristic toggle.
+
+**Fact-check pass (local).** `POST /v1/skills/writing/factcheck`
+(caps: draft 30k / canon 60k chars) makes ONE call to the node's own
+hosted model with a strict reviewer prompt and returns flagged
+claims + the served_by label. No tier reroute, no mesh fallback, and
+it REFUSES outright when no `[model]` is declared — on a proxy-only
+runtime the skill would ship the draft off-box, defeating itself.
+Canon is auto-loaded: the body's `canon` field wins when present, and
+otherwise the resolution order is `JERITH_FACTCHECK_CANON` (a file
+path) → the node workspace register
+(`<home>/workspace/COLONY-X-CANON.md` — the owner-maintained Colony X
+canon). The response carries `canon_source` (`body`,
+`default:<path>`, or `none`) so the caller always knows what the draft
+was checked against. A register that exists but fails to read is a
+loud 503 — never a silent empty-canon CLEAN; no register means no
+default canon (draft-only), not a fake one.

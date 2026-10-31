@@ -32,6 +32,7 @@ parameters + runner. Touch `plugins.rs`, not three call sites.
 | `websearch` | `web_search`, `web_fetch`                 | `POST {gateway}/v1/skills/web/{search,fetch}` — Brave Search API + readable-text fetch (HTML stripped, length-capped, private targets refused) |
 | `memory`    | `memory.embed`, `memory.search`           | `POST {gateway}/v1/skills/memory/{embed,search}` — node-private SQLite + embeddings; data never leaves the node |
 | `lore`      | `lore.search`                             | `POST {gateway}/v1/skills/lore/search` — community-canon index (`503` with a hint when no vault is configured, never an empty fake result) |
+| `writing`   | `writing.factcheck`, `writing.template`   | `POST {gateway}/v1/skills/writing/factcheck` — the pre-publish fact-check pass: flags invented numbers/dates/places/people/titles against the operator's canon register (auto-loaded by the gateway from `JERITH_FACTCHECK_CANON` → the node workspace `COLONY-X-CANON.md`; an explicit `canon` argument overrides). One strictly-local model call — never a tier reroute, never mesh; refuses outright on a proxy-only runtime. `POST {gateway}/v1/skills/writing/template` — creator template pack (`short_script` / `episode_blurb` / `sponsor_about` / `youtube_seo`): one local-model call, returned as a JSON object VALIDATED against the template's field list (one corrective retry on a bad fill, loud `502` after two); narrative templates ride the same auto-loaded canon register |
 | `vision`    | `vision.describe`, `vision.analyze`       | `POST {gateway}/v1/skills/vision/{describe,analyze}` — multimodal forward through the model router's vision tier (base64 image or `data:` URL in, text out) |
 | `squeeze`   | *(none — lifecycle plugin)*               | bot-side history compaction (`crates/bot/src/squeeze.rs`): passive transcript trim + deep pass; registers no model tools deliberately |
 
@@ -259,6 +260,8 @@ LangChain, a future UI) can call them directly:
 | `/v1/skills/memory/similar`| POST | `{"id": <note id>, "top_k": …}` | nearest neighbours of an existing note (needs the memory backend; `503` when unconfigured) |
 | `/v1/skills/memory/stats`  | GET  | —  | note/graph counters for dashboards |
 | `/v1/skills/lore/search`   | POST | `{"query": …, "top_k": …}` | lore index; **`503` + hint** when no vault configured |
+| `/v1/skills/writing/factcheck` | POST | `{"draft": …, "canon": …}` | pre-publish fact-check; canon optional (auto-loaded register, see the `writing` plugin row); returns `flags` + `served_by` + `canon_source` |
+| `/v1/skills/writing/template` | POST | `{"template": "short_script\|episode_blurb\|sponsor_about\|youtube_seo", "subject": …, "style": …, "canon": …}` | structured template fill; only `template` + `subject` required; returns `template` + `fields` (validated JSON object) + `served_by` + `canon_source`; `502` when the local model answers non-JSON twice |
 | `/v1/skills/web/search`    | POST | `{"query", "count", "freshness"}` | Brave Search API (`[websearch]` key required) |
 | `/v1/skills/web/fetch`     | POST | `{"url", "max_chars"}` | readable text only; private targets refused |
 | `/v1/skills/vision/describe` POST | `{"image", "prompt"}` | routes via the model router's vision tier |

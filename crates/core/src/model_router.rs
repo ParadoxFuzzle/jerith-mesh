@@ -102,11 +102,40 @@ impl RouterModels {
                  parse-reliable model unless you have verified it"
             );
         }
+        // Reliability pin (2026-10-30): `privacy.level = "local_only"` now
+        // means every auto chat stays on the node's own hosted model — the
+        // tier models are runtime-served ids (LiteLLM tiers proxy upstream,
+        // observed live: "qwen3:8b" requests surfacing laguna-m/Poolside),
+        // so under local_only they are DISABLED, not just unused. Explicit
+        // caller ids still pass: a pinned model is the caller saying where
+        // to go. (Inbound peer hops were already refused at this level —
+        // this closes the AUTO-ROUTE gap, the one that leaked Colony-X
+        // drafts upstream.)
+        let pinned_local = cfg.privacy.level == crate::config::PrivacyLevel::LocalOnly;
+        if pinned_local {
+            tracing::warn!(
+                target: "privacy",
+                tier_state = "all-tiers-disabled",
+                "privacy level local_only: chat tiers (tool/vision/deep/primary) DISABLED — every auto chat rides the node's own hosted model ([model])"
+            );
+        }
         Self {
-            tool,
-            vision: cfg.runtime_vision_model.clone().unwrap_or_default(),
-            deep: cfg.runtime_deep_model.clone().unwrap_or_default(),
-            primary: cfg.runtime_primary_model.clone().unwrap_or_default(),
+            tool: if pinned_local { String::new() } else { tool },
+            vision: if pinned_local {
+                String::new()
+            } else {
+                cfg.runtime_vision_model.clone().unwrap_or_default()
+            },
+            deep: if pinned_local {
+                String::new()
+            } else {
+                cfg.runtime_deep_model.clone().unwrap_or_default()
+            },
+            primary: if pinned_local {
+                String::new()
+            } else {
+                cfg.runtime_primary_model.clone().unwrap_or_default()
+            },
         }
     }
 
@@ -285,6 +314,49 @@ mod tests {
 
     fn tiers() -> RouterModels {
         RouterModels::default()
+    }
+
+    #[test]
+    fn local_only_privacy_pins_every_tier_shut() {
+        // A fully pinned node normally keeps every tier.
+        let mut cfg = crate::config::NodeConfig {
+            runtime_tool_model: Some("qwen3:8b".to_string()),
+            runtime_vision_model: Some("vision-x:2b".to_string()),
+            runtime_deep_model: Some("deep-x:30b".to_string()),
+            runtime_primary_model: Some("primary-x".to_string()),
+            ..Default::default()
+        };
+        let full = RouterModels::from_config(&cfg);
+        assert_eq!(full.tool, "qwen3:8b");
+        assert_eq!(full.vision, "vision-x:2b");
+        assert_eq!(full.deep, "deep-x:30b");
+        assert_eq!(full.primary, "primary-x");
+
+        // Reliability pin (2026-10-30): local_only empties every tier —
+        // auto chat stays on the node's own hosted model instead of
+        // riding runtime-tier ids that may proxy upstream.
+        cfg.privacy.level = crate::config::PrivacyLevel::LocalOnly;
+        let pinned = RouterModels::from_config(&cfg);
+        assert!(
+            pinned.tool.is_empty()
+                && pinned.vision.is_empty()
+                && pinned.deep.is_empty()
+                && pinned.primary.is_empty()
+        );
+        // End-to-end: no auto request can be rerouted off the base.
+        let msgs = vec![json!(
+            {"role": "user", "content": format!("explain everything [deep] {}", "y".repeat(DEEP_MIN_CHARS))}
+        )];
+        assert_eq!(
+            reroute_for_gateway(
+                Some("base-model"),
+                Some("base-model"),
+                &msgs,
+                &pinned,
+                false
+            ),
+            None
+        );
     }
 
     #[test]

@@ -219,6 +219,11 @@ impl Gateway {
             .route("/v1/skills/lore/search", post(skill_lore_search))
             .route("/v1/skills/web/search", post(skill_web_search))
             .route("/v1/skills/web/fetch", post(skill_web_fetch))
+            .route(
+                "/v1/skills/writing/factcheck",
+                post(skill_writing_factcheck),
+            )
+            .route("/v1/skills/writing/template", post(skill_writing_template))
             .route("/v1/skills/vision/describe", post(skill_vision_describe))
             .route("/v1/skills/vision/analyze", post(skill_vision_analyze))
             .route("/v1/metrics", get(metrics_handler))
@@ -260,8 +265,8 @@ async fn skill_memory_embed(State(gw): State<Arc<Gateway>>, Json(body): Json<Val
         )
             .into_response();
     };
-    let text = match text.chars().count() {
-        n if n <= MEMORY_EMBED_TEXT_CAP_CHARS => text,
+    let mut text: String = match text.chars().count() {
+        n if n <= MEMORY_EMBED_TEXT_CAP_CHARS => text.to_string(),
         _ => {
             crate::metrics::bump(&crate::metrics::OVERSIZE_MEMORY_REJECTS);
             return (
@@ -275,7 +280,42 @@ async fn skill_memory_embed(State(gw): State<Arc<Gateway>>, Json(body): Json<Val
                 .into_response();
         }
     };
-    match memory.embed_and_store(text).await {
+    // Secrets rule (operator, 2026-10-30): API keys, vault secrets, and
+    // credential-shaped strings never land in memory. The same Guard that
+    // screens egress screens the embed input: blocked-category hits (the
+    // api-keys family in the shipped policy) REFUSE the write outright;
+    // redact-category hits store the REDACTED text, never the raw secret.
+    if let Some(guard) = &gw.guard {
+        let probe = serde_json::json!({"role": "user", "content": text});
+        match guard.screen_messages(std::slice::from_ref(&probe)) {
+            Ok(Some(patched)) => {
+                let redacted = patched
+                    .first()
+                    .and_then(|m| m.get("content").and_then(Value::as_str))
+                    .unwrap_or(text.as_str());
+                if redacted != text.as_str() {
+                    tracing::warn!(
+                        target: "guard",
+                        "memory embed carried secret/PII-shaped text — storing the REDACTED version"
+                    );
+                    text = redacted.to_string();
+                }
+            }
+            Ok(None) => {} // clean
+            Err(verdict) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": "memory embed refused",
+                        "reason": verdict.block_reason(),
+                        "why": "secrets/credentials never go into memory (guard API-key/password categories are policy-blocked)"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    match memory.embed_and_store(&text).await {
         Ok((id, provider)) => (
             StatusCode::OK,
             Json(json!({"id": id, "provider": provider})),
@@ -789,6 +829,18 @@ async fn health(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> Response 
         "tokens_served": meters.tokens_served,
         "expert_activations": meters.expert_activations,
         "bytes_relayed": meters.bytes_relayed,
+        // Reliability (2026-10-30): the "which provider answered?" line —
+        // provider label of the last served completion plus a stayed-local
+        // verdict, so private-work callers check on-box vs off-box at a
+        // glance.
+        "served_by": {
+            "last": gw.metrics.served_by(),
+            "stayed_local": gw
+                .metrics
+                .served_by()
+                .map(|s| s.starts_with("local:"))
+                .unwrap_or(false),
+        },
         "measurement": measurement,
     }))
     .into_response()
@@ -1443,7 +1495,8 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body: Value = resp.json().await.unwrap_or_else(|_| json!({"data": []}));
+            let mut body: Value = resp.json().await.unwrap_or_else(|_| json!({"data": []}));
+            annotate_models(&mut body, gw.base_model.as_deref());
             (StatusCode::OK, Json(body)).into_response()
         }
         Ok(resp) => (
@@ -1457,6 +1510,528 @@ async fn list_models(State(gw): State<Arc<Gateway>>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Reliability (2026-10-30): which-provider classification for a served
+/// completion. "local:{model}" = the node's own hosted id (text stayed
+/// on-box, modulo the local runtime), "mesh:{peer}" = a mesh peer answered
+/// (left the box), "runtime:{model}" = a runtime-tier id — with LiteLLM
+/// tiers these are the shapes that can proxy off-box. The label rides the
+/// x-jerith-served-by header of chat completions and the /health
+/// served_by line, so private-work callers can check on-box vs off-box at
+/// a glance instead of discovering the route after the fact.
+pub fn classify_served_by(base_model: Option<&str>, model: &str) -> String {
+    if base_model.is_some_and(|b| b == model) {
+        format!("local:{model}")
+    } else if model.starts_with("mesh:") {
+        model.to_string()
+    } else {
+        format!("runtime:{model}")
+    }
+}
+
+/// Attach `x-jerith-served-by` to a built chat-completion response (every
+/// return path that knows what answered goes through here).
+fn attach_served_header(label: &str, resp: Response) -> Response {
+    let mut resp = resp;
+    let value = axum::http::HeaderValue::from_str(label)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown"));
+    resp.headers_mut().insert("x-jerith-served-by", value);
+    resp
+}
+
+/// Annotate a runtime /v1/models listing with per-row `provider` labels
+/// (same classification as x-jerith-served-by) plus a top-level
+/// `local_model` echo — the operator's "which of these stay on-box?"
+/// view for private-work planning.
+fn annotate_models(body: &mut Value, base_model: Option<&str>) {
+    if let Some(rows) = body.get_mut("data").and_then(Value::as_array_mut) {
+        for row in rows {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                let label = classify_served_by(base_model, id);
+                let provider = label.split(':').next().unwrap_or("runtime");
+                row["provider"] = Value::String(provider.to_string());
+            }
+        }
+    }
+    if let Some(base) = base_model {
+        body["local_model"] = Value::String(base.to_string());
+    }
+}
+
+/// skill: writing.factcheck — the fact-check pass for sell/publish drafts
+/// (reliability 2026-10-30). ONE call to the node's OWN hosted model
+/// (never a tier reroute, never mesh fallback): handed CANON + DRAFT, it
+/// flags conflicting or likely-invented numbers, dates, people, places
+/// and titles — it never rewrites. Canon is auto-loaded so every draft
+/// is checked against the operator's register even when the caller
+/// forgets to paste it (see `default_factcheck_canon_path`); the
+/// response's `canon_source` always says what the draft was checked
+/// against. Refused loudly when the node hosts no local model: on a
+/// runtime-proxy-only node this skill would ship the draft off-box,
+/// which is the exact failure it exists to prevent.
+const FACTCHECK_DRAFT_CAP_CHARS: usize = 30_000;
+const FACTCHECK_CANON_CAP_CHARS: usize = 60_000;
+
+/// Default canon register for the fact-check pass: an explicit
+/// `JERITH_FACTCHECK_CANON` file path first, then the operator-maintained
+/// register in the node workspace (`<home>/workspace/COLONY-X-CANON.md`
+/// — today: the Colony X canon). None → the pass runs draft-only until
+/// the caller supplies `canon` in the body; a NONE verdict is never
+/// fabricated from a missing file.
+pub fn default_factcheck_canon_path() -> Option<std::path::PathBuf> {
+    canon_register_path(
+        std::env::var("JERITH_FACTCHECK_CANON").ok().as_deref(),
+        std::path::Path::new(&crate::config::NodeConfig::home()),
+    )
+}
+
+/// Pure form of the canon-register resolution (testable without touching
+/// static env). Order: env hint → `<home>/workspace/COLONY-X-CANON.md`.
+fn canon_register_path(
+    env_override: Option<&str>,
+    home: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = env_override.map(str::trim).filter(|p| !p.is_empty()) {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let p = home.join("workspace").join("COLONY-X-CANON.md");
+    p.is_file().then_some(p)
+}
+
+async fn skill_writing_factcheck(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(base) = gw
+        .base_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "no local model declared ([model] unset) — fact-check refuses rather than leave the box",
+            })),
+        )
+            .into_response();
+    };
+    let Some(draft) = body.get("draft").and_then(Value::as_str) else {
+        return bad_request("field 'draft' is required");
+    };
+    if draft.chars().count() > FACTCHECK_DRAFT_CAP_CHARS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": format!("draft exceeds {FACTCHECK_DRAFT_CAP_CHARS} chars")})),
+        )
+            .into_response();
+    }
+    // Canon: an explicit `canon` body field wins; otherwise the
+    // operator's default register is auto-loaded. A register that exists
+    // but fails to READ is a loud 503, never a silent empty-canon CLEAN
+    // (an empty canon would mint clean verdicts from nothing).
+    let (canon, canon_source) = match resolve_writing_canon(&body, true, FACTCHECK_CANON_CAP_CHARS)
+    {
+        Ok(pair) => pair,
+        Err(resp) => return *resp,
+    };
+    let system = "You are a strict fact-check reviewer. Compare the DRAFT only against the CANON \
+        the user supplies above (no web access, no memory of anything else). List ONLY claims that \
+        conflict with the canon or appear invented: numbers, percentages, dates, counts, named \
+        people, places, episode titles. For each flagged claim output one bullet: the claim, why \
+        it is suspect (conflicts-canon / no-canon-support / off-canon), and nothing else. Do NOT \
+        rewrite or improve the draft. If nothing is suspect, output exactly: CLEAN";
+    let user_text = if canon.is_empty() {
+        format!("DRAFT:\n{draft}")
+    } else {
+        format!("CANON:\n{canon}\n\nDRAFT:\n{draft}")
+    };
+    let payload = json!({
+        "model": base,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+        "stream": false,
+        "max_tokens": gw.runtime_num_predict.unwrap_or(1024),
+    });
+    let url = format!(
+        "{}/v1/chat/completions",
+        gw.runtime_url.trim_end_matches('/')
+    );
+    let mut req = crate::http::mesh_http().post(&url).json(&payload);
+    if let Some(k) = &gw.runtime_api_key {
+        req = req.bearer_auth(k);
+    }
+    let label = format!("local:{base}");
+    match tokio::time::timeout(RUNTIME_HEADERS_TIMEOUT, req.send()).await {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            let value: Value = resp.json().await.unwrap_or(json!({}));
+            let flags = value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let flags = sanitize_runtime_text(flags);
+            gw.metrics.note_served(label.clone());
+            let reply = (
+                StatusCode::OK,
+                Json(json!({
+                    "flags": flags,
+                    "served_by": label,
+                    "canon_source": canon_source,
+                })),
+            )
+                .into_response();
+            attach_served_header(&label, reply)
+        }
+        Ok(Ok(resp)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("runtime returned {}", resp.status())})),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!(
+                    "local runtime unreachable (fact-check uses ONLY the local lane): {e}"
+                )
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "local runtime unreachable (fact-check uses ONLY the local lane): timed out waiting for response headers"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Canon resolution shared by the writing skills (factcheck + template
+/// pack): an explicit `canon` body field wins; otherwise, when
+/// `auto_default` allows it, the operator's default register is
+/// auto-loaded — and a register that exists but cannot be READ is a
+/// loud 503, never a silent empty-canon pass (an empty canon would mint
+/// clean verdicts / grounded prose from nothing). `auto_default = false`
+/// (non-narrative templates) never sniffs the workspace register.
+fn resolve_writing_canon(
+    body: &Value,
+    auto_default: bool,
+    canon_cap_chars: usize,
+) -> Result<(String, String), Box<axum::response::Response>> {
+    let mut canon_source = "none".to_string();
+    let canon = match body.get("canon").and_then(Value::as_str) {
+        Some(c) if !c.is_empty() => {
+            canon_source = "body".to_string();
+            c.to_string()
+        }
+        _ if auto_default => match default_factcheck_canon_path() {
+            None => String::new(),
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    canon_source = format!("default:{}", path.display());
+                    text
+                }
+                Err(e) => {
+                    return Err(Box::new((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({
+                            "error": format!(
+                                "default canon register unreadable at {}: {e} — fix the file or pass canon in the body",
+                                path.display()
+                            ),
+                        })),
+                    )
+                        .into_response()));
+                }
+            },
+        },
+        _ => String::new(),
+    };
+    if canon.chars().count() > canon_cap_chars {
+        return Err(Box::new(
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                axum::Json(json!({"error": format!("canon exceeds {canon_cap_chars} chars")})),
+            )
+                .into_response(),
+        ));
+    }
+    Ok((canon, canon_source))
+}
+
+/// skill: writing.template — creator/writing template pack (2026-10-30):
+/// structured OUTPUTS, not freeform — short scripts, episode blurbs,
+/// sponsor About copy and YouTube SEO packs. ONE call to the node's OWN
+/// hosted model (same local-only contract as writing.factcheck: never a
+/// tier reroute, never mesh fallback, refused loudly when no local model
+/// is declared), parsed as a JSON object and VALIDATED against the
+/// template's required field list before it is returned — a violating
+/// fill costs the model exactly one corrective retry, then a loud 502,
+/// never a silently half-filled pack. Narrative templates
+/// (short_script / episode_blurb / youtube_seo) auto-load the operator's
+/// canon register, so a fill cannot invent "73% of sightings" folklore
+/// stats; the response's canon_source always names what grounded it.
+const TEMPLATE_SUBJECT_CAP_CHARS: usize = 12_000;
+const TEMPLATE_STYLE_CAP_CHARS: usize = 4_000;
+
+struct TemplateSpec {
+    name: &'static str,
+    /// Narrative templates: the canon register rides the prompt (and is
+    /// attributed in canon_source) unless body canon overrides.
+    canon_grounded: bool,
+    /// Required string fields the filled JSON must carry (validation).
+    fields: &'static [&'static str],
+    scaffold: &'static str,
+}
+
+const WRITING_TEMPLATES: [TemplateSpec; 4] = [
+    TemplateSpec {
+        name: "short_script",
+        canon_grounded: true,
+        fields: &["title", "hook", "script", "outro_cta"],
+        scaffold: "You write short YouTube scripts for the Colony X series. Write a 60-90 second script about the SUBJECT using ONLY facts stated in the CANON above — no invented statistics, dates, cast members or episode titles. Keep everything SFW and audience-friendly. Output ONLY a JSON object with string fields: title (episode-style title), hook (first spoken line), script (the full narration), outro_cta (closing call to action). No markdown, no code fences.",
+    },
+    TemplateSpec {
+        name: "episode_blurb",
+        canon_grounded: true,
+        fields: &["title", "blurb"],
+        scaffold: "You write episode blurbs for the Colony X series, grounded strictly in the CANON above — never invent statistics, dates, cast members or episode titles. Keep everything SFW. Output ONLY a JSON object with string fields: title, blurb (2-4 sentences, spoiler-safe). No markdown, no code fences.",
+    },
+    TemplateSpec {
+        name: "sponsor_about",
+        canon_grounded: false,
+        fields: &["tagline", "about", "reply_note"],
+        scaffold: "You write sponsor-friendly channel About copy for a creator. Tone: warm, professional, concrete. Keep everything SFW. Output ONLY a JSON object with string fields: tagline (one line), about (a 4-6 sentence About section), reply_note (a short closing note the sponsor can reply to). No markdown, no code fences.",
+    },
+    TemplateSpec {
+        name: "youtube_seo",
+        canon_grounded: true,
+        fields: &["title", "description", "tags", "chapters"],
+        scaffold: "You write YouTube SEO packs, grounded strictly in the CANON above — never invent statistics, dates or episode titles. Output ONLY a JSON object with string fields: title (70 chars or fewer), description (upload description opening with a 2-sentence summary), tags (comma-separated keywords), chapters (one chapter line per row, '0:00 Opening' style). No markdown, no code fences.",
+    },
+];
+
+fn writing_template(name: &str) -> Option<&'static TemplateSpec> {
+    WRITING_TEMPLATES.iter().find(|t| t.name == name)
+}
+
+/// The model's answer, tolerated-fences edition: models love wrapping
+/// JSON in ```json blocks — take the first-`{`..last-`}` slice.
+fn extract_json_object(text: &str) -> Option<&'_ str> {
+    let t = text.trim();
+    let stripped = t
+        .strip_prefix("```")
+        .map(|r| r.trim().trim_start_matches("json").trim())
+        .unwrap_or(t);
+    let start = stripped.find('{')?;
+    let end = stripped.rfind('}')?;
+    (end >= start).then(|| &stripped[start..=end])
+}
+
+/// Validate a template fill: one JSON object carrying every required
+/// field as a non-empty string. Extra fields are tolerated and returned
+/// as-is — the required set is the contract, extras are the model's
+/// decoration.
+fn validate_template_fill(
+    content: &str,
+    spec: &TemplateSpec,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let slice = extract_json_object(content)
+        .ok_or_else(|| "no JSON object found in the answer".to_string())?;
+    let value: Value = serde_json::from_str(slice).map_err(|e| format!("invalid JSON: {e}"))?;
+    let map = value
+        .as_object()
+        .ok_or_else(|| "JSON answer is not an object".to_string())?;
+    for field in spec.fields {
+        let ok = map
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !ok {
+            return Err(format!("missing or empty required field '{field}'"));
+        }
+    }
+    Ok(map.clone())
+}
+
+async fn skill_writing_template(
+    State(gw): State<Arc<Gateway>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(base) = gw
+        .base_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "no local model declared ([model] unset) — template fills refuse rather than leave the box",
+            })),
+        )
+            .into_response();
+    };
+    let Some(tpl_name) = body
+        .get("template")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return bad_request("field 'template' is required");
+    };
+    let Some(spec) = writing_template(tpl_name) else {
+        return bad_request(&format!(
+            "unknown template '{tpl_name}' — available: {}",
+            WRITING_TEMPLATES
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    let Some(subject) = body
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return bad_request("field 'subject' is required");
+    };
+    if subject.chars().count() > TEMPLATE_SUBJECT_CAP_CHARS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!("subject exceeds {TEMPLATE_SUBJECT_CAP_CHARS} chars")
+            })),
+        )
+            .into_response();
+    }
+    let style = body
+        .get("style")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if style.chars().count() > TEMPLATE_STYLE_CAP_CHARS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!("style exceeds {TEMPLATE_STYLE_CAP_CHARS} chars")
+            })),
+        )
+            .into_response();
+    }
+    // Canon: narrative templates auto-load the operator's register (same
+    // resolution + loud-unreadable rule as factcheck); only a body canon
+    // or the register joins the prompt — never both.
+    let (canon, canon_source) =
+        match resolve_writing_canon(&body, spec.canon_grounded, FACTCHECK_CANON_CAP_CHARS) {
+            Ok(pair) => pair,
+            Err(resp) => return *resp,
+        };
+    let mut system = spec.scaffold.to_string();
+    system.push_str(
+        "\n\nEvery claim must be supported by the canon or the SUBJECT itself — omit rather than invent.",
+    );
+    let mut user_text = String::new();
+    if !canon.is_empty() {
+        user_text.push_str("CANON:\n");
+        user_text.push_str(&canon);
+        user_text.push_str("\n\n");
+    }
+    user_text.push_str("SUBJECT:\n");
+    user_text.push_str(subject);
+    if !style.trim().is_empty() {
+        user_text.push_str("\n\nSTYLE GUIDANCE:\n");
+        user_text.push_str(style);
+    }
+    let url = format!(
+        "{}/v1/chat/completions",
+        gw.runtime_url.trim_end_matches('/')
+    );
+    let label = format!("local:{base}");
+    // Two local attempts max: small models often answer wrapped in
+    // ```json fences (tolerated above) or drop a field (one corrective
+    // retry); a second failure is a loud 502, never a half-filled pack.
+    let mut parsed: Option<serde_json::Map<String, Value>> = None;
+    let mut last_fail = String::from("no local attempt succeeded");
+    for attempt in 0..2 {
+        let mut messages = vec![
+            json!({"role": "system", "content": system}),
+            json!({"role": "user", "content": user_text}),
+        ];
+        if attempt > 0 {
+            messages.push(json!({
+                "role": "system",
+                "content": format!(
+                    "Your previous answer failed validation: {last_fail}. Try again — output ONLY the JSON object with string fields: {}.",
+                    spec.fields.join(", ")
+                ),
+            }));
+        }
+        let payload = json!({
+            "model": base,
+            "messages": messages,
+            "stream": false,
+            "max_tokens": gw.runtime_num_predict.unwrap_or(1024),
+        });
+        let mut req = crate::http::mesh_http()
+            .post(&url)
+            .timeout(RUNTIME_HEADERS_TIMEOUT)
+            .json(&payload);
+        if let Some(k) = &gw.runtime_api_key {
+            req = req.bearer_auth(k);
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let value: Value = resp.json().await.unwrap_or(json!({}));
+                let content = value
+                    .pointer("/choices/0/message/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let content = sanitize_runtime_text(content);
+                match validate_template_fill(&content, spec) {
+                    Ok(fields) => {
+                        parsed = Some(fields);
+                        break;
+                    }
+                    Err(msg) => {
+                        tracing::info!(attempt, fail = %msg, "template fill attempt failed validation");
+                        last_fail = msg;
+                    }
+                }
+            }
+            Ok(resp) => last_fail = format!("runtime returned {}", resp.status()),
+            Err(e) => last_fail = format!("local runtime unreachable: {e}"),
+        }
+    }
+    let Some(fields) = parsed else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!("template fill failed after 2 local attempts: {last_fail}"),
+            })),
+        )
+            .into_response();
+    };
+    gw.metrics.note_served(label.clone());
+    let reply = (
+        StatusCode::OK,
+        Json(json!({
+            "template": spec.name,
+            "fields": fields,
+            "canon_source": canon_source,
+            "served_by": label,
+        })),
+    )
+        .into_response();
+    attach_served_header(&label, reply)
 }
 
 /// A guard block response (400) carrying the whole-detector report.
@@ -1609,6 +2184,16 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             body["max_tokens"] = serde_json::json!(cap);
         }
     }
+    // Provider-attribution (reliability 2026-10-30): classify the id that
+    // will answer this forward — the node's hosted base reads "local:",
+    // anything else reads "runtime:" (LiteLLM tiers proxy upstream). The
+    // label is recorded into /health's served_by and stamped on the reply
+    // header only on success; a failed lane never claims a provider.
+    let pending_label = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|m| classify_served_by(gw.base_model.as_deref(), m));
     // Spec-decode lane (FEATURES §1): decide whether this forward
     // carries the speculative hint. The engine-side draft-and-verify owns
     // the real algorithm (it has the logits); the mesh's lane is honest
@@ -1759,6 +2344,12 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                     return match result {
                         Ok((content, served_by)) => {
                             let content = sanitize_runtime_text(&content);
+                            // Reliability: a fallback answer LEFT the box — label it honestly.
+                            let served_label = format!(
+                                "mesh:{}",
+                                served_by.as_deref().unwrap_or("(unknown peer)")
+                            );
+                            gw.metrics.note_served(served_label.clone());
                             {
                                 let mut meters = gw.state.meters.lock().await;
                                 meters.tokens_served += 1;
@@ -1788,12 +2379,13 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                                 "data: {}\n\ndata: [DONE]\n\n",
                                 serde_json::to_string(&chunk).unwrap_or_default()
                             );
-                            (
+                            let stream_reply = (
                                 StatusCode::OK,
                                 [("content-type", "text/event-stream")],
                                 sse,
                             )
-                                .into_response()
+                                .into_response();
+                            attach_served_header(&served_label, stream_reply)
                         }
                         Err(e) => (
                             StatusCode::BAD_GATEWAY,
@@ -1817,6 +2409,10 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                 return match result {
                     Ok((content, served_by)) => {
                         let content = sanitize_runtime_text(&content);
+                        // Reliability: a fallback answer LEFT the box — label it honestly.
+                        let served_label =
+                            format!("mesh:{}", served_by.as_deref().unwrap_or("(unknown peer)"));
+                        gw.metrics.note_served(served_label.clone());
                         {
                             let mut meters = gw.state.meters.lock().await;
                             meters.tokens_served += 1;
@@ -1839,7 +2435,7 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                             );
                         }
                         // OpenAI-shape reply.
-                        (
+                        let json_reply = (
                             StatusCode::OK,
                             Json(json!({
                                 "id": format!("mesh-{}", crate::bootstrap::now_ms()),
@@ -1852,7 +2448,8 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
                                 "mesh_fallback": served_by,
                             })),
                         )
-                            .into_response()
+                            .into_response();
+                        attach_served_header(&served_label, json_reply)
                     }
                     Err(e) => (
                         StatusCode::BAD_GATEWAY,
@@ -1896,18 +2493,29 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
         // stream:true (bot live-typing reads it, 2026-10-14). Chunk
         // metering moves client-side along with the old Phase-1 note.
         let status = resp.status();
+        // Reliability: streaming never reaches the parsed-JSON branch, so
+        // the label pinned from the forwarded id is the honest bound here.
+        if status.is_success()
+            && let Some(label) = &pending_label
+        {
+            gw.metrics.note_served(label.clone());
+        }
         let ct = resp
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("text/event-stream")
             .to_string();
-        return (
+        let stream_reply = (
             status,
             [("content-type", ct.as_str())],
             axum::body::Body::from_stream(resp.bytes_stream()),
         )
             .into_response();
+        return match (&pending_label, status.is_success()) {
+            (Some(label), true) => attach_served_header(label, stream_reply),
+            _ => stream_reply,
+        };
     }
 
     let status = resp.status();
@@ -1935,6 +2543,7 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
         Err(_) => bytes,
     };
     let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
+    let mut served_label: Option<String> = None;
     if let Ok(body) = &parsed {
         // Tokens metered when usage is present.
         if let Some(usage) = body.get("usage") {
@@ -1952,6 +2561,13 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             .and_then(|v| v.as_str())
             .unwrap_or(&requested_model)
             .to_string();
+        // Reliability: the runtime's own reply is the exact-served truth —
+        // label from it, not just the id we forwarded. Successes only.
+        if status.is_success() {
+            let label = classify_served_by(gw.base_model.as_deref(), &effective_model);
+            gw.metrics.note_served(label.clone());
+            served_label = Some(label);
+        }
         gw.metrics.record_simple(
             &effective_model,
             request_started,
@@ -1985,7 +2601,11 @@ async fn chat_completions(State(gw): State<Arc<Gateway>>, Json(mut body): Json<V
             meters.mines_attempted += 1;
         }
     }
-    (status, [("content-type", "application/json")], bytes).into_response()
+    let json_reply = (status, [("content-type", "application/json")], bytes).into_response();
+    match &served_label {
+        Some(label) => attach_served_header(label, json_reply),
+        None => json_reply,
+    }
 }
 
 /// ONE synthetic admission probe for the spec-decode lane (FEATURES §1): a
@@ -2145,6 +2765,45 @@ fn sanitize_choices(body: &mut Value) {
 mod tests {
     use super::*;
     use axum_test::TestServer;
+
+    #[test]
+    fn classify_served_by_shapes_the_three_provider_labels() {
+        // Hosted base id → local (stayed on-box).
+        assert_eq!(
+            classify_served_by(Some("qwen3:8b"), "qwen3:8b"),
+            "local:qwen3:8b"
+        );
+        // A runtime tier id (or unknown downstream variant) → runtime:
+        // these are the shapes that can proxy off-box.
+        assert_eq!(
+            classify_served_by(Some("qwen3:8b"), "laguna-m"),
+            "runtime:laguna-m"
+        );
+        // Mesh fallback answers arrive pre-attributed and pass through.
+        assert_eq!(
+            classify_served_by(None, "mesh:peer-node-1"),
+            "mesh:peer-node-1"
+        );
+    }
+
+    #[test]
+    fn annotate_models_labels_rows_and_names_the_local_model() {
+        let mut body = json!({"data": [
+            {"id": "qwen3:8b"},
+            {"id": "laguna-m"},
+            {"id": "minicpm-v4.6:1b"},
+        ]});
+        annotate_models(&mut body, Some("qwen3:8b"));
+        assert_eq!(body["data"][0]["provider"], "local");
+        assert_eq!(body["data"][1]["provider"], "runtime");
+        assert_eq!(body["data"][2]["provider"], "runtime");
+        assert_eq!(body["local_model"], "qwen3:8b");
+        // No listed base → no local_model echo, rows still labeled runtime.
+        let mut body2 = json!({"data": [{"id": "whatever:7b"}]});
+        annotate_models(&mut body2, None);
+        assert_eq!(body2["data"][0]["provider"], "runtime");
+        assert!(body2.get("local_model").is_none());
+    }
 
     fn fleet_sample(ram_total: u64, ram_avail: u64) -> crate::hw::ResourceSample {
         crate::hw::ResourceSample {
@@ -3826,5 +4485,473 @@ mod tests {
             .json(&json!({"model": "m", "messages": [{"role": "user", "content": "again"}]}))
             .await;
         assert!(res.status_code().is_success());
+    }
+
+    #[test]
+    fn factcheck_canon_register_resolution_prefers_env_then_workspace_default() {
+        let dir = std::env::temp_dir().join(format!("jerith-fc-canon-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let override_file = dir.join("register.md");
+        std::fs::write(&override_file, "# canon\n").unwrap();
+        let home_plain = dir.join("home-without-register");
+        std::fs::create_dir_all(&home_plain).unwrap();
+        let home_with = dir.join("home-with-register");
+        let default_reg = home_with.join("workspace").join("COLONY-X-CANON.md");
+        std::fs::create_dir_all(home_with.join("workspace")).unwrap();
+        std::fs::write(&default_reg, "# canon\n").unwrap();
+
+        // A real override wins over whatever the home workspace holds.
+        assert_eq!(
+            canon_register_path(Some(override_file.to_str().unwrap()), &home_with).as_deref(),
+            Some(override_file.as_path())
+        );
+        // A broken override hint falls through to the workspace default.
+        let missing = dir.join("missing.md");
+        assert_eq!(
+            canon_register_path(Some(missing.to_str().unwrap()), &home_with).as_deref(),
+            Some(default_reg.as_path())
+        );
+        // Whitespace-only is "not set" — same as absent, NOT a parse
+        // error, so a stray export can't silently disable the register.
+        assert_eq!(
+            canon_register_path(Some("   "), &home_with).as_deref(),
+            Some(default_reg.as_path())
+        );
+        // No override + no register → no default canon (never fake one).
+        assert_eq!(canon_register_path(None, &home_plain), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    } // NOTE: mutates JERITH_FACTCHECK_CANON — a var unique to the
+    // factcheck lane (no other test reads it); written and removed within
+    // this single test, so ordering is guaranteed on its own thread.
+    // (The broad registry of canon resolution rules is list-style;
+    // combine rather than parallelize.)    /// Stub runtime + a handler lane for canon attribution: the shared
+    /// setup — one stub runtime (per-case) + a canon register for the
+    /// mixed tests.
+    #[tokio::test]
+    async fn factcheck_handler_resolves_canon_and_fails_loud_on_broken_register() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("jerith-fc-handler-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let register = dir.join("register.md");
+        std::fs::write(
+            &register,
+            "CANON row: Rafey is a pink husky-puppy. Rocky is a raccoon.\n",
+        )
+        .unwrap();
+
+        // Stub local runtime: records what it was handed, answers CLEAN —
+        // attribution (body vs registry) is proven by canon_source, and
+        // the recorded request proves the canon actually flowed to the
+        // model, not just into the response label.
+        let bodies: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let lock = bodies.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move |body: String| {
+                        let lock = lock.clone();
+                        async move {
+                            lock.lock().await.push(body);
+                            axum::Json(json!({
+                                "choices": [{"message": {
+                                    "role": "assistant",
+                                    "content": "CLEAN"
+                                }}]
+                            }))
+                            .into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .ok();
+        });
+
+        let runtime_url = format!("http://{addr}");
+        let runtime_url: &'static str = Box::leak(runtime_url.into_boxed_str());
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: runtime_url.to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("factcheck-test-model".to_string()),
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("server");
+
+        // 1. Missing draft → 400 before any canon work.
+        let res = server
+            .post("/v1/skills/writing/factcheck")
+            .json(&json!({}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
+
+        // 2. Env register auto-loads when the caller omits canon: the
+        // response ATTRIBUTES the register, and the stub received the
+        // register content in the prompt (not just a postal label).
+        unsafe {
+            std::env::set_var("JERITH_FACTCHECK_CANON", register.display().to_string());
+        }
+        let res = server
+            .post("/v1/skills/writing/factcheck")
+            .json(&json!({"draft": "Rafey is 73% brown-fox now."}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let body: Value = res.json();
+        let canon_source = body["canon_source"].as_str().expect("canon_source present");
+        assert_eq!(
+            canon_source,
+            format!("default:{}", register.display()),
+            "register must be the attributed canon source"
+        );
+        assert_eq!(body["served_by"], "local:factcheck-test-model");
+        assert_eq!(body["flags"], "CLEAN");
+        // Scoped borrow: the stub's tokio::Mutex must be FREE again
+        // before the next call, or the next stub invocation self-deadlocks
+        // and the handler eats its full header timeout (live bug we hit).
+        {
+            let guard = bodies.lock().await;
+            let handed = guard.last().expect("one runtime call");
+            assert!(
+                handed.contains("CANON row: Rafey is a pink husky-puppy."),
+                "the register content must reach the model prompt"
+            );
+        }
+
+        // 3. An explicit body canon OVERRIDES the file — and the file is
+        // NOT forwarded (one canon source, declared honestly).
+        let res = server
+            .post("/v1/skills/writing/factcheck")
+            .json(&json!({
+                "draft": "Rocky is a raccoon.",
+                "canon": "Finding Nemo is set in the Great Barrier Reef."
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK);
+        let body: Value = res.json();
+        assert_eq!(body["canon_source"], "body");
+        {
+            let guard = bodies.lock().await;
+            let handed = guard.last().expect("second call");
+            assert!(
+                handed.contains("Great Barrier Reef"),
+                "body canon wins: {handed}"
+            );
+            assert!(
+                !handed.contains("husky-puppy"),
+                "the file register must NOT also ride along"
+            );
+        }
+
+        // 4. A register that exists but cannot be READ is a loud 503,
+        // never a silent empty-canon CLEAN.
+        std::fs::set_permissions(&register, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = server
+            .post("/v1/skills/writing/factcheck")
+            .json(&json!({"draft": "still checked?"}))
+            .await;
+        assert_eq!(
+            res.status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "unreadable register must fail loud"
+        );
+        let body: Value = res.json();
+        assert!(
+            body["error"].as_str().unwrap().contains("unreadable"),
+            "got: {body}"
+        );
+        std::fs::set_permissions(&register, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // 5. Draft over the cap → 413 before an embed round-trip.
+        let big = "d".repeat(FACTCHECK_DRAFT_CAP_CHARS + 1);
+        let res = server
+            .post("/v1/skills/writing/factcheck")
+            .json(&json!({"draft": big}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        unsafe {
+            std::env::remove_var("JERITH_FACTCHECK_CANON");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The template-pack handler: contract lanes — routing/validation
+    /// errors, ONE corrective retry then success, and the loud 502 when
+    /// both local attempts answer non-JSON. Deliberately no env-var
+    /// mutation: text canon rides the body (env auto-load is the shared
+    /// `resolve_writing_canon` path, already covered handler-side by the
+    /// factcheck test), so this test never races the factcheck test's
+    /// JERITH_FACTCHECK_CANON window under parallel execution.
+    #[tokio::test]
+    async fn template_handler_validates_and_names_canon() {
+        // Stub: call 1 answers fence-wrapped garbage-free fill missing a
+        // field? NO — call 1 answers prose (parse failure provoking the
+        // corrective retry), call 2 answers a fence-wrapped valid fill.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handed: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls1 = calls.clone();
+        let handed1 = handed.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move |body: String| {
+                        let calls = calls1.clone();
+                        let handed = handed1.clone();
+                        async move {
+                            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            handed.lock().await.push(body.clone());
+                            let fill = if n == 0 {
+                                // Prose: provokes the corrective retry.
+                                "Sure — I'll write that shortly."
+                            // The runtime payload never carries the template
+                            // id (only scaffold text rides) — branch on the
+                            // sponsor scaffold's distinctive field name.
+                            } else if body.contains("reply_note") {
+                                "```json\n{\"tagline\": \"One diner, infinite rifts.\", \"about\": \"About the Rift-R Ranch diner channel.\", \"reply_note\": \"Ask us anything about tiers.\"}\n```"
+                            } else {
+                                "```json\n{\"title\": \"Rift-Ranch Shift\", \"hook\": \"The diner sign buzzed on.\", \"blurb\": \"One shift at the Rift-R Ranch diner.\"}\n```"
+                            };
+                            axum::Json(json!({
+                                "choices": [{"message": {"role": "assistant", "content": fill}}]
+                            }))
+                            .into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .ok();
+        });
+        let runtime_url = format!("http://{addr}");
+        let runtime_url: &'static str = Box::leak(runtime_url.into_boxed_str());
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.to_string(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url: runtime_url.to_string(),
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("template-test-model".to_string()),
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("server");
+
+        // 1. Unknown template → 400 with the available list.
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({"template": "haiku", "subject": "x"}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let body: Value = res.json();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown template 'haiku'"),
+            "got: {body}"
+        );
+        // 2. Missing subject → 400.
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({"template": "episode_blurb"}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        // 3. Over-cap subject → 413 before any round-trip.
+        let big = "s".repeat(TEMPLATE_SUBJECT_CAP_CHARS + 1);
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({"template": "episode_blurb", "subject": big}))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 4. Prose answer → one corrective retry → a VALID fill, with the
+        // body canon attributed and the canon text actually in the model
+        // prompt (both calls recorded).
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({
+                "template": "episode_blurb",
+                "subject": "Rafey's first shift at the Rift-Ranch diner",
+                "canon": "CANON row: Rafey is a pink husky-puppy."
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::OK, "retry lane");
+        let body: Value = res.json();
+        assert_eq!(body["template"], "episode_blurb");
+        assert_eq!(body["canon_source"], "body");
+        assert_eq!(body["served_by"], "local:template-test-model");
+        assert_eq!(body["fields"]["title"], "Rift-Ranch Shift");
+        assert_eq!(
+            body["fields"]["blurb"],
+            "One shift at the Rift-R Ranch diner."
+        );
+        {
+            let guard = handed.lock().await;
+            assert_eq!(guard.len(), 2, "exactly ONE corrective retry");
+            let first = &guard[0];
+            assert!(first.contains("CANON row: Rafey is a pink husky-puppy."));
+            let second = &guard[1];
+            assert!(
+                second.contains("failed validation: no JSON object found"),
+                "the retry must carry the corrective nudge: {second}"
+            );
+        }
+
+        // 5. Non-grounded template (sponsor_about), no canon → canon is
+        // honestly "none" and NO CANON section is shipped to the model.
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({
+                "template": "sponsor_about",
+                "subject": "the colony-x channel",
+                "canon": "sponsor-visible tone rules: concrete, warm"
+            }))
+            .await;
+        let body: Value = res.json();
+        assert!(
+            body.get("template").is_some(),
+            "sponsor fill must succeed: {body}"
+        );
+        assert_eq!(body["canon_source"], "body");
+        {
+            let guard = handed.lock().await;
+            assert!(
+                guard.last().unwrap().contains("sponsor-visible tone rules"),
+                "an explicit body canon rides for any template"
+            );
+        }
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({"template": "sponsor_about", "subject": "again"}))
+            .await;
+        let body: Value = res.json();
+        assert_eq!(body["canon_source"], "none");
+        {
+            let guard = handed.lock().await;
+            assert!(
+                !guard.last().unwrap().contains("CANON:"),
+                "non-grounded + no canon must not ship a CANON section"
+            );
+        }
+    }
+
+    /// Both attempts answer non-JSON: loud 502 after exactly two local
+    /// calls, never a quietly half-filled pack.
+    #[tokio::test]
+    async fn template_handler_fails_loud_when_both_fill_attempts_are_non_json() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls1 = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(move |_body: String| {
+                        let calls = calls1.clone();
+                        async move {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::Json(json!({
+                                "choices": [{"message": {"role": "assistant", "content": "no braces here"}}]
+                            }))
+                            .into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .ok();
+        });
+        let runtime_url = format!("http://{addr}");
+        let mut cfg = crate::config::NodeConfig {
+            runtime_url: runtime_url.clone(),
+            ..crate::config::NodeConfig::default()
+        };
+        cfg.ensure_identity().expect("test identity");
+        let (state, _rx) = MeshState::new(cfg).expect("test mesh state");
+        let gw = Gateway {
+            state,
+            runtime_url,
+            runtime_api_key: None,
+            runtime_num_predict: None,
+            miner: None,
+            mesh_fallback: None,
+            guard: None,
+            model_router: None,
+            base_model: Some("template-test-model".to_string()),
+            web: None,
+            chain_url: None,
+            wallet: None,
+            optional_wallet: None,
+            spec_decode: None,
+            spec_lane: std::sync::Arc::new(SpecLane::default()),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+        };
+        let server = TestServer::new(gw.router().into_make_service()).expect("server");
+        let res = server
+            .post("/v1/skills/writing/template")
+            .json(&json!({
+                "template": "short_script",
+                "subject": "the diner.Tables — keep it strict:         ep 2",
+            }))
+            .await;
+        assert_eq!(res.status_code(), axum::http::StatusCode::BAD_GATEWAY);
+        let body: Value = res.json();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("failed after 2 local attempts"),
+            "got: {body}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly two local attempts, no silent pass-through"
+        );
     }
 }

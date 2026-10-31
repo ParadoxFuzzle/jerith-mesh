@@ -241,6 +241,13 @@ struct MetricsInner {
     ok_total: u64,
     failed_total: u64,
     tokens_total: u64,
+    /// Reliability (2026-10-30): provider label of the last served chat
+    /// completion — "local:{model}" (the node's hosted id, text stayed
+    /// on-box), "runtime:{model}" (a runtime tier id, LiteLLM-tiered and
+    /// potentially proxied off-box), or "mesh:{peer}". Surfaced by
+    /// /health so private-work callers can check at a glance. Never
+    /// persisted; resets with the process.
+    last_served: Option<String>,
     /// When the metering window opened (node start), epoch ms.
     window_started_ms: u64,
     /// M3 pipeline-route counters.
@@ -263,6 +270,18 @@ impl Metrics {
                 ..Default::default()
             }),
         }
+    }
+
+    /// Note which provider just served a completion (see
+    /// MetricsInner::last_served). Successes only — a failed lane never
+    /// claims a provider.
+    pub fn note_served(&self, label: String) {
+        self.inner.lock().expect("metrics lock").last_served = Some(label);
+    }
+
+    /// The last served provider label (None = nothing served this process).
+    pub fn served_by(&self) -> Option<String> {
+        self.inner.lock().expect("metrics lock").last_served.clone()
     }
 
     /// Record one finished completion (success or failure). Cheap: one

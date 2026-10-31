@@ -580,6 +580,235 @@ pub async fn lore_search(
         .unwrap_or_default())
 }
 
+/// Fact-check a draft against the canon register (single local-model
+/// call, mesh never involved).
+///
+/// No model runs on THIS side: the gateway's writing/factcheck skill
+/// makes exactly one LOCAL-lane call — by contract the draft never
+/// leaves the node, which is the whole reason the skill exists.
+#[poise::command(slash_command, prefix_command, broadcast_typing)]
+pub async fn factcheck(
+    ctx: Ctx<'_>,
+    #[description = "The draft text to fact-check"] draft: String,
+    #[description = "Explicit canon text (default: the node's canon register)"] canon: Option<
+        String,
+    >,
+) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !draft.trim().is_empty(),
+        "draft is empty — pass the text you want checked"
+    );
+    ctx.defer().await?;
+    let res = factcheck_call(&ctx.data().cfg, &draft, canon.as_deref()).await?;
+    ctx.say(clip_tail(&format_factcheck(&res), 1900)).await?;
+    Ok(())
+}
+
+/// Call the gateway's writing/factcheck skill and return the raw JSON
+/// response (`flags` / `served_by` / `canon_source`). The `canon` body
+/// field is optional exactly like the skill: omitted, the gateway
+/// auto-loads the operator's canon register on the node.
+async fn factcheck_call(
+    cfg: &BotConfig,
+    draft: &str,
+    canon: Option<&str>,
+) -> Result<serde_json::Value, Error> {
+    let url = format!("{}/v1/skills/writing/factcheck", cfg.gateway_url);
+    let mut body = serde_json::json!({ "draft": draft });
+    if let Some(c) = canon.map(str::trim).filter(|c| !c.is_empty()) {
+        body["canon"] = serde_json::json!(c);
+    }
+    let resp = jerith_mesh_core::http::mesh_http()
+        .post(&url)
+        // One local-model round-trip: the vision lane's 300 s budget,
+        // not lore's sub-second local-responder assumption.
+        .timeout(std::time::Duration::from_secs(300))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("gateway unreachable at {url}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.context("factcheck: non-JSON body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "fact-check failed: {}",
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+    }
+    Ok(body)
+}
+
+/// /factcheck rendering (split for the unit test): verdict first, then
+/// the two honesty lines — WHICH canon the draft was checked against
+/// (and the loud `none` distrust case) and WHICH lane served it.
+/// `served_by` always rides: the skill is local-only by contract, so a
+/// mesh-peer label here is a bug worth seeing, not hiding.
+fn format_factcheck(res: &serde_json::Value) -> String {
+    let flags = res.get("flags").and_then(|v| v.as_str()).unwrap_or("");
+    let head = if flags.trim().eq_ignore_ascii_case("clean") {
+        "✅ **Fact-check: CLEAN** — every claim is supported by the checked canon.".to_string()
+    } else if flags.trim().is_empty() {
+        "⚠️ **Fact-check returned no verdict** — check the node's local model lane.".to_string()
+    } else {
+        format!(
+            "🚩 **Fact-check flags:**\n> {}",
+            flags.replace('\n', "\n> ")
+        )
+    };
+    let canon = res
+        .get("canon_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let canon_line = if canon == "none" {
+        "⚠️ canon: **none loaded** — no basis for any verdict; treat claims as unsourced"
+            .to_string()
+    } else {
+        format!("canon checked: `{canon}`")
+    };
+    let served = res.get("served_by").and_then(|v| v.as_str()).unwrap_or("?");
+    format!("{head}\n{canon_line}\n— {served}")
+}
+
+/// One template for the /template menu: name + its validated JSON
+/// fields (mirrors the gateway's WRITING_TEMPLATES registry — the bot
+/// renders the menu, the gateway owns the contract).
+const TEMPLATE_MENU: [(&str, &str, &[&str]); 4] = [
+    (
+        "short_script",
+        "60–90s Colony X script",
+        &["title", "hook", "script", "outro_cta"],
+    ),
+    (
+        "episode_blurb",
+        "2–4 sentence spoiler-safe blurb",
+        &["title", "blurb"],
+    ),
+    (
+        "sponsor_about",
+        "sponsor-friendly About copy",
+        &["tagline", "about", "reply_note"],
+    ),
+    (
+        "youtube_seo",
+        "upload title/description/tags/chapters",
+        &["title", "description", "tags", "chapters"],
+    ),
+];
+
+/// The creator writing-template command (omit args to list them
+/// inline).
+///
+/// No template arg → the inline menu listing the four templates with
+/// their JSON field sets; a template name + subject → one LOCAL-lane
+/// fill returned as validated structured JSON (the gateway rejects
+/// tier reroutes and mesh hops by contract; narrative templates
+/// auto-load the canon register).
+#[poise::command(slash_command, prefix_command, broadcast_typing)]
+pub async fn template(
+    ctx: Ctx<'_>,
+    #[description = "Template: short_script, episode_blurb, sponsor_about, or youtube_seo (omit to list them)"]
+    template: Option<String>,
+    #[description = "What the piece is about"] subject: Option<String>,
+    #[description = "Optional style guidance"] style: Option<String>,
+) -> Result<(), Error> {
+    if let Err(msg) = ctx.data().state.gate_cmd(user_id(&ctx)) {
+        ctx.say(msg).await?;
+        return Ok(());
+    }
+    match (
+        template.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        subject.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (None, _) | (_, None) => {
+            ctx.say(format_template_menu()).await?;
+        }
+        (Some(tpl), Some(sub)) => {
+            ctx.defer().await?;
+            let res = template_call(&ctx.data().cfg, tpl, sub, style.as_deref()).await?;
+            ctx.say(clip_tail(&format_template_fill(&res), 1900))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The inline template menu: all four templates with their field sets.
+fn format_template_menu() -> String {
+    let mut out =
+        String::from("🧱 **Writing templates** — structured JSON fills, one local-lane call:\n");
+    for (name, what, fields) in TEMPLATE_MENU {
+        out.push_str(&format!(
+            "• `{name}` — {what}\n   fields: {}\n",
+            fields.join(", ")
+        ));
+    }
+    out.push_str(
+        "Fill: `/template <name> <subject> [style]` — narrative templates auto-load the canon register; the reply names the canon and the lane used.",
+    );
+    out
+}
+
+/// Call the gateway's writing/template skill; raw JSON response.
+/// Same 300s local-model budget as factcheck_call — one round-trip.
+async fn template_call(
+    cfg: &BotConfig,
+    template: &str,
+    subject: &str,
+    style: Option<&str>,
+) -> Result<serde_json::Value, Error> {
+    let url = format!("{}/v1/skills/writing/template", cfg.gateway_url);
+    let mut body = serde_json::json!({ "template": template, "subject": subject });
+    if let Some(s) = style.map(str::trim).filter(|s| !s.is_empty()) {
+        body["style"] = serde_json::json!(s);
+    }
+    let resp = jerith_mesh_core::http::mesh_http()
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(300))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("gateway unreachable at {url}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.context("template: non-JSON body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "template fill failed: {}",
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+    }
+    Ok(body)
+}
+
+/// /template fill rendering (split for the unit test): the validated
+/// fields, then the honesty lines — which register grounded it (and the
+/// loud `none` case for sponsor_about) and which lane served it.
+fn format_template_fill(res: &serde_json::Value) -> String {
+    let tpl = res.get("template").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut out = format!("🧱 **{tpl}** — filled (structured JSON):\n");
+    if let Some(fields) = res.get("fields").and_then(|v| v.as_object()) {
+        for (k, v) in fields {
+            if let Some(text) = v.as_str() {
+                out.push_str(&format!("\n**{k}:** {text}\n"));
+            }
+        }
+    }
+    let canon = res
+        .get("canon_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let canon_line = if canon == "none" {
+        "⚠️ canon: **none loaded** — not a narrative template (or intentional override); fact-check against the register is still its own gate".to_string()
+    } else {
+        format!("canon checked: `{canon}`")
+    };
+    let served = res.get("served_by").and_then(|v| v.as_str()).unwrap_or("?");
+    format!("{out}\n{canon_line}\n— {served}")
+}
+
 /// Show bot help.
 #[poise::command(slash_command, prefix_command)]
 pub async fn help(ctx: Ctx<'_>) -> Result<(), Error> {
@@ -688,6 +917,8 @@ pub const HELP_TEXT: &str = "\
 `/reset` — clear your conversation history
 `/remember <text>` — store a note in the node's private memory
 `/recall <query>` — search the node's private memory
+`/factcheck <draft> [canon]` — fact-check a draft against the node's canon register (local-only lane; omit canon to auto-load the Colony X register)
+`/template [name] [subject] [style]` — writing-template pack: no args lists the four templates inline; with args fills one as structured JSON (local-only lane)
 `/briefing [hours]` — what happened across the watched threads (decisions + mesh digest, OpenClaw what-did-i-miss port)
 `/status` — node + mesh status snapshot
 `/peers` — list live peers in the mesh
@@ -701,12 +932,26 @@ System-level actions are **owner-DM only**: commands outside this list are
 refused for everyone except direct messages from the bot owner's account
 (OpenClaw trust model, default-deny for unclassified commands).";
 
-/// Append attribution when a mesh peer (not the local runtime) served it.
+/// Reply attribution: every reply names WHAT answered. The gateway's
+/// `x-jerith-served-by` classifies the lane — "local:{model}" stayed
+/// on-box, "runtime:{id}" rode the runtime tiers (this text may have
+/// left the box), "mesh:{peer}" was computed by a peer node. A bare id
+/// (no prefix; pre-attribution bodies) keeps the mesh-peer line.
 pub fn format_reply(reply: &str, served_by: Option<&str>) -> String {
-    match served_by {
-        Some(node) => format!("{reply}\n\n— served by mesh peer `{node}`"),
-        None => reply.to_string(),
-    }
+    let label = match served_by {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return reply.to_string(),
+    };
+    let line = if let Some(peer) = label.strip_prefix("mesh:") {
+        format!("— served by mesh peer `{peer}`")
+    } else if let Some(id) = label.strip_prefix("local:") {
+        format!("— kept on-box: local `{id}`")
+    } else if let Some(id) = label.strip_prefix("runtime:") {
+        format!("— runtime tier `{id}` answered — this text may have left the box")
+    } else {
+        format!("— served by mesh peer `{label}`")
+    };
+    format!("{reply}\n\n{line}")
 }
 
 /// /myjercraft rendering: named after the `/balance` contract (exists flag
@@ -970,10 +1215,24 @@ mod tests {
     #[test]
     fn reply_attribution_line() {
         assert_eq!(format_reply("hello", None), "hello");
+        // Stamped mesh label and bare-id fallback render the same line.
+        assert_eq!(
+            format_reply("hello", Some("mesh:node-abc")),
+            "hello\n\n— served by mesh peer `node-abc`"
+        );
         assert_eq!(
             format_reply("hello", Some("node-abc")),
             "hello\n\n— served by mesh peer `node-abc`"
         );
+        // Local: the receipt proves the text stayed on-box.
+        assert_eq!(
+            format_reply("nice", Some("local:qwen3:8b")),
+            "nice\n\n— kept on-box: local `qwen3:8b`"
+        );
+        // Runtime tier: the off-box risk stated plainly.
+        let rt = format_reply("resp", Some("runtime:laguna-m"));
+        assert!(rt.contains("runtime tier `laguna-m`"), "{rt}");
+        assert!(rt.contains("may have left the box"), "{rt}");
     }
 
     #[test]
@@ -1089,6 +1348,94 @@ mod tests {
         assert!(out.contains("opted out"));
         // short addresses pass through
         assert!(out.contains("`JERDAB`"));
+    }
+
+    #[test]
+    fn factcheck_rendering_covers_all_verdicts() {
+        // CLEAN path, with the honesty lines intact.
+        let clean = format_factcheck(&json!({
+            "flags": "CLEAN",
+            "served_by": "local:qwen3:8b",
+            "canon_source": "default:/home/x/COLONY-X-CANON.md",
+        }));
+        assert!(clean.contains("CLEAN"), "{clean}");
+        assert!(clean.contains("canon checked: `default:/home/x/COLONY-X-CANON.md`"));
+        assert!(clean.contains("— local:qwen3:8b"));
+
+        // Flagged path: multi-line flags render as a block-quote list.
+        let flagged = format_factcheck(&json!({
+            "flags": "line one\nline two",
+            "served_by": "local:m",
+            "canon_source": "default:reg",
+        }));
+        assert!(flagged.starts_with("🚩"), "{flagged}");
+        assert!(flagged.contains("> line one"));
+        assert!(flagged.contains("> line two"));
+
+        // The canon-missing distrust case is loud, not quiet.
+        let none = format_factcheck(&json!({
+            "flags": "some flags",
+            "served_by": "local:m",
+            "canon_source": "none",
+        }));
+        assert!(none.contains("none loaded"), "{none}");
+        assert!(none.contains("unsourced"));
+
+        // Empty flags → a loud no-verdict, never a fake CLEAN.
+        let empty = format_factcheck(&json!({
+            "flags": "",
+            "served_by": "local:m",
+            "canon_source": "default:reg",
+        }));
+        assert!(empty.contains("no verdict"), "{empty}");
+    }
+
+    #[test]
+    fn template_menu_lists_all_four_inline() {
+        let menu = format_template_menu();
+        let four: [(&str, &[&str]); 4] = [
+            ("short_script", &["title", "hook", "script", "outro_cta"]),
+            ("episode_blurb", &["title", "blurb"]),
+            ("sponsor_about", &["tagline", "about", "reply_note"]),
+            ("youtube_seo", &["title", "description", "tags", "chapters"]),
+        ];
+        for (name, fields) in four {
+            assert!(menu.contains(&format!("`{name}`")), "{menu}");
+            for f in fields {
+                assert!(menu.contains(f), "{name} field {f} missing: {menu}");
+            }
+        }
+        // The fill affordance rides the menu.
+        assert!(menu.contains("/template <name>"), "{menu}");
+    }
+
+    #[test]
+    fn template_fill_rendering_names_fields_and_honesty() {
+        // Normal grounded fill: every field renders, plus the honesty lines.
+        let fill = format_template_fill(&json!({
+            "template": "episode_blurb",
+            "fields": {"title": "The Drone Test", "blurb": "One shift at the Rift-Ranch diner."},
+            "canon_source": "default:/home/x/COLONY-X-CANON.md",
+            "served_by": "local:qwen3:8b",
+        }));
+        assert!(fill.contains("**episode_blurb**"), "{fill}");
+        assert!(fill.contains("**title:** The Drone Test"), "{fill}");
+        assert!(
+            fill.contains("**blurb:** One shift at the Rift-Ranch diner."),
+            "{fill}"
+        );
+        assert!(fill.contains("canon checked: `default:/home/x/COLONY-X-CANON.md`"));
+        assert!(fill.contains("— local:qwen3:8b"));
+
+        // Non-grounded lane (sponsor_about without canon) stays loud: the
+        // reader is told the register did NOT check this one.
+        let none = format_template_fill(&json!({
+            "template": "sponsor_about",
+            "fields": {"tagline": "One diner, infinite rifts."},
+            "canon_source": "none",
+            "served_by": "local:qwen3:8b",
+        }));
+        assert!(none.contains("none loaded"), "{none}");
     }
 
     #[test]

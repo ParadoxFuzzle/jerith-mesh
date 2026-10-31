@@ -27,10 +27,11 @@ use std::pin::Pin;
 
 /// Pre-packaged plugin ids (`[plugins] enabled = [...]` in bot.toml).
 /// Bare ids gate in-tree plugins; external drops gate as `external:<id>`.
-pub const PREPACKAGED_PLUGINS: [&str; 7] = [
+pub const PREPACKAGED_PLUGINS: [&str; 8] = [
     "websearch",
     "memory",
     "lore",
+    "writing",
     "squeeze",
     "vision",
     "approvals",
@@ -189,6 +190,36 @@ fn standard_skills() -> Vec<SkillSpec> {
                 "required": ["query"]
             }),
             run: lore_search_runner,
+        },
+        SkillSpec {
+            name: "writing.factcheck",
+            plugin: "writing",
+            description: "Fact-check a draft before it is sold or published: one strict local reviewer pass that flags invented numbers, dates, people, places and titles against the operator's canon register (auto-loaded by the gateway — no canon paste needed). Use this on every draft before sending it out.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "draft": {"type": "string", "description": "The draft text to check"},
+                    "canon": {"type": "string", "description": "Optional explicit canon text; omitted means the operator's default canon register"}
+                },
+                "required": ["draft"]
+            }),
+            run: factcheck_runner,
+        },
+        SkillSpec {
+            name: "writing.template",
+            plugin: "writing",
+            description: "Fill a creator writing template into STRUCTURED JSON (short_script | episode_blurb | sponsor_about | youtube_seo). Runs on one local-model call; narrative templates ride the operator's canon register, so facts stay grounded — the reply is a validated JSON object, never freeform prose.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "template": {"type": "string", "description": "Template name: short_script, episode_blurb, sponsor_about, or youtube_seo"},
+                    "subject": {"type": "string", "description": "What the piece is about"},
+                    "style": {"type": "string", "description": "Optional style guidance"},
+                    "canon": {"type": "string", "description": "Optional explicit canon text; omitted means the operator's default register for narrative templates"}
+                },
+                "required": ["template", "subject"]
+            }),
+            run: template_runner,
         },
         SkillSpec {
             name: "vision.describe",
@@ -362,6 +393,93 @@ fn lore_search_runner<'args>(
         let body: Value = resp.json().await.context("gateway returned non-JSON")?;
         if !status.is_success() {
             anyhow::bail!("lore.search failed: {}", status);
+        }
+        Ok(body)
+    })
+}
+
+fn factcheck_runner<'args>(
+    cfg: &'args crate::config::BotConfig,
+    args: &'args Value,
+) -> BoxedSkillFut<'args> {
+    Box::pin(async move {
+        let draft = args
+            .get("draft")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        anyhow::ensure!(!draft.trim().is_empty(), "writing.factcheck: empty draft");
+        // The canon field is OPTIONAL: the gateway auto-loads the
+        // operator's default register (COLONY-X-CANON.md) when this is
+        // omitted — that auto-load is the whole point (every draft
+        // checked, not just the ones someone remembers to paste).
+        let mut body = json!({ "draft": draft });
+        if let Some(canon) = args
+            .get("canon")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            body["canon"] = json!(canon);
+        }
+        // A model round-trip on the local lane — vision_call's 300 s
+        // budget, not lore's default client (which assumes the local
+        // sub-second gateway responder behind it).
+        let url = format!("{}/v1/skills/writing/factcheck", cfg.gateway_url);
+        let resp = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()?
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("gateway unreachable at {url}"))?;
+        let status = resp.status();
+        let body: Value = resp.json().await.context("gateway returned non-JSON")?;
+        if !status.is_success() {
+            anyhow::bail!("writing.factcheck failed: {}", status);
+        }
+        Ok(body)
+    })
+}
+
+fn template_runner<'args>(
+    cfg: &'args crate::config::BotConfig,
+    args: &'args Value,
+) -> BoxedSkillFut<'args> {
+    Box::pin(async move {
+        let template = args
+            .get("template")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        let subject = args
+            .get("subject")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            !template.is_empty() && !subject.is_empty(),
+            "writing.template: template and subject are both required"
+        );
+        // A model round-trip on the local lane — factcheck's 300 s budget,
+        // never the sub-second local-responder default.
+        let url = format!("{}/v1/skills/writing/template", cfg.gateway_url);
+        let resp = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()?
+            .post(&url)
+            .json(&args)
+            .send()
+            .await
+            .with_context(|| format!("gateway unreachable at {url}"))?;
+        let status = resp.status();
+        let body: Value = resp.json().await.context("gateway returned non-JSON")?;
+        if !status.is_success() {
+            anyhow::bail!("writing.template failed: {}", status);
         }
         Ok(body)
     })
@@ -873,6 +991,8 @@ mod tests {
             "memory.embed",
             "memory.search",
             "lore.search",
+            "writing.factcheck",
+            "writing.template",
             "vision.describe",
             "vision.analyze",
             "approval.request",
@@ -884,9 +1004,9 @@ mod tests {
         ] {
             assert!(names.iter().any(|n| n == expect), "missing {expect}");
         }
-        // 13 model-facing skills; squeeze is bot-side (no tool def
+        // 15 model-facing skills; squeeze is bot-side (no tool def
         // anywhere); coordinator/workflows never appear (owner-only gate).
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 15);
         assert!(!names.iter().any(|n| n.contains("squeeze")));
         assert!(!names.iter().any(|n| n.starts_with("workflow.")));
     }
