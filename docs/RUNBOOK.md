@@ -2466,3 +2466,95 @@ canon). The response carries `canon_source` (`body`,
 was checked against. A register that exists but fails to read is a
 loud 503 — never a silent empty-canon CLEAN; no register means no
 default canon (draft-only), not a fake one.
+
+---
+
+## The reddit lane (eighth live consumer, LIVE 2026-10-31, crates/reddit-plugin)
+
+Nine skills on `127.0.0.1:7794` over the signed `/rpc` contract:
+`browse`, `search`, `thread`, `submit`, `comment`, `edit`, `vote`,
+`watch`, `about`. Gated in `bot.toml` as `external:reddit` under
+`[plugins] owner_only` — **owner DMs only**, so no guild member can ever
+post as the account.
+
+### Two read modes, and which one you are in
+
+| credentials file | reads | writes |
+| --- | --- | --- |
+| present + valid | OAuth API (scores, comment counts, paging) | allowed, two-step |
+| absent | public Atom feeds, `mode: "anonymous"` | refused, naming the missing key |
+
+`reddit.about` answers this in one call: `read_mode: "anonymous_feed"`
+and `can_write: false` mean signed-out. The startup journal says the same
+(`read mode="anonymous_feed"`). Adding
+`~/.jerith-mesh/reddit/credentials.toml` (`0600`; `client_id`,
+`client_secret`, `user_agent`, plus `refresh_token` or
+`username`+`password`) and restarting the unit upgrades every path in
+place — no code change, no manifest edit.
+
+**The signed-out budget is the whole design.** Measured on the main node:
+about **one feed request per 30 s**, alternating between an empty `429`
+and a `403` block page. So `watch check` spends its allowance on **one
+subreddit per tick — the least recently ATTEMPTED** (`last_try` in the
+watch file, which counts failures too, or a throttled sub would starve
+the rest) and returns the others under `deferred`. At the 30-minute
+monitor cadence each watched sub is refreshed roughly hourly. Feed reads
+carry **no score, no comment count, no paging** — cards print `▲?` rather
+than inventing `▲0`, and `guard`-free consumers see `score: null`.
+
+### Watch state
+
+`~/.jerith-mesh/reddit/watch.json` (override: `JERITH_REDDIT_WATCH`),
+`0600`:
+
+```json
+{ "subs": ["selfhosted", "LocalLLaMA"], "terms": ["jerith"],
+  "cursor": {}, "seen": [], "inbox": [], "last_try": {} }
+```
+
+`terms` are case-insensitive substrings of title+body; no terms means
+every new post in the watched subs. Subs are lowercased on the way in via
+`action=add` — a hand-written file keeps its case and still works
+(Reddit paths are case-insensitive). `inbox` is the 7-day digest the
+08:00 briefing reads with `action=recent` (which never advances the
+cursor, so the digest and the next tick can both report the same match).
+
+### Write rail
+
+`submit`/`comment`/`edit` never touch Reddit on the first call: they
+return a preview plus `proposal_id` + `confirm_token`, and only a second
+call carrying both (within 10 minutes, single use) posts anything. `vote`
+is one call and reversible — one considered vote on something the bot
+read; coordinated voting is Reddit-policy-forbidden and out of bounds.
+
+### Verify without the bot
+
+```bash
+SECRET=$(python3 -c "import tomllib;print(tomllib.load(open('$HOME/.jerith-mesh/plugins.d/reddit/plugin.toml','rb'))['plugin']['secret'])")
+python3 - "$SECRET" <<'PY'
+import hmac, hashlib, json, sys, time, urllib.request
+secret = sys.argv[1].encode()
+body = json.dumps({"method": "invoke", "skill": "reddit.watch", "args": {"action": "check"}})
+ts = str(int(time.time() * 1000))
+sig = hmac.new(secret, f"{ts}.{body}".encode(), hashlib.sha256).hexdigest()
+req = urllib.request.Request("http://127.0.0.1:7794/rpc", data=body.encode(),
+    headers={"content-type": "application/json", "x-jerith-timestamp": ts,
+             "x-jerith-signature": sig})
+print(json.load(urllib.request.urlopen(req, timeout=40))["checked_subs"])
+PY
+```
+
+A tick that was throttled reports `errors` and no `checked_subs`; that is
+the throttle talking, not a broken drop — the next tick rotates to the
+next sub. The bot's monitor stays silent on `new_count: 0`, so a quiet
+lookout never becomes a daily nag.
+
+### Failure modes seen so far
+
+- **Throttled first sub with no rotation** (fixed 2026-10-31): the queue
+  picked the oldest successful read, so a throttled sub was retried every
+  tick and the others were never read. `last_try` now records attempts.
+- **`limit=50` is not the trigger**: probing showed `429` on any limit
+  while the IP is hot; the fix is pacing, not a smaller limit.
+- **A drop installed with no watch list is quiet by design** — `check`
+  answers `new_count: 0` with a note instead of demanding credentials.

@@ -2100,3 +2100,59 @@ Live-fire receipts (2026-10-27/28):
   time receipts were not armed then (the api.rs `skill executed` line
   landed in the same wave as this discovery), so this is pattern
   evidence over tool-shape replies, not a journal roundtrip.
+
+## 28. The reddit lane (2026-10-31)
+
+`crates/reddit-plugin/` + `external:reddit` — the eighth live consumer of
+the plugin SDK, and the first one that had to stay useful with NO
+credentials at all. It sits on `127.0.0.1:7794` with nine skills:
+`browse`, `search`, `thread` (reads), `submit`, `comment`, `edit` (writes),
+`vote`, `watch` (the lookout), `about` (health). Gated
+`owner_only` in bot.toml — reading can be room-wide later, but a lane that
+can post as the account is owner-DM only by construction.
+
+**Two read modes, one shape.** With a Reddit script app in
+`~/.jerith-mesh/reddit/credentials.toml` the reads are the OAuth API:
+scores, comment counts, cursors, ~600 calls / 10 min. Without one the drop
+still STARTS and still reads, through Reddit's public Atom feeds: same
+`Post` rows, same cards, same JSON — plus `mode: "anonymous"` and a note
+saying what a feed does not carry. Posting, commenting, editing and
+voting have no token to use and refuse with the exact missing key.
+
+**Honesty rules the code enforces, not the prompt:**
+
+- `metrics_known` rides every post and comment. Feed rows print `▲?` and
+  serialize `score: null`; a synthesized `▲0` would read as "nobody
+  upvoted this" when the truth is "Reddit didn't say". The digest copies
+  the flag, so the 08:00 note can't launder it either.
+- The signed-out budget is real (≈1 feed request / 30 s, alternating 429
+  and 403 block pages) and is stated in every throttle error. A watch
+  tick spends it on ONE sub — the least recently ATTEMPTED, failures
+  included, or a throttled sub starves the queue — and names the rest as
+  `deferred`.
+- `watch recent` (the briefing's read) never advances anything, and
+  carries the last tick's `checked`/`deferred`/`errors`, so "0 caught"
+  and "3 subs never got read" cannot print the same line. The morning
+  digest appends `⏳ not read yet (signed-out throttle): r/x, r/y`.
+- Writes never happen on the first call: `submit`/`comment`/`edit` return
+  a preview + `proposal_id` + one-use `confirm_token` (10-minute TTL) and
+  post only when the second call carries both. `vote` is single-call and
+  reversible, and the manifest says outright that coordinated voting is
+  Reddit-policy-forbidden.
+
+**Engine/lib split** (same discipline as every drop): `lib.rs` is
+networkless and tested — credential parsing with per-key errors, the
+three OAuth flows, URL builders for both modes, the JSON listing/thread
+parsers, a hand-rolled Atom reader (entities, HTML content → text, RFC3339
+→ epoch without a date crate), the propose/confirm outbox, the watch state
+(subs, terms, per-sub cursor, seen ring, 7-day digest, `last_try`,
+`last_check`) — 22 unit tests plus 9 feed tests. `main.rs` is wire glue:
+bind the manifest's endpoint, hold one token, serve the nine skills.
+
+**Live receipts (2026-10-31, signed-out):** `reddit.about` →
+`read_mode: anonymous_feed`, `can_write: false`; `reddit.browse
+selfhosted` → real posts with `▲?` and null comment counts; `watch check`
+tick 1 throttled on one sub, tick 2 rotated to the other and read it
+clean (`deferred` naming the first); `reddit.submit` refused with the
+exact credentials path. A bug fell out of that fire: throttled attempts
+didn't rotate, fixed with `last_try`.

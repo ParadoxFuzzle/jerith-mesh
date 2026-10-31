@@ -633,15 +633,50 @@ fn reddit_opted_in(enabled: &[String], owner_only: &[String]) -> bool {
     enabled.iter().any(|r| r == gate) || owner_only.iter().any(|r| r == gate)
 }
 
+/// Subs the last tick could not reach (the signed-out feed's one-request
+/// budget), as `r/<name>` labels, capped so the line stays a line.
+fn reddit_deferred(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = v["last_check"]["deferred"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(REDDIT_DEFERRED_SHOWN)
+        .map(|s| format!("r/{s}"))
+        .collect();
+    let total = v["last_check"]["deferred"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if total > out.len() {
+        out.push(format!("+{} more", total - out.len()));
+    }
+    out
+}
+
+/// How many deferred subs the digest names before summarizing the rest.
+const REDDIT_DEFERRED_SHOWN: usize = 3;
+
 /// The morning digest line from a `reddit.watch recent` card. `None` when
-/// nothing was caught — a quiet night adds no line, the same rule the
-/// monitor keeps. The titles are clipped so one line stays one line.
+/// nothing was caught AND nothing was skipped — a genuinely quiet night
+/// adds no line, the same rule the monitor keeps.
+///
+/// A skipped sub is NOT a quiet night: the signed-out feed only affords one
+/// request per tick, so "0 caught" can mean "3 subs never got read". That
+/// case prints, names the subs, and says why — silence there would make a
+/// stalled lookout indistinguishable from a boring one. The titles are
+/// clipped so one line stays one line.
 fn render_reddit_line(v: &Value) -> Option<String> {
     let count = v["count"].as_u64()?;
-    if count == 0 {
+    let hours = v["hours"].as_u64().unwrap_or(24);
+    let deferred = reddit_deferred(v);
+    let failed = v["last_check"]["errors"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if count == 0 && deferred.is_empty() && failed == 0 {
         return None;
     }
-    let hours = v["hours"].as_u64().unwrap_or(24);
     let mut line = format!("👀 reddit lookout: {count} caught in the last {hours}h");
     let caught: Vec<String> = v["matches"]
         .as_array()
@@ -656,6 +691,15 @@ fn render_reddit_line(v: &Value) -> Option<String> {
         .collect();
     if !caught.is_empty() {
         line.push_str(&format!(" — {}", caught.join(" · ")));
+    }
+    if !deferred.is_empty() {
+        line.push_str(&format!(
+            " — ⏳ not read yet (signed-out throttle): {}",
+            deferred.join(", ")
+        ));
+    }
+    if failed > 0 {
+        line.push_str(&format!(" — ⚠️ {failed} sub(s) failed the last tick"));
     }
     Some(line)
 }
@@ -833,6 +877,62 @@ mod tests {
             "{line}"
         );
         assert!(line.chars().count() < 400, "clipped: {line}");
+    }
+
+    /// A tick that only read one sub is NOT a quiet night: the digest names
+    /// the subs it never reached, so a stalled lookout cannot hide behind a
+    /// zero count.
+    #[test]
+    fn reddit_digest_names_the_subs_a_throttled_tick_skipped() {
+        let quiet = serde_json::json!({"count": 0, "hours": 24});
+        assert_eq!(
+            render_reddit_line(&quiet),
+            None,
+            "a truly quiet night stays silent"
+        );
+
+        let throttled = serde_json::json!({
+            "count": 0,
+            "hours": 24,
+            "last_check": {
+                "checked": ["selfhosted"],
+                "deferred": ["localllama", "rust", "godot", "linux_gaming"],
+                "errors": []
+            }
+        });
+        let line = render_reddit_line(&throttled).expect("a throttled tick speaks");
+        assert!(line.contains("⏳ not read yet"), "{line}");
+        assert!(
+            line.contains("r/localllama") && line.contains("r/rust"),
+            "{line}"
+        );
+        assert!(line.contains("+1 more"), "the list is capped: {line}");
+        assert!(
+            !line.contains("r/linux_gaming"),
+            "only three are named: {line}"
+        );
+
+        let failed = serde_json::json!({
+            "count": 0,
+            "hours": 24,
+            "last_check": {"checked": [], "deferred": [], "errors": ["r/rust: throttled"]}
+        });
+        let line = render_reddit_line(&failed).expect("a failed tick speaks");
+        assert!(line.contains("1 sub(s) failed"), "{line}");
+
+        // Matches and a skipped sub both show, in that order.
+        let both = serde_json::json!({
+            "count": 1,
+            "hours": 24,
+            "matches": [{"subreddit": "selfhosted", "title": "Jerith mesh", "score": null}],
+            "last_check": {"checked": ["selfhosted"], "deferred": ["rust"], "errors": []}
+        });
+        let line = render_reddit_line(&both).expect("matches still print");
+        assert!(
+            line.contains("1 caught") && line.contains("r/rust"),
+            "{line}"
+        );
+        assert!(line.chars().count() < 500, "still one line: {line}");
     }
 
     /// The digest only appears for an install that gated the drop in —

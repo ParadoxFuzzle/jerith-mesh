@@ -56,6 +56,28 @@ pub const INBOX_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const PENDING_TTL_MS: u64 = 10 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
+// The credential-free read path (public Atom feeds)
+// ---------------------------------------------------------------------------
+
+/// The signed-out read host. `www.reddit.com` serves Atom for every
+/// listing, search and comment tree without an OAuth token — which is what
+/// keeps reading (and the lookout) alive on a box with no Reddit app
+/// registered. Writes are never possible here; they are not a grey area,
+/// they need a token.
+pub const ANON_BASE: &str = "https://www.reddit.com";
+/// Reddit refuses requests with no User-Agent. This one names the software
+/// instead of claiming an account that does not exist.
+pub const ANON_USER_AGENT: &str = "linux:jerith-mesh:0.1.4 (anonymous lookout)";
+/// Measured on the operator's box (2026-10-31): the anonymous feed answers
+/// roughly one request per thirty seconds and 429s in between, against
+/// ~600 calls / 10 min on an OAuth app. The watch tick spends its whole
+/// allowance on one sub for exactly that reason.
+pub const ANON_MIN_GAP_SECS: u64 = 30;
+/// What every signed-out answer says about itself, so nothing downstream
+/// mistakes a feed read for a full API read.
+pub const ANON_NOTE: &str = "signed-out read from reddit's public Atom feed: title, author, permalink, age and body only — score, comment count and vote state need a script app in ~/.jerith-mesh/reddit/credentials.toml";
+
+// ---------------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------------
 
@@ -511,6 +533,16 @@ pub struct Post {
     pub link_flair_text: Option<String>,
     #[serde(default)]
     pub stickied: bool,
+    /// False on the anonymous Atom path. The feed carries no score and no
+    /// comment count, and a card printing "▲0" would be inventing numbers
+    /// Reddit never sent — so the card asks instead.
+    #[serde(default = "metrics_known_default")]
+    pub metrics_known: bool,
+}
+
+/// The API answers carry scores; only the feed parser turns this off.
+fn metrics_known_default() -> bool {
+    true
 }
 
 impl Post {
@@ -599,6 +631,9 @@ pub struct Comment {
     pub parent_id: String,
     #[serde(default)]
     pub permalink: Option<String>,
+    /// Same contract as [`Post::metrics_known`]: the feed has no scores.
+    #[serde(default = "metrics_known_default")]
+    pub metrics_known: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,6 +695,373 @@ pub fn parse_thread_value(v: &Value) -> Result<ThreadView, String> {
         None => Vec::new(),
     };
     Ok(ThreadView { post, comments })
+}
+
+// ---------------------------------------------------------------------------
+// The signed-out read path (Atom → the same shapes as the API)
+// ---------------------------------------------------------------------------
+
+/// `/r/<sub>/<sort>/.rss?limit=…` — the listing a signed-out box can read.
+/// An empty sub means the site-wide `all` feed.
+pub fn rss_listing_url(base: &str, sub: &str, sort: &str, limit: u32, window: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let sort = match sort {
+        "hot" | "new" | "top" | "rising" | "controversial" => sort,
+        _ => "new",
+    };
+    let sub = if sub.trim().is_empty() {
+        "all".to_string()
+    } else {
+        sub.trim().to_string()
+    };
+    let mut url = format!("{base}/r/{sub}/{sort}/.rss?limit={limit}");
+    if matches!(sort, "top" | "controversial") {
+        url.push_str(&format!("&t={window}"));
+    }
+    url
+}
+
+/// `search.rss`, restricted to a sub when one is given — the signed-out
+/// twin of [`search_url`].
+pub fn rss_search_url(
+    base: &str,
+    sub: Option<&str>,
+    query: &str,
+    sort: &str,
+    limit: u32,
+    window: &str,
+) -> String {
+    let base = base.trim_end_matches('/');
+    let q = urlencode(query.trim());
+    let sort = match sort {
+        "new" | "top" | "comments" => sort,
+        _ => "relevance",
+    };
+    let mut url = match sub.filter(|s| !s.trim().is_empty()) {
+        Some(sub) => format!(
+            "{base}/r/{}/search.rss?q={q}&restrict_sr=1&sort={sort}&limit={limit}",
+            sub.trim()
+        ),
+        None => format!("{base}/search.rss?q={q}&sort={sort}&limit={limit}"),
+    };
+    if sort == "top" {
+        url.push_str(&format!("&t={window}"));
+    }
+    url
+}
+
+/// A post's comment feed: the only signed-out view of a thread.
+pub fn rss_thread_url(base: &str, id: &str, limit: u32) -> String {
+    format!(
+        "{}/comments/{}/.rss?limit={limit}",
+        base.trim_end_matches('/'),
+        post_id_from(id)
+    )
+}
+
+/// Decode the XML entities Atom uses (named + numeric). Unknown entities
+/// pass through untouched rather than eating the rest of the string.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let semi = match tail.find(';') {
+            Some(semi) if semi > 1 && semi <= 10 => semi,
+            _ => {
+                out.push('&');
+                rest = &tail[1..];
+                continue;
+            }
+        };
+        let ent = &tail[1..semi];
+        let decoded: Option<String> = match ent {
+            "amp" => Some("&".into()),
+            "lt" => Some("<".into()),
+            "gt" => Some(">".into()),
+            "quot" => Some("\"".into()),
+            "apos" => Some("'".into()),
+            _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                u32::from_str_radix(&ent[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(String::from)
+            }
+            _ if ent.starts_with('#') => ent[1..]
+                .parse::<u32>()
+                .ok()
+                .and_then(char::from_u32)
+                .map(String::from),
+            _ => None,
+        };
+        match decoded {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Atom `<content>` is HTML escaped once more for XML: strip the tags,
+/// decode what is left, and flatten the whitespace runs.
+fn html_to_text(html: &str) -> String {
+    let mut stripped = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                stripped.push(' ');
+            }
+            _ if !in_tag => stripped.push(ch),
+            _ => {}
+        }
+    }
+    let text = decode_entities(&stripped);
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Every tag boundary became a space, which is right between words and
+    // wrong before punctuation: "docker </code>, honestly" must read as
+    // "docker, honestly".
+    let mut out = String::with_capacity(collapsed.len());
+    for (i, ch) in collapsed.char_indices() {
+        if ch == ' '
+            && matches!(
+                collapsed[i + 1..].chars().next(),
+                Some(',' | '.' | ';' | ':' | '!' | '?' | ')' | ']')
+            )
+        {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Text of the first `<tag …>…</tag>` in `entry`.
+fn element_text(entry: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = entry.find(&open)?;
+    let gt = start + entry[start..].find('>')? + 1;
+    let close = format!("</{tag}>");
+    let end = gt + entry[gt..].find(&close)?;
+    let raw = entry[gt..end].trim();
+    if let Some(inner) = raw
+        .strip_prefix("<![CDATA[")
+        .and_then(|r| r.strip_suffix("]]>"))
+    {
+        return Some(inner.to_string());
+    }
+    Some(decode_entities(raw))
+}
+
+/// `href` of the entry's self-closing `<link …/>`.
+fn link_href(entry: &str) -> Option<String> {
+    let start = entry.find("<link")?;
+    let tag = &entry[start..];
+    let end = tag.find('>')?;
+    let tag = &tag[..end];
+    let href = tag.find("href=\"")? + "href=\"".len();
+    let rest = &tag[href..];
+    let close = rest.find('"')?;
+    Some(decode_entities(&rest[..close]))
+}
+
+/// `2026-10-29T01:49:15+00:00` → seconds since the epoch. Feeds are UTC,
+/// so the offset is read and ignored; a missing seconds field is `:00`.
+pub fn parse_rfc3339_secs(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once('T')?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let clock = rest.split(['+', 'Z', 'z']).next().unwrap_or(rest);
+    let clock = clock.split('-').next().unwrap_or(clock);
+    let mut hms = clock.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next().unwrap_or("0").parse().ok()?;
+    let second: i64 = hms.next().unwrap_or("0").split('.').next()?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) as f64)
+}
+
+/// Howard Hinnant's civil→serial conversion (no chrono dependency).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `https://www.reddit.com/r/rust/comments/abc/x/` → `rust`.
+fn sub_of_permalink(url: &str) -> String {
+    let Some(idx) = url.find("/r/") else {
+        return String::new();
+    };
+    let rest = &url[idx + 3..];
+    rest.split('/').next().unwrap_or("").trim().to_string()
+}
+
+fn post_from_entry(entry: &str) -> Option<Post> {
+    let id = element_text(entry, "id")
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("t3_")
+        .to_string();
+    let permalink = link_href(entry).unwrap_or_default();
+    if id.is_empty() && permalink.is_empty() {
+        return None;
+    }
+    let title = element_text(entry, "title")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let author = element_text(entry, "name")
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("/u/")
+        .trim_start_matches("u/")
+        .to_string();
+    let created_utc = element_text(entry, "published")
+        .or_else(|| element_text(entry, "updated"))
+        .and_then(|t| parse_rfc3339_secs(&t))
+        .unwrap_or(0.0);
+    // A self post's body sits in <content>; a link post's is only the
+    // "submitted by … [link] [comments]" boilerplate, which drops out at
+    // the split and leaves an empty selftext.
+    let content = element_text(entry, "content").unwrap_or_default();
+    let text = html_to_text(&content);
+    let selftext = text
+        .split("submitted by")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let subreddit = sub_of_permalink(&permalink);
+    Some(Post {
+        id: id.clone(),
+        name: if id.is_empty() {
+            String::new()
+        } else {
+            format!("t3_{id}")
+        },
+        title,
+        author,
+        subreddit,
+        url: permalink.clone(),
+        permalink,
+        is_self: !selftext.is_empty(),
+        selftext,
+        created_utc,
+        metrics_known: false,
+        ..Post::default()
+    })
+}
+
+fn comment_from_entry(entry: &str) -> Option<Comment> {
+    let id = element_text(entry, "id")?
+        .trim()
+        .trim_start_matches("t1_")
+        .to_string();
+    let author = element_text(entry, "name")
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("/u/")
+        .trim_start_matches("u/")
+        .to_string();
+    let body = html_to_text(&element_text(entry, "content").unwrap_or_default());
+    if body.trim().is_empty() {
+        return None;
+    }
+    let created_utc = element_text(entry, "published")
+        .or_else(|| element_text(entry, "updated"))
+        .and_then(|t| parse_rfc3339_secs(&t))
+        .unwrap_or(0.0);
+    Some(Comment {
+        id,
+        author,
+        body,
+        created_utc,
+        permalink: link_href(entry),
+        metrics_known: false,
+        ..Comment::default()
+    })
+}
+
+fn entries_of(body: &str) -> Vec<&str> {
+    body.split("<entry>")
+        .skip(1)
+        .map(|chunk| chunk.split("</entry>").next().unwrap_or(chunk))
+        .collect()
+}
+
+/// Parse an Atom listing into the same [`Post`] rows the API path returns.
+/// A feed with no entries is an empty page, not an error; anything without
+/// Atom structure is an error that quotes what came back.
+pub fn parse_atom_posts(body: &str) -> Result<Vec<Post>, String> {
+    if !body.contains("<entry") {
+        if body.contains("<feed") {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "reddit's public feed returned no Atom: {}",
+            clip(body.trim(), 160)
+        ));
+    }
+    Ok(entries_of(body)
+        .into_iter()
+        .filter_map(post_from_entry)
+        .collect())
+}
+
+/// Parse a post's comment feed.
+pub fn parse_atom_comments(body: &str) -> Result<Vec<Comment>, String> {
+    if !body.contains("<entry") {
+        if body.contains("<feed") {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "reddit's comment feed returned no Atom: {}",
+            clip(body.trim(), 160)
+        ));
+    }
+    Ok(entries_of(body)
+        .into_iter()
+        .filter_map(comment_from_entry)
+        .collect())
+}
+
+/// "▲12", or "▲?" when the source carries no score at all.
+pub fn score_label(score: i64, known: bool) -> String {
+    if known {
+        format!("▲{score}")
+    } else {
+        "▲?".to_string()
+    }
+}
+
+/// "14 comment(s)", or the honest placeholder on the feed path.
+fn comments_label(count: u32, known: bool) -> String {
+    if known {
+        format!("{count} comment(s)")
+    } else {
+        "comments not in feed".to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +1264,33 @@ pub struct Watch {
     /// read can both see the same match, and neither steals it.
     #[serde(default)]
     pub inbox: VecDeque<Caught>,
+    /// When each sub was last ATTEMPTED, success or failure. The signed-out
+    /// path may only fetch one sub per tick, so rotation has to count a
+    /// throttled attempt too — otherwise the same first sub is retried
+    /// forever and every sub behind it starves.
+    #[serde(default)]
+    pub last_try: BTreeMap<String, f64>,
+    /// What the last tick actually managed to do. Persisted because the
+    /// morning digest reads `recent` (which never advances anything) and a
+    /// throttled tick and a quiet tick otherwise look identical: zero
+    /// matches. `None` until a check has run.
+    #[serde(default)]
+    pub last_check: Option<CheckReport>,
+}
+
+/// The outcome of one watch tick, as the file remembers it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CheckReport {
+    #[serde(default)]
+    pub at_ms: u64,
+    /// Subs that were actually read this tick.
+    #[serde(default)]
+    pub checked: Vec<String>,
+    /// Subs the signed-out budget could not reach this tick.
+    #[serde(default)]
+    pub deferred: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 impl Watch {
@@ -916,6 +1345,16 @@ impl Watch {
 
     pub fn unseen(&self, p: &Post) -> bool {
         !self.seen.iter().any(|s| s == &p.id)
+    }
+
+    /// Record an attempt (the cursor only moves on a successful read).
+    pub fn tried(&mut self, sub: &str, at_secs: f64) {
+        self.last_try.insert(sub.to_string(), at_secs);
+    }
+
+    /// `0.0` = never attempted; oldest attempt sorts first.
+    pub fn last_try_of(&self, sub: &str) -> f64 {
+        self.last_try.get(sub).copied().unwrap_or(0.0)
     }
 
     pub fn cursor_of(&self, sub: &str) -> f64 {
@@ -985,6 +1424,10 @@ pub struct Caught {
     pub permalink: String,
     pub created_utc: f64,
     pub caught_at_ms: u64,
+    /// Copied from the post so the digest can print `▲?` for a row caught
+    /// on the signed-out feed — a stored 0 would read as "nobody upvoted".
+    #[serde(default = "metrics_known_default")]
+    pub metrics_known: bool,
 }
 
 impl Caught {
@@ -997,6 +1440,7 @@ impl Caught {
             permalink: p.permalink_url(),
             created_utc: p.created_utc,
             caught_at_ms,
+            metrics_known: p.metrics_known,
         }
     }
 }
@@ -1087,8 +1531,13 @@ pub fn post_json(p: &Post, now_secs: f64) -> Value {
         "subreddit": p.subreddit,
         "title": p.title,
         "author": p.author,
-        "score": p.score,
-        "comments": p.num_comments,
+        "score": if p.metrics_known { json!(p.score) } else { Value::Null },
+        "comments": if p.metrics_known {
+            json!(p.num_comments)
+        } else {
+            Value::Null
+        },
+        "metrics_known": p.metrics_known,
         "age": relative_age(p.created_utc, now_secs),
         "created_utc": p.created_utc,
         "permalink": p.permalink_url(),
@@ -1101,8 +1550,8 @@ pub fn post_json(p: &Post, now_secs: f64) -> Value {
 
 pub fn post_line(p: &Post, now_secs: f64) -> String {
     format!(
-        "▲{score} · r/{sub} · {age} · u/{author}\n   {title}\n   {link}",
-        score = p.score,
+        "{score} · r/{sub} · {age} · u/{author}\n   {title}\n   {link}",
+        score = score_label(p.score, p.metrics_known),
         sub = p.subreddit,
         age = relative_age(p.created_utc, now_secs),
         author = if p.author.is_empty() {
@@ -1142,10 +1591,10 @@ pub fn thread_card(view: &ThreadView, now_secs: f64) -> String {
         out.push_str(&format!("   {}\n", clip(&view.post.selftext, 300)));
     }
     out.push_str(&format!(
-        "▲{} · u/{} · {} comment(s) · {}\n",
-        view.post.score,
+        "{} · u/{} · {} · {}\n",
+        score_label(view.post.score, view.post.metrics_known),
         view.post.author,
-        view.post.num_comments,
+        comments_label(view.post.num_comments, view.post.metrics_known),
         relative_age(view.post.created_utc, now_secs)
     ));
     for c in view.comments.iter().take(8) {
@@ -1156,7 +1605,7 @@ pub fn thread_card(view: &ThreadView, now_secs: f64) -> String {
             } else {
                 &c.author
             },
-            c.score,
+            score_label(c.score, c.metrics_known),
             clip(&c.body.replace('\n', " "), 240)
         ));
         if !c.id.is_empty() {
@@ -1673,12 +2122,24 @@ mod tests {
             subreddit: "rust".into(),
             author: "ann".into(),
             score: 12,
+            metrics_known: true,
             permalink: "/r/rust/comments/a/t/".into(),
             created_utc: now - 60.0,
             ..Post::default()
         };
         let line = post_line(&p, now);
         assert!(line.contains("▲12") && line.contains("r/rust") && line.contains("u/ann"));
+        // The feed path has no score to print, so it asks instead of
+        // claiming the post scored zero.
+        let anon = Post {
+            metrics_known: false,
+            ..p.clone()
+        };
+        assert!(
+            post_line(&anon, now).contains("▲?"),
+            "{}",
+            post_line(&anon, now)
+        );
         assert!(line.chars().count() < 400, "titles are clipped");
         let empty = listing_card("rust", &[], now);
         assert!(empty.contains("nothing there"));

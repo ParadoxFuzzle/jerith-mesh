@@ -23,6 +23,16 @@
 # and service cannot drift. Loopback by default; non-loopback must be
 # https (the drop parser enforces this, fail-closed at bot start).
 #
+# Signed-out reads: with no credentials file the drop still STARTs and
+# still reads — `browse`, `search`, `thread` and `watch check` use Reddit's
+# public Atom feeds (www.reddit.com, no token). That path carries title,
+# author, permalink, age and body only (no scores, no comment counts, no
+# paging) and is throttled to roughly one request per 30s, so a watch tick
+# spends its allowance on the single least-recently-checked sub and names
+# the rest as `deferred`. Writes are impossible without a token and refuse
+# with the exact missing key; adding credentials upgrades every path in
+# place (restart the service to re-read the file).
+#
 # Write safety: submit/comment/edit NEVER touch Reddit on the first
 # call. They return a preview plus `proposal_id` + `confirm_token`;
 # only a second call carrying both (within 10 minutes) posts anything.
@@ -39,17 +49,17 @@ timeout_secs = 15                         # clamped 1-30 (hook discipline)
 
 [[skill]]
 name = "browse"
-description = "Read a subreddit listing: the newest, hottest, top or rising posts in r/<subreddit>. Returns per post its fullname (t3_…), title, author, score, comment count, permalink and a card. Pass subreddit \"all\" or \"popular\" for the site-wide feeds. Read-only; costs nothing but a rate-limit slot."
+description = "Read a subreddit listing: the newest, hottest, top or rising posts in r/<subreddit>. Returns per post its fullname (t3_…), title, author, score, comment count, permalink and a card. Pass subreddit \"all\" or \"popular\" for the site-wide feeds. Works signed-out too (no credentials → the public Atom feed: same rows, `mode: anonymous`, score/comments null, no paging). Read-only; costs nothing but a rate-limit slot."
 parameters = { type = "object", properties = { subreddit = { type = "string", description = "Subreddit name, r/-prefix optional" }, sort = { type = "string", description = "hot (default), new, top, rising or controversial" }, window = { type = "string", description = "For top/controversial: hour, day (default), week, month, year, all" }, limit = { type = "integer", description = "1-50, default 10" }, after = { type = "string", description = "Paging cursor from a previous call" } }, required = ["subreddit"] }
 
 [[skill]]
 name = "search"
-description = "Search Reddit posts. Inside one subreddit when `subreddit` is given, site-wide otherwise. Returns the same per-post shape as browse. Read-only."
+description = "Search Reddit posts. Inside one subreddit when `subreddit` is given, site-wide otherwise. Returns the same per-post shape as browse. Read-only. Also works signed-out through the public feed (`mode: anonymous`, no scores)."
 parameters = { type = "object", properties = { query = { type = "string", description = "Search terms" }, subreddit = { type = "string", description = "Optional: restrict to this subreddit" }, sort = { type = "string", description = "relevance (default), new, top, comments" }, window = { type = "string", description = "For top: hour, day, week, month, year, all" }, limit = { type = "integer", description = "1-50, default 10" } }, required = ["query"] }
 
 [[skill]]
 name = "thread"
-description = "Open one Reddit post: its title, body, score, and the top-level comments (author, score, text). `id` takes a fullname (t3_…), a bare post id, or a reddit.com permalink/URL. Read-only — use it before replying so a comment answers the actual thread."
+description = "Open one Reddit post: its title, body, score, and the top-level comments (author, score, text). `id` takes a fullname (t3_…), a bare post id, or a reddit.com permalink/URL. Read-only — use it before replying so a comment answers the actual thread. Signed-out it returns the comment feed only (no post body or scores) and says so."
 parameters = { type = "object", properties = { id = { type = "string", description = "t3_ fullname, post id, or permalink" }, limit = { type = "integer", description = "Comments to read, 1-50, default 15" } }, required = ["id"] }
 
 [[skill]]
@@ -74,7 +84,7 @@ parameters = { type = "object", properties = { thing_id = { type = "string", des
 
 [[skill]]
 name = "watch"
-description = "The lookout list. action add/remove/list manages watched subreddits and match terms (terms are case-insensitive substrings of title+body; no terms = every new post in the sub). action check polls the watched subs' newest posts since the last check, marks them delivered, and returns only new matches — the bot's monitor calls this on a timer, so a check with no matches is normal and quiet. action recent (hours 1-168, default 24) re-reads the already-delivered digest without advancing anything — the daily briefing uses it, so asking for the digest never swallows what the next check should still report."
+description = "The lookout list. action add/remove/list manages watched subreddits and match terms (terms are case-insensitive substrings of title+body; no terms = every new post in the sub). action check polls the watched subs' newest posts since the last check, marks them delivered, and returns only new matches — the bot's monitor calls this on a timer, so a check with no matches is normal and quiet. action recent (hours 1-168, default 24) re-reads the already-delivered digest without advancing anything — the daily briefing uses it, so asking for the digest never swallows what the next check should still report. Signed-out, one check polls one sub (the least recently checked) and returns the others under `deferred` — the public feed's rate limit, stated rather than papered over."
 parameters = { type = "object", properties = { action = { type = "string", description = "add, remove, list, check, or recent" }, subreddit = { type = "string", description = "For add/remove" }, terms = { type = "string", description = "Comma-separated match terms to add (add only)" }, term = { type = "string", description = "One term to remove (remove only)" }, limit = { type = "integer", description = "check: max matches to return, default 10, max 25" }, hours = { type = "integer", description = "recent: how far back, 1-168, default 24" } }, required = ["action"] }
 
 [[skill]]

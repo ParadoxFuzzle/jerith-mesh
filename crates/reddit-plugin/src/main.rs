@@ -21,11 +21,13 @@
 use anyhow::{Context as _, Result};
 use jerith_plugin_template::{SkillServer, endpoint_addr, skill};
 use jerith_reddit_plugin::{
-    Credentials, Outbox, PENDING_TTL_MS, Post, clamp_limit, comment_form, edit_form, form_errors,
-    fullname, listing_card, listing_url, load_watch, normalize_sub, parse_listing_value,
-    parse_thread_value, parse_token, post_id_from, post_json, save_watch, search_url,
-    select_matches, sort_or_default, submit_form, thread_card, thread_url, vote_dir, vote_form,
-    window_or_default, write_result,
+    ANON_BASE, ANON_MIN_GAP_SECS, ANON_NOTE, ANON_USER_AGENT, CheckReport, Credentials, Outbox,
+    PENDING_TTL_MS, Post, clamp_limit, comment_form, edit_form, form_errors, fullname,
+    listing_card, listing_url, load_watch, normalize_sub, parse_atom_comments, parse_atom_posts,
+    parse_listing_value, parse_thread_value, parse_token, post_id_from, post_json, rss_listing_url,
+    rss_search_url, rss_thread_url, save_watch, score_label, search_url, select_matches,
+    sort_or_default, submit_form, thread_card, thread_url, vote_dir, vote_form, window_or_default,
+    write_result,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -93,6 +95,9 @@ impl Rate {
 struct Reddit {
     http: reqwest::Client,
     creds: std::result::Result<Credentials, String>,
+    /// The signed-out read host (public Atom feeds); env-overridable for
+    /// tests and for a mirror.
+    anon_base: String,
     token: tokio::sync::Mutex<Option<(String, u64)>>,
     outbox: std::sync::Mutex<Outbox>,
     watch_file: PathBuf,
@@ -106,9 +111,15 @@ impl Reddit {
             .build()
             .context("reddit http client build")?;
         let creds = Credentials::load();
+        let anon_base = std::env::var("JERITH_REDDIT_RSS_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| ANON_BASE.to_string());
         Ok(Self {
             http,
             creds,
+            anon_base,
             token: tokio::sync::Mutex::new(None),
             outbox: std::sync::Mutex::new(Outbox::new()),
             watch_file: jerith_reddit_plugin::watch_path(),
@@ -117,6 +128,51 @@ impl Reddit {
 
     fn creds(&self) -> std::result::Result<&Credentials, String> {
         self.creds.as_ref().map_err(Clone::clone)
+    }
+
+    /// No credentials = signed-out: reads go through the public Atom feeds,
+    /// and writes have no token to use at all (they refuse with the exact
+    /// missing key, never a mystery 401).
+    fn has_creds(&self) -> bool {
+        self.creds.is_ok()
+    }
+
+    /// One anonymous feed fetch. The throttle is Reddit's, so a 429 comes
+    /// back as the actionable sentence instead of a bare status.
+    async fn get_feed(&self, url: &str) -> std::result::Result<String, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header("user-agent", ANON_USER_AGENT)
+            .header("accept", "application/atom+xml, application/xml;q=0.9")
+            .send()
+            .await
+            .map_err(|e| format!("reddit's public feed is unreachable: {e}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("reddit's feed reply could not be read: {e}"))?;
+        // 403 and 429 are the same answer here: Reddit throttles signed-out
+        // readers and alternates between an empty 429 and an HTML block
+        // page. Both get the actionable sentence — never two kilobytes of
+        // theme CSS in a monitor line (seen live 2026-10-31).
+        if !status.is_success() {
+            let throttled = matches!(status.as_u16(), 403 | 429)
+                || body.contains("theme-beta")
+                || body.contains("whoa there");
+            if throttled {
+                return Err(format!(
+                    "reddit is throttling signed-out reads right now (about one request every {ANON_MIN_GAP_SECS}s) — the next watch tick retries; add credentials in {} for ~600 calls / 10 min",
+                    Credentials::path().display()
+                ));
+            }
+            return Err(format!(
+                "reddit's public feed answered {status}: {}",
+                clip(body.trim(), 200)
+            ));
+        }
+        Ok(body)
     }
 
     fn outbox(&self) -> std::result::Result<std::sync::MutexGuard<'_, Outbox>, String> {
@@ -278,6 +334,24 @@ async fn do_browse(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, St
         .map(str::trim)
         .filter(|a| !a.is_empty())
         .map(str::to_string);
+    let now = now_secs();
+    if !r.has_creds() {
+        // Signed-out: the public Atom listing. Same rows, no scores and no
+        // `after` cursor (feeds do not page), labelled rather than faked.
+        let url = rss_listing_url(&r.anon_base, &sub, sort, limit, window);
+        let body = r.get_feed(&url).await?;
+        let posts = parse_atom_posts(&body)?;
+        return Ok(json!({
+            "subreddit": sub,
+            "sort": sort,
+            "mode": "anonymous",
+            "note": ANON_NOTE,
+            "count": posts.len(),
+            "after": Value::Null,
+            "posts": posts.iter().map(|p| post_json(p, now)).collect::<Vec<_>>(),
+            "card": listing_card(&sub, &posts, now),
+        }));
+    }
     let url = listing_url(
         &r.creds()?.base(),
         &sub,
@@ -288,7 +362,6 @@ async fn do_browse(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, St
     );
     let (body, rate) = r.get(&url).await?;
     let page = parse_listing_value(&body)?;
-    let now = now_secs();
     Ok(json!({
         "subreddit": sub,
         "sort": sort,
@@ -314,16 +387,6 @@ async fn do_search(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, St
     };
     let window = window_or_default(args["window"].as_str().unwrap_or(""));
     let limit = clamp_limit(args["limit"].as_u64().unwrap_or(10));
-    let url = search_url(
-        &r.creds()?.base(),
-        Some(sub.as_str()).filter(|s| !s.is_empty()),
-        query,
-        sort,
-        limit,
-        window,
-    );
-    let (body, rate) = r.get(&url).await?;
-    let page = parse_listing_value(&body)?;
     let now = now_secs();
     let label = format!(
         "{} — search “{}”",
@@ -334,6 +397,38 @@ async fn do_search(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, St
         },
         clip(query, 60)
     );
+    if !r.has_creds() {
+        let url = rss_search_url(
+            &r.anon_base,
+            Some(sub.as_str()).filter(|s| !s.is_empty()),
+            query,
+            sort,
+            limit,
+            window,
+        );
+        let body = r.get_feed(&url).await?;
+        let posts = parse_atom_posts(&body)?;
+        return Ok(json!({
+            "query": query,
+            "subreddit": sub,
+            "sort": sort,
+            "mode": "anonymous",
+            "note": ANON_NOTE,
+            "count": posts.len(),
+            "posts": posts.iter().map(|p| post_json(p, now)).collect::<Vec<_>>(),
+            "card": listing_card(&label, &posts, now),
+        }));
+    }
+    let url = search_url(
+        &r.creds()?.base(),
+        Some(sub.as_str()).filter(|s| !s.is_empty()),
+        query,
+        sort,
+        limit,
+        window,
+    );
+    let (body, rate) = r.get(&url).await?;
+    let page = parse_listing_value(&body)?;
     Ok(json!({
         "query": query,
         "subreddit": sub,
@@ -351,6 +446,45 @@ async fn do_thread(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, St
         return Err("a post id, fullname (t3_…) or permalink is required".into());
     }
     let limit = clamp_limit(args["limit"].as_u64().unwrap_or(15));
+    if !r.has_creds() {
+        // Signed-out a thread is its comment feed: the comments come back,
+        // the post body and every score do not. Say that instead of
+        // handing back a hollow post row.
+        let body = r
+            .get_feed(&rss_thread_url(&r.anon_base, &id, limit))
+            .await?;
+        let comments = parse_atom_comments(&body)?;
+        let now = now_secs();
+        let permalink = format!("https://www.reddit.com/comments/{id}");
+        let mut card = format!(
+            "🧵 thread {id} — {} comment(s) from the public feed (no post body or scores signed-out)\n   {permalink}\n",
+            comments.len()
+        );
+        for c in comments.iter().take(8) {
+            card.push_str(&format!(
+                "  • u/{} — {}\n",
+                c.author,
+                clip(&c.body.replace('\n', " "), 240)
+            ));
+        }
+        return Ok(json!({
+            "post": {
+                "id": id,
+                "fullname": format!("t3_{id}"),
+                "permalink": permalink,
+            },
+            "comments": comments.iter().map(|c| json!({
+                "fullname": if c.id.is_empty() { Value::Null } else { json!(format!("t1_{}", c.id)) },
+                "author": c.author,
+                "score": Value::Null,
+                "age": jerith_reddit_plugin::relative_age(c.created_utc, now),
+                "body": clip(&c.body, 900),
+            })).collect::<Vec<_>>(),
+            "mode": "anonymous",
+            "note": ANON_NOTE,
+            "card": card.trim_end(),
+        }));
+    }
     let url = thread_url(&r.creds()?.base(), &id, limit);
     let (body, rate) = r.get(&url).await?;
     let view = parse_thread_value(&body)?;
@@ -663,10 +797,10 @@ fn watch_card(matches: &[Post], now: f64) -> String {
     let mut out = format!("👀 **reddit watch** — {} new match(es)\n", matches.len());
     for p in matches.iter().take(8) {
         out.push_str(&format!(
-            "• r/{} — {} (▲{})\n  {}\n",
+            "• r/{} — {} ({})\n  {}\n",
             p.subreddit,
             clip(&p.title, 110),
-            p.score,
+            score_label(p.score, p.metrics_known),
             p.permalink_url()
         ));
     }
@@ -688,22 +822,54 @@ async fn do_check(r: Arc<Reddit>, limit: usize) -> std::result::Result<Value, St
             "note": "no subreddits on the watch list yet — add one with action=add",
         }));
     }
-    let base = r.creds()?.base();
+    // Signed-out, the feed's allowance is about one request per 30s, so a
+    // tick spends it on the single least-recently-checked sub and names the
+    // rest as deferred — burning the budget on certain 429s would report
+    // noise instead of matches.
+    let anonymous = !r.has_creds();
+    let mut subs: Vec<String> = w.subs.iter().take(8).cloned().collect();
+    let mut deferred: Vec<String> = Vec::new();
+    if anonymous {
+        // Oldest ATTEMPT first, not oldest successful read: a sub that was
+        // throttled last tick must not hold the slot again this tick.
+        subs.sort_by(|a, b| {
+            w.last_try_of(a)
+                .partial_cmp(&w.last_try_of(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        deferred = subs.split_off(1);
+    }
+    let base = if anonymous {
+        r.anon_base.clone()
+    } else {
+        r.creds()?.base()
+    };
     let mut posts: Vec<Post> = Vec::new();
     let mut checked: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
-    for sub in w.subs.iter().take(8) {
+    for sub in &subs {
         // /new is the only sort that gives a stable "since last time"
         // window without paging back through history.
-        let url = listing_url(&base, sub, "new", 50, "day", None);
-        match r.get(&url).await {
-            Ok((body, _)) => match parse_listing_value(&body) {
-                Ok(page) => {
-                    checked.push(sub.clone());
-                    posts.extend(page.posts);
-                }
-                Err(e) => errors.push(format!("r/{sub}: {e}")),
-            },
+        let fetched: std::result::Result<Vec<Post>, String> = if anonymous {
+            match r
+                .get_feed(&rss_listing_url(&base, sub, "new", 50, "day"))
+                .await
+            {
+                Ok(body) => parse_atom_posts(&body),
+                Err(e) => Err(e),
+            }
+        } else {
+            let url = listing_url(&base, sub, "new", 50, "day", None);
+            match r.get(&url).await {
+                Ok((body, _)) => parse_listing_value(&body).map(|page| page.posts),
+                Err(e) => Err(e),
+            }
+        };
+        match fetched {
+            Ok(rows) => {
+                checked.push(sub.clone());
+                posts.extend(rows);
+            }
             Err(e) => errors.push(format!("r/{sub}: {e}")),
         }
     }
@@ -715,10 +881,22 @@ async fn do_check(r: Arc<Reddit>, limit: usize) -> std::result::Result<Value, St
     for p in &posts {
         next.mark(p);
     }
+    for s in &subs {
+        next.tried(s, now);
+    }
     // Keep the matches for the morning digest. Recording is separate from
     // the cursor, so `watch recent` can re-read last night without
     // consuming what this check just announced.
     next.record(&matches, now_ms());
+    // Persist what this tick could and could not do: the briefing reads the
+    // digest WITHOUT advancing anything, so this is the only way it can tell
+    // "nothing matched" apart from "the budget only reached one sub".
+    next.last_check = Some(CheckReport {
+        at_ms: now_ms(),
+        checked: checked.clone(),
+        deferred: deferred.clone(),
+        errors: errors.clone(),
+    });
     if let Err(e) = save_watch(&r.watch_file, &next) {
         return Err(format!(
             "the watch file {} could not be saved: {e}",
@@ -728,7 +906,10 @@ async fn do_check(r: Arc<Reddit>, limit: usize) -> std::result::Result<Value, St
     Ok(json!({
         "new_count": matches.len(),
         "checked_subs": checked,
+        "deferred": deferred,
         "errors": errors,
+        "mode": if anonymous { "anonymous" } else { "oauth" },
+        "note": if anonymous { ANON_NOTE } else { "" },
         "matches": matches.iter().map(|p| post_json(p, now)).collect::<Vec<_>>(),
         "card": watch_card(&matches, now),
     }))
@@ -800,6 +981,7 @@ async fn do_watch(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, Str
             let cutoff = now_ms().saturating_sub(hours * 3_600_000);
             let caught = w.caught_since(cutoff);
             let now = now_secs();
+            let last = w.last_check.clone().unwrap_or_default();
             let mut card = if caught.is_empty() {
                 format!("👀 reddit lookout — nothing caught in the last {hours}h")
             } else {
@@ -810,21 +992,51 @@ async fn do_watch(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, Str
             };
             for c in caught.iter().take(8) {
                 card.push_str(&format!(
-                    "• r/{} — {} (▲{})\n  {}\n",
+                    "• r/{} — {} ({})\n  {}\n",
                     c.subreddit,
                     clip(&c.title, 110),
-                    c.score,
+                    score_label(c.score, c.metrics_known),
                     c.permalink
+                ));
+            }
+            // A quiet digest because nothing matched and a quiet digest
+            // because the throttle only let one sub be read must not read
+            // the same. Name the subs that weren't reached.
+            if !last.deferred.is_empty() {
+                card.push_str(&format!(
+                    "\n⏳ not read yet (signed-out throttle): {}",
+                    last.deferred
+                        .iter()
+                        .map(|s| format!("r/{s}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !last.errors.is_empty() {
+                card.push_str(&format!(
+                    "\n⚠️ last tick could not read {} watched sub(s)",
+                    last.errors.len()
                 ));
             }
             Ok(json!({
                 "count": caught.len(),
                 "hours": hours,
+                "last_check": if last.at_ms == 0 {
+                    Value::Null
+                } else {
+                    json!({
+                        "age": jerith_reddit_plugin::relative_age(last.at_ms as f64 / 1000.0, now),
+                        "checked": last.checked.clone(),
+                        "deferred": last.deferred.clone(),
+                        "errors": last.errors.clone(),
+                    })
+                },
                 "matches": caught.iter().map(|c| json!({
                     "id": c.id,
                     "subreddit": c.subreddit,
                     "title": c.title,
-                    "score": c.score,
+                    "score": if c.metrics_known { json!(c.score) } else { Value::Null },
+                    "metrics_known": c.metrics_known,
                     "permalink": c.permalink,
                     "age": jerith_reddit_plugin::relative_age(c.created_utc, now),
                 })).collect::<Vec<_>>(),
@@ -857,7 +1069,17 @@ async fn do_watch(r: Arc<Reddit>, args: Value) -> std::result::Result<Value, Str
 async fn do_about(r: Arc<Reddit>, _args: Value) -> std::result::Result<Value, String> {
     let creds = match r.creds() {
         Ok(c) => c,
-        Err(e) => return Ok(json!({"connected": false, "problem": e})),
+        Err(e) => {
+            return Ok(json!({
+                "connected": false,
+                "read_mode": "anonymous_feed",
+                "can_write": false,
+                "rss_base": r.anon_base,
+                "problem": e,
+                "note": ANON_NOTE,
+                "card": "🔵 reddit: signed-out read mode — browse/search/thread/watch read the public Atom feed; posting, voting and scores need a script app + refresh token",
+            }));
+        }
     };
     if let Err(e) = creds.validate() {
         return Ok(json!({"connected": false, "problem": e}));
@@ -937,7 +1159,12 @@ async fn main() -> Result<()> {
             "reddit credentials loaded"
         ),
         Err(e) => {
-            tracing::warn!(error = %e, "reddit credentials missing — reads/writes will refuse until configured")
+            tracing::warn!(
+                error = %e,
+                read_mode = "anonymous_feed",
+                rss_base = %reddit.anon_base,
+                "reddit credentials missing — reads fall back to the public Atom feeds (paced, no scores); writes refuse until configured"
+            )
         }
     }
     let watch_file = reddit.watch_file.clone();
