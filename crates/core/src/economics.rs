@@ -587,12 +587,21 @@ pub async fn chain_balance_uj(rpc_url: &str, identity: &str) -> anyhow::Result<u
         rpc_url.trim_end_matches('/'),
         urlencode(identity)
     );
-    let resp = crate::http::mesh_http()
+    let mut req = crate::http::mesh_http()
         .get(&url)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .context("chain balance unreachable")?;
+        .timeout(Duration::from_secs(5));
+    // The live chain node token-gates /balance: attach the standard api
+    // token when one resolves (JERITH_TOKEN → keys/api.token), same as
+    // every other chain caller. A token-less deployment (test shims)
+    // keeps working — the header is simply absent and an unauthenticated
+    // /balance still answers. 2026-10-31: the boot stake gate's probe
+    // 401'd here and the node demoted hybrid → requester despite a
+    // funded, exactly-at-threshold wallet — the gate's own wallet leg
+    // never saw the truth.
+    if let Some(token) = read_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.context("chain balance unreachable")?;
     let body: serde_json::Value = resp
         .error_for_status()
         .context("chain balance rejected")?
@@ -933,6 +942,51 @@ mod tests {
         // …and the real adapters stay silent (nothing to refuse).
         assert_eq!(optional_chain_note(CryptoChain::Jerithchain), None);
         assert_eq!(optional_chain_note(CryptoChain::None), None);
+    }
+
+    /// 2026-10-31 regression: the boot stake gate's balance probe 401'd
+    /// on the token-gated chain node and demoted a funded hybrid node
+    /// to requester. The probe must attach the standard api token
+    /// (JERITH_TOKEN or keys/api.token) like every other chain caller,
+    /// so the gate's wallet leg reads the real balance. Same env VALUE
+    /// as the bootstrap_server drill test on purpose: that suite shares
+    /// this static env cross-test, and equal writes can't race values.
+    #[tokio::test]
+    async fn chain_balance_probe_carries_the_standard_token() {
+        unsafe { std::env::set_var("JERITH_TOKEN", "drill-token") };
+        let app = axum::Router::new().route(
+            "/balance",
+            axum::routing::get(
+                async |headers: axum::http::HeaderMap| -> axum::Json<serde_json::Value> {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    assert_eq!(
+                        auth, "Bearer drill-token",
+                        "/balance must carry the standard api token"
+                    );
+                    axum::Json(json!({
+                        "exists": true,
+                        "balance_uj": 1_000_000u64,
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap()
+        });
+        let balance = chain_balance_uj(&format!("http://{addr}"), "some-node-id")
+            .await
+            .expect("token-authed /balance probe");
+        assert_eq!(
+            balance, 1_000_000,
+            "a funded exact-threshold wallet must read through to the gate"
+        );
     }
 
     /// The optional-chain wallet card exists exactly when an http(s)
