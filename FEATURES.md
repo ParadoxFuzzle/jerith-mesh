@@ -300,7 +300,7 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
     `[sandbox]` in bot.toml: enabled/image/timeout_secs/max_file_mb/
     max_files/max_output_kb — on by default over the repo-baked
     `jerith-sandbox` image built by `deploy/docker/sandbox.Dockerfile`
-    from the migrated OpenClaw sandbox base + poppler-utils): one
+    from the migrated sandbox base + poppler-utils): one
     disposable container per batch, `--network none`, `--cap-drop ALL`,
     no-new-privileges, read-only rootfs, 16 MiB noexec tmpfs as the only
     writable path, uid 65534, memory/pids/cpu caps, fresh staging volume
@@ -373,7 +373,7 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   push-only via `webinbox` (public webhook URL required — 📋 open lane)
 
 ## 8. Plugin / Skill System
-- 🔄 OpenClaw-style modular plugin and skill architecture (Phase 3 core ✅;
+- 🔄 Jerith Mesh modular plugin and skill architecture (Phase 3 core ✅;
   see plugins.rs — full reference now in [docs/PLUGINS.md](docs/PLUGINS.md)):
   - Capabilities are **plugins** owning dot-named **skills** (`web_search`,
     `memory.embed`, …): one `SkillSpec` table entry per skill derives the
@@ -424,7 +424,7 @@ Status legend: ✅ in MVP · 🔄 in progress · 📋 planned (phase noted)
   - Detections logged locally without raw values; stats on `/status`
   - Configured via `[guard]` in config.toml (`guard.enabled = false` to
     switch the whole gate off)
-- ✅ Default pre-packaged plugins (registry-managed; OpenClaw lineage kept
+- ✅ Default pre-packaged plugins (registry-managed; Jerith Mesh plugin model kept
   in the names): Juice Compact = web tools (`web_search`, `web_fetch` via
   `[websearch]`), Context Squeeze = bot-side compaction (registers no
   model tools — a lifecycle plugin), plus `memory` and `lore` plugins over

@@ -97,7 +97,7 @@ its auth and introspects it:
 - **Bot attachment sandbox**: non-image Discord attachments are read
   inside a disposable container from `jerith-sandbox:latest` — built by
   `docker build -f deploy/docker/sandbox.Dockerfile -t jerith-sandbox:latest .`
-  (extends the migrated OpenClaw sandbox base with poppler-utils; rebuild
+  (extends the migrated sandbox base with poppler-utils; rebuild
   it on the host after a fresh clone or the files line reads
   "could not read: sandbox …"). Safety contract lives in
   `crates/bot/src/sandbox.rs` (`--network none`, caps dropped, read-only
@@ -380,6 +380,77 @@ curl -s http://127.0.0.1:8900/status | python3 -c \
 If every step above passes, the deploy is live and consistent with the
 pushed code. Record the deployed commit (`git log -1`) for rollback.
 
+## Production state — Postgres + pgvector memory (2026-10-31)
+
+The live node's memory backend is the operator's own PostgreSQL 16 +
+pgvector 0.6.0 on loopback. This section is production state, not the
+switch drill above (§5c/§5d).
+
+| Item | Value |
+|---|---|
+| Backend | `memory_backend = "postgres_pgvector"` in `~/.jerith-mesh/config.toml` |
+| Database | `jerith_mesh`, owner `jerith_user`, extension `vector` |
+| Table | `public.memories` — `vector(256)` pinned, HNSW cosine index |
+| Embeddings | local nomic (`nomic-embed-text-v2-moe`, dim 256) |
+| Retention | `memory_max_rows = 10000` (default) |
+| DSN | `memory_dsn` in `~/.jerith-mesh/config.toml` (mode 0600) |
+
+**DSN location.** The DSN carries the password because the node store
+connects `NoTls` and does not read `~/.pgpass`; keep `config.toml` at
+0600. `JERITH_MEMORY_DSN` overrides the config value for packaged
+deployments. `sslmode=require` is refused by design — use a loopback
+database or terminate TLS at a sidecar. The role only needs `CONNECT`
+and table rights on `jerith_mesh`; extension creation is a superuser
+one-time step (`psql -d jerith_mesh -c 'CREATE EXTENSION IF NOT EXISTS vector'`).
+
+The legacy databases (`jerith`, `community_memory`,
+`self_improving`, `jerith_people`) are NOT this store and were left
+untouched. `jerith_mesh` is a separate database so the old
+`jerith.memories` layout (`vector(768)`, topic/content columns) is
+never reshaped by the 256-dim pin. Previous-stack memories imported into
+Jerith carry an `[openclaw:<db>]` prefix; the bot's live people lookup
+still reads `jerith_people` directly (`[postgres]` in bot.toml).
+
+### Verify
+
+```bash
+journalctl --user -u jerith-node -n 100 --no-pager | grep -i 'memory store'
+# want: postgres memory store ready schema=public pgvector=true
+jerith memory stats      # entries; every dim must be 256
+curl -s http://127.0.0.1:8900/v1/skills/memory/stats
+PGPASSWORD=… psql -h 127.0.0.1 -U jerith_user -d jerith_mesh \
+  -c 'select count(*), min(dim), max(dim) from memories'
+```
+
+### Backup and restore
+
+```bash
+pg_dump -h 127.0.0.1 -U jerith_user -Fc \
+  -f ~/jerith_mesh-$(date +%F).dump jerith_mesh
+```
+
+Restore into a fresh database (never `--clean` over the live one while
+the node runs):
+
+```bash
+psql -h 127.0.0.1 -U postgres -d postgres \
+  -c 'CREATE DATABASE jerith_mesh OWNER jerith_user'
+psql -h 127.0.0.1 -U postgres -d jerith_mesh \
+  -c 'CREATE EXTENSION IF NOT EXISTS vector'
+pg_restore -h 127.0.0.1 -U jerith_user -d jerith_mesh --no-owner \
+  ~/jerith_mesh-YYYY-MM-DD.dump
+systemctl --user restart jerith-node
+```
+
+If the database is lost and only the SQLite store remains: set
+`memory_backend = "sqlite"`, restart, then switch back with
+`jerith config set memory_backend=postgres memory_dsn=…` and
+`jerith memory migrate` (rows copy verbatim; duplicates by text are
+skipped, so it is idempotent). A broken pgvector DSN degrades only the
+memory skills — chat, mesh and the dashboard keep serving
+(`memory backend not configured` / swap-failed WARN), so recovery never
+has to race a restart.
+
 ## Optional-chain wallet adapters (§9, per-chain examples)
 
 The default chain is JerithChain. Setting `[crypto] chain` to a PoW chain
@@ -524,10 +595,10 @@ refuses any hostname whose resolved addresses are private/loopback
 
 ## Bot-facing ops (lore index, monitor scaffold, guild-admin)
 
-### Lore index (OpenClaw void-lore vault port)
+### Lore index (void-lore vault)
 
 A per-request index over the lore vault (`$JERITH_LORE_VAULT`, else the
-`[lore] vault_dir` in config.toml, else the migrated OpenClaw vault),
+`[lore] vault_dir` in config.toml, else the migrated vault),
 served by the node and surfaced in Discord as `/lore` (excerpts only —
 no model call, no cost):
 
@@ -543,7 +614,7 @@ curl -s -X POST http://127.0.0.1:8900/v1/skills/lore/search \
 No vault configured → the endpoint answers 503 with a hint, never a
 wrong empty result.
 
-### Monitor scaffold (OpenClaw ops-monitor family port)
+### Monitor scaffold (Jerith Mesh ops-monitor family)
 
 `jerith-bot` runs five checks every `[monitor] interval_minutes`
 (default 30): disk (warn 5 points before the threshold), SSL expiry of
@@ -2411,9 +2482,9 @@ verbatim.
 
 Same session, the guild-watcher retired: the welcome-DM lane moved
 into `crates/bot/src/welcome.rs` (`[welcome]` in bot.toml — the
-OpenClaw guild-watcher port: same three embeds, the red-panda GIF pool
+Jerith Mesh guild watcher: same three embeds, the red-panda GIF pool
 migrated to `~/.jerith-mesh/workspace/gifworkshop/redpandas/`, members
-intent unioned in main.rs). The OpenClaw-era Python unit
+intent unioned in main.rs). The legacy Python unit
 (`guild-admin-watcher.service`) is stopped + disabled 2026-10-27
 (reversible with `systemctl --user start`); both lanes firing at once
 would double-DM — keep only one up.

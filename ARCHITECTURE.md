@@ -265,7 +265,7 @@ Started 2026-10-15 (M0). The ladder, each milestone verifiable on its own:
 | CLI | ✅ `jerith setup/run/status/peers` | plugins, model switch UX |
 | Web UI | ✅ status page | full dashboard |
 | OpenAI API | ✅ | tool calling, embeddings |
-| Discord | ✅ `/ask /reset /remember /recall /status /peers /mine` | expanded beyond OpenClaw |
+| Discord | ✅ `/ask /reset /remember /recall /status /peers /mine` | expanded beyond the previous stack |
 | Telegram / WhatsApp | 📋 Phase 3 | via plugin SDK |
 
 ## 12. Non-goals

@@ -1,6 +1,6 @@
 # Plugin / skill system (Phase 3)
 
-The bot's model-facing capabilities follow the OpenClaw lineage: a
+The bot's model-facing capabilities follow the Jerith Mesh plugin model: a
 **plugin** owns capabilities, a **skill** is one callable the model can
 summon mid-answer. The whole architecture lives in one table
 (`crates/bot/src/plugins.rs`): every skill is a single `SkillSpec` entry
@@ -34,6 +34,7 @@ parameters + runner. Touch `plugins.rs`, not three call sites.
 | `lore`      | `lore.search`                             | `POST {gateway}/v1/skills/lore/search` — community-canon index (`503` with a hint when no vault is configured, never an empty fake result) |
 | `writing`   | `writing.factcheck`, `writing.template`   | `POST {gateway}/v1/skills/writing/factcheck` — the pre-publish fact-check pass: flags invented numbers/dates/places/people/titles against the operator's canon register (auto-loaded by the gateway from `JERITH_FACTCHECK_CANON` → the node workspace `COLONY-X-CANON.md`; an explicit `canon` argument overrides). One strictly-local model call — never a tier reroute, never mesh; refuses outright on a proxy-only runtime. `POST {gateway}/v1/skills/writing/template` — creator template pack (`short_script` / `episode_blurb` / `sponsor_about` / `youtube_seo`): one local-model call, returned as a JSON object VALIDATED against the template's field list (one corrective retry on a bad fill, loud `502` after two); narrative templates ride the same auto-loaded canon register |
 | `vision`    | `vision.describe`, `vision.analyze`       | `POST {gateway}/v1/skills/vision/{describe,analyze}` — multimodal forward through the model router's vision tier (base64 image or `data:` URL in, text out) |
+| `pgquery`   | `pg.query`                                | Read-only Postgres lookups, owner-DM sessions only: one `SELECT`/`WITH` against a database on the `[pgquery] databases` allowlist, inside `BEGIN TRANSACTION READ ONLY`, with a statement timeout, a row cap and a response-size cap. Write/DDL keywords are refused before connecting; the password comes from `~/.pgpass`, never bot.toml. See `pgquery.rs` |
 | `squeeze`   | *(none — lifecycle plugin)*               | bot-side history compaction (`crates/bot/src/squeeze.rs`): passive transcript trim + deep pass; registers no model tools deliberately |
 
 `vision.analyze` shares the describe endpoint's transport; the schema
@@ -62,6 +63,9 @@ enabled = ["websearch", "memory", "lore", "squeeze"]
   dispatch whitelist, so a disabled or unknown skill **cannot be
   summoned** by the model at all — including via the lenient
   content-intent path (its allowlist is the same registry list).
+- `pgquery` is owner-only (`OWNER_ONLY_PLUGINS`): `pg.query` joins the
+  registry only in owner-DM sessions and never appears in `enabled`.
+  Opt out with `[pgquery] enabled = false` in bot.toml.
 
 ## The refusal contract
 
