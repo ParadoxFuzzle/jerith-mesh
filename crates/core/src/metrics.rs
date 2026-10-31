@@ -1,7 +1,7 @@
 //! Perf/cost meters — model-performance-benchmark + session-cost-tracker
 //! ports, built on the gateway's existing counters.
 //!
-//! What OpenClaw's two skills did (latency/success per model; real token
+//! What the previous stack's two skills did (latency/success per model; real token
 //! counts per session) now lives in the mesh node one layer lower:
 //!
 //! - **Per-request capture** (gateway `chat_completions` completion paths):
@@ -9,7 +9,7 @@
 //!   runtime's `usage` when present), served-by (local vs mesh peer).
 //! - **Aggregates** ([`Metrics::snapshot`]): per-model request/latency/
 //!   token totals plus global success rate — the ranking inputs the
-//!   OpenClaw skill computed from trajectory logs, here from live traffic.
+//!   Jerith Mesh skill computed from trajectory logs, here from live traffic.
 //! - **Exposure**: `GET /v1/metrics` (full JSON) and a `metrics` section
 //!   in `/status` — both cheap reads over a ring + a BTreeMap.
 //!

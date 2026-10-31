@@ -1,16 +1,16 @@
 //! Web access skills: Brave Search API + URL fetch with readable-text
 //! extraction.
 //!
-//! Ported from the OpenClaw stack (`@openclaw/brave-plugin` web-search
+//! Ported from the previous stack (`@openclaw/brave-plugin` web-search
 //! provider and the `web_fetch` tool) so a jerith-mesh node can answer
-//! with live web data the same way the OpenClaw agent could:
+//! with live web data the same way the legacy agent could:
 //!
 //! - `web_search` → `GET {base_url}/res/v1/web/search` with
 //!   `X-Subscription-Token` auth (Brave Search API v1, `web` mode), each
 //!   `web.results[]` entry mapped to title/url/description/page_age/site.
 //! - `web_fetch`  → download a page and strip HTML down to readable text
 //!   (scripts/styles/comments removed, entities decoded, whitespace
-//!   collapsed) — the paged-read counterpart of OpenClaw's web_fetch.
+//!   collapsed) — the paged-read counterpart of the previous stack's web_fetch.
 //!
 //! SSRF stance (as upstream): non-HTTP(S) schemes and loopback/private/
 //! link-local/metadata host literals are rejected before any request is
@@ -46,7 +46,7 @@ const USER_AGENT: &str =
 /// node's memory; past this the download simply stops.
 const FETCH_BODY_CAP_BYTES: usize = 2 * 1024 * 1024;
 
-/// One search result — the OpenClaw `web_search` shape (minus the
+/// One search result — the Jerith Mesh `web_search` shape (minus the
 /// `wrapWebContent` marking, which is agent-side framing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebHit {
@@ -86,8 +86,8 @@ impl WebHit {
     }
 }
 
-/// Brave snippets carry `<b>`/`<strong>`-style highlight tags; OpenClaw
-/// passes them through with wrapWebContent framing and jerith strips them.
+/// Brave snippets carry `<b>`/`<strong>`-style highlight tags; they pass
+/// through wrapWebContent framing and are stripped here.
 fn clean_snippet(v: Option<&Value>) -> String {
     let s = v.and_then(Value::as_str).unwrap_or_default();
     strip_tags(s).trim().to_string()
@@ -276,7 +276,7 @@ pub struct SearchQuery {
     pub freshness: Option<String>,
 }
 
-/// Brave Search (web mode) client — OpenClaw brave-plugin port.
+/// Brave Search (web mode) client.
 pub struct WebSearchService {
     client: reqwest::Client,
     base_url: String,
@@ -343,7 +343,7 @@ impl WebSearchService {
             bail!(
                 "missing Brave API key — a node's [websearch] table resolves it from \
                  `api_key` / `api_key_path` in config.toml, $JERITH_BRAVE_API_KEY, \
-                 ~/.jerith-mesh/brave-key, or the OpenClaw keyring copy"
+                 ~/.jerith-mesh/brave-key, or the legacy keyring copy"
             );
         };
         if q.query.trim().is_empty() {

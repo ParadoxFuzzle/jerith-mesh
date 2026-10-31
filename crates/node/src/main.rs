@@ -618,7 +618,7 @@ async fn run(cmd: Cmd) -> anyhow::Result<()> {
 }
 
 /// `jerith lore <query>` — sourced canon answers from the lore vault
-/// (void-lore-index port; vault default is the OpenClaw borrow).
+/// (void-lore-index; vault default is the migrated vault borrow).
 /// `jerith experts …` — the local expert weight store (Phase 2 tensor
 /// transport). Reads the same `[experts]` config the node serves from.
 async fn experts_cmd(cmd: ExpertsCmd) -> anyhow::Result<()> {
@@ -4308,7 +4308,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         None
     };
 
-    // Web access skills (OpenClaw migration): Brave search + URL fetch.
+    // Web access skills (migration): Brave search + URL fetch.
     // Disabled in config, or a search call simply reports "missing Brave
     // API key" with the resolution order as the hint.
     let web = if cfg.websearch.enabled {
@@ -4318,7 +4318,7 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
         } else {
             tracing::warn!(
                 "web skills enabled but no Brave API key found — set [websearch] api_key/api_key_path, \
-                 $JERITH_BRAVE_API_KEY, or copy the OpenClaw keyring to ~/.jerith-mesh/brave-key"
+                 $JERITH_BRAVE_API_KEY, or copy the legacy keyring to ~/.jerith-mesh/brave-key"
             );
         }
         let svc = jerith_mesh_core::websearch::WebSearchService::new(

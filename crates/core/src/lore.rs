@@ -4,10 +4,10 @@
 //! rules, artifacts — any directory of `.md` files, subdirs included) and
 //! answers canon questions **with sourced excerpts**: every result carries
 //! the file, the section heading, and a real excerpt from the vault. No
-//! embeddings, no network — the OpenClaw skill's "excerpt + id" contract
+//! embeddings, no network — the Jerith Mesh skill's "excerpt + id" contract
 //! kept, as a pure-Rust in-memory index rebuilt on demand (or at boot).
 //!
-//! Vault default: the migrated OpenClaw vault
+//! Vault default: the migrated vault
 //! (`~/.openclaw/workspace/voidsaga-vault/` — read-only borrow; the mesh
 //! never writes to it). Override with the `[lore]` config table
 //! (`vault_dir`, see config.rs) or `$JERITH_LORE_VAULT`.
@@ -21,7 +21,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 /// One addressable lore unit: a whole small doc or one `#`/`##` section
-/// of a bigger one — the granularity the OpenClaw API served.
+/// of a bigger one — the granularity the previous API served.
 #[derive(Debug, Clone, Serialize)]
 pub struct LoreEntry {
     /// Stable id: vault-relative path + optional `#Section` anchor.
@@ -60,7 +60,7 @@ pub struct LoreIndex {
     built_ms: u64,
 }
 
-/// Default vault location (the migrated OpenClaw vault), when present.
+/// Default vault location (the migrated vault), when present.
 pub fn default_vault_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("JERITH_LORE_VAULT") {
         let p = PathBuf::from(d.trim());
@@ -73,7 +73,7 @@ pub fn default_vault_dir() -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// Parse `tags: a, b, c` out of YAML-ish front matter (the OpenClaw skill's
+/// Parse `tags: a, b, c` out of YAML-ish front matter (the Jerith Mesh skill's
 /// minimal subset: only the tags key is consumed).
 fn parse_front_tags(front: &str) -> Vec<String> {
     front
