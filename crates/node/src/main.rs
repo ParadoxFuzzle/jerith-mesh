@@ -4434,7 +4434,10 @@ async fn run_node(switch_model: Option<String>) -> anyhow::Result<()> {
     // tensors (a populated expert store) — a node that pools expert
     // weights serves them with no LLM runtime installed at all.
     let quic_port = cfg.effective_rpc_port();
-    let rpc_addr: std::net::SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
+    // `rpc_bind` (default 0.0.0.0) scopes who may dial IN; the advertised
+    // rpc address is unchanged (it comes from advertise_host).
+    let rpc_addr: std::net::SocketAddr =
+        format!("{}:{quic_port}", cfg.effective_rpc_bind()).parse()?;
     let model_name = cfg.model.as_ref().map(|m| m.id.clone()).unwrap_or_default();
     let runtime = match jerith_mesh_core::quic::RuntimeExpert::discover(
         &cfg.runtime_url,
@@ -4772,6 +4775,13 @@ async fn config_cmd(assignments: Vec<String>) -> anyhow::Result<()> {
                 } else {
                     cfg.rpc_port = Some(v.parse().context("bad rpc_port")?);
                 }
+            }
+            "rpc_bind" => {
+                cfg.rpc_bind = if v.eq_ignore_ascii_case("none") || v == "0.0.0.0" {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
             }
             "runtime_url" => cfg.runtime_url = v.to_string(),
             "runtime_api_key" => cfg.runtime_api_key = Some(v.to_string()),

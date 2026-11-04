@@ -418,6 +418,13 @@ pub struct NodeConfig {
     pub gateway_port: u16,
     /// UDP port for the QUIC NodeRPC listener (defaults to gateway_port+1).
     pub rpc_port: Option<u16>,
+    /// Address the QUIC NodeRPC listener binds. Defaults to `0.0.0.0` (the
+    /// historical wildcard behavior). Set a LAN IP or `127.0.0.1` to scope
+    /// who can reach peer dispatch without a firewall rule — the ADVERTISED
+    /// rpc address still comes from `advertise_host`, so narrowing the bind
+    /// limits who may dial in, never where peers are told to dial.
+    #[serde(default)]
+    pub rpc_bind: Option<String>,
     /// Hostname or IP peers should use to reach this node's advertised
     /// gateway + QUIC rpc addresses. None → auto-detect the default-route
     /// interface address at first use; sticks with `127.0.0.1` only when
@@ -427,7 +434,7 @@ pub struct NodeConfig {
     /// Address the gateway HTTP/WebUI server binds. Defaults to
     /// `127.0.0.1` (the historical loopback-only behavior — opt in to
     /// `0.0.0.0` when the node serves remote peers over the network; the
-    /// QUIC rpc listener has always been wildcard-bound).
+    /// QUIC rpc listener has its own knob — see `rpc_bind`).
     #[serde(default)]
     pub gateway_bind: Option<String>,
     /// Colibri / Ollama base URL to forward chat completions to.
@@ -992,6 +999,7 @@ impl Default for NodeConfig {
             specialists: SpecialistConfig::default(),
             gateway_port: 8900,
             rpc_port: None,
+            rpc_bind: None,
             advertise_host: None,
             gateway_bind: None,
             runtime_api_key: None,
@@ -1035,6 +1043,17 @@ impl NodeConfig {
         match self.gateway_bind.as_deref() {
             Some(b) if !b.trim().is_empty() => b.trim(),
             _ => "127.0.0.1",
+        }
+    }
+
+    /// Bind address for the QUIC NodeRPC listener (see `rpc_bind`). Stays
+    /// wildcard when unset: narrowing binds are an explicit operator choice,
+    /// and a pre-existing config must keep accepting LAN peers exactly as it
+    /// always has.
+    pub fn effective_rpc_bind(&self) -> &str {
+        match self.rpc_bind.as_deref() {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => "0.0.0.0",
         }
     }
 

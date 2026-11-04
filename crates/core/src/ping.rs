@@ -2002,6 +2002,24 @@ async fn run_loop(
     tracing::info!("mesh loop stopped");
 }
 
+/// Peers the health loop probes this tick: every advertised peer except
+/// ourselves — deprecated ones INCLUDED.
+///
+/// Deliberately not [`PeerRegistry::connectable`]: that view drops
+/// `Deprecated` peers so dispatch never plans around a dead node, but this
+/// loop is the only thing that can clear the verdict. Probing the same view
+/// made deprecation a one-way door — a peer that recovered stayed evicted
+/// until the process restarted (seen live: a node whose gateway was
+/// loopback-bound got deprecated on its peer, and fixing the bind left it
+/// `deprecated, fails=3` until a restart).
+fn ping_targets(reg: &PeerRegistry, my_id: &str) -> Vec<(String, String)> {
+    reg.all_ads()
+        .into_iter()
+        .filter(|ad| ad.node_id != my_id)
+        .map(|ad| (ad.node_id.clone(), format!("http://{}/health", ad.address)))
+        .collect()
+}
+
 /// Ping all connectable peers with a minimal-resource, signed request.
 /// The reply must carry a valid Ed25519 health signature from the peer's
 /// own key before we count it as alive — spoofed liveness is rejected.
@@ -2013,11 +2031,7 @@ async fn ping_all(state: &Arc<MeshState>, bootstrap: &BootstrapClient) {
     let my_id = state.identity.node_id();
     let targets: Vec<(String, String)> = {
         let reg = state.registry.lock().await;
-        reg.connectable()
-            .into_iter()
-            .filter(|(ad, _)| ad.node_id != my_id)
-            .map(|(ad, _)| (ad.node_id.clone(), format!("http://{}/health", ad.address)))
-            .collect()
+        ping_targets(&reg, &my_id)
     };
     if targets.is_empty() {
         return;
@@ -3405,6 +3419,49 @@ mod tests {
     #[test]
     fn deprecate_count_matches_spec_threshold() {
         assert_eq!(DEPRECATE_AFTER_FAILED_PINGS, 3);
+    }
+
+    /// Deprecation must not be a one-way door: the health loop keeps probing
+    /// peers the dispatch views exclude, so a peer that recovers is promoted
+    /// back without a node restart.
+    #[test]
+    fn deprecated_peer_stays_in_the_ping_set_and_recovers() {
+        let model = crate::models::ModelId {
+            id: "ping-recovery".into(),
+            quant: "int4".into(),
+            source: crate::models::ModelSource::Curated,
+        };
+        let mut reg = crate::bootstrap::PeerRegistry::new(Some(model));
+        let ad: crate::bootstrap::PeerAd = serde_json::from_str(
+            r#"{"node_id":"aaaa","address":"127.0.0.1:9","model_id":"ping-recovery","quant":"int4","contribution_percent":25,"last_seen_ms":1,"role":"hybrid","rpc_address":""}"#,
+        )
+        .expect("ad parses");
+        assert!(reg.upsert(ad));
+        for _ in 0..DEPRECATE_AFTER_FAILED_PINGS {
+            reg.record_ping_fail("aaaa");
+        }
+        assert_eq!(
+            reg.state_of("aaaa"),
+            Some(crate::bootstrap::PeerState::Deprecated)
+        );
+        assert!(
+            reg.connectable().is_empty(),
+            "dispatch candidates still exclude a deprecated peer"
+        );
+        assert_eq!(
+            ping_targets(&reg, "self"),
+            vec![(
+                "aaaa".to_string(),
+                "http://127.0.0.1:9/health".to_string()
+            )],
+            "the health loop must keep probing it"
+        );
+        reg.record_ping_ok("aaaa", 7);
+        assert_eq!(
+            reg.state_of("aaaa"),
+            Some(crate::bootstrap::PeerState::Alive)
+        );
+        assert_eq!(reg.health_of("aaaa").unwrap().consecutive_failures, 0);
     }
 
     #[test]
