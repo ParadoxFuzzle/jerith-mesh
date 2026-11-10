@@ -1,3 +1,5 @@
+JER is just the currency of JerithCoin.  I just wanted to see if I could make something similar to Steemit and Hive but with AI as a service and proof of work.  It's never meant to be listed in any indexes and has zero monetary value.
+
 # jerith-mesh
 
 > A model-homogeneous P2P compute mesh for MoE LLM inference.
